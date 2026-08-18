@@ -1104,11 +1104,22 @@ pub struct WarmupSample {
     pub input_ref: String,
     /// Number of dummy inferences for this sample (default 1).
     pub iterations: u32,
+    /// G3a: target route. Default `/predict` = the inference pipeline via the
+    /// queue; any other absolute path is dispatched as a RouteCall directly
+    /// to the pinned worker (custom `@route` handlers).
+    pub route: String,
+    /// G3a: extra request headers carried on the sample's RequestMeta.
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 impl Default for WarmupSample {
     fn default() -> Self {
-        Self { input_ref: String::new(), iterations: 1 }
+        Self {
+            input_ref: String::new(),
+            iterations: 1,
+            route: "/predict".to_string(),
+            headers: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -1148,6 +1159,27 @@ impl WarmupPolicy {
         for (i, s) in self.samples.iter().enumerate() {
             if s.input_ref.trim().is_empty() {
                 anyhow::bail!("policies.warmup.samples[{i}].input_ref must not be empty");
+            }
+            // G3a: route must be an absolute path; header keys must be HTTP
+            // token chars (RFC 9110 tchar) — they ride RequestMeta verbatim.
+            if !s.route.starts_with('/') {
+                anyhow::bail!(
+                    "policies.warmup.samples[{i}].route must be an absolute path starting with '/'"
+                );
+            }
+            for k in s.headers.keys() {
+                let valid = !k.is_empty()
+                    && k.bytes().all(|b| {
+                        matches!(b,
+                            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+                            | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*'
+                            | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+                    });
+                if !valid {
+                    anyhow::bail!(
+                        "policies.warmup.samples[{i}].headers key {k:?} is not a valid HTTP header name"
+                    );
+                }
             }
         }
         Ok(())
@@ -1672,6 +1704,57 @@ mod tests {
         assert_eq!(p.total_timeout_secs, 30.0);
         assert_eq!(p.concurrency, 4);
         assert_eq!(p.retries, 2);
+    }
+
+    #[test]
+    fn warmup_sample_route_and_headers_parse_with_defaults() {
+        // G3a: a sample may target a custom @route with explicit headers;
+        // defaults keep the /predict queue path.
+        let s: WarmupSample = serde_yaml::from_str("input_ref: warmup/in.json\n").unwrap();
+        assert_eq!(s.route, "/predict", "default route is the inference path");
+        assert!(s.headers.is_empty());
+
+        let s: WarmupSample = serde_yaml::from_str(
+            "input_ref: warmup/in.json\nroute: /preprocess\nheaders:\n  x-mode: warm\n",
+        )
+        .unwrap();
+        assert_eq!(s.route, "/preprocess");
+        assert_eq!(s.headers.get("x-mode").map(String::as_str), Some("warm"));
+    }
+
+    #[test]
+    fn warmup_sample_route_and_header_validation() {
+        // route must be an absolute path; header keys must be HTTP token chars.
+        for (route, why) in [("", "empty"), ("preprocess", "no leading slash")] {
+            let p = WarmupPolicy {
+                enabled: true,
+                samples: vec![WarmupSample {
+                    input_ref: "w/in.json".to_string(),
+                    route: route.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(
+                p.validate().is_err(),
+                "route {route:?} ({why}) must fail validation"
+            );
+        }
+        let p = WarmupPolicy {
+            enabled: true,
+            samples: vec![WarmupSample {
+                input_ref: "w/in.json".to_string(),
+                headers: [("bad header".to_string(), "v".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            p.validate().is_err(),
+            "a space in a header key must fail validation"
+        );
     }
 
     #[test]

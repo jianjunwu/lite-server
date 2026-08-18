@@ -2,7 +2,6 @@
 //! max_requests auto-recycle listener, and FILE_CHANGED hot-reload notify.
 
 use super::hooks::{execute_hook, policies_from_config};
-use futures::StreamExt;
 use super::process::{
     classify_stderr_line, drain_worker_stderr, emit_stderr_line, new_worker_command,
     spawn_worker_monitor, strip_level_prefix, worker_endpoint,
@@ -15,6 +14,7 @@ use crate::inference_queue::{model_version_key, OutlierState};
 use crate::registry::types::*;
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
+use futures::StreamExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,10 +99,7 @@ impl WarmupFailure {
 /// workers cold. `version` scope keeps the configured total
 /// (Σ samples×iterations) and round-robins units across workers. Pins ride
 /// the existing `x-lite-worker-id` direct-pin header (B3).
-fn build_warmup_plan(
-    policy: &crate::config::WarmupPolicy,
-    worker_count: usize,
-) -> Vec<WarmupUnit> {
+fn build_warmup_plan(policy: &crate::config::WarmupPolicy, worker_count: usize) -> Vec<WarmupUnit> {
     let sample_units = || {
         policy
             .samples
@@ -178,6 +175,33 @@ fn group_units_by_pin(plan: &[WarmupUnit]) -> Vec<Vec<WarmupUnit>> {
         .collect()
 }
 
+/// Shared warmup response check (queue and RouteCall paths alike): a non-Ok
+/// status (or a non-Single payload) fails the attempt.
+fn validate_warmup_response(
+    response: crate::proto::liteserver::Response,
+) -> Result<(), WarmupFailure> {
+    let ok = matches!(
+        response.payload,
+        Some(crate::proto::liteserver::response::Payload::Single(ref s))
+            if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+    );
+    if ok {
+        return Ok(());
+    }
+    let detail = match response.payload {
+        Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
+            .status
+            .as_ref()
+            .map(|st| st.message.clone())
+            .unwrap_or_default(),
+        _ => "unexpected response payload".to_string(),
+    };
+    Err(WarmupFailure::failure(format!(
+        "warmup inference returned error: {}",
+        detail
+    )))
+}
+
 impl WorkerManager {
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
@@ -194,16 +218,26 @@ impl WorkerManager {
                         continue; // already reloading
                     }
                     if let Some(wm) = wm.upgrade() {
-                        info!("Auto-recycling model {} version {} (max_requests reached)",
-                            signal.model_name, signal.version);
-                        let result = wm.reload_model(&signal.model_name, Some(&signal.version)).await;
+                        info!(
+                            "Auto-recycling model {} version {} (max_requests reached)",
+                            signal.model_name, signal.version
+                        );
+                        let result = wm
+                            .reload_model(&signal.model_name, Some(&signal.version))
+                            .await;
                         match result {
-                            Ok(true) => info!("Model {} version {} auto-recycled successfully",
-                                signal.model_name, signal.version),
-                            Ok(false) => warn!("Model {} version {} not found for auto-recycle",
-                                signal.model_name, signal.version),
-                            Err(e) => error!("Model {} version {} auto-recycle failed: {}",
-                                signal.model_name, signal.version, e),
+                            Ok(true) => info!(
+                                "Model {} version {} auto-recycled successfully",
+                                signal.model_name, signal.version
+                            ),
+                            Ok(false) => warn!(
+                                "Model {} version {} not found for auto-recycle",
+                                signal.model_name, signal.version
+                            ),
+                            Err(e) => error!(
+                                "Model {} version {} auto-recycle failed: {}",
+                                signal.model_name, signal.version, e
+                            ),
                         }
                         reloading.remove(&key);
                     } else {
@@ -233,7 +267,10 @@ impl WorkerManager {
         let file_changed_timeout =
             Duration::from_secs_f32(self.server_tunables.file_changed_timeout_secs);
 
-        let clients = self.get_zmq_clients(model_name, version).await.unwrap_or_default();
+        let clients = self
+            .get_zmq_clients(model_name, version)
+            .await
+            .unwrap_or_default();
         if clients.is_empty() {
             return false;
         }
@@ -252,7 +289,10 @@ impl WorkerManager {
                     },
                 )),
             };
-            let handled = match client.send_with_timeout(request, file_changed_timeout).await {
+            let handled = match client
+                .send_with_timeout(request, file_changed_timeout)
+                .await
+            {
                 Ok(resp) => resp
                     .payload
                     .and_then(|p| match p {
@@ -294,9 +334,7 @@ impl WorkerManager {
 
         info!("Loading model {} version {}", model_name, version);
 
-        let model_dir = crate::validation::resolve_model_dir(
-            &self.repo_path, model_name, version,
-        )?;
+        let model_dir = crate::validation::resolve_model_dir(&self.repo_path, model_name, version)?;
         if !model_dir.exists() {
             return Err(AppError::ModelNotFound(format!(
                 "{} version {} not found",
@@ -354,8 +392,13 @@ impl WorkerManager {
         // above so a doomed load never evicts a healthy version.
         self.enforce_max_loaded_versions(model_name).await?;
 
-        self.registry
-            .register(model_name, version, model_config.clone(), model_type, model_dir.clone())?;
+        self.registry.register(
+            model_name,
+            version,
+            model_config.clone(),
+            model_type,
+            model_dir.clone(),
+        )?;
 
         if is_ensemble {
             // P0/P6: parse the plan NOW — config validation surfaces at
@@ -381,8 +424,7 @@ impl WorkerManager {
                 }
             }
             // Ensemble: no workers, just mark ready
-            self.registry
-                .mark_ready(model_name, version)?;
+            self.registry.mark_ready(model_name, version)?;
             // P6 (batch 0): background warm — pre-check sub-model readiness
             // without blocking the load (sub-model preloading + the E4
             // resolved-version side-table land with batch 3).
@@ -506,21 +548,28 @@ impl WorkerManager {
                 })
                 .inspect_err(|_| self.mark_load_failed(model_name, version))?;
 
-            let stdout = child.stdout.take()
+            let stdout = child
+                .stdout
+                .take()
                 .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
                 .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-            let stderr = child.stderr.take()
+            let stderr = child
+                .stderr
+                .take()
                 .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
                 .inspect_err(|_| self.mark_load_failed(model_name, version))?;
 
             // Wait for "ready" signal
             let mut reader = BufReader::new(stdout);
             let mut ready_line = String::new();
-            let n = timeout(Duration::from_secs_f32(model_config.startup_timeout), reader.read_line(&mut ready_line))
-                .await
-                .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
-                .and_then(|r| r.map_err(AppError::Io))
-                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
+            let n = timeout(
+                Duration::from_secs_f32(model_config.startup_timeout),
+                reader.read_line(&mut ready_line),
+            )
+            .await
+            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+            .and_then(|r| r.map_err(AppError::Io))
+            .inspect_err(|_| self.mark_load_failed(model_name, version))?;
             if n == 0 {
                 self.mark_load_failed(model_name, version);
                 let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
@@ -553,7 +602,9 @@ impl WorkerManager {
                         .iter()
                         .map(|s| (s.name.as_str(), s.metric_type.as_str()))
                         .collect();
-                    crate::metrics::prometheus::register_custom_metrics(model_name, version, &spec_refs);
+                    crate::metrics::prometheus::register_custom_metrics(
+                        model_name, version, &spec_refs,
+                    );
                 }
             }
 
@@ -562,16 +613,28 @@ impl WorkerManager {
                 .set_policies(model_name, version, policies_from_config(&model_config));
 
             // Register custom @route declarations (phase 2)
-            self.upsert_routes(model_name, version, startup.custom_routes).await;
+            self.upsert_routes(model_name, version, startup.custom_routes)
+                .await;
 
-            info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());
+            info!(
+                "Worker {} for {} v{} ready (pid={:?})",
+                worker_id,
+                model_name,
+                version,
+                child.id()
+            );
 
             // Fire on_ready lifecycle hook
-            execute_hook("ready", &model_config.hooks, vec![
-                ("$MODEL".to_string(), model_name.to_string()),
-                ("$VERSION".to_string(), version.to_string()),
-                ("$WORKER_ID".to_string(), worker_id.to_string()),
-            ], &self.hook_tasks);
+            execute_hook(
+                "ready",
+                &model_config.hooks,
+                vec![
+                    ("$MODEL".to_string(), model_name.to_string()),
+                    ("$VERSION".to_string(), version.to_string()),
+                    ("$WORKER_ID".to_string(), worker_id.to_string()),
+                ],
+                &self.hook_tasks,
+            );
 
             // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
             // if anything writes to stdout after the ready signal.
@@ -609,10 +672,20 @@ impl WorkerManager {
                             let line = String::from_utf8_lossy(&buf);
                             let level = classify_stderr_line(line.trim());
                             let msg = strip_level_prefix(line.trim());
-                            emit_stderr_line(level, msg, worker_id_clone, &model_name_clone, &version_clone);
+                            emit_stderr_line(
+                                level,
+                                msg,
+                                worker_id_clone,
+                                &model_name_clone,
+                                &version_clone,
+                            );
                         }
                         Err(e) => {
-                            tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
+                            tracing::error!(
+                                worker_id = worker_id_clone,
+                                "Worker stderr read error: {}",
+                                e
+                            );
                             break;
                         }
                     }
@@ -641,7 +714,11 @@ impl WorkerManager {
             // their caller-side timeouts (request_timeout, else 300s).
             let hooks_arc = Arc::new(model_config.hooks.clone());
             let done_rx = spawn_worker_monitor(
-                child, model_name, version, worker_id as u32, shutdown_rx,
+                child,
+                model_name,
+                version,
+                worker_id as u32,
+                shutdown_rx,
                 crate::worker::process::crash_exit_handler(
                     Some(zmq_client.clone()),
                     Some(outlier.clone()),
@@ -665,7 +742,12 @@ impl WorkerManager {
             };
             worker_infos.push(info);
             if let Some(pid) = pid {
-                crate::metrics::prometheus::set_worker_pid(model_name, version, worker_id as u32, pid);
+                crate::metrics::prometheus::set_worker_pid(
+                    model_name,
+                    version,
+                    worker_id as u32,
+                    pid,
+                );
             }
 
             worker_processes.push(WorkerProcess {
@@ -695,8 +777,16 @@ impl WorkerManager {
         }
 
         // Register inference queue for batching
-        self.inference_queue
-            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone(), self.reload_tx.clone(), outlier.clone(), Some(self.respawn_tx.clone()));
+        self.inference_queue.register_model(
+            model_name,
+            version,
+            &model_config,
+            worker_infos,
+            zmq_clients_for_model.clone(),
+            self.reload_tx.clone(),
+            outlier.clone(),
+            Some(self.respawn_tx.clone()),
+        );
 
         {
             let mut workers = self.workers.write().await;
@@ -715,7 +805,10 @@ impl WorkerManager {
         // serving an unwarmed/broken model). Skipped entirely when disabled.
         if let Some(ref policy) = warmup {
             if policy.enabled {
-                match self.run_warmup(model_name, version, &model_config, policy, None).await {
+                match self
+                    .run_warmup(model_name, version, &model_config, policy, None)
+                    .await
+                {
                     Ok(()) => {
                         self.registry.mark_ready(model_name, version)?;
                         info!(
@@ -730,8 +823,7 @@ impl WorkerManager {
                             reason = %reason,
                             "warmup failed; marking version Failed"
                         );
-                        self.registry
-                            .mark_failed(model_name, version, &reason)?;
+                        self.registry.mark_failed(model_name, version, &reason)?;
                         // L5: workers were spawned and the queue/client/
                         // routing state registered BEFORE warmup ran — tear
                         // that runtime state down through the single shared
@@ -739,17 +831,9 @@ impl WorkerManager {
                         // Failed (D33: /health must show why the version is
                         // not serving); only its runtime footprint is freed.
                         self.teardown_version_runtime(model_name, version).await;
-                        crate::metrics::prometheus::set_active_workers(
-                            model_name,
-                            version,
-                            0.0,
-                        );
+                        crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
                         self.sync_grpc_health().await;
-                        crate::metrics::prometheus::record_model_load(
-                            model_name,
-                            version,
-                            false,
-                        );
+                        crate::metrics::prometheus::record_model_load(model_name, version, false);
                         return Err(AppError::WorkerCrashed(format!(
                             "warmup failed for {} {}: {}",
                             model_name, version, reason
@@ -774,14 +858,22 @@ impl WorkerManager {
         crate::metrics::prometheus::record_model_load(model_name, version, true);
         crate::metrics::prometheus::set_active_workers(model_name, version, total_workers as f64);
 
-        info!("Model {} version {} loaded with {} workers", model_name, version, total_workers);
+        info!(
+            "Model {} version {} loaded with {} workers",
+            model_name, version, total_workers
+        );
 
         // Fire ModelLoad callback
-        self.callback_runner.on_model_load(&ModelLifecycleContext {
-            model_name: model_name.to_string(),
-            version: version.to_string(),
-            device: config.devices.as_ref().and_then(|d| d.as_str().map(|s| s.to_string())),
-        }).await;
+        self.callback_runner
+            .on_model_load(&ModelLifecycleContext {
+                model_name: model_name.to_string(),
+                version: version.to_string(),
+                device: config
+                    .devices
+                    .as_ref()
+                    .and_then(|d| d.as_str().map(|s| s.to_string())),
+            })
+            .await;
 
         Ok(())
     }
@@ -815,12 +907,7 @@ impl WorkerManager {
         // per-iteration budget inside — whichever fires first fails the run.
         let inner = self.run_warmup_inner(model_name, version, model_config, policy, pin);
         let result = if policy.total_timeout_secs > 0.0 {
-            match timeout(
-                Duration::from_secs_f32(policy.total_timeout_secs),
-                inner,
-            )
-            .await
-            {
+            match timeout(Duration::from_secs_f32(policy.total_timeout_secs), inner).await {
                 Ok(r) => r,
                 Err(_) => Err(WarmupFailure::timeout(format!(
                     "warmup: total timeout after {:.1}s",
@@ -867,15 +954,9 @@ impl WorkerManager {
         let mut payloads: Vec<bytes::Bytes> = Vec::with_capacity(policy.samples.len());
         for sample in &policy.samples {
             let dummy_path = model_dir.join(&sample.input_ref);
-            let body = tokio::fs::read(&dummy_path)
-                .await
-                .map_err(|e| {
-                    WarmupFailure::failure(format!(
-                        "read dummy input {}: {}",
-                        dummy_path.display(),
-                        e
-                    ))
-                })?;
+            let body = tokio::fs::read(&dummy_path).await.map_err(|e| {
+                WarmupFailure::failure(format!("read dummy input {}: {}", dummy_path.display(), e))
+            })?;
             payloads.push(bytes::Bytes::from(body));
         }
 
@@ -898,7 +979,16 @@ impl WorkerManager {
         let concurrency = policy.concurrency.max(1) as usize;
         for group in group_units_by_pin(&plan) {
             let mut units = futures::stream::iter(group.into_iter().map(|unit| {
-                self.run_warmup_unit(model_name, version, policy, unit, &payloads, timeout_opt)
+                let sample = &policy.samples[unit.sample];
+                self.run_warmup_unit(
+                    model_name,
+                    version,
+                    policy,
+                    unit,
+                    sample,
+                    &payloads,
+                    timeout_opt,
+                )
             }))
             .buffer_unordered(concurrency);
             while let Some(result) = units.next().await {
@@ -921,13 +1011,14 @@ impl WorkerManager {
         version: &str,
         policy: &crate::config::WarmupPolicy,
         unit: WarmupUnit,
+        sample: &crate::config::WarmupSample,
         payloads: &[bytes::Bytes],
         timeout_opt: Option<Duration>,
     ) -> Result<(), WarmupFailure> {
         let mut attempt = 0u32;
         loop {
             match self
-                .run_warmup_unit_once(model_name, version, &unit, payloads, timeout_opt)
+                .run_warmup_unit_once(model_name, version, &unit, sample, payloads, timeout_opt)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -955,20 +1046,32 @@ impl WorkerManager {
         model_name: &str,
         version: &str,
         unit: &WarmupUnit,
+        sample: &crate::config::WarmupSample,
         payloads: &[bytes::Bytes],
         timeout_opt: Option<Duration>,
     ) -> Result<(), WarmupFailure> {
-        let uid = format!(
-            "warmup_{}_{}_{}",
-            model_name,
-            version,
-            uuid::Uuid::new_v4()
-        );
+        // G3a: non-/predict samples ride the RouteCall channel (custom routes
+        // bypass the inference queue), same as the HTTP custom-route handler.
+        if sample.route != "/predict" {
+            return self
+                .run_route_warmup_once(
+                    model_name,
+                    version,
+                    unit,
+                    sample,
+                    payloads[unit.sample].clone(),
+                    timeout_opt,
+                )
+                .await;
+        }
+        let uid = format!("warmup_{}_{}_{}", model_name, version, uuid::Uuid::new_v4());
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let mut headers = std::collections::HashMap::new();
+        // User headers first, pin last — the control-plane pin must not be
+        // overridable by a sample's headers.
+        let mut headers = sample.headers.clone();
         if let Some(w) = unit.worker_pin {
             headers.insert("x-lite-worker-id".to_string(), w.to_string());
         }
@@ -1030,26 +1133,108 @@ impl WorkerManager {
         };
 
         // A non-Ok status (or a non-Single payload) fails the attempt.
-        let ok = matches!(
-            response.payload,
-            Some(crate::proto::liteserver::response::Payload::Single(ref s))
-                if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
-        );
-        if !ok {
-            let detail = match response.payload {
-                Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
-                    .status
-                    .as_ref()
-                    .map(|st| st.message.clone())
-                    .unwrap_or_default(),
-                _ => "unexpected response payload".to_string(),
+        validate_warmup_response(response)
+    }
+
+    /// G3a: one RouteCall warmup attempt. Custom routes bypass the inference
+    /// queue — they ride `send_route_or_stream` on the worker's direct
+    /// client, mirroring the HTTP custom-route handler — so the pinned
+    /// worker's client is picked here directly.
+    async fn run_route_warmup_once(
+        &self,
+        model_name: &str,
+        version: &str,
+        unit: &WarmupUnit,
+        sample: &crate::config::WarmupSample,
+        payload: bytes::Bytes,
+        timeout_opt: Option<Duration>,
+    ) -> Result<(), WarmupFailure> {
+        let key = model_version_key(model_name, version);
+        let client = {
+            let clients = self.zmq_clients.read().await;
+            let Some(clients) = clients.get(&key) else {
+                return Err(WarmupFailure::failure(format!(
+                    "warmup: no worker clients for {model_name} {version}"
+                )));
             };
-            return Err(WarmupFailure::failure(format!(
-                "warmup inference returned error: {}",
-                detail
-            )));
-        }
-        Ok(())
+            // Unpinned units only occur on a 0-worker version (no pin
+            // targets) — fall back to the first client; the empty case
+            // errors out below.
+            let idx = unit.worker_pin.unwrap_or(0);
+            clients.get(idx).cloned().ok_or_else(|| {
+                WarmupFailure::failure(format!(
+                    "warmup: no client for worker {idx} ({model_name} {version})"
+                ))
+            })?
+        };
+
+        let uid = format!(
+            "warmup_route_{}_{}_{}",
+            model_name,
+            version,
+            uuid::Uuid::new_v4()
+        );
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let meta = crate::proto::liteserver::RequestMeta {
+            route: sample.route.clone(),
+            method: "POST".to_string(),
+            request_id: uid.clone(),
+            client_ip: "127.0.0.1".to_string(),
+            timestamp_ns,
+            headers: sample.headers.clone(),
+            ..Default::default()
+        };
+        let request = crate::proto::liteserver::Request {
+            uid,
+            meta: Some(meta),
+            payload: Some(crate::proto::liteserver::request::Payload::RouteCall(
+                crate::proto::liteserver::SingleRequest { data: payload },
+            )),
+        };
+        let (resp_rx, mut chunk_rx) = client
+            .send_route_or_stream(request)
+            .await
+            .map_err(|e| WarmupFailure::failure(format!("warmup route send: {e}")))?;
+
+        // First-frame arbitration mirrors the HTTP custom-route handler: a
+        // stream frame means the route is streaming, which warmup does not
+        // support (G3b) — fail loudly rather than silently skip the sample.
+        let wait = async move {
+            let mut resp_rx = resp_rx;
+            tokio::select! {
+                biased;
+                frame = chunk_rx.recv() => match frame {
+                    Some(_) => Err(WarmupFailure::failure(format!(
+                        "warmup: route {} returned a stream — streaming warmup is not supported (G3b)",
+                        sample.route
+                    ))),
+                    None => (&mut resp_rx).await.map_err(|_| {
+                        WarmupFailure::failure(
+                            "warmup: route response channel closed".to_string(),
+                        )
+                    }),
+                },
+                unary = &mut resp_rx => unary.map_err(|_| {
+                    WarmupFailure::failure("warmup: route response channel closed".to_string())
+                }),
+            }
+        };
+        let response = match timeout_opt {
+            Some(t) => match timeout(t, wait).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(WarmupFailure::timeout(format!(
+                        "warmup: timed out after {:.1}s",
+                        t.as_secs_f32()
+                    )))
+                }
+            },
+            None => wait.await?,
+        };
+        validate_warmup_response(response)
     }
 
     pub async fn unload_model(
@@ -1129,11 +1314,13 @@ impl WorkerManager {
         self.stop_status_coordinator(model_name, version).await;
 
         // Fire ModelUnload callback before unloading
-        self.callback_runner.on_model_unload(&ModelLifecycleContext {
-            model_name: model_name.to_string(),
-            version: version.to_string(),
-            device: None,
-        }).await;
+        self.callback_runner
+            .on_model_unload(&ModelLifecycleContext {
+                model_name: model_name.to_string(),
+                version: version.to_string(),
+                device: None,
+            })
+            .await;
 
         // Status must flip to Unloading BEFORE the teardown kills workers —
         // a still-Ready version whose workers die invites respawn/routing
@@ -1155,7 +1342,9 @@ impl WorkerManager {
         // purge, the event log survives). Worker memory registrations were
         // already dropped inside teardown_version_runtime (before this purge).
         crate::metrics::prometheus::remove_version_metrics(model_name, version);
-        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
+        crate::metrics::aggregator::TIMELINE
+            .remove(model_name, version)
+            .await;
 
         info!("Model {} version {} unloaded", model_name, version);
         Ok(())
@@ -1240,7 +1429,10 @@ impl WorkerManager {
             for proc in procs {
                 #[cfg(unix)]
                 {
-                    let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                    let socket_str = proc
+                        .endpoint
+                        .strip_prefix("ipc://")
+                        .unwrap_or(&proc.endpoint);
                     let socket_path = std::path::Path::new(socket_str);
                     let _ = tokio::fs::remove_file(socket_path).await;
                 }
@@ -1296,7 +1488,10 @@ impl WorkerManager {
             // Clean up ZMQ socket files (Unix only).
             #[cfg(unix)]
             for proc in procs.iter() {
-                let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                let socket_str = proc
+                    .endpoint
+                    .strip_prefix("ipc://")
+                    .unwrap_or(&proc.endpoint);
                 let socket_path = std::path::Path::new(socket_str);
                 let _ = tokio::fs::remove_file(socket_path).await;
             }
@@ -1313,7 +1508,9 @@ impl WorkerManager {
         // the graceful path above.
         crate::metrics::prometheus::clear_worker_pids(model_name, version);
         crate::metrics::prometheus::remove_version_metrics(model_name, version);
-        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
+        crate::metrics::aggregator::TIMELINE
+            .remove(model_name, version)
+            .await;
         Ok(())
     }
 
@@ -1354,7 +1551,8 @@ impl WorkerManager {
             .validate()
             .map_err(|e| AppError::Config(e.to_string()))?;
 
-        let was_active = self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
+        let was_active =
+            self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
 
         info!("Reloading {} version {}", model_name, v);
         self.unload_version(model_name, &v).await?;
@@ -1371,11 +1569,16 @@ impl WorkerManager {
         }
 
         // Fire ModelReload callback
-        self.callback_runner.on_model_reload(&ModelLifecycleContext {
-            model_name: model_name.to_string(),
-            version: v.clone(),
-            device: config.devices.as_ref().and_then(|d| d.as_str().map(|s| s.to_string())),
-        }).await;
+        self.callback_runner
+            .on_model_reload(&ModelLifecycleContext {
+                model_name: model_name.to_string(),
+                version: v.clone(),
+                device: config
+                    .devices
+                    .as_ref()
+                    .and_then(|d| d.as_str().map(|s| s.to_string())),
+            })
+            .await;
 
         info!("Model {} version {} reloaded", model_name, v);
         Ok(true)
@@ -1418,7 +1621,10 @@ mod tests {
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             wm.force_unload_version("m", "1").await.unwrap();
-            assert!(registry.get("m", Some("1")).is_none(), "version must be removed");
+            assert!(
+                registry.get("m", Some("1")).is_none(),
+                "version must be removed"
+            );
             // Idempotent: a second call on the deleted version is a no-op.
             wm.force_unload_version("m", "1").await.unwrap();
         });
@@ -1437,7 +1643,9 @@ mod tests {
             tx.send(crate::inference_queue::ReloadSignal {
                 model_name: "test".to_string(),
                 version: "1".to_string(),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             let signal = rx.recv().await.unwrap();
             assert_eq!(signal.model_name, "test");
@@ -1447,7 +1655,9 @@ mod tests {
             tx2.send(crate::inference_queue::ReloadSignal {
                 model_name: "test2".to_string(),
                 version: "1".to_string(),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             let signal2 = rx.recv().await.unwrap();
             assert_eq!(signal2.model_name, "test2");
         });
@@ -1485,16 +1695,20 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<crate::inference_queue::ReloadSignal>(1);
 
         // First send succeeds
-        assert!(tx.try_send(crate::inference_queue::ReloadSignal {
-            model_name: "m1".to_string(),
-            version: "1".to_string(),
-        }).is_ok());
+        assert!(tx
+            .try_send(crate::inference_queue::ReloadSignal {
+                model_name: "m1".to_string(),
+                version: "1".to_string(),
+            })
+            .is_ok());
 
         // Second send should fail (channel full) — not block
-        assert!(tx.try_send(crate::inference_queue::ReloadSignal {
-            model_name: "m2".to_string(),
-            version: "1".to_string(),
-        }).is_err());
+        assert!(tx
+            .try_send(crate::inference_queue::ReloadSignal {
+                model_name: "m2".to_string(),
+                version: "1".to_string(),
+            })
+            .is_err());
     }
 
     // ===== LRU eviction tests (§4.2) =====
@@ -1526,7 +1740,13 @@ mod tests {
         registry.set_strategy("m", &lru_strategy(Some(2))).unwrap();
         for v in ["1", "2"] {
             registry
-                .register("m", v, ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .register(
+                    "m",
+                    v,
+                    ModelConfig::default(),
+                    ModelType::LitAPI,
+                    std::path::PathBuf::new(),
+                )
                 .unwrap();
             registry.mark_ready("m", v).unwrap();
         }
@@ -1535,8 +1755,14 @@ mod tests {
         let wm = lru_test_manager(&registry);
         wm.enforce_max_loaded_versions("m").await.unwrap();
 
-        assert!(registry.get("m", Some("1")).is_none(), "LRU non-active version evicted");
-        assert!(registry.get("m", Some("2")).is_some(), "active version preserved");
+        assert!(
+            registry.get("m", Some("1")).is_none(),
+            "LRU non-active version evicted"
+        );
+        assert!(
+            registry.get("m", Some("2")).is_some(),
+            "active version preserved"
+        );
     }
 
     #[tokio::test]
@@ -1544,7 +1770,13 @@ mod tests {
         let registry = Arc::new(ModelRegistry::new());
         registry.set_strategy("m", &lru_strategy(Some(1))).unwrap();
         registry
-            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                "m",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         registry.mark_ready("m", "1").unwrap();
         registry.activate_version("m", "1").unwrap();
@@ -1553,7 +1785,10 @@ mod tests {
         // warning rather than evicting active or failing the load.
         let wm = lru_test_manager(&registry);
         wm.enforce_max_loaded_versions("m").await.unwrap();
-        assert!(registry.get("m", Some("1")).is_some(), "active version must never be evicted");
+        assert!(
+            registry.get("m", Some("1")).is_some(),
+            "active version must never be evicted"
+        );
     }
 
     #[tokio::test]
@@ -1562,13 +1797,23 @@ mod tests {
         registry.set_strategy("m", &lru_strategy(None)).unwrap();
         for v in ["1", "2", "3"] {
             registry
-                .register("m", v, ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .register(
+                    "m",
+                    v,
+                    ModelConfig::default(),
+                    ModelType::LitAPI,
+                    std::path::PathBuf::new(),
+                )
                 .unwrap();
         }
 
         let wm = lru_test_manager(&registry);
         wm.enforce_max_loaded_versions("m").await.unwrap();
-        assert_eq!(registry.list_versions("m").len(), 3, "no limit → nothing evicted");
+        assert_eq!(
+            registry.list_versions("m").len(),
+            3,
+            "no limit → nothing evicted"
+        );
     }
 
     /// Real-worker regression test: unload_model must not return before the
@@ -1578,8 +1823,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_unload_model_leaves_no_orphan_worker() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-orphan-test-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-orphan-test-{}", std::process::id()));
         let model_dir = repo.join("orphan_guard_model").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(
@@ -1636,7 +1881,11 @@ class TestAPI(LitAPI):
         // a live (or zombie) process here means the orphan race is back.
         for pid in pids {
             let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-            assert!(!alive, "worker pid {} orphaned: still alive after unload_model returned", pid);
+            assert!(
+                !alive,
+                "worker pid {} orphaned: still alive after unload_model returned",
+                pid
+            );
         }
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1662,8 +1911,8 @@ class TestAPI(LitAPI):
         use std::io::Read;
         use std::time::Duration;
 
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-w1-orphan-test-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-w1-orphan-test-{}", std::process::id()));
         let model_dir = repo.join("w1_model").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
         // Worker 0 (device cpu:0) records its pid so the test can track it;
@@ -1756,7 +2005,9 @@ class TestAPI(LitAPI):
         }
         if !reaped {
             // Clean up the orphan so the test does not leak a rogue process.
-            unsafe { libc::kill(pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
         assert!(
             reaped,
@@ -1779,8 +2030,8 @@ class TestAPI(LitAPI):
     async fn test_load_model_duplicate_rejects_before_lru_eviction() {
         // On-disk fixture so load_model passes the model.py checks and
         // reaches the duplicate guard.
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b2-dup-test-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b2-dup-test-{}", std::process::id()));
         for v in ["1", "2"] {
             let dir = repo.join("m").join(v);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1788,13 +2039,12 @@ class TestAPI(LitAPI):
         }
 
         let registry = Arc::new(ModelRegistry::new());
-        registry
-            .set_strategy("m", &lru_strategy(Some(2)))
-            .unwrap();
+        registry.set_strategy("m", &lru_strategy(Some(2))).unwrap();
         for v in ["1", "2"] {
             registry
                 .register(
-                    "m", v,
+                    "m",
+                    v,
                     ModelConfig::default(),
                     ModelType::LitAPI,
                     repo.join("m").join(v),
@@ -1840,10 +2090,8 @@ class TestAPI(LitAPI):
     /// structural; this test locks that in.
     #[tokio::test]
     async fn test_load_model_ensemble_detection_false_positive_on_comment() {
-        let repo = std::env::temp_dir().join(format!(
-            "lite-server-wm-ensemble-fp-{}",
-            std::process::id()
-        ));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-wm-ensemble-fp-{}", std::process::id()));
         let model_dir = repo.join("test_model").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
 
@@ -1975,7 +2223,9 @@ class TestAPI(LitAPI):
             socket.set_rcvtimeo(5000).unwrap();
             socket.set_linger(0).unwrap();
             socket.connect(&endpoint).unwrap();
-            let bytes = socket.recv_bytes(0).expect("fake worker: no request received");
+            let bytes = socket
+                .recv_bytes(0)
+                .expect("fake worker: no request received");
             let req = crate::proto::liteserver::Request::decode(bytes.as_slice()).unwrap();
             match req.payload {
                 Some(crate::proto::liteserver::request::Payload::FileChanged(fc)) => {
@@ -2021,7 +2271,8 @@ class TestAPI(LitAPI):
     async fn notify_file_changed_no_workers_returns_false() {
         let wm = fc_test_manager();
         assert!(
-            !wm.notify_file_changed("m", "1", &["/x.py".to_string()]).await,
+            !wm.notify_file_changed("m", "1", &["/x.py".to_string()])
+                .await,
             "no workers → nothing handled → caller must fall back to restart"
         );
     }
@@ -2030,10 +2281,15 @@ class TestAPI(LitAPI):
     #[tokio::test]
     async fn notify_file_changed_handled_returns_true() {
         let (wm, endpoint) = fc_manager_with_worker("handled").await;
-        let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string(), "/b.yaml".to_string()], b"{\"handled\":true}");
-        assert!(wm
-            .notify_file_changed("m", "1", &["/a.py".to_string(), "/b.yaml".to_string()])
-            .await);
+        let fake = spawn_fake_worker(
+            endpoint,
+            vec!["/a.py".to_string(), "/b.yaml".to_string()],
+            b"{\"handled\":true}",
+        );
+        assert!(
+            wm.notify_file_changed("m", "1", &["/a.py".to_string(), "/b.yaml".to_string()])
+                .await
+        );
         fake.join().unwrap();
     }
 
@@ -2042,7 +2298,10 @@ class TestAPI(LitAPI):
     async fn notify_file_changed_unhandled_returns_false() {
         let (wm, endpoint) = fc_manager_with_worker("unhandled").await;
         let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string()], b"{\"handled\":false}");
-        assert!(!wm.notify_file_changed("m", "1", &["/a.py".to_string()]).await);
+        assert!(
+            !wm.notify_file_changed("m", "1", &["/a.py".to_string()])
+                .await
+        );
         fake.join().unwrap();
     }
 
@@ -2053,8 +2312,15 @@ class TestAPI(LitAPI):
         // (an error SingleResponse); any non-{"handled":true} body means the
         // caller must fall back to restart.
         let (wm, endpoint) = fc_manager_with_worker("malformed").await;
-        let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string()], b"Unsupported payload type");
-        assert!(!wm.notify_file_changed("m", "1", &["/a.py".to_string()]).await);
+        let fake = spawn_fake_worker(
+            endpoint,
+            vec!["/a.py".to_string()],
+            b"Unsupported payload type",
+        );
+        assert!(
+            !wm.notify_file_changed("m", "1", &["/a.py".to_string()])
+                .await
+        );
         fake.join().unwrap();
     }
 
@@ -2073,8 +2339,7 @@ class TestAPI(LitAPI):
     /// survived the drop before this test was written.
     #[tokio::test]
     async fn test_load_model_drops_model_defaults_when_config_yaml_exists() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-def-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("lite-server-b4-def-{}", std::process::id()));
         let model_dir = repo.join("m").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
 
@@ -2125,7 +2390,10 @@ class TestAPI(LitAPI):
             ..Default::default()
         };
         defaults.apply_to(&mut config);
-        assert_eq!(config.max_queue_size, 500, "defaults applied before load_model");
+        assert_eq!(
+            config.max_queue_size, 500,
+            "defaults applied before load_model"
+        );
 
         wm.load_model("m", "1", &config).await.unwrap();
 
@@ -2149,8 +2417,8 @@ class TestAPI(LitAPI):
     /// reload must not lose those defaults.
     #[tokio::test]
     async fn test_reload_model_preserves_model_defaults() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-reload-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-reload-{}", std::process::id()));
         let model_dir = repo.join("m").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
 
@@ -2221,8 +2489,8 @@ class TestAPI(LitAPI):
     /// measures the old config (plan §0.1).
     #[tokio::test]
     async fn test_reload_model_rereads_config_from_disk() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-reload-disk-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-reload-disk-{}", std::process::id()));
         let model_dir = repo.join("m").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
 
@@ -2263,7 +2531,10 @@ class TestAPI(LitAPI):
 
         let config = crate::config::load_model_config(&model_dir.join("config.yaml")).unwrap();
         wm.load_model("m", "1", &config).await.unwrap();
-        assert_eq!(registry.get("m", Some("1")).unwrap().config.max_batch_size, 1);
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            1
+        );
 
         // Change config.yaml on disk, then reload — the new value must land.
         std::fs::write(
@@ -2289,8 +2560,8 @@ class TestAPI(LitAPI):
     /// early, **old workers keep serving** (no unload happens).
     #[tokio::test]
     async fn test_reload_model_bad_config_keeps_old_version() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-reload-badcfg-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-reload-badcfg-{}", std::process::id()));
         let model_dir = repo.join("m").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
 
@@ -2333,11 +2604,7 @@ class TestAPI(LitAPI):
         wm.load_model("m", "1", &config).await.unwrap();
 
         // Corrupt the config: unclosed flow sequence is a YAML parse error.
-        std::fs::write(
-            model_dir.join("config.yaml"),
-            "max_batch_size: [unclosed\n",
-        )
-        .unwrap();
+        std::fs::write(model_dir.join("config.yaml"), "max_batch_size: [unclosed\n").unwrap();
 
         let err = wm.reload_model("m", Some("1")).await.unwrap_err();
         assert!(
@@ -2363,10 +2630,12 @@ class TestAPI(LitAPI):
                 crate::config::WarmupSample {
                     input_ref: "warmup/a.json".to_string(),
                     iterations: 2,
+                    ..Default::default()
                 },
                 crate::config::WarmupSample {
                     input_ref: "warmup/b.json".to_string(),
                     iterations: 1,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2379,7 +2648,11 @@ class TestAPI(LitAPI):
         );
         for w in 0..3 {
             let units: Vec<_> = plan.iter().filter(|u| u.worker_pin == Some(w)).collect();
-            assert_eq!(units.len(), 3, "worker {w} must receive the full sample set");
+            assert_eq!(
+                units.len(),
+                3,
+                "worker {w} must receive the full sample set"
+            );
             assert_eq!(
                 units.iter().filter(|u| u.sample == 0).count(),
                 2,
@@ -2396,6 +2669,7 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup/a.json".to_string(),
                 iterations: 7,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2404,7 +2678,15 @@ class TestAPI(LitAPI):
         let pins: Vec<_> = plan.iter().map(|u| u.worker_pin).collect();
         assert_eq!(
             pins,
-            vec![Some(0), Some(1), Some(2), Some(0), Some(1), Some(2), Some(0)],
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(0)
+            ],
             "units must round-robin so no worker stays cold"
         );
     }
@@ -2417,6 +2699,7 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup/a.json".to_string(),
                 iterations: 2,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2440,16 +2723,14 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup/a.json".to_string(),
                 iterations: 7,
+                ..Default::default()
             }],
             ..Default::default()
         };
         let plan = build_warmup_plan(&policy, 3);
         let groups = group_units_by_pin(&plan);
         assert_eq!(groups.len(), 3, "three pins -> three groups");
-        let group_pins: Vec<_> = groups
-            .iter()
-            .map(|g| g[0].worker_pin)
-            .collect();
+        let group_pins: Vec<_> = groups.iter().map(|g| g[0].worker_pin).collect();
         assert_eq!(group_pins, vec![Some(0), Some(1), Some(2)]);
         for g in &groups {
             assert!(
@@ -2539,13 +2820,14 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_total_timeout_fails_the_whole_run() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b4_total-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b4_total-{}", std::process::id()));
         let policy = crate::config::WarmupPolicy {
             enabled: true,
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup_input.json".to_string(),
                 iterations: 4,
+                ..Default::default()
             }],
             timeout_secs: 30.0,
             total_timeout_secs: 0.25,
@@ -2573,14 +2855,15 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_concurrency_bounds_wall_time_and_runs_all_units() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b4_conc-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b4_conc-{}", std::process::id()));
         let marker = repo.join("marker.txt");
         let policy = crate::config::WarmupPolicy {
             enabled: true,
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup_input.json".to_string(),
                 iterations: 6,
+                ..Default::default()
             }],
             timeout_secs: 30.0,
             concurrency: 3,
@@ -2610,8 +2893,8 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_retries_absorb_transient_failures() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b4_retry-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b4_retry-{}", std::process::id()));
         let counter = repo.join("calls.txt");
         let model_py = format!(
             r#"from lite_server import LitAPI
@@ -2642,6 +2925,7 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup_input.json".to_string(),
                 iterations: 1,
+                ..Default::default()
             }],
             timeout_secs: 30.0,
             retries: 2,
@@ -2661,8 +2945,8 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_zero_retries_keeps_fail_fast() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b4_noretry-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b4_noretry-{}", std::process::id()));
         let counter = repo.join("calls.txt");
         let model_py = format!(
             r#"from lite_server import LitAPI
@@ -2691,12 +2975,12 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup_input.json".to_string(),
                 iterations: 1,
+                ..Default::default()
             }],
             timeout_secs: 30.0,
             ..Default::default()
         };
-        let (wm, _registry, repo, result) =
-            warmup_e2e_load("b4_noretry", &model_py, policy).await;
+        let (wm, _registry, repo, result) = warmup_e2e_load("b4_noretry", &model_py, policy).await;
         result.expect_err("no retries -> first failure fails the load (D33)");
         assert_eq!(
             std::fs::read_to_string(&counter).unwrap(),
@@ -2704,6 +2988,114 @@ class TestAPI(LitAPI):
             "exactly one attempt without retries"
         );
         let _ = wm.unload_model("b4_noretry", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G3a: a sample may target a custom @route — the handler runs (its lazy
+    /// state initialized) BEFORE the version goes Ready.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_custom_route_is_exercised() {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b5_route-{}", std::process::id()));
+        let marker = repo.join("route_marker.txt");
+        let model_py = format!(
+            r#"from lite_server import LitAPI, route
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    @route.post("/warm_route")
+    def warm_route(self, ctx):
+        with open({marker:?}, "a") as f:
+            f.write("r\n")
+        return {{"warmed": True}}
+"#,
+            marker = marker.display().to_string()
+        );
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![
+                crate::config::WarmupSample {
+                    input_ref: "warmup_input.json".to_string(),
+                    iterations: 1,
+                    ..Default::default()
+                },
+                crate::config::WarmupSample {
+                    input_ref: "warmup_input.json".to_string(),
+                    iterations: 2,
+                    route: "/warm_route".to_string(),
+                    ..Default::default()
+                },
+            ],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) = warmup_e2e_load("b5_route", &model_py, policy).await;
+        result.expect("route warmup must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "the route sample must run its iterations through the @route handler"
+        );
+        let _ = wm.unload_model("b5_route", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G3a: a sample targeting a route with no registered handler must fail
+    /// the load — a silently skipped route sample is a silently cold handler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_unknown_route_fails_the_load() {
+        let model_py = r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#;
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+                route: "/no_such_route".to_string(),
+                ..Default::default()
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) = warmup_e2e_load("b5_noroute", model_py, policy).await;
+        let err = result.expect_err("unknown route must fail the load");
+        assert!(
+            err.to_string().contains("warmup inference returned error")
+                || err.to_string().contains("no_such_route"),
+            "reason must surface the route failure, got: {err}"
+        );
+        let _ = wm.unload_model("b5_noroute", Some("1")).await;
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -2719,10 +3111,12 @@ class TestAPI(LitAPI):
                 crate::config::WarmupSample {
                     input_ref: "warmup/a.json".to_string(),
                     iterations: 2,
+                    ..Default::default()
                 },
                 crate::config::WarmupSample {
                     input_ref: "warmup/b.json".to_string(),
                     iterations: 1,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2751,8 +3145,8 @@ class TestAPI(LitAPI):
     async fn test_warmup_failure_leaves_no_live_workers() {
         use crate::config::{WarmupPolicy, WarmupSample};
 
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-l5-warmup-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-l5-warmup-{}", std::process::id()));
         let model_dir = repo.join("l5_model").join("1");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(
@@ -2800,6 +3194,7 @@ class TestAPI(LitAPI):
             samples: vec![WarmupSample {
                 input_ref: "does_not_exist.json".to_string(),
                 iterations: 1,
+                ..Default::default()
             }],
             timeout_secs: 5.0,
             dummy_input_ref: None,
@@ -2858,7 +3253,9 @@ class TestAPI(LitAPI):
         // Clean up any orphan so the test never leaks a rogue process.
         if !alive.is_empty() {
             for p in &alive {
-                unsafe { libc::kill(*p, libc::SIGKILL); }
+                unsafe {
+                    libc::kill(*p, libc::SIGKILL);
+                }
             }
             let _ = wm.unload_model("l5_model", Some("1")).await;
         }

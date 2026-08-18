@@ -117,7 +117,10 @@ where
 
 /// Production wrapper: drains worker stderr with the configured deadline and
 /// capture bound (`tunables:` in server.yaml).
-pub(super) async fn drain_worker_stderr<R>(stderr: R, tunables: &crate::config::ServerTunables) -> String
+pub(super) async fn drain_worker_stderr<R>(
+    stderr: R,
+    tunables: &crate::config::ServerTunables,
+) -> String
 where
     R: AsyncRead + Unpin,
 {
@@ -156,7 +159,13 @@ pub(super) fn strip_level_prefix(line: &str) -> &str {
 }
 
 /// Emit a single stderr line at the given tracing level.
-pub(super) fn emit_stderr_line(level: tracing::Level, msg: &str, worker_id: usize, model: &str, version: &str) {
+pub(super) fn emit_stderr_line(
+    level: tracing::Level,
+    msg: &str,
+    worker_id: usize,
+    model: &str,
+    version: &str,
+) {
     match level {
         tracing::Level::ERROR => {
             tracing::error!(worker_id = worker_id, model = %model, version = %version, "{}", msg);
@@ -347,9 +356,13 @@ pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
             python_module_dir.to_string()
         } else {
             #[cfg(windows)]
-            { format!("{};{}", current_pythonpath, python_module_dir) }
+            {
+                format!("{};{}", current_pythonpath, python_module_dir)
+            }
             #[cfg(not(windows))]
-            { format!("{}:{}", current_pythonpath, python_module_dir) }
+            {
+                format!("{}:{}", current_pythonpath, python_module_dir)
+            }
         };
         cmd.env("PYTHONPATH", new_pythonpath);
     }
@@ -385,20 +398,24 @@ pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
 pub(super) fn worker_endpoint(model_name: &str, version: &str, worker_id: usize) -> String {
     #[cfg(unix)]
     {
-        let sock_path = std::env::temp_dir()
-            .join("lite-server")
-            .join(format!(
-                "{}_{}_{}_{}.sock",
-                model_name,
-                version,
-                worker_id,
-                std::process::id()
-            ));
+        let sock_path = std::env::temp_dir().join("lite-server").join(format!(
+            "{}_{}_{}_{}.sock",
+            model_name,
+            version,
+            worker_id,
+            std::process::id()
+        ));
         format!("ipc://{}", sock_path.display())
     }
     #[cfg(windows)]
     {
-        let key = format!("{}_{}_{}_{}", model_name, version, worker_id, std::process::id());
+        let key = format!(
+            "{}_{}_{}_{}",
+            model_name,
+            version,
+            worker_id,
+            std::process::id()
+        );
         let port = crate::transport::derive_port_from_path(&key);
         format!("tcp://127.0.0.1:{}", port)
     }
@@ -418,9 +435,15 @@ impl WorkerManager {
                             worker_id = signal.worker_id, reason = signal.reason,
                             "Respawning worker"
                         );
-                        if let Err(e) = wm.respawn_worker(
-                            &signal.model_name, &signal.version, signal.worker_id, signal.reason,
-                        ).await {
+                        if let Err(e) = wm
+                            .respawn_worker(
+                                &signal.model_name,
+                                &signal.version,
+                                signal.worker_id,
+                                signal.reason,
+                            )
+                            .await
+                        {
                             error!(
                                 model = %signal.model_name, version = %signal.version,
                                 worker_id = signal.worker_id,
@@ -467,14 +490,13 @@ impl WorkerManager {
         let key = model_version_key(model_name, version);
 
         // Get config from registry
-        let model_version = self.registry
+        let model_version = self
+            .registry
             .get(model_name, Some(version))
             .ok_or_else(|| AppError::ModelNotFound(format!("{} v{}", model_name, version)))?;
         let model_config = model_version.config;
 
-        let model_dir = crate::validation::resolve_model_dir(
-            &self.repo_path, model_name, version,
-        )?;
+        let model_dir = crate::validation::resolve_model_dir(&self.repo_path, model_name, version)?;
         let model_py = model_dir.join("model.py");
         let config_yaml = model_dir.join("config.yaml");
 
@@ -485,7 +507,9 @@ impl WorkerManager {
         let old_proc = {
             let mut workers = self.workers.write().await;
             workers.get_mut(&key).and_then(|procs| {
-                procs.iter().position(|w| w.worker_id == worker_id)
+                procs
+                    .iter()
+                    .position(|w| w.worker_id == worker_id)
                     .map(|pos| procs.remove(pos))
             })
         };
@@ -579,21 +603,28 @@ impl WorkerManager {
             .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))
             .inspect_err(|_| self.mark_degraded(model_name, version))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
             .inspect_err(|_| self.mark_degraded(model_name, version))?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
             .inspect_err(|_| self.mark_degraded(model_name, version))?;
 
         // Wait for "ready" signal
         let mut reader = BufReader::new(stdout);
         let mut ready_line = String::new();
-        let n = timeout(Duration::from_secs_f32(model_config.startup_timeout), reader.read_line(&mut ready_line))
-            .await
-            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
-            .and_then(|r| r.map_err(AppError::Io))
-            .inspect_err(|_| self.mark_degraded(model_name, version))?;
+        let n = timeout(
+            Duration::from_secs_f32(model_config.startup_timeout),
+            reader.read_line(&mut ready_line),
+        )
+        .await
+        .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+        .and_then(|r| r.map_err(AppError::Io))
+        .inspect_err(|_| self.mark_degraded(model_name, version))?;
         if n == 0 {
             self.mark_degraded(model_name, version);
             let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
@@ -626,7 +657,9 @@ impl WorkerManager {
                     .iter()
                     .map(|s| (s.name.as_str(), s.metric_type.as_str()))
                     .collect();
-                crate::metrics::prometheus::register_custom_metrics(model_name, version, &spec_refs);
+                crate::metrics::prometheus::register_custom_metrics(
+                    model_name, version, &spec_refs,
+                );
             }
         }
 
@@ -635,16 +668,28 @@ impl WorkerManager {
             .set_policies(model_name, version, policies_from_config(&model_config));
 
         // Register custom @route declarations (phase 2)
-        self.upsert_routes(model_name, version, startup.custom_routes).await;
+        self.upsert_routes(model_name, version, startup.custom_routes)
+            .await;
 
-        info!("Worker {} for {} v{} respawned (pid={:?})", worker_id, model_name, version, child.id());
+        info!(
+            "Worker {} for {} v{} respawned (pid={:?})",
+            worker_id,
+            model_name,
+            version,
+            child.id()
+        );
 
         // Fire on_ready lifecycle hook
-        execute_hook("ready", &model_config.hooks, vec![
-            ("$MODEL".to_string(), model_name.to_string()),
-            ("$VERSION".to_string(), version.to_string()),
-            ("$WORKER_ID".to_string(), worker_id.to_string()),
-        ], &self.hook_tasks);
+        execute_hook(
+            "ready",
+            &model_config.hooks,
+            vec![
+                ("$MODEL".to_string(), model_name.to_string()),
+                ("$VERSION".to_string(), version.to_string()),
+                ("$WORKER_ID".to_string(), worker_id.to_string()),
+            ],
+            &self.hook_tasks,
+        );
 
         // Drain stdout
         tokio::spawn(async move {
@@ -677,10 +722,20 @@ impl WorkerManager {
                         let line = String::from_utf8_lossy(&buf);
                         let level = classify_stderr_line(line.trim());
                         let msg = strip_level_prefix(line.trim());
-                        emit_stderr_line(level, msg, worker_id_clone as usize, &model_name_clone, &version_clone);
+                        emit_stderr_line(
+                            level,
+                            msg,
+                            worker_id_clone as usize,
+                            &model_name_clone,
+                            &version_clone,
+                        );
                     }
                     Err(e) => {
-                        tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
+                        tracing::error!(
+                            worker_id = worker_id_clone,
+                            "Worker stderr read error: {}",
+                            e
+                        );
                         break;
                     }
                 }
@@ -698,7 +753,9 @@ impl WorkerManager {
         // otherwise hang until their caller-side timeouts.
         let fail_client = {
             let clients = self.zmq_clients.read().await;
-            clients.get(&key).and_then(|cs| cs.get(worker_id as usize).cloned())
+            clients
+                .get(&key)
+                .and_then(|cs| cs.get(worker_id as usize).cloned())
         };
         let outlier = {
             let outliers = self.outlier_states.read().await;
@@ -706,7 +763,11 @@ impl WorkerManager {
         };
         let hooks_arc = Arc::new(model_config.hooks.clone());
         let done_rx = spawn_worker_monitor(
-            child, model_name, version, worker_id, shutdown_rx,
+            child,
+            model_name,
+            version,
+            worker_id,
+            shutdown_rx,
             crash_exit_handler(
                 fail_client,
                 outlier,
@@ -729,7 +790,8 @@ impl WorkerManager {
             status: WorkerStatus::Ready,
             capacity: None,
         };
-        self.registry.replace_worker(model_name, version, worker_id, new_info)?;
+        self.registry
+            .replace_worker(model_name, version, worker_id, new_info)?;
         // Respawn replaced the process: point memory sampling at the new PID
         // (same worker_id overwrites the stale entry).
         if let Some(pid) = pid {
@@ -867,8 +929,16 @@ mod tests {
             ep.contains(&std::process::id().to_string()),
             "endpoint {ep} must embed the pid for cross-process uniqueness"
         );
-        assert_eq!(ep, worker_endpoint("m", "1", 0), "same process → stable path");
-        assert_ne!(ep, worker_endpoint("m", "1", 1), "worker_id still distinguishes");
+        assert_eq!(
+            ep,
+            worker_endpoint("m", "1", 0),
+            "same process → stable path"
+        );
+        assert_ne!(
+            ep,
+            worker_endpoint("m", "1", 1),
+            "worker_id still distinguishes"
+        );
     }
 
     /// When a child process exits unexpectedly, the monitor task must detect it
@@ -897,8 +967,14 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
-            move |_kind| { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
+            move |_kind| {
+                cleaned_up_clone.store(true, Ordering::SeqCst);
+            },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -909,7 +985,10 @@ mod tests {
         while !cleaned_up.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
+        assert!(
+            cleaned_up.load(Ordering::SeqCst),
+            "monitor should have triggered cleanup"
+        );
     }
 
     /// Audit 2026-08-10 #8: a crash must fail the worker's in-flight requests
@@ -1009,7 +1088,11 @@ mod tests {
             .unwrap();
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
             {
                 let handler = crash_exit_handler(
                     Some(client.clone()),
@@ -1085,8 +1168,14 @@ mod tests {
         let observed_c = observed.clone();
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
-            move |kind| { *observed_c.lock().unwrap() = Some(kind); },
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
+            move |kind| {
+                *observed_c.lock().unwrap() = Some(kind);
+            },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1106,14 +1195,24 @@ mod tests {
     async fn test_monitor_reports_killed_kind() {
         let mut cmd = Command::new("python");
         cmd.arg("-c").arg("import time; time.sleep(60)");
-        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
 
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_c = observed.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
-            move |kind| { *observed_c.lock().unwrap() = Some(kind); },
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
+            move |kind| {
+                *observed_c.lock().unwrap() = Some(kind);
+            },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1161,8 +1260,14 @@ mod tests {
         };
 
         let done_rx = spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
-            move |_kind| { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
+            move |_kind| {
+                cleaned_up_clone.store(true, Ordering::SeqCst);
+            },
             Some(Arc::new(hooks)),
             hook_tasks_clone,
             Arc::new(AtomicBool::new(true)), // draining=true
@@ -1174,12 +1279,18 @@ mod tests {
             .expect("monitor should signal completion even during drain")
             .expect("completion channel should not be dropped");
 
-        assert!(cleaned_up.load(Ordering::SeqCst), "on_exit callback must fire during drain");
+        assert!(
+            cleaned_up.load(Ordering::SeqCst),
+            "on_exit callback must fire during drain"
+        );
 
         // The error hook task should NOT have been spawned (draining suppresses it)
         let tasks = hook_tasks.lock().unwrap();
-        assert!(tasks.is_empty(),
-            "error hook should NOT fire when draining=true (found {} tasks)", tasks.len());
+        assert!(
+            tasks.is_empty(),
+            "error hook should NOT fire when draining=true (found {} tasks)",
+            tasks.len()
+        );
     }
 
     /// B1 inverse (audit 2026-08-04): with draining=false a non-zero worker exit
@@ -1212,7 +1323,11 @@ mod tests {
         };
 
         let done_rx = spawn_worker_monitor(
-            child, "test_model", "1", 0, shutdown_rx,
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
             |_kind| {},
             Some(Arc::new(hooks)),
             hook_tasks_clone,
@@ -1225,13 +1340,18 @@ mod tests {
             .expect("completion channel should not be dropped");
 
         let tasks = hook_tasks.lock().unwrap();
-        assert!(!tasks.is_empty(),
-            "error hook MUST fire on unexpected exit when draining=false");
+        assert!(
+            !tasks.is_empty(),
+            "error hook MUST fire on unexpected exit when draining=false"
+        );
     }
 
     // ===== Respawn tests =====
 
-    fn test_worker_manager() -> (WorkerManager, std::sync::Arc<crate::registry::ModelRegistry>) {
+    fn test_worker_manager() -> (
+        WorkerManager,
+        std::sync::Arc<crate::registry::ModelRegistry>,
+    ) {
         let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
         let queue = std::sync::Arc::new(crate::inference_queue::InferenceQueue::new());
         let cb = std::sync::Arc::new(crate::callback::CallbackRunner::new());
@@ -1261,11 +1381,13 @@ mod tests {
             )
             .unwrap();
         let labels = &["mfail", "1", "load", "fail"];
-        let before =
-            crate::metrics::prometheus::MODEL_LOAD_TOTAL.with_label_values(labels).get();
+        let before = crate::metrics::prometheus::MODEL_LOAD_TOTAL
+            .with_label_values(labels)
+            .get();
         wm.mark_load_failed("mfail", "1");
-        let after =
-            crate::metrics::prometheus::MODEL_LOAD_TOTAL.with_label_values(labels).get();
+        let after = crate::metrics::prometheus::MODEL_LOAD_TOTAL
+            .with_label_values(labels)
+            .get();
         assert_eq!(
             after,
             before + 1.0,
@@ -1361,6 +1483,7 @@ class TestAPI(LitAPI):
             samples: vec![crate::config::WarmupSample {
                 input_ref: "warmup_input.json".to_string(),
                 iterations,
+                ..Default::default()
             }],
             timeout_secs: 30.0,
             ..Default::default()
@@ -1444,8 +1567,12 @@ class TestAPI(LitAPI):
     async fn respawn_warmup_failure_force_ejects_replacement() {
         let (wm, registry, repo, _marker) = rewarm_harness("g2_rewarm_fail", 1).await;
         // Break the sample AFTER load so only the re-warm fails reading it.
-        std::fs::remove_file(repo.join("g2_rewarm_fail").join("1").join("warmup_input.json"))
-            .unwrap();
+        std::fs::remove_file(
+            repo.join("g2_rewarm_fail")
+                .join("1")
+                .join("warmup_input.json"),
+        )
+        .unwrap();
         let labels = &["g2_rewarm_fail", "1", "warmup"];
         let before = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
             .with_label_values(labels)
@@ -1471,7 +1598,9 @@ class TestAPI(LitAPI):
             .with_label_values(labels)
             .get();
         assert_eq!(after, before + 1.0, "re-warm failure must be counted");
-        let status = registry.get("g2_rewarm_fail", Some("1")).map(|mv| mv.status);
+        let status = registry
+            .get("g2_rewarm_fail", Some("1"))
+            .map(|mv| mv.status);
         assert_eq!(
             status,
             Some(crate::registry::types::VersionStatus::Degraded),
@@ -1490,7 +1619,9 @@ class TestAPI(LitAPI):
             version: "1".to_string(),
             worker_id: 0,
             reason: "health_check",
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let sig = rx.recv().await.unwrap();
         assert_eq!(sig.model_name, "m");
         assert_eq!(sig.worker_id, 0);
@@ -1501,14 +1632,24 @@ class TestAPI(LitAPI):
     async fn test_monitor_exits_on_shutdown() {
         let mut cmd = Command::new("python");
         cmd.arg("-c").arg("import time; time.sleep(60)");
-        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done = Arc::new(AtomicBool::new(false));
         let done_c = done.clone();
 
         spawn_worker_monitor(
-            child, "test", "1", 0, shutdown_rx,
-            move |_kind| { done_c.store(true, Ordering::SeqCst); },
+            child,
+            "test",
+            "1",
+            0,
+            shutdown_rx,
+            move |_kind| {
+                done_c.store(true, Ordering::SeqCst);
+            },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1517,7 +1658,10 @@ class TestAPI(LitAPI):
         // Send shutdown
         shutdown_tx.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(done.load(Ordering::SeqCst), "monitor should exit on shutdown signal");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "monitor should exit on shutdown signal"
+        );
     }
 
     // ===== Orphan prevention: kill completion signal =====
@@ -1529,13 +1673,21 @@ class TestAPI(LitAPI):
     async fn test_monitor_signals_completion_after_shutdown_kill() {
         let mut cmd = Command::new("python");
         cmd.arg("-c").arg("import time; time.sleep(60)");
-        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         #[cfg(unix)]
         let pid = child.id().unwrap() as i32;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
-            child, "test", "1", 0, shutdown_rx,
+            child,
+            "test",
+            "1",
+            0,
+            shutdown_rx,
             |_kind| {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -1554,7 +1706,11 @@ class TestAPI(LitAPI):
         #[cfg(unix)]
         {
             let alive = unsafe { libc::kill(pid, 0) } == 0;
-            assert!(!alive, "worker process {} should be dead once completion fires", pid);
+            assert!(
+                !alive,
+                "worker process {} should be dead once completion fires",
+                pid
+            );
         }
     }
 
@@ -1578,7 +1734,11 @@ class TestAPI(LitAPI):
 
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
-            child, "test", "1", 0, shutdown_rx,
+            child,
+            "test",
+            "1",
+            0,
+            shutdown_rx,
             |_kind| {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -1619,7 +1779,11 @@ class TestAPI(LitAPI):
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(!alive, "dropped worker process {} should be killed via kill_on_drop", pid);
+        assert!(
+            !alive,
+            "dropped worker process {} should be killed via kill_on_drop",
+            pid
+        );
     }
 
     /// Worker processes MUST be in their own process group so terminal SIGINT
@@ -1642,11 +1806,15 @@ class TestAPI(LitAPI):
 
         // The child must be in its own process group (PGID == its own PID when
         // spawned with process_group(0)), different from the server's PGID.
-        assert_eq!(child_pgid, child_pid,
-            "worker should be process group leader (PGID == PID)");
-        assert_ne!(child_pgid, server_pgid,
+        assert_eq!(
+            child_pgid, child_pid,
+            "worker should be process group leader (PGID == PID)"
+        );
+        assert_ne!(
+            child_pgid, server_pgid,
             "worker process group {} must differ from server process group {}",
-            child_pgid, server_pgid);
+            child_pgid, server_pgid
+        );
 
         // Clean up
         unsafe { libc::kill(child_pid, libc::SIGKILL) };
@@ -1729,8 +1897,7 @@ ModuleNotFoundError: No module named 'torch'";
         // the deadline and return whatever it captured (empty), not hang.
         let (_tx, rx) = tokio::io::duplex(64);
         // keep _tx alive so the pipe never sees EOF
-        let got =
-            drain_worker_stderr_bounded(rx, Duration::from_millis(50), 64 * 1024).await;
+        let got = drain_worker_stderr_bounded(rx, Duration::from_millis(50), 64 * 1024).await;
         assert_eq!(got, "");
         let _ = _tx;
     }
@@ -1749,11 +1916,20 @@ ModuleNotFoundError: No module named 'torch'";
         assert_eq!(classify_stderr_line("[ERROR] boom"), tracing::Level::ERROR);
         assert_eq!(classify_stderr_line("[WARN] hmm"), tracing::Level::WARN);
         assert_eq!(classify_stderr_line("plain text"), tracing::Level::DEBUG);
-        assert_eq!(classify_stderr_line("[DEBUG] debug stuff"), tracing::Level::DEBUG);
+        assert_eq!(
+            classify_stderr_line("[DEBUG] debug stuff"),
+            tracing::Level::DEBUG
+        );
         // Traceback lines (indented) should be DEBUG so they don't spam unless
         // the user wants full verbosity.
-        assert_eq!(classify_stderr_line("  File \"x.py\", line 1"), tracing::Level::DEBUG);
-        assert_eq!(classify_stderr_line("Traceback (most recent call last):"), tracing::Level::DEBUG);
+        assert_eq!(
+            classify_stderr_line("  File \"x.py\", line 1"),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            classify_stderr_line("Traceback (most recent call last):"),
+            tracing::Level::DEBUG
+        );
     }
 
     #[test]
