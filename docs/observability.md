@@ -67,12 +67,15 @@ purged on version unload.
 | `liteserver_model_warmup_duration_seconds` | `model, version` | Whole-run wall time (all samples × iterations × worker shares), observed on success AND failure — a failed run's wall time is diagnostic too. |
 | `liteserver_model_warmup_total` | `model, version, status` | `status` ∈ `success` \| `failure` \| `timeout` (closed enum; `timeout` covers both the per-iteration and the `total_timeout_secs` budget). |
 
-Warmup traffic is synthetic: it never counts toward
-`liteserver_inference_duration_seconds`, `liteserver_batch_size`, or
-`liteserver_worker_inference_total`, so those series stay pure real-traffic
-signals (a mixed batch — respawn re-warm overlapping live traffic — records
-normally because it carries real requests). Respawn re-warm failures
-additionally count
+Warmup traffic is synthetic: the batch collector never mixes warmup items
+with live requests in one batch, and all-warmup batches count toward none of
+the real-traffic series — `liteserver_inference_duration_seconds`,
+`liteserver_batch_size`, `liteserver_worker_inference_total`,
+`liteserver_queue_wait_seconds`, and `liteserver_retries_total` all stay pure
+real-traffic signals. Warmup inferences also do not consume the
+`max_requests` auto-recycle budget (worker-scope warmup multiplies the unit
+count by the worker count; counting it could auto-recycle immediately after
+every load). Respawn re-warm failures additionally count
 `liteserver_worker_respawn_failures_total{reason="warmup"}`.
 
 ### Streaming metrics

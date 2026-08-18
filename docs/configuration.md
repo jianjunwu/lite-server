@@ -468,7 +468,9 @@ policies:
     enabled: true                #   false = version goes straight to Ready (no behavior change)
     scope: worker                #   worker (default) = full sample set on EVERY worker process;
                                  #   version = keep the configured total, round-robin across workers
-    respawn: true                #   re-warm a replacement worker after respawn (default true)
+    respawn: true                #   re-warm a replacement worker after respawn (default true); the
+                                 #   re-warm runs in the background (respawn never blocks crash
+                                 #   recovery); a failed re-warm force-ejects the slot (version → Degraded)
     samples:                     #   dummy inputs, consumed in order — one file per input
                                  #   shape/batch (M7; legacy dummy_input_ref/iterations removed)
       - input_ref: warmup/batch1.json   # dummy request-body JSON, relative to the model dir

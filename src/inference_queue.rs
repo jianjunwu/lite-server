@@ -1432,9 +1432,9 @@ async fn do_send_batch(
     let batch_size = batch.len();
     // G6: a batch made entirely of synthetic warmup items must not touch the
     // queue-level inference metrics — cold-start dummy inferences are exactly
-    // the slow outliers these series exist to expose on real traffic. Mixed
-    // batches (a respawn re-warm overlapping live traffic) record normally:
-    // they carry real requests.
+    // the slow outliers these series exist to expose on real traffic. The
+    // collector never mixes warmup with live traffic (F5), so batches are
+    // homogeneous and this check is exact.
     let all_warmup = batch.iter().all(|i| i.is_warmup);
     // B3 direct-mode pin（x-lite-worker-id）优先于一切挑选：pin 在提交时已校验
     // （不存在/已剔除→400），此处仅剩提交后竞态（worker 被剔除/重试排除）——
@@ -1703,13 +1703,25 @@ async fn send_batch_with_retry(
         return;
     }
 
+    // G6/F2/F3 (warmup-gaps audit): an all-warmup batch is synthetic load —
+    // it must not touch real-traffic series (queue wait, retries) nor
+    // consume the max_requests auto-recycle budget (worker-scope warmup
+    // multiplies the unit count by the worker count; counting it could cross
+    // the threshold during load and auto-recycle immediately after every
+    // load — a reload loop, since the reload re-runs warmup against a fresh
+    // counter). The collector never mixes warmup with live items (F5), so a
+    // batch is homogeneous and this check is exact.
+    let all_warmup = batch.iter().all(|i| i.is_warmup);
+
     // Decrement queue depth once per item — retries must not decrement again
     for _ in 0..batch.len() {
         prometheus::dec_queue_depth(model_name, version);
     }
     // P2-1 扩缩指标：提交 → 首次派发（含攒批等待）采样一次；重试不重复采样。
-    for item in &batch {
-        prometheus::observe_queue_wait(model_name, version, item.enqueued_at.elapsed().as_secs_f64());
+    if !all_warmup {
+        for item in &batch {
+            prometheus::observe_queue_wait(model_name, version, item.enqueued_at.elapsed().as_secs_f64());
+        }
     }
 
     let batch_size = batch.len();
@@ -1718,7 +1730,11 @@ async fn send_batch_with_retry(
     if zmq_clients.len() <= 1 || max_retries == 0 {
         let result = do_send_batch(&mut batch, dispatch, inflight, request_timeout, &[]).await;
         match result {
-            Ok(()) => check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await,
+            Ok(()) => {
+                if !all_warmup {
+                    check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                }
+            }
             Err(e) => fail_batch_items(&mut batch, &e),
         }
         return;
@@ -1727,12 +1743,14 @@ async fn send_batch_with_retry(
     let mut excluded: Vec<usize> = Vec::new();
     let mut last_err: Option<BatchError> = None;
     for attempt in 0..max_retries {
-        if attempt > 0 {
+        if attempt > 0 && !all_warmup {
             prometheus::inc_retry(model_name, version);
         }
         match do_send_batch(&mut batch, dispatch, inflight, request_timeout, &excluded).await {
             Ok(()) => {
-                check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                if !all_warmup {
+                    check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                }
                 return;
             }
             Err(e) => {
@@ -1890,6 +1908,25 @@ async fn batch_collector(
                 ) else {
                     continue;
                 };
+                // F5 (warmup-gaps audit): never batch warmup items with live
+                // traffic. A mixed batch can carry conflicting
+                // x-lite-worker-id pins — the conflict fallback then drops
+                // BOTH pins (the re-warm lands on a random worker while
+                // reporting success), and unpinned live items get dragged
+                // onto the warmup pin. Flush the open batch on a
+                // warmup/live boundary instead; warmup items still batch
+                // among themselves (G5 groups are pin-unanimous), and
+                // live+live behavior is unchanged.
+                if !batch.is_empty() && batch[0].is_warmup != item.is_warmup {
+                    let current_batch = std::mem::take(&mut batch);
+                    let dispatch = dispatch.clone();
+                    let worker_inflight = worker_inflight.clone();
+                    let request_count = request_count.clone();
+                    tokio::spawn(async move {
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+                    });
+                    deadline = None;
+                }
                 batch.push(item);
                 if batch.len() >= max_batch_size {
                     let current_batch = std::mem::take(&mut batch);
@@ -4400,6 +4437,9 @@ mod tests {
                     + crate::metrics::prometheus::WORKER_INFERENCE_TOTAL
                         .with_label_values(&[model, "1", "1"])
                         .get(),
+                crate::metrics::prometheus::QUEUE_WAIT_SECONDS
+                    .with_label_values(&[model, "1"])
+                    .get_sample_count(),
             )
         };
         let before = read();
@@ -4430,6 +4470,226 @@ mod tests {
             after.2,
             before.2 + 1.0,
             "real request must record worker inference"
+        );
+        assert_eq!(
+            after.3,
+            before.3 + 1,
+            "real request must record queue wait"
+        );
+    }
+
+    /// F2 (warmup-gaps audit): warmup traffic must NOT consume the
+    /// max_requests auto-recycle budget. Worker-scope warmup multiplies the
+    /// unit count by the worker count — if those counted, a big enough
+    /// sample set would cross the threshold during load and trigger an
+    /// auto-recycle immediately after every load (a reload loop, since the
+    /// reload re-runs warmup against a fresh counter).
+    #[tokio::test]
+    async fn warmup_items_do_not_consume_max_requests_budget() {
+        let model = "warmup_maxreq_m";
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            max_requests: 2,
+            ..Default::default()
+        };
+        let (reload_tx, mut reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+        let mut clients = Vec::new();
+        for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
+            let endpoint = drain_test_endpoint(&format!("warmup-maxreq-{i}"));
+            spawn_tagged_worker(endpoint.clone(), tag.to_vec());
+            clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
+        }
+        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Three warmup items — past the max_requests=2 threshold if counted.
+        for i in 0..3 {
+            let (mut item, rx) = hint_item_rx(&format!("warmup_{i}"), meta_with_headers(&[]));
+            item.is_warmup = true;
+            queue.try_submit(model, "1", item).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("warmup response in time")
+                .expect("channel open");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), reload_rx.recv())
+                .await
+                .is_err(),
+            "warmup items must not signal auto-recycle"
+        );
+
+        // Real traffic still counts: two real items cross the threshold.
+        for i in 0..2 {
+            let (item, rx) = hint_item_rx(&format!("real_{i}"), meta_with_headers(&[]));
+            queue.try_submit(model, "1", item).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("real response in time")
+                .expect("channel open");
+        }
+        let signal = tokio::time::timeout(Duration::from_secs(2), reload_rx.recv())
+            .await
+            .expect("real items crossing max_requests must signal reload")
+            .expect("reload channel open");
+        assert_eq!(signal.model_name, model);
+    }
+
+    /// F3 (warmup-gaps audit): a retrying all-warmup batch must not count
+    /// against RETRIES_TOTAL either — the retry series is a real-traffic
+    /// health signal, and respawn re-warms retry against a dead predecessor's
+    /// siblings by design.
+    #[tokio::test]
+    async fn warmup_batch_retries_do_not_count_retry_metric() {
+        let model = "warmup_retry_m";
+        // Worker 0 has no peer: the send times out and the batch retries on 1.
+        let dead_endpoint = drain_test_endpoint("warmup-retry-dead");
+        let live_endpoint = drain_test_endpoint("warmup-retry-live");
+        spawn_tagged_worker(live_endpoint.clone(), b"w1".to_vec());
+        let dispatch = BatchDispatch {
+            zmq_clients: vec![
+                Arc::new(WorkerZmqClient::new(dead_endpoint)),
+                Arc::new(WorkerZmqClient::new(live_endpoint)),
+            ],
+            outlier: Arc::new(OutlierState::new(2)),
+            model_name: model.to_string(),
+            version: "1".to_string(),
+            reload_tx: mpsc::channel(1).0,
+            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
+            balance: BalanceConfig::default(),
+        };
+        let inflight: Vec<Arc<AtomicUsize>> =
+            vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let retries = || {
+            crate::metrics::prometheus::RETRIES_TOTAL
+                .with_label_values(&[model, "1"])
+                .get()
+        };
+
+        let run = |is_warmup: bool| {
+            let dispatch = &dispatch;
+            let inflight = &inflight;
+            async move {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let batch = vec![QueueItem {
+                    uid: if is_warmup { "wu".to_string() } else { "ru".to_string() },
+                    data: Bytes::from_static(b"{}"),
+                    meta: None,
+                    response_tx: resp_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup,
+                }];
+                let request_count = Arc::new(AtomicUsize::new(0));
+                send_batch_with_retry(
+                    batch,
+                    dispatch,
+                    inflight,
+                    Duration::from_millis(150),
+                    &request_count,
+                    0,
+                    2,
+                )
+                .await;
+                let resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+                    .await
+                    .expect("response in time")
+                    .expect("channel open");
+                match resp.payload {
+                    Some(pb::response::Payload::Single(s)) => {
+                        assert_eq!(&s.data[..], b"w1", "retry must land on the live worker");
+                    }
+                    other => panic!("expected Single, got {other:?}"),
+                }
+            }
+        };
+
+        let before = retries();
+        run(true).await;
+        assert_eq!(
+            retries(),
+            before,
+            "an all-warmup batch retry must not touch RETRIES_TOTAL"
+        );
+        run(false).await;
+        assert_eq!(
+            retries(),
+            before + 1.0,
+            "a real batch retry must count exactly once"
+        );
+    }
+
+    /// F5 (warmup-gaps audit): the collector must never batch a warmup item
+    /// together with live traffic. A mixed batch with conflicting
+    /// x-lite-worker-id pins drops BOTH pins (conflict fallback) — the warmup
+    /// unit then lands on a random worker (the re-warm reports success while
+    /// the replacement stays cold), and unpinned live items get dragged onto
+    /// the warmup pin. Warmup/live items flush the open batch instead.
+    #[tokio::test]
+    async fn collector_never_mixes_warmup_and_live_items() {
+        let model = "warmup_nomix_m";
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 2,
+            // A wide batching window: without the fix the two items below
+            // WOULD share a batch.
+            batch_timeout: 0.3,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+        let mut clients = Vec::new();
+        for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
+            let endpoint = drain_test_endpoint(&format!("warmup-nomix-{i}"));
+            spawn_tagged_worker(endpoint.clone(), tag.to_vec());
+            clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
+        }
+        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Live item pinned to worker 1, warmup item pinned to worker 0, both
+        // inside the same batching window.
+        let (live_item, live_rx) = hint_item_rx("live", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        queue.try_submit(model, "1", live_item).unwrap();
+        let (mut warm_item, warm_rx) =
+            hint_item_rx("warm", meta_with_headers(&[("x-lite-worker-id", "0")]));
+        warm_item.is_warmup = true;
+        queue.try_submit(model, "1", warm_item).unwrap();
+
+        let tag_of = |resp: crate::proto::liteserver::Response| match resp.payload {
+            Some(pb::response::Payload::Single(s)) => s.data,
+            other => panic!("expected Single, got {other:?}"),
+        };
+        let live_resp = tokio::time::timeout(Duration::from_secs(5), live_rx)
+            .await
+            .expect("live response in time")
+            .expect("channel open");
+        let warm_resp = tokio::time::timeout(Duration::from_secs(5), warm_rx)
+            .await
+            .expect("warmup response in time")
+            .expect("channel open");
+        assert_eq!(
+            &tag_of(live_resp)[..],
+            b"w1",
+            "the live item must keep its own pin (not be dragged/degraded by the warmup item)"
+        );
+        assert_eq!(
+            &tag_of(warm_resp)[..],
+            b"w0",
+            "the warmup item must keep its pin (a dropped pin re-warms a random worker)"
         );
     }
 

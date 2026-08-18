@@ -423,7 +423,9 @@ policies:
     enabled: true                #   false = 版本直接置 Ready（行为不变）
     scope: worker                #   worker（默认）= 每个 worker 进程都跑全量样本；
                                  #   version = 总量不变，轮转摊到各 worker
-    respawn: true                #   respawn 后对替补 worker 重新预热（默认 true）
+    respawn: true                #   respawn 后对替补 worker 重新预热（默认 true）；重暖在后台
+                                 #   进行（respawn 不阻塞崩溃恢复）；重暖失败则强制剔除该 slot
+                                 #   （版本 → Degraded）
     samples:                     #   dummy 输入列表，按序消费——每样本一个文件覆盖一种
                                  #   输入形状/batch（M7；旧 dummy_input_ref/iterations 已移除）
       - input_ref: warmup/batch1.json   # dummy 请求体 JSON 路径，相对模型目录

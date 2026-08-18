@@ -463,7 +463,7 @@ impl WorkerManager {
     /// all registries. Failures are counted (WORKER_RESPAWN_FAILURES_TOTAL) —
     /// a replacement that never comes up must be metric-visible, not log-only.
     async fn respawn_worker(
-        &self,
+        self: &Arc<Self>,
         model_name: &str,
         version: &str,
         worker_id: u32,
@@ -481,7 +481,7 @@ impl WorkerManager {
     }
 
     async fn respawn_worker_inner(
-        &self,
+        self: &Arc<Self>,
         model_name: &str,
         version: &str,
         worker_id: u32,
@@ -812,49 +812,20 @@ impl WorkerManager {
             }
         }
 
-        // G2: the replacement is a fresh, cold process — with warmup enabled,
-        // re-warm it (pinned to its own slot) BEFORE it rejoins rotation at
-        // mark_ready. The slot is still dead/ejected from the old worker's
-        // demise, so reset it first or the pinned submissions would be
-        // rejected. Live traffic may route here during the re-warm window —
-        // strictly narrower than the previous behavior, where the cold slot
-        // rejoined rotation immediately at mark_ready.
-        let warmup = model_config.policies.warmup.clone();
-        if let Some(ref p) = warmup {
-            if p.enabled && p.respawn {
-                {
-                    let outliers = self.outlier_states.read().await;
-                    if let Some(outlier) = outliers.get(&key) {
-                        outlier.reset(worker_id as usize);
-                    }
-                }
-                if let Err(reason) = self
-                    .run_warmup(model_name, version, &model_config, p, Some(worker_id))
-                    .await
-                {
-                    error!(
-                        model = %model_name, version = %version, worker_id,
-                        reason = %reason,
-                        "respawn re-warm failed; force-ejecting the cold replacement"
-                    );
-                    let newly_ejected = {
-                        let outliers = self.outlier_states.read().await;
-                        outliers
-                            .get(&key)
-                            .map(|o| o.force_eject(worker_id as usize))
-                            .unwrap_or(false)
-                    };
-                    if newly_ejected {
-                        crate::metrics::prometheus::inc_worker_ejection(model_name, version);
-                    }
-                    crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
-                        .with_label_values(&[model_name, version, "warmup"])
-                        .inc();
-                    self.sync_grpc_health().await;
-                    return Ok(());
-                }
-            }
-        }
+        // G2 (F4): the replacement is a fresh, cold process — with warmup
+        // enabled, re-warm it (pinned to its own slot). The re-warm runs as a
+        // BACKGROUND task: the respawn listener is a global serial loop and
+        // the re-warm has no default total budget, so running it inline would
+        // stall crash recovery for every other model behind one slow/hung
+        // warmup. The slot rejoins rotation at the reset below (live traffic
+        // may route here during the re-warm window); a failed re-warm
+        // force-ejects the slot after the fact, and the circuit's half-open
+        // probe re-warms it lazily on later traffic.
+        let rewarm = model_config
+            .policies
+            .warmup
+            .clone()
+            .filter(|p| p.enabled && p.respawn);
 
         // Replacement worker is up: Loading → Ready (loaded_at preserved).
         self.registry.mark_ready(model_name, version)?;
@@ -873,6 +844,42 @@ impl WorkerManager {
         crate::metrics::prometheus::WORKER_RESPAWNS_TOTAL
             .with_label_values(&[model_name, version, reason])
             .inc();
+
+        if let Some(p) = rewarm {
+            let wm = Arc::clone(self);
+            let model = model_name.to_string();
+            let ver = version.to_string();
+            tokio::spawn(async move {
+                if let Err(reason) =
+                    wm.run_warmup(&model, &ver, &model_config, &p, Some(worker_id))
+                        .await
+                {
+                    error!(
+                        model = %model, version = %ver, worker_id,
+                        reason = %reason,
+                        "respawn re-warm failed; force-ejecting the cold replacement"
+                    );
+                    let newly_ejected = {
+                        let outliers = wm.outlier_states.read().await;
+                        outliers
+                            .get(&key)
+                            .map(|o| o.force_eject(worker_id as usize))
+                            .unwrap_or(false)
+                    };
+                    if newly_ejected {
+                        crate::metrics::prometheus::inc_worker_ejection(&model, &ver);
+                    }
+                    crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+                        .with_label_values(&[&model, &ver, "warmup"])
+                        .inc();
+                    // The slot left rotation — flip to Degraded event-driven
+                    // (there is no periodic coordinator when
+                    // health_check_interval == 0).
+                    wm.mark_degraded(&model, &ver);
+                    wm.sync_grpc_health().await;
+                }
+            });
+        }
 
         Ok(())
     }
@@ -1406,6 +1413,7 @@ mod tests {
     #[tokio::test]
     async fn respawn_failure_records_metric() {
         let (wm, _registry) = test_worker_manager();
+        let wm = std::sync::Arc::new(wm);
         let labels = &["ghost_m", "1", "health_check"];
         let before = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
             .with_label_values(labels)
@@ -1507,6 +1515,7 @@ class TestAPI(LitAPI):
         };
         let w0 = warmups();
         let (wm, registry, repo, marker) = rewarm_harness("g2_rewarm", 2).await;
+        let wm = std::sync::Arc::new(wm);
         assert_eq!(
             warmups(),
             w0 + 1.0,
@@ -1528,6 +1537,15 @@ class TestAPI(LitAPI):
             .await
             .expect("respawn must succeed");
 
+        // F4: the re-warm runs as a background task (the respawn listener is
+        // a global serial loop) — poll for its effects instead of expecting
+        // them synchronously.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (lines(&marker) < 4 || warmups() < w0 + 2.0)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(
             warmups(),
             w0 + 2.0,
@@ -1557,6 +1575,105 @@ class TestAPI(LitAPI):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// F4 (warmup-gaps audit): the respawn listener is a GLOBAL serial loop —
+    /// a re-warm running inline would stall crash recovery for every other
+    /// model (the re-warm has no default total budget). The respawn must
+    /// return with the re-warm still running in the background; the cold
+    /// slot is then force-ejected after the fact if the re-warm fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_returns_before_rewarm_completes() {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-g2-async-{}", std::process::id()));
+        let model_dir = repo.join("g2_async").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let marker = repo.join("marker.txt");
+        // Sleep BEFORE the marker write: a completed re-warm is exactly 2 new
+        // lines; an in-flight one is fewer.
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"from lite_server import LitAPI
+import asyncio
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    async def predict(self, x):
+        await asyncio.sleep(1.0)
+        with open({marker:?}, "a") as f:
+            f.write("w\n")
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#,
+                marker = marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("warmup_input.json"), "{\"input\": 7}").unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let wm = std::sync::Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            std::sync::Arc::new(crate::inference_queue::InferenceQueue::new()),
+            "debug".to_string(),
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+        ));
+        let mut config = crate::config::ModelConfig::default();
+        config.policies.warmup = Some(crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 2,
+                ..Default::default()
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        });
+        wm.load_model("g2_async", "1", &config)
+            .await
+            .expect("load with a valid warmup sample must succeed");
+        let lines = || {
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(lines(), 2, "load warmup: 2 iterations");
+
+        wm.respawn_worker("g2_async", "1", 0, "health_check")
+            .await
+            .expect("respawn must succeed");
+
+        assert!(
+            lines() < 4,
+            "respawn must NOT block on the re-warm (2 x 1s units), got {} lines",
+            lines()
+        );
+        // The background re-warm still completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lines() < 4 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(lines(), 4, "the background re-warm must finish");
+
+        let _ = wm.unload_model("g2_async", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// G2: when the re-warm fails (sample file unreadable), the cold
     /// replacement must LEAVE rotation — force-ejected, so the coordinator
     /// keeps the version Degraded and the circuit's half-open probe can still
@@ -1566,6 +1683,7 @@ class TestAPI(LitAPI):
     #[tokio::test]
     async fn respawn_warmup_failure_force_ejects_replacement() {
         let (wm, registry, repo, _marker) = rewarm_harness("g2_rewarm_fail", 1).await;
+        let wm = std::sync::Arc::new(wm);
         // Break the sample AFTER load so only the re-warm fails reading it.
         std::fs::remove_file(
             repo.join("g2_rewarm_fail")
@@ -1582,10 +1700,16 @@ class TestAPI(LitAPI):
             .await
             .expect("the respawn itself succeeded — only the re-warm failed");
 
+        // F4: the re-warm (and thus the force-eject) runs in a background
+        // task — poll for the ejection.
         let outlier = wm
             .get_outlier_state("g2_rewarm_fail", "1")
             .await
             .expect("outlier state");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !outlier.is_ejected(0) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
             outlier.is_ejected(0),
             "cold replacement must be ejected from rotation"
@@ -1594,13 +1718,25 @@ class TestAPI(LitAPI):
             !outlier.is_dead(0),
             "ejected, not dead: half-open recovery must stay possible"
         );
-        let after = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
-            .with_label_values(labels)
-            .get();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut after;
+        let mut status;
+        loop {
+            after = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+                .with_label_values(labels)
+                .get();
+            status = registry
+                .get("g2_rewarm_fail", Some("1"))
+                .map(|mv| mv.status);
+            if (after == before + 1.0
+                && status == Some(crate::registry::types::VersionStatus::Degraded))
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(after, before + 1.0, "re-warm failure must be counted");
-        let status = registry
-            .get("g2_rewarm_fail", Some("1"))
-            .map(|mv| mv.status);
         assert_eq!(
             status,
             Some(crate::registry::types::VersionStatus::Degraded),

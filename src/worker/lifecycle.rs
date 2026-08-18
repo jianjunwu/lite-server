@@ -93,6 +93,52 @@ impl WarmupFailure {
     }
 }
 
+/// F1 (warmup-gaps audit): RAII cancel for a warmup stream. Any exit that
+/// did not observe a terminal frame (Done/Error) or a channel close drops
+/// the guard armed → a StreamCancel goes out so the worker-side generator
+/// stops instead of running to its natural Done (unbounded waste for a long
+/// LLM stream). Covers every abort shape: per-iteration timeout, unexpected
+/// frames, a sibling unit's failure dropping the unit future mid-poll, and
+/// the G4 total budget cutting the whole run. `send_raw` is async, so the
+/// cancel rides a spawned task (Drop is sync); a vanished runtime (process
+/// teardown) skips it — the workers die with the runtime there anyway.
+struct StreamCancelGuard {
+    client: Arc<WorkerZmqClient>,
+    stream_id: String,
+    armed: bool,
+}
+
+impl StreamCancelGuard {
+    fn armed(client: Arc<WorkerZmqClient>, stream_id: String) -> Self {
+        Self {
+            client,
+            stream_id,
+            armed: true,
+        }
+    }
+
+    /// Terminal frame observed or the channel already closed — no cancel.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let client = self.client.clone();
+                let stream_id = std::mem::take(&mut self.stream_id);
+                handle.spawn(async move {
+                    let _ = client
+                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                        .await;
+                });
+            }
+        }
+    }
+}
+
 /// G1: build the warmup execution plan. `worker` scope (default) replays the
 /// full sample set on EVERY worker process (worker-major order) — each process
 /// owns separate engine state, so a version-wide pass would leave N-1 of N
@@ -160,19 +206,16 @@ fn build_warmup_plan_for_worker(
 /// share a collector window (a mixed batch would silently drop the pin via
 /// the conflict fallback).
 fn group_units_by_pin(plan: &[WarmupUnit]) -> Vec<Vec<WarmupUnit>> {
-    let mut order: Vec<Option<usize>> = Vec::new();
-    let mut groups: std::collections::HashMap<Option<usize>, Vec<WarmupUnit>> =
-        std::collections::HashMap::new();
+    // Ordered linear scan (pins ≤ worker count, so the group list is tiny) —
+    // no HashMap, no unwrap on the lookup-back.
+    let mut groups: Vec<(Option<usize>, Vec<WarmupUnit>)> = Vec::new();
     for u in plan {
-        if !groups.contains_key(&u.worker_pin) {
-            order.push(u.worker_pin);
+        match groups.iter_mut().find(|(pin, _)| *pin == u.worker_pin) {
+            Some((_, units)) => units.push(u.clone()),
+            None => groups.push((u.worker_pin, vec![u.clone()])),
         }
-        groups.entry(u.worker_pin).or_default().push(u.clone());
     }
-    order
-        .into_iter()
-        .map(|k| groups.remove(&k).expect("key inserted above"))
-        .collect()
+    groups.into_iter().map(|(_, units)| units).collect()
 }
 
 /// Shared warmup response check (queue and RouteCall paths alike): a non-Ok
@@ -1109,16 +1152,12 @@ impl WorkerManager {
             enqueued_at: std::time::Instant::now(),
             is_warmup: true,
         };
-        match self.inference_queue.try_submit(model_name, version, item) {
-            Ok(()) => {}
-            Err(crate::inference_queue::QueueError::Full) => {
-                return Err(WarmupFailure::failure("warmup queue full".to_string()));
-            }
-            Err(_) => {
-                return Err(WarmupFailure::failure(
-                    "warmup: inference queue not available".to_string(),
-                ));
-            }
+        if let Err(e) = self.inference_queue.try_submit(model_name, version, item) {
+            // Keep the QueueError detail (full / invalid pin / no live
+            // workers) — a bare "queue not available" misdirects debugging.
+            return Err(WarmupFailure::failure(format!(
+                "warmup: queue submit failed: {e}"
+            )));
         }
 
         // Bound the dummy inference by the per-iteration budget (None = unbounded).
@@ -1301,46 +1340,66 @@ impl WorkerManager {
 
         use crate::proto::liteserver::stream_response::Payload as Frame;
         let completion = sample.completion.unwrap_or_default();
-        let cancel_client = client.clone();
-        let cancel_id = stream_id.clone();
-        let wait = async move {
+        // Cancel the worker-side stream on every non-terminal exit (see the
+        // guard's doc). Terminal frames and a closed channel disarm.
+        let mut guard = StreamCancelGuard::armed(client, stream_id);
+        let wait = async {
             match completion {
                 crate::config::WarmupStreamCompletion::FirstChunk => {
                     match chunk_rx.recv().await {
                         Some(frame) => match frame.payload {
                             // TTFT path warm — cancel instead of draining.
                             Some(Frame::Chunk(_)) => {
-                                let _ = cancel_client
-                                    .send_raw(crate::streaming::build_stream_cancel(cancel_id))
+                                let _ = guard
+                                    .client
+                                    .send_raw(crate::streaming::build_stream_cancel(
+                                        guard.stream_id.clone(),
+                                    ))
                                     .await;
+                                guard.disarm();
                                 Ok(())
                             }
                             // Empty stream: the generator ran to Done (Q3 ruling).
-                            Some(Frame::Done(_)) => Ok(()),
-                            Some(Frame::Error(e)) => Err(WarmupFailure::failure(format!(
-                                "warmup stream returned error: {}",
-                                e.message
-                            ))),
+                            Some(Frame::Done(_)) => {
+                                guard.disarm();
+                                Ok(())
+                            }
+                            Some(Frame::Error(e)) => {
+                                guard.disarm();
+                                Err(WarmupFailure::failure(format!(
+                                    "warmup stream returned error: {}",
+                                    e.message
+                                )))
+                            }
+                            // Armed: dropping the guard cancels the stream.
                             other => Err(WarmupFailure::failure(format!(
                                 "warmup: unexpected first stream frame ({other:?})"
                             ))),
                         },
-                        None => Err(WarmupFailure::failure(
-                            "warmup: stream closed before any frame".to_string(),
-                        )),
+                        None => {
+                            guard.disarm();
+                            Err(WarmupFailure::failure(
+                                "warmup: stream closed before any frame".to_string(),
+                            ))
+                        }
                     }
                 }
                 crate::config::WarmupStreamCompletion::Drain => loop {
                     match chunk_rx.recv().await {
                         Some(frame) => match frame.payload {
                             Some(Frame::Chunk(_)) => continue,
-                            Some(Frame::Done(_)) => break Ok(()),
+                            Some(Frame::Done(_)) => {
+                                guard.disarm();
+                                break Ok(());
+                            }
                             Some(Frame::Error(e)) => {
+                                guard.disarm();
                                 break Err(WarmupFailure::failure(format!(
                                     "warmup stream returned error: {}",
                                     e.message
-                                )))
+                                )));
                             }
+                            // Armed: dropping the guard cancels the stream.
                             other => {
                                 break Err(WarmupFailure::failure(format!(
                                     "warmup: unexpected stream frame ({other:?})"
@@ -1348,9 +1407,10 @@ impl WorkerManager {
                             }
                         },
                         None => {
+                            guard.disarm();
                             break Err(WarmupFailure::failure(
                                 "warmup: stream closed before Done".to_string(),
-                            ))
+                            ));
                         }
                     }
                 },
@@ -1359,6 +1419,8 @@ impl WorkerManager {
         match timeout_opt {
             Some(t) => match timeout(t, wait).await {
                 Ok(r) => r,
+                // Timed out with the guard armed — its Drop cancels the
+                // worker-side stream on the way out.
                 Err(_) => Err(WarmupFailure::timeout(format!(
                     "warmup: timed out after {:.1}s",
                     t.as_secs_f32()
@@ -3392,6 +3454,160 @@ class TestAPI(LitAPI):
             "both iterations must run their generator to Done"
         );
         let _ = wm.unload_model("b6_drain", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// F1 (warmup-gaps audit): dropping an ARMED StreamCancelGuard must put a
+    /// StreamCancel on the wire — the timeout/unexpected-frame/outer-abort
+    /// paths rely on it to stop the worker-side generator.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_cancel_guard_sends_cancel_on_armed_drop() {
+        use prost::Message as _;
+        let endpoint = fc_ipc_endpoint("cancel-guard");
+        let client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
+        // Give the blocking bind a moment to come up before the peer connects.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let socket = ctx.socket(zmq::PAIR).unwrap();
+            socket.set_rcvtimeo(5000).unwrap();
+            socket.set_linger(0).unwrap();
+            socket.connect(&endpoint).unwrap();
+            connected_tx.send(()).unwrap();
+            let bytes = socket.recv_bytes(0).expect("peer: no frame received");
+            tx.send(bytes).unwrap();
+            // Keep the socket alive briefly so the receive is not raced by drop.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        // The actor's raw send is EAGAIN-dropped without a connected peer —
+        // wait out the ZMQ handshake before arming/dropping the guard.
+        connected_rx.recv().unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        {
+            let _guard = StreamCancelGuard::armed(client.clone(), "stream-x".to_string());
+        }
+        // spawn_blocking: a bare blocking recv on the current-thread test
+        // runtime would starve the spawned cancel task itself.
+        let bytes = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("armed drop must send a cancel frame")
+        })
+        .await
+        .unwrap();
+        let req = crate::proto::liteserver::Request::decode(bytes.as_slice()).unwrap();
+        match req.payload {
+            Some(crate::proto::liteserver::request::Payload::Stream(sr)) => {
+                assert_eq!(sr.stream_id, "stream-x");
+                assert!(
+                    matches!(
+                        sr.action,
+                        Some(crate::proto::liteserver::stream_request::Action::Cancel(_))
+                    ),
+                    "armed drop must send StreamCancel, got {:?}",
+                    sr.action
+                );
+            }
+            other => panic!("expected Stream payload, got {other:?}"),
+        }
+        peer.join().unwrap();
+
+        // A disarmed guard sends nothing (no spawn, no panic).
+        let mut guard = StreamCancelGuard::armed(client, "stream-y".to_string());
+        guard.disarm();
+        drop(guard);
+    }
+
+    /// F1 (warmup-gaps audit): a stream warmup that TIMES OUT must cancel the
+    /// worker-side stream — previously the generator kept running to its
+    /// natural end (here: 5s) because only the first_chunk SUCCESS path sent
+    /// a cancel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_stream_timeout_cancels_worker_side_stream() {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b6_to_cancel-{}", std::process::id()));
+        let marker = repo.join("cancel_marker.txt");
+        let model_py = format!(
+            r#"from lite_server import LitAPI
+import asyncio
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    async def stream_predict(self, x):
+        try:
+            await asyncio.sleep(5)
+            yield {{"chunk": 0}}
+        except asyncio.CancelledError:
+            with open({marker:?}, "a") as f:
+                f.write("cancelled\n")
+            raise
+"#,
+            marker = marker.display().to_string()
+        );
+        // Load with warmup DISABLED so the version is Ready; the warmup under
+        // test is then run manually (a load-time failure would tear the
+        // workers down before the cancel could be observed).
+        let disabled = crate::config::WarmupPolicy::default();
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b6_to_cancel", &model_py, disabled).await;
+        result.expect("load without warmup must succeed");
+
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+                mode: crate::config::WarmupSampleMode::Stream,
+                ..Default::default()
+            }],
+            timeout_secs: 0.3,
+            ..Default::default()
+        };
+        let config = crate::config::ModelConfig::default();
+        let err = wm
+            .run_warmup("b6_to_cancel", "1", &config, &policy, None)
+            .await
+            .expect_err("the 0.3s budget must cut the 5s stream");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout failure, got: {err}"
+        );
+
+        // The cancel must land well before the stream's 5s natural end.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut cancelled = false;
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .contains("cancelled")
+            {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cancelled,
+            "the timed-out stream must be cancelled worker-side (long before its 5s natural end)"
+        );
+        let _ = wm.unload_model("b6_to_cancel", Some("1")).await;
         let _ = std::fs::remove_dir_all(&repo);
     }
 
