@@ -1005,6 +1005,7 @@ impl WorkerManager {
     /// G7: run one warmup unit, retrying transient failures on the same
     /// worker (fixed 500ms interval, `policy.retries` extra attempts;
     /// 0 = fail-fast, D33).
+    #[allow(clippy::too_many_arguments)] // execution-context bundle; splitting adds indirection only
     async fn run_warmup_unit(
         &self,
         model_name: &str,
