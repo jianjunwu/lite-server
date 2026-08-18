@@ -750,6 +750,50 @@ impl WorkerManager {
             }
         }
 
+        // G2: the replacement is a fresh, cold process — with warmup enabled,
+        // re-warm it (pinned to its own slot) BEFORE it rejoins rotation at
+        // mark_ready. The slot is still dead/ejected from the old worker's
+        // demise, so reset it first or the pinned submissions would be
+        // rejected. Live traffic may route here during the re-warm window —
+        // strictly narrower than the previous behavior, where the cold slot
+        // rejoined rotation immediately at mark_ready.
+        let warmup = model_config.policies.warmup.clone();
+        if let Some(ref p) = warmup {
+            if p.enabled && p.respawn {
+                {
+                    let outliers = self.outlier_states.read().await;
+                    if let Some(outlier) = outliers.get(&key) {
+                        outlier.reset(worker_id as usize);
+                    }
+                }
+                if let Err(reason) = self
+                    .run_warmup(model_name, version, &model_config, p, Some(worker_id))
+                    .await
+                {
+                    error!(
+                        model = %model_name, version = %version, worker_id,
+                        reason = %reason,
+                        "respawn re-warm failed; force-ejecting the cold replacement"
+                    );
+                    let newly_ejected = {
+                        let outliers = self.outlier_states.read().await;
+                        outliers
+                            .get(&key)
+                            .map(|o| o.force_eject(worker_id as usize))
+                            .unwrap_or(false)
+                    };
+                    if newly_ejected {
+                        crate::metrics::prometheus::inc_worker_ejection(model_name, version);
+                    }
+                    crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+                        .with_label_values(&[model_name, version, "warmup"])
+                        .inc();
+                    self.sync_grpc_health().await;
+                    return Ok(());
+                }
+            }
+        }
+
         // Replacement worker is up: Loading → Ready (loaded_at preserved).
         self.registry.mark_ready(model_name, version)?;
         self.sync_grpc_health().await;
@@ -1251,6 +1295,175 @@ mod tests {
             .with_label_values(labels)
             .get();
         assert_eq!(after, before + 1.0, "a failed respawn must be counted");
+    }
+
+    /// G2 harness: a temp repo with an echo model whose `predict` appends one
+    /// marker line per call, so tests can count how many warmup inferences a
+    /// worker process actually ran. Returns (manager, registry, repo, marker).
+    #[cfg(unix)]
+    async fn rewarm_harness(
+        tag: &str,
+        iterations: u32,
+    ) -> (
+        WorkerManager,
+        std::sync::Arc<crate::registry::ModelRegistry>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-g2-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let marker = repo.join("marker.txt");
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        with open({marker:?}, "a") as f:
+            f.write("w\n")
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#,
+                marker = marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("warmup_input.json"), "{\"input\": 7}").unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            std::sync::Arc::new(crate::inference_queue::InferenceQueue::new()),
+            "debug".to_string(),
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+        );
+        let mut config = crate::config::ModelConfig::default();
+        config.policies.warmup = Some(crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations,
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        });
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load with a valid warmup sample must succeed");
+        (wm, registry, repo, marker)
+    }
+
+    /// G2: a respawned replacement is a cold process — with warmup enabled it
+    /// must be re-warmed (pinned to its own slot) BEFORE the version returns
+    /// to Ready, so post-recovery traffic never pays the cold-start cost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_rewarms_replacement_worker() {
+        let (wm, registry, repo, marker) = rewarm_harness("g2_rewarm", 2).await;
+        let lines = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(
+            lines(&marker),
+            2,
+            "load warmup: 1 worker x 1 sample x 2 iterations"
+        );
+
+        wm.respawn_worker("g2_rewarm", "1", 0, "health_check")
+            .await
+            .expect("respawn must succeed");
+
+        assert_eq!(
+            lines(&marker),
+            4,
+            "respawn must re-warm the cold replacement (2 more units)"
+        );
+        let status = registry.get("g2_rewarm", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Ready),
+            "a successful re-warm returns the version to Ready"
+        );
+        let outlier = wm
+            .get_outlier_state("g2_rewarm", "1")
+            .await
+            .expect("outlier state");
+        assert!(
+            !outlier.is_ejected(0) && !outlier.is_dead(0),
+            "re-warmed replacement must be back in rotation"
+        );
+
+        let _ = wm.unload_model("g2_rewarm", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G2: when the re-warm fails (sample file unreadable), the cold
+    /// replacement must LEAVE rotation — force-ejected, so the coordinator
+    /// keeps the version Degraded and the circuit's half-open probe can still
+    /// re-warm it lazily on later real traffic. The failure is counted and
+    /// the version is never marked Failed (runtime recovery ≠ load failure).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_warmup_failure_force_ejects_replacement() {
+        let (wm, registry, repo, _marker) = rewarm_harness("g2_rewarm_fail", 1).await;
+        // Break the sample AFTER load so only the re-warm fails reading it.
+        std::fs::remove_file(repo.join("g2_rewarm_fail").join("1").join("warmup_input.json"))
+            .unwrap();
+        let labels = &["g2_rewarm_fail", "1", "warmup"];
+        let before = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+            .with_label_values(labels)
+            .get();
+
+        wm.respawn_worker("g2_rewarm_fail", "1", 0, "health_check")
+            .await
+            .expect("the respawn itself succeeded — only the re-warm failed");
+
+        let outlier = wm
+            .get_outlier_state("g2_rewarm_fail", "1")
+            .await
+            .expect("outlier state");
+        assert!(
+            outlier.is_ejected(0),
+            "cold replacement must be ejected from rotation"
+        );
+        assert!(
+            !outlier.is_dead(0),
+            "ejected, not dead: half-open recovery must stay possible"
+        );
+        let after = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+            .with_label_values(labels)
+            .get();
+        assert_eq!(after, before + 1.0, "re-warm failure must be counted");
+        let status = registry.get("g2_rewarm_fail", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Degraded),
+            "re-warm failure leaves the version Degraded, never Failed"
+        );
+
+        let _ = wm.unload_model("g2_rewarm_fail", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[tokio::test]

@@ -1054,6 +1054,11 @@ pub struct WarmupPolicy {
     /// pass would leave N-1 of N workers cold. `version` keeps the configured
     /// total (Σ samples×iterations) and round-robins units across workers.
     pub scope: WarmupScope,
+    /// G2: re-warm a replacement worker after respawn (pinned to its slot,
+    /// full sample set). Default true — a respawned process is cold, so
+    /// skipping the re-warm would re-admit the first-request spike exactly
+    /// at crash-recovery time. Only meaningful when `enabled` is true.
+    pub respawn: bool,
     /// Warmup samples, consumed in order. Each = one dummy request-body file +
     /// its iteration count. Must be non-empty when `enabled` is true.
     pub samples: Vec<WarmupSample>,
@@ -1101,6 +1106,7 @@ impl Default for WarmupPolicy {
         Self {
             enabled: false,
             scope: WarmupScope::default(),
+            respawn: true,
             samples: Vec::new(),
             timeout_secs: 0.0,
             dummy_input_ref: None,
@@ -1612,6 +1618,24 @@ mod tests {
             "enabled: true\nscope: bogus\nsamples:\n  - input_ref: warmup/input.json\n",
         );
         assert!(res.is_err(), "unknown scope variant must fail to parse");
+    }
+
+    #[test]
+    fn warmup_respawn_flag_defaults_to_true() {
+        // G2: a respawned replacement worker is a cold process, so re-warming
+        // after respawn defaults on (Q2 ruling 2026-08-18); `respawn: false`
+        // opts out.
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert!(p.respawn, "respawn re-warm must default on");
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nrespawn: false\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert!(!p.respawn);
+        assert!(WarmupPolicy::default().respawn);
     }
 
     #[test]

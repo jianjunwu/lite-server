@@ -288,6 +288,35 @@ impl OutlierState {
         }
     }
 
+    /// Force-eject a worker, bypassing the error-count threshold (G2): used
+    /// when a respawned replacement fails its re-warm. Chosen over
+    /// `mark_dead` deliberately — the status coordinator derives Degraded
+    /// from ejection only, and the circuit's half-open probe keeps a natural
+    /// recovery path (a later real request re-warms the slot lazily), while
+    /// `mark_dead` would show a misleading Ready and never recover without
+    /// operator action. Not outlier-driven, so neither the threshold nor the
+    /// max-ejection-percent cap applies. Returns `true` when this call
+    /// performed the ejection (mirrors `record_error` for metric pairing).
+    pub fn force_eject(&self, worker_idx: usize) -> bool {
+        let Some(w) = self.workers.get(worker_idx) else {
+            return false;
+        };
+        let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return false;
+        }
+        let series = w.ejection_series.fetch_add(1, Ordering::Relaxed) + 1;
+        *guard = Some(EjectedWorker {
+            ejected_at: Instant::now(),
+            half_open: false,
+        });
+        info!(
+            "Worker {worker_idx} force-ejected (respawn re-warm failed; series {series}, backoff {:?})",
+            self.backoff(series)
+        );
+        true
+    }
+
     /// Is the worker's process known to be dead? (false for unknown index)
     pub fn is_dead(&self, worker_idx: usize) -> bool {
         self.workers

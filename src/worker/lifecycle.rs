@@ -112,6 +112,25 @@ fn build_warmup_plan(
     }
 }
 
+/// G2: plan for re-warming ONE replacement worker after respawn — the full
+/// sample set pinned to its slot, regardless of `scope` (the goal is "this
+/// process is warm"; a version-wide fraction would leave it mostly cold).
+fn build_warmup_plan_for_worker(
+    policy: &crate::config::WarmupPolicy,
+    worker_id: u32,
+) -> Vec<WarmupUnit> {
+    policy
+        .samples
+        .iter()
+        .enumerate()
+        .flat_map(|(si, s)| std::iter::repeat_n(si, s.iterations.max(1) as usize))
+        .map(|si| WarmupUnit {
+            sample: si,
+            worker_pin: Some(worker_id as usize),
+        })
+        .collect()
+}
+
 impl WorkerManager {
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
@@ -649,7 +668,7 @@ impl WorkerManager {
         // serving an unwarmed/broken model). Skipped entirely when disabled.
         if let Some(ref policy) = warmup {
             if policy.enabled {
-                match self.run_warmup(model_name, version, &model_config, policy).await {
+                match self.run_warmup(model_name, version, &model_config, policy, None).await {
                     Ok(()) => {
                         self.registry.mark_ready(model_name, version)?;
                         info!(
@@ -730,13 +749,16 @@ impl WorkerManager {
     /// (see [`build_warmup_plan`]); under serial submission least-loaded would
     /// otherwise land every unit on worker 0. Returns `Err(reason)` on any
     /// failure (file unreadable, queue error, error response, timeout); the
-    /// caller marks the version `Failed`.
-    async fn run_warmup(
+    /// caller marks the version `Failed`. `pin` selects the plan shape:
+    /// `None` (load) = [`build_warmup_plan`] over all workers; `Some(worker)`
+    /// (G2 respawn re-warm) = the full sample set pinned to that one slot.
+    pub(super) async fn run_warmup(
         &self,
         model_name: &str,
         version: &str,
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
+        pin: Option<u32>,
     ) -> Result<(), String> {
         let (model_dir, worker_count) = self
             .registry
@@ -759,7 +781,10 @@ impl WorkerManager {
             payloads.push(bytes::Bytes::from(body));
         }
 
-        let plan = build_warmup_plan(policy, worker_count);
+        let plan = match pin {
+            Some(w) => build_warmup_plan_for_worker(policy, w),
+            None => build_warmup_plan(policy, worker_count),
+        };
         info!(
             model = %model_name, version = %version,
             units = plan.len(),
@@ -2219,6 +2244,36 @@ class TestAPI(LitAPI):
         );
     }
 
+    #[test]
+    fn warmup_plan_pinned_rewarm_covers_full_sample_set() {
+        // G2: re-warming ONE replacement worker must run the full sample set
+        // pinned to its slot — regardless of `scope` (a version-wide fraction
+        // would leave the cold process mostly unwarmed).
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            scope: crate::config::WarmupScope::Version,
+            samples: vec![
+                crate::config::WarmupSample {
+                    input_ref: "warmup/a.json".to_string(),
+                    iterations: 2,
+                },
+                crate::config::WarmupSample {
+                    input_ref: "warmup/b.json".to_string(),
+                    iterations: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let plan = build_warmup_plan_for_worker(&policy, 2);
+        assert_eq!(plan.len(), 3, "full sample set: 2 + 1 units");
+        assert!(
+            plan.iter().all(|u| u.worker_pin == Some(2)),
+            "every unit pinned to the replacement's slot"
+        );
+        assert_eq!(plan.iter().filter(|u| u.sample == 0).count(), 2);
+        assert_eq!(plan.iter().filter(|u| u.sample == 1).count(), 1);
+    }
+
     /// L5 reproduction (RED): `load_model` spawns workers and registers the
     /// queue/client/outlier state BEFORE running warmup (:320-590, then :597).
     /// When warmup fails the version is only `mark_failed` and `Err` returned —
@@ -2287,6 +2342,7 @@ class TestAPI(LitAPI):
             dummy_input_ref: None,
             iterations: None,
             scope: crate::config::WarmupScope::default(),
+            respawn: true,
         });
 
         let err = wm.load_model("l5_model", "1", &config).await.unwrap_err();
