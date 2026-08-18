@@ -1048,6 +1048,12 @@ impl ModelPolicies {
 pub struct WarmupPolicy {
     /// Master switch. False = warmup skipped (version goes straight to Ready).
     pub enabled: bool,
+    /// G1: coverage scope. `worker` (default) runs the full sample set on
+    /// EVERY worker process — each process owns separate engine state (CUDA
+    /// graph capture / torch.compile / allocator pools), so a version-wide
+    /// pass would leave N-1 of N workers cold. `version` keeps the configured
+    /// total (Σ samples×iterations) and round-robins units across workers.
+    pub scope: WarmupScope,
     /// Warmup samples, consumed in order. Each = one dummy request-body file +
     /// its iteration count. Must be non-empty when `enabled` is true.
     pub samples: Vec<WarmupSample>,
@@ -1059,6 +1065,17 @@ pub struct WarmupPolicy {
     pub dummy_input_ref: Option<String>,
     /// M7 migration sentinel — removed config shape, never consumed.
     pub iterations: Option<u32>,
+}
+
+/// G1: warmup coverage scope (see `WarmupPolicy::scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarmupScope {
+    /// Keep the configured total, round-robin units across workers.
+    Version,
+    /// Run the full sample set on every worker process.
+    #[default]
+    Worker,
 }
 
 /// One warmup sample: a dummy `/predict` request-body file run `iterations`
@@ -1083,6 +1100,7 @@ impl Default for WarmupPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
+            scope: WarmupScope::default(),
             samples: Vec::new(),
             timeout_secs: 0.0,
             dummy_input_ref: None,
@@ -1565,6 +1583,35 @@ mod tests {
         assert_eq!(p.samples[0].iterations, 1, "iterations 缺省 1");
         assert_eq!(p.samples[1].iterations, 4);
         assert_eq!(p.timeout_secs, 10.0);
+    }
+
+    #[test]
+    fn warmup_scope_defaults_to_worker() {
+        // G1 (Q1 ruling): every worker process has its own engine state (CUDA
+        // graphs / allocator pools), so the default must warm ALL workers —
+        // `worker` scope, not the legacy version-wide single pass.
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert_eq!(p.scope, WarmupScope::Worker);
+    }
+
+    #[test]
+    fn warmup_scope_version_parses() {
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nscope: version\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert_eq!(p.scope, WarmupScope::Version);
+    }
+
+    #[test]
+    fn warmup_scope_invalid_value_rejected() {
+        let res: Result<WarmupPolicy, _> = serde_yaml::from_str(
+            "enabled: true\nscope: bogus\nsamples:\n  - input_ref: warmup/input.json\n",
+        );
+        assert!(res.is_err(), "unknown scope variant must fail to parse");
     }
 
     #[test]

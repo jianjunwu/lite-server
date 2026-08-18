@@ -367,6 +367,7 @@ async fn do_infer(
         response_tx,
         inflight_guard: None,
         enqueued_at: std::time::Instant::now(),
+        is_warmup: false,
     };
 
     match state.inference_queue.try_submit(&model_name, &resolved_version, item) {

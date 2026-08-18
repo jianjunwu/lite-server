@@ -60,6 +60,12 @@ pub struct QueueItem {
     pub inflight_guard: Option<InflightGuard>,
     /// 入队时刻（P2-1 扩缩指标）：首次派发时采样 queue_wait_seconds。
     pub enqueued_at: Instant,
+    /// G6: synthetic warmup traffic (P-WARM). Batch-level dispatch metrics
+    /// (latency histogram / batch size / per-worker inference totals) skip
+    /// all-warmup batches so cold-start dummy inferences never pollute the
+    /// series that exist to expose first-request spikes on real traffic.
+    /// Process-internal bookkeeping — never crosses the wire.
+    pub is_warmup: bool,
 }
 
 /// Decrements the per-version in-flight counter and the
@@ -1395,6 +1401,12 @@ async fn do_send_batch(
     }
 
     let batch_size = batch.len();
+    // G6: a batch made entirely of synthetic warmup items must not touch the
+    // queue-level inference metrics — cold-start dummy inferences are exactly
+    // the slow outliers these series exist to expose on real traffic. Mixed
+    // batches (a respawn re-warm overlapping live traffic) record normally:
+    // they carry real requests.
+    let all_warmup = batch.iter().all(|i| i.is_warmup);
     // B3 direct-mode pin（x-lite-worker-id）优先于一切挑选：pin 在提交时已校验
     // （不存在/已剔除→400），此处仅剩提交后竞态（worker 被剔除/重试排除）——
     // warn 降级正常挑选，可用性优先于 hint。
@@ -1437,10 +1449,12 @@ async fn do_send_batch(
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     update_worker_saturation(model_name, version, inflight);
     let zmq_client = &zmq_clients[worker_idx];
-    prometheus::observe_batch_size(model_name, version, batch_size);
-    // P6 GetModelStats: count logical inferences per worker (batch size here;
-    // per-attempt like observe_inference_duration above, so retries count too).
-    prometheus::record_worker_inference(model_name, version, worker_idx, batch_size);
+    if !all_warmup {
+        prometheus::observe_batch_size(model_name, version, batch_size);
+        // P6 GetModelStats: count logical inferences per worker (batch size here;
+        // per-attempt like observe_inference_duration above, so retries count too).
+        prometheus::record_worker_inference(model_name, version, worker_idx, batch_size);
+    }
     // P8-1: record sequence_id → chosen worker for every sequenced item so the
     // next same-sequence request biases here (last-writer-wins; a retry to a
     // different worker updates the mapping to the actual handler).
@@ -1486,7 +1500,9 @@ async fn do_send_batch(
     } else {
         zmq_client.send(request).await
     };
-    prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
+    if !all_warmup {
+        prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
+    }
 
     match result {
         Ok(resp) => {
@@ -2195,6 +2211,7 @@ mod tests {
             response_tx: tx,
             inflight_guard: None,
             enqueued_at: Instant::now(),
+            is_warmup: false,
         };
         (item, rx)
     }
@@ -2622,6 +2639,7 @@ mod tests {
                 response_tx: resp_tx,
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
+                is_warmup: false,
             })
             .unwrap();
 
@@ -2636,6 +2654,7 @@ mod tests {
                 response_tx: late_tx,
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
+                is_warmup: false,
             })
             .unwrap_err();
         assert!(matches!(err, QueueError::NotFound));
@@ -2720,6 +2739,7 @@ mod tests {
             response_tx: tx,
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
+            is_warmup: false,
         };
         // Bytes::clone shares the same underlying buffer
         let cloned_data = item.data.clone();
@@ -2781,6 +2801,7 @@ mod tests {
             response_tx: tx,
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
+            is_warmup: false,
         };
 
         // Cloning the item's data is zero-copy
@@ -2825,6 +2846,7 @@ mod tests {
             response_tx: resp_tx,
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
+            is_warmup: false,
         };
         tx.try_send(item, 0).unwrap();
 
@@ -2929,6 +2951,7 @@ mod tests {
             response_tx: tx,
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
+            is_warmup: false,
         };
         // Cloning meta should be a refcount bump, not a deep copy
         let meta_clone = item.meta.clone();
@@ -3747,6 +3770,7 @@ mod tests {
                 response_tx: resp_tx,
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
+                is_warmup: false,
             })
             .unwrap();
 
@@ -3859,6 +3883,7 @@ mod tests {
                 response_tx: resp_tx,
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
+                is_warmup: false,
             })
             .unwrap();
         resp_rx
@@ -3932,6 +3957,7 @@ mod tests {
             response_tx,
             inflight_guard: None,
             enqueued_at: Instant::now(),
+            is_warmup: false,
         }
     }
 
@@ -3999,6 +4025,7 @@ mod tests {
             enqueued_at: Instant::now()
                 .checked_sub(ago)
                 .unwrap_or_else(Instant::now),
+            is_warmup: false,
         }
     }
 
@@ -4014,6 +4041,7 @@ mod tests {
             enqueued_at: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap(),
+            is_warmup: false,
         };
         let opt = check_queue_timeout(
             item,
@@ -4186,6 +4214,7 @@ mod tests {
             // Already past the 100ms queue_timeout by the time the collector
             // dequeues it — the reject path fires.
             enqueued_at: Instant::now() - Duration::from_secs(1),
+            is_warmup: false,
         };
         tx.try_send(item, 0).unwrap();
         let collector = tokio::spawn(batch_collector(rx, tunables, dispatch));
@@ -4295,6 +4324,86 @@ mod tests {
         }
     }
 
+    /// G6: warmup traffic is synthetic load — it must NOT pollute the
+    /// queue-level inference metrics (latency histogram, batch size,
+    /// per-worker inference totals). The warmup's cold-start requests are
+    /// exactly the slow outliers those series exist to expose on real
+    /// traffic; counting them would hide the very spike warmup removes.
+    #[tokio::test]
+    async fn warmup_items_skip_queue_level_metrics() {
+        // Unique model name: the global REGISTRY is shared across tests in
+        // this process, so asserting on a common name would race other
+        // tests' submissions.
+        let model = "warmup_mute_m";
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+        let mut clients = Vec::new();
+        for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
+            let endpoint = drain_test_endpoint(&format!("warmup-mute-{i}"));
+            spawn_tagged_worker(endpoint.clone(), tag.to_vec());
+            clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
+        }
+        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let read = || {
+            (
+                crate::metrics::prometheus::INFERENCE_DURATION
+                    .with_label_values(&[model, "1"])
+                    .get_sample_count(),
+                crate::metrics::prometheus::BATCH_SIZE
+                    .with_label_values(&[model, "1"])
+                    .get_sample_count(),
+                crate::metrics::prometheus::WORKER_INFERENCE_TOTAL
+                    .with_label_values(&[model, "1", "0"])
+                    .get()
+                    + crate::metrics::prometheus::WORKER_INFERENCE_TOTAL
+                        .with_label_values(&[model, "1", "1"])
+                        .get(),
+            )
+        };
+        let before = read();
+
+        let (mut item, rx) = hint_item_rx("warmup_1", meta_with_headers(&[]));
+        item.is_warmup = true;
+        queue.try_submit(model, "1", item).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("warmup response in time")
+            .expect("channel open");
+        assert_eq!(
+            read(),
+            before,
+            "warmup item must not touch queue-level metrics"
+        );
+
+        let (item, rx) = hint_item_rx("real_1", meta_with_headers(&[]));
+        queue.try_submit(model, "1", item).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("real response in time")
+            .expect("channel open");
+        let after = read();
+        assert_eq!(after.0, before.0 + 1, "real request must record latency");
+        assert_eq!(after.1, before.1 + 1, "real request must record batch size");
+        assert_eq!(
+            after.2,
+            before.2 + 1.0,
+            "real request must record worker inference"
+        );
+    }
+
     /// Items already queued when the last worker died must not dispatch to a
     /// dead peer (they would hang until request_timeout): do_send_batch
     /// fails the batch with the structured 503 single instead.
@@ -4323,6 +4432,7 @@ mod tests {
             response_tx: resp_tx,
             inflight_guard: None,
             enqueued_at: Instant::now(),
+            is_warmup: false,
         }];
         let err = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
             .await

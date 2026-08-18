@@ -241,6 +241,7 @@ impl GrpcService {
             response_tx,
             inflight_guard: None,
             enqueued_at: Instant::now(),
+            is_warmup: false,
         };
         let resp = match self
             .worker_manager

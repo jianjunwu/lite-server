@@ -59,6 +59,59 @@ impl Drop for SpawnedWorkersGuard {
     }
 }
 
+/// G1: one warmup execution unit — the sample to run plus the worker it is
+/// pinned to (`None` when the version has no workers to pin; the unit then
+/// rides normal least-loaded selection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmupUnit {
+    sample: usize,
+    worker_pin: Option<usize>,
+}
+
+/// G1: build the warmup execution plan. `worker` scope (default) replays the
+/// full sample set on EVERY worker process (worker-major order) — each process
+/// owns separate engine state, so a version-wide pass would leave N-1 of N
+/// workers cold. `version` scope keeps the configured total
+/// (Σ samples×iterations) and round-robins units across workers. Pins ride
+/// the existing `x-lite-worker-id` direct-pin header (B3).
+fn build_warmup_plan(
+    policy: &crate::config::WarmupPolicy,
+    worker_count: usize,
+) -> Vec<WarmupUnit> {
+    let sample_units = || {
+        policy
+            .samples
+            .iter()
+            .enumerate()
+            .flat_map(|(si, s)| std::iter::repeat_n(si, s.iterations.max(1) as usize))
+    };
+    match policy.scope {
+        crate::config::WarmupScope::Worker if worker_count > 0 => (0..worker_count)
+            .flat_map(|w| {
+                sample_units().map(move |si| WarmupUnit {
+                    sample: si,
+                    worker_pin: Some(w),
+                })
+            })
+            .collect(),
+        // No pin targets: a single unpinned pass (defensive — load registers
+        // workers before warmup, so this only fires on a 0-worker version).
+        crate::config::WarmupScope::Worker => sample_units()
+            .map(|si| WarmupUnit {
+                sample: si,
+                worker_pin: None,
+            })
+            .collect(),
+        crate::config::WarmupScope::Version => sample_units()
+            .enumerate()
+            .map(|(g, si)| WarmupUnit {
+                sample: si,
+                worker_pin: (worker_count > 0).then_some(g % worker_count),
+            })
+            .collect(),
+    }
+}
+
 impl WorkerManager {
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
@@ -601,7 +654,7 @@ impl WorkerManager {
                         self.registry.mark_ready(model_name, version)?;
                         info!(
                             model = %model_name, version = %version,
-                            iterations = policy.iterations,
+                            scope = ?policy.scope,
                             "warmup complete"
                         );
                     }
@@ -672,9 +725,12 @@ impl WorkerManager {
     /// allocator pools) before the version becomes `Ready`. Each sample is the
     /// raw `/predict` request body read from `<model_dir>/<input_ref>`, sent
     /// verbatim — multiple samples cover production input shapes/batches
-    /// (Triton ModelWarmup 范式, M7). Returns `Err(reason)` on any failure
-    /// (file unreadable, queue error, error response, timeout); the caller
-    /// marks the version `Failed`.
+    /// (Triton ModelWarmup 范式, M7). G1: units are pinned per worker via the
+    /// existing `x-lite-worker-id` direct pin so EVERY worker process is warmed
+    /// (see [`build_warmup_plan`]); under serial submission least-loaded would
+    /// otherwise land every unit on worker 0. Returns `Err(reason)` on any
+    /// failure (file unreadable, queue error, error response, timeout); the
+    /// caller marks the version `Failed`.
     async fn run_warmup(
         &self,
         model_name: &str,
@@ -682,10 +738,10 @@ impl WorkerManager {
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
     ) -> Result<(), String> {
-        let model_dir = self
+        let (model_dir, worker_count) = self
             .registry
             .get(model_name, Some(version))
-            .map(|mv| mv.model_dir.clone())
+            .map(|mv| (mv.model_dir.clone(), mv.workers.len()))
             .ok_or_else(|| format!("version {}/{} vanished during warmup", model_name, version))?;
         let timeout_opt = policy.effective_timeout(model_config.request_timeout);
         let timestamp_ns = std::time::SystemTime::now()
@@ -693,84 +749,94 @@ impl WorkerManager {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        for (si, sample) in policy.samples.iter().enumerate() {
+        // Read each sample's dummy body once — worker scope replays it per worker.
+        let mut payloads: Vec<bytes::Bytes> = Vec::with_capacity(policy.samples.len());
+        for sample in &policy.samples {
             let dummy_path = model_dir.join(&sample.input_ref);
-            let payload_bytes = tokio::fs::read(&dummy_path)
+            let body = tokio::fs::read(&dummy_path)
                 .await
                 .map_err(|e| format!("read dummy input {}: {}", dummy_path.display(), e))?;
-            let iterations = sample.iterations.max(1);
-            info!(
-                model = %model_name, version = %version,
-                sample = si,
-                iterations = iterations,
-                dummy = %dummy_path.display(),
-                "warming up model"
-            );
+            payloads.push(bytes::Bytes::from(body));
+        }
 
-            for i in 0..iterations {
-                let uid = format!("warmup_{}_{}_{}_{}", model_name, version, si, i);
-                let meta = crate::proto::liteserver::RequestMeta {
-                    route: "/predict".to_string(),
-                    request_id: uid.clone(),
-                    client_ip: "127.0.0.1".to_string(),
-                    timestamp_ns,
-                    payload: bytes::Bytes::from(payload_bytes.clone()),
-                    ..Default::default()
-                };
-                let (response_tx, response_rx) = oneshot::channel();
-                let item = crate::inference_queue::QueueItem {
-                    uid: uid.clone(),
-                    data: bytes::Bytes::from(payload_bytes.clone()),
-                    meta: Some(Arc::new(meta)),
-                    response_tx,
-                    inflight_guard: None,
-                    enqueued_at: std::time::Instant::now(),
-                };
-                match self.inference_queue.try_submit(model_name, version, item) {
-                    Ok(()) => {}
-                    Err(crate::inference_queue::QueueError::Full) => {
-                        return Err("warmup queue full".to_string());
-                    }
+        let plan = build_warmup_plan(policy, worker_count);
+        info!(
+            model = %model_name, version = %version,
+            units = plan.len(),
+            workers = worker_count,
+            scope = ?policy.scope,
+            "warming up model"
+        );
+
+        for (ui, unit) in plan.iter().enumerate() {
+            let uid = format!("warmup_{}_{}_{}", model_name, version, ui);
+            let mut headers = std::collections::HashMap::new();
+            if let Some(w) = unit.worker_pin {
+                headers.insert("x-lite-worker-id".to_string(), w.to_string());
+            }
+            let meta = crate::proto::liteserver::RequestMeta {
+                route: "/predict".to_string(),
+                request_id: uid.clone(),
+                client_ip: "127.0.0.1".to_string(),
+                timestamp_ns,
+                headers,
+                payload: payloads[unit.sample].clone(),
+                ..Default::default()
+            };
+            let (response_tx, response_rx) = oneshot::channel();
+            let item = crate::inference_queue::QueueItem {
+                uid: uid.clone(),
+                data: payloads[unit.sample].clone(),
+                meta: Some(Arc::new(meta)),
+                response_tx,
+                inflight_guard: None,
+                enqueued_at: std::time::Instant::now(),
+                is_warmup: true,
+            };
+            match self.inference_queue.try_submit(model_name, version, item) {
+                Ok(()) => {}
+                Err(crate::inference_queue::QueueError::Full) => {
+                    return Err("warmup queue full".to_string());
+                }
+                Err(_) => {
+                    return Err("warmup: inference queue not available".to_string());
+                }
+            }
+
+            // Bound the dummy inference by the warmup timeout (None = unbounded).
+            let response = match timeout_opt {
+                Some(t) => match timeout(t, response_rx).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
                     Err(_) => {
-                        return Err("warmup: inference queue not available".to_string());
+                        return Err(format!(
+                            "warmup: timed out after {:.1}s",
+                            t.as_secs_f32()
+                        ))
                     }
-                }
+                },
+                None => match response_rx.await {
+                    Ok(r) => r,
+                    Err(_) => return Err("warmup: response channel closed".to_string()),
+                },
+            };
 
-                // Bound the dummy inference by the warmup timeout (None = unbounded).
-                let response = match timeout_opt {
-                    Some(t) => match timeout(t, response_rx).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
-                        Err(_) => {
-                            return Err(format!(
-                                "warmup: timed out after {:.1}s",
-                                t.as_secs_f32()
-                            ))
-                        }
-                    },
-                    None => match response_rx.await {
-                        Ok(r) => r,
-                        Err(_) => return Err("warmup: response channel closed".to_string()),
-                    },
+            // A non-Ok status (or a non-Single payload) fails the warmup.
+            let ok = matches!(
+                response.payload,
+                Some(crate::proto::liteserver::response::Payload::Single(ref s))
+                    if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+            );
+            if !ok {
+                let detail = match response.payload {
+                    Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
+                        .status
+                        .as_ref()
+                        .map(|st| st.message.clone())
+                        .unwrap_or_default(),
+                    _ => "unexpected response payload".to_string(),
                 };
-
-                // A non-Ok status (or a non-Single payload) fails the warmup.
-                let ok = matches!(
-                    response.payload,
-                    Some(crate::proto::liteserver::response::Payload::Single(ref s))
-                        if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
-                );
-                if !ok {
-                    let detail = match response.payload {
-                        Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
-                            .status
-                            .as_ref()
-                            .map(|st| st.message.clone())
-                            .unwrap_or_default(),
-                        _ => "unexpected response payload".to_string(),
-                    };
-                    return Err(format!("warmup inference returned error: {}", detail));
-                }
+                return Err(format!("warmup inference returned error: {}", detail));
             }
         }
 
@@ -2075,6 +2141,84 @@ class TestAPI(LitAPI):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// G1: the warmup plan must spread dummy inferences across ALL workers —
+    /// each worker process owns separate engine state (CUDA graphs, allocator
+    /// pools), so warming only the least-loaded winner (worker 0 under serial
+    /// submission) would leave N-1 workers cold.
+    #[test]
+    fn warmup_plan_worker_scope_covers_every_worker() {
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            scope: crate::config::WarmupScope::Worker,
+            samples: vec![
+                crate::config::WarmupSample {
+                    input_ref: "warmup/a.json".to_string(),
+                    iterations: 2,
+                },
+                crate::config::WarmupSample {
+                    input_ref: "warmup/b.json".to_string(),
+                    iterations: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let plan = build_warmup_plan(&policy, 3);
+        assert_eq!(
+            plan.len(),
+            3 * (2 + 1),
+            "worker scope = workers x samples x iterations"
+        );
+        for w in 0..3 {
+            let units: Vec<_> = plan.iter().filter(|u| u.worker_pin == Some(w)).collect();
+            assert_eq!(units.len(), 3, "worker {w} must receive the full sample set");
+            assert_eq!(
+                units.iter().filter(|u| u.sample == 0).count(),
+                2,
+                "worker {w} must run sample 0 twice"
+            );
+        }
+    }
+
+    #[test]
+    fn warmup_plan_version_scope_round_robins_across_workers() {
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            scope: crate::config::WarmupScope::Version,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup/a.json".to_string(),
+                iterations: 7,
+            }],
+            ..Default::default()
+        };
+        let plan = build_warmup_plan(&policy, 3);
+        assert_eq!(plan.len(), 7, "version scope keeps the configured total");
+        let pins: Vec<_> = plan.iter().map(|u| u.worker_pin).collect();
+        assert_eq!(
+            pins,
+            vec![Some(0), Some(1), Some(2), Some(0), Some(1), Some(2), Some(0)],
+            "units must round-robin so no worker stays cold"
+        );
+    }
+
+    #[test]
+    fn warmup_plan_zero_workers_leaves_units_unpinned() {
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            scope: crate::config::WarmupScope::Worker,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup/a.json".to_string(),
+                iterations: 2,
+            }],
+            ..Default::default()
+        };
+        let plan = build_warmup_plan(&policy, 0);
+        assert_eq!(plan.len(), 2, "no workers -> a single unpinned pass");
+        assert!(
+            plan.iter().all(|u| u.worker_pin.is_none()),
+            "no pin target must not fabricate one"
+        );
+    }
+
     /// L5 reproduction (RED): `load_model` spawns workers and registers the
     /// queue/client/outlier state BEFORE running warmup (:320-590, then :597).
     /// When warmup fails the version is only `mark_failed` and `Err` returned —
@@ -2142,6 +2286,7 @@ class TestAPI(LitAPI):
             timeout_secs: 5.0,
             dummy_input_ref: None,
             iterations: None,
+            scope: crate::config::WarmupScope::default(),
         });
 
         let err = wm.load_model("l5_model", "1", &config).await.unwrap_err();

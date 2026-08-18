@@ -625,6 +625,7 @@ pub(crate) async fn execute_step(
             response_tx,
             inflight_guard: None,
             enqueued_at: std::time::Instant::now(),
+            is_warmup: false,
         };
 
         match state.inference_queue.try_submit(&step.model, &resolved_version, item) {

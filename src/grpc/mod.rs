@@ -1687,6 +1687,7 @@ mod request_metrics_tests {
                 response_tx: filler_tx,
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
+                is_warmup: false,
             })
             .unwrap();
 
