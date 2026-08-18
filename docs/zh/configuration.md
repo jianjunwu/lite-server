@@ -428,6 +428,12 @@ policies:
                                  #   输入形状/batch（M7；旧 dummy_input_ref/iterations 已移除）
       - input_ref: warmup/batch1.json   # dummy 请求体 JSON 路径，相对模型目录
         iterations: 3            #   该样本的 dummy 推理次数（默认 1）
+        route: /predict          #   目标路由（默认 /predict）；其他绝对路径 = 在 pin 的
+                                 #   worker 上直接调用自定义 @route handler
+        headers: {}              #   该样本携带的额外请求头
+        mode: unary              #   unary（默认）| stream（经 StreamOpen 的 uni-stream）
+        completion: first_chunk  #   仅 stream：first_chunk（默认；首 chunk 后取消，成本有界）
+                                 #   | drain（消费至 Done）
       - input_ref: warmup/batch8.json   # 另一形状/batch（iterations 缺省 1）
     timeout_secs: 30.0           #   单次 dummy 推理预算（0 = 回退到 request_timeout；二者皆 0 = 无上限）
     total_timeout_secs: 0        #   整个预热运行的总预算（0 = 无，默认）

@@ -1065,6 +1065,20 @@ impl WorkerManager {
                 )
                 .await;
         }
+        // G3b: stream samples ride StreamOpen on the pinned worker's direct
+        // client (validation forbids combining this with a custom route).
+        if sample.mode == crate::config::WarmupSampleMode::Stream {
+            return self
+                .run_stream_warmup_once(
+                    model_name,
+                    version,
+                    unit,
+                    sample,
+                    payloads[unit.sample].clone(),
+                    timeout_opt,
+                )
+                .await;
+        }
         let uid = format!("warmup_{}_{}_{}", model_name, version, uuid::Uuid::new_v4());
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1137,6 +1151,30 @@ impl WorkerManager {
         validate_warmup_response(response)
     }
 
+    /// G3a/G3b: pick the direct client for a warmup unit's pinned worker
+    /// (unpinned = a 0-worker version with no pin targets — fall back to the
+    /// first client; the empty case errors out).
+    async fn warmup_worker_client(
+        &self,
+        model_name: &str,
+        version: &str,
+        pin: Option<usize>,
+    ) -> Result<Arc<WorkerZmqClient>, WarmupFailure> {
+        let key = model_version_key(model_name, version);
+        let clients = self.zmq_clients.read().await;
+        let Some(clients) = clients.get(&key) else {
+            return Err(WarmupFailure::failure(format!(
+                "warmup: no worker clients for {model_name} {version}"
+            )));
+        };
+        let idx = pin.unwrap_or(0);
+        clients.get(idx).cloned().ok_or_else(|| {
+            WarmupFailure::failure(format!(
+                "warmup: no client for worker {idx} ({model_name} {version})"
+            ))
+        })
+    }
+
     /// G3a: one RouteCall warmup attempt. Custom routes bypass the inference
     /// queue — they ride `send_route_or_stream` on the worker's direct
     /// client, mirroring the HTTP custom-route handler — so the pinned
@@ -1150,24 +1188,9 @@ impl WorkerManager {
         payload: bytes::Bytes,
         timeout_opt: Option<Duration>,
     ) -> Result<(), WarmupFailure> {
-        let key = model_version_key(model_name, version);
-        let client = {
-            let clients = self.zmq_clients.read().await;
-            let Some(clients) = clients.get(&key) else {
-                return Err(WarmupFailure::failure(format!(
-                    "warmup: no worker clients for {model_name} {version}"
-                )));
-            };
-            // Unpinned units only occur on a 0-worker version (no pin
-            // targets) — fall back to the first client; the empty case
-            // errors out below.
-            let idx = unit.worker_pin.unwrap_or(0);
-            clients.get(idx).cloned().ok_or_else(|| {
-                WarmupFailure::failure(format!(
-                    "warmup: no client for worker {idx} ({model_name} {version})"
-                ))
-            })?
-        };
+        let client = self
+            .warmup_worker_client(model_name, version, unit.worker_pin)
+            .await?;
 
         let uid = format!(
             "warmup_route_{}_{}_{}",
@@ -1236,6 +1259,113 @@ impl WorkerManager {
             None => wait.await?,
         };
         validate_warmup_response(response)
+    }
+
+    /// G3b: one uni-stream warmup attempt — StreamOpen to the pinned worker's
+    /// direct client (the SSE handler's wire path: `build_stream_open` +
+    /// `send_stream`, minus HTTP), judge by the frames per `completion`, and
+    /// in first_chunk mode CANCEL rather than drain so cost stays bounded.
+    /// Bypassing HTTP means no streaming metrics are touched (they live in
+    /// the handlers).
+    async fn run_stream_warmup_once(
+        &self,
+        model_name: &str,
+        version: &str,
+        unit: &WarmupUnit,
+        sample: &crate::config::WarmupSample,
+        payload: bytes::Bytes,
+        timeout_opt: Option<Duration>,
+    ) -> Result<(), WarmupFailure> {
+        let client = self
+            .warmup_worker_client(model_name, version, unit.worker_pin)
+            .await?;
+        let stream_id = format!("warmup-stream-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let meta = crate::proto::liteserver::RequestMeta {
+            route: "/predict".to_string(),
+            request_id: stream_id.clone(),
+            client_ip: "127.0.0.1".to_string(),
+            timestamp_ns,
+            headers: sample.headers.clone(),
+            ..Default::default()
+        };
+        let open =
+            crate::streaming::build_stream_open(stream_id.clone(), payload, Some(meta), false);
+        let mut chunk_rx = client
+            .send_stream(open, stream_id.clone())
+            .await
+            .map_err(|e| WarmupFailure::failure(format!("warmup stream open: {e}")))?;
+
+        use crate::proto::liteserver::stream_response::Payload as Frame;
+        let completion = sample.completion.unwrap_or_default();
+        let cancel_client = client.clone();
+        let cancel_id = stream_id.clone();
+        let wait = async move {
+            match completion {
+                crate::config::WarmupStreamCompletion::FirstChunk => {
+                    match chunk_rx.recv().await {
+                        Some(frame) => match frame.payload {
+                            // TTFT path warm — cancel instead of draining.
+                            Some(Frame::Chunk(_)) => {
+                                let _ = cancel_client
+                                    .send_raw(crate::streaming::build_stream_cancel(cancel_id))
+                                    .await;
+                                Ok(())
+                            }
+                            // Empty stream: the generator ran to Done (Q3 ruling).
+                            Some(Frame::Done(_)) => Ok(()),
+                            Some(Frame::Error(e)) => Err(WarmupFailure::failure(format!(
+                                "warmup stream returned error: {}",
+                                e.message
+                            ))),
+                            other => Err(WarmupFailure::failure(format!(
+                                "warmup: unexpected first stream frame ({other:?})"
+                            ))),
+                        },
+                        None => Err(WarmupFailure::failure(
+                            "warmup: stream closed before any frame".to_string(),
+                        )),
+                    }
+                }
+                crate::config::WarmupStreamCompletion::Drain => loop {
+                    match chunk_rx.recv().await {
+                        Some(frame) => match frame.payload {
+                            Some(Frame::Chunk(_)) => continue,
+                            Some(Frame::Done(_)) => break Ok(()),
+                            Some(Frame::Error(e)) => {
+                                break Err(WarmupFailure::failure(format!(
+                                    "warmup stream returned error: {}",
+                                    e.message
+                                )))
+                            }
+                            other => {
+                                break Err(WarmupFailure::failure(format!(
+                                    "warmup: unexpected stream frame ({other:?})"
+                                )))
+                            }
+                        },
+                        None => {
+                            break Err(WarmupFailure::failure(
+                                "warmup: stream closed before Done".to_string(),
+                            ))
+                        }
+                    }
+                },
+            }
+        };
+        match timeout_opt {
+            Some(t) => match timeout(t, wait).await {
+                Ok(r) => r,
+                Err(_) => Err(WarmupFailure::timeout(format!(
+                    "warmup: timed out after {:.1}s",
+                    t.as_secs_f32()
+                ))),
+            },
+            None => wait.await,
+        }
     }
 
     pub async fn unload_model(
@@ -3097,6 +3227,171 @@ class TestAPI(LitAPI):
             "reason must surface the route failure, got: {err}"
         );
         let _ = wm.unload_model("b5_noroute", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G3b harness model: an async `stream_predict` generator that writes one
+    /// marker line at generator ENTRY (deterministic — per-yield writes would
+    /// race the cancel), then yields `chunks` chunks with `chunk_delay`
+    /// between them.
+    #[cfg(unix)]
+    fn stream_marker_model(marker: &std::path::Path, chunks: u32, chunk_delay: f64) -> String {
+        format!(
+            r#"from lite_server import LitAPI
+import asyncio
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    async def stream_predict(self, x):
+        with open({marker:?}, "a") as f:
+            f.write("s\n")
+        for i in range({chunks}):
+            yield {{"chunk": i}}
+            await asyncio.sleep({chunk_delay})
+"#,
+            marker = marker.display().to_string(),
+        )
+    }
+
+    /// G3b: mode=stream + first_chunk (defaults) warms the streaming TTFT
+    /// path — the generator runs — then CANCELS instead of draining: the
+    /// whole run must finish well before the stream's natural end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_stream_first_chunk_cancels_instead_of_draining() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b6_stream-{}", std::process::id()));
+        let marker = repo.join("stream_marker.txt");
+        // 200 chunks x 10ms = 2s if drained; first_chunk + cancel ≈ instant.
+        let model_py = stream_marker_model(&marker, 200, 0.01);
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+                mode: crate::config::WarmupSampleMode::Stream,
+                ..Default::default()
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b6_stream", &model_py, policy).await;
+        result.expect("stream warmup must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "the generator must have run exactly once"
+        );
+        let wall = crate::metrics::prometheus::MODEL_WARMUP_DURATION
+            .with_label_values(&["b6_stream", "1"])
+            .get_sample_sum();
+        assert!(
+            wall < 1.0,
+            "first_chunk must cancel, not drain (drain = 2s); took {wall:.3}s"
+        );
+        let _ = wm.unload_model("b6_stream", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G3b: an error frame from the stream fails the warmup (and thus the
+    /// load, D33) — a broken stream_predict must never go Ready silent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_stream_error_frame_fails_the_load() {
+        let model_py = r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    async def stream_predict(self, x):
+        raise RuntimeError("stream boom")
+        yield {"never": True}
+"#;
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+                mode: crate::config::WarmupSampleMode::Stream,
+                ..Default::default()
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b6_stream_err", model_py, policy).await;
+        let err = result.expect_err("an error frame must fail the load");
+        assert!(
+            err.to_string().contains("stream boom"),
+            "the stream error message must surface, got: {err}"
+        );
+        let _ = wm.unload_model("b6_stream_err", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G3b: completion=drain consumes the stream to Done — every chunk the
+    /// model produces is pulled through the pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_stream_drain_consumes_to_done() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b6_drain-{}", std::process::id()));
+        let marker = repo.join("stream_marker.txt");
+        let model_py = stream_marker_model(&marker, 3, 0.0);
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 2,
+                mode: crate::config::WarmupSampleMode::Stream,
+                completion: Some(crate::config::WarmupStreamCompletion::Drain),
+                ..Default::default()
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b6_drain", &model_py, policy).await;
+        result.expect("drain warmup must succeed");
+        // Generator-entry marker: 2 iterations. If drain stopped early the
+        // stream would leak; success already proves Done was received, and
+        // the marker proves both iterations ran.
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "both iterations must run their generator to Done"
+        );
+        let _ = wm.unload_model("b6_drain", Some("1")).await;
         let _ = std::fs::remove_dir_all(&repo);
     }
 

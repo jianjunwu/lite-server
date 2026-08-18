@@ -498,6 +498,15 @@ Coverage, recovery, and observability semantics:
   traffic does NOT count toward `liteserver_inference_duration_seconds`,
   `liteserver_batch_size`, or `liteserver_worker_inference_total` — those
   series stay pure real-traffic signals.
+- **Beyond `/predict`** (per-sample): `route` targets a custom `@route`
+  handler (dispatched directly to the pinned worker, bypassing the queue);
+  `headers` adds request headers. `mode: stream` warms the streaming TTFT
+  path by driving a real `StreamOpen` — `completion: first_chunk` (default)
+  judges on the first chunk and cancels the stream (bounded cost), while
+  `completion: drain` consumes to `Done`. An error frame fails the load like
+  any warmup failure. Bidi and decoupled streams are not warmable (the
+  sample format cannot express a chunk sequence; decoupled streams have no
+  `Done`).
 
 > Since 0.7.6, the four Python policy callbacks (`RequireApiKey`, `Cors`,
 > `RateLimit`, `LogRequests`) are removed — they duplicated the Rust-side

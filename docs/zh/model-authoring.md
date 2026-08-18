@@ -485,6 +485,13 @@ policies:
   预热流量**不会**计入 `liteserver_inference_duration_seconds`、
   `liteserver_batch_size` 或 `liteserver_worker_inference_total`——
   这些序列保持纯真实流量信号。
+- **`/predict` 之外**（按样本）:`route` 可指定自定义 `@route` handler
+  （直连 pin 的 worker 派发，绕过队列）;`headers` 附加请求头。
+  `mode: stream` 通过真实 `StreamOpen` 暖流式 TTFT 路径——
+  `completion: first_chunk`（默认）以首个 chunk 判定并取消流（成本
+  有界）,`completion: drain` 消费至 `Done`。error 帧与其他预热失败
+  一样使加载失败。bidi 与 decoupled 流不可暖（样本格式表达不了 chunk
+  序列；decoupled 流没有 `Done` 帧）。
 
 > 0.7.6 起，`RequireApiKey` / `Cors` / `RateLimit` / `LogRequests` 四个
 > Python policy callback 已移除——它们与 Rust 侧执行是双实现，且按 worker

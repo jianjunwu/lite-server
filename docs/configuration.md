@@ -473,6 +473,12 @@ policies:
                                  #   shape/batch (M7; legacy dummy_input_ref/iterations removed)
       - input_ref: warmup/batch1.json   # dummy request-body JSON, relative to the model dir
         iterations: 3            #   dummy inferences for this sample (default 1)
+        route: /predict          #   target route (default /predict); any other absolute path
+                                 #   invokes a custom @route handler directly on the pinned worker
+        headers: {}              #   extra request headers carried on this sample
+        mode: unary              #   unary (default) | stream (uni-stream via StreamOpen)
+        completion: first_chunk  #   stream only: first_chunk (default; cancel after the first
+                                 #   chunk — bounded cost) | drain (consume to Done)
       - input_ref: warmup/batch8.json   # another shape/batch (default iterations: 1)
     timeout_secs: 30.0           #   per-ITERATION budget (0 = fall back to request_timeout; 0 there = no bound)
     total_timeout_secs: 0        #   whole-run budget across all units (0 = none, default)

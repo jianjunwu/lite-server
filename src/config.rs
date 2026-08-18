@@ -1110,6 +1110,35 @@ pub struct WarmupSample {
     pub route: String,
     /// G3a: extra request headers carried on the sample's RequestMeta.
     pub headers: std::collections::HashMap<String, String>,
+    /// G3b: execution mode. `unary` (default) = queue inference / RouteCall;
+    /// `stream` = uni-stream via StreamOpen to the pinned worker, judged by
+    /// the first frame (see `completion`).
+    pub mode: WarmupSampleMode,
+    /// G3b: when a streaming unit counts as done. Only meaningful with
+    /// `mode: stream` — `None` resolves to `first_chunk` at the point of use.
+    pub completion: Option<WarmupStreamCompletion>,
+}
+
+/// G3b: sample execution mode (see `WarmupSample::mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarmupSampleMode {
+    #[default]
+    Unary,
+    Stream,
+}
+
+/// G3b: streaming completion semantics (see `WarmupSample::completion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmupStreamCompletion {
+    /// First chunk (or an empty Done) — the TTFT path is warm; the stream is
+    /// then cancelled, not drained, so cost stays bounded.
+    #[default]
+    FirstChunk,
+    /// Consume the stream to Done/Error — a full streaming pass, cost scales
+    /// with stream length.
+    Drain,
 }
 
 impl Default for WarmupSample {
@@ -1119,6 +1148,8 @@ impl Default for WarmupSample {
             iterations: 1,
             route: "/predict".to_string(),
             headers: std::collections::HashMap::new(),
+            mode: WarmupSampleMode::default(),
+            completion: None,
         }
     }
 }
@@ -1165,6 +1196,21 @@ impl WarmupPolicy {
             if !s.route.starts_with('/') {
                 anyhow::bail!(
                     "policies.warmup.samples[{i}].route must be an absolute path starting with '/'"
+                );
+            }
+            // G3b: stream mode drives the inference stream (StreamOpen on
+            // /predict); combining it with a custom route is unsupported —
+            // reject loudly rather than silently warming the wrong thing.
+            if s.mode == WarmupSampleMode::Stream && s.route != "/predict" {
+                anyhow::bail!(
+                    "policies.warmup.samples[{i}]: mode 'stream' cannot be combined with \
+                     a custom route ({}) — streaming route warmup is not supported",
+                    s.route
+                );
+            }
+            if s.completion.is_some() && s.mode != WarmupSampleMode::Stream {
+                anyhow::bail!(
+                    "policies.warmup.samples[{i}]: 'completion' is only meaningful with mode: stream"
                 );
             }
             for k in s.headers.keys() {
@@ -1720,6 +1766,52 @@ mod tests {
         .unwrap();
         assert_eq!(s.route, "/preprocess");
         assert_eq!(s.headers.get("x-mode").map(String::as_str), Some("warm"));
+    }
+
+    #[test]
+    fn warmup_sample_stream_mode_parses_with_defaults() {
+        // G3b: mode defaults to unary; completion stays None unless
+        // explicitly set (first_chunk is the point-of-use default).
+        let s: WarmupSample = serde_yaml::from_str("input_ref: warmup/in.json\n").unwrap();
+        assert_eq!(s.mode, WarmupSampleMode::Unary);
+        assert_eq!(s.completion, None);
+
+        let s: WarmupSample = serde_yaml::from_str(
+            "input_ref: warmup/in.json\nmode: stream\ncompletion: drain\n",
+        )
+        .unwrap();
+        assert_eq!(s.mode, WarmupSampleMode::Stream);
+        assert_eq!(s.completion, Some(WarmupStreamCompletion::Drain));
+    }
+
+    #[test]
+    fn warmup_sample_stream_mode_validation() {
+        // stream mode is an inference-stream concept: combining it with a
+        // custom route is unsupported (route streaming is out of scope, and a
+        // silent skip would leave the handler cold); completion without
+        // mode: stream is a config mistake worth failing fast on.
+        let mut p = WarmupPolicy {
+            enabled: true,
+            samples: vec![WarmupSample {
+                input_ref: "w/in.json".to_string(),
+                mode: WarmupSampleMode::Stream,
+                route: "/custom".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            p.validate().is_err(),
+            "stream mode + custom route must be rejected"
+        );
+
+        p.samples[0].route = "/predict".to_string();
+        p.samples[0].mode = WarmupSampleMode::Unary;
+        p.samples[0].completion = Some(WarmupStreamCompletion::Drain);
+        assert!(
+            p.validate().is_err(),
+            "completion without mode: stream must be rejected"
+        );
     }
 
     #[test]
