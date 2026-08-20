@@ -404,6 +404,10 @@ continuous_batching: false     # Enable continuous batching mode
 accelerator: null              # Device type label, passed through to device string (e.g. "cuda:0"); null = cpu
 devices: null                  # Device assignment (null = auto, or integer like 1)
 workers_per_device: null       # Workers per device (null = 1)
+startup_concurrency: null      # Max workers spawned+handshaken concurrently at load
+                               # (null = 1, serial). >1 overlaps weight loading across
+                               # workers; same-device workers then load concurrently,
+                               # so size it against GPU memory headroom.
 max_queue_size: 1000           # Max pending requests per worker
 request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
 # Overload queue control. Per request, set the

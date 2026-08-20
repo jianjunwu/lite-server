@@ -91,6 +91,13 @@ pub struct WorkerManager {
     /// B1: set true at shutdown start so worker monitors know to suppress
     /// ERROR-level "exited unexpectedly" for workers killed during drain.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancelled at shutdown start (mark_draining / shutdown): in-flight
+    /// `load_model` calls select on this around the ready handshake and
+    /// warmup so a slow worker setup cannot hold the process until
+    /// startup_timeout, and workers already spawned mid-loop are unwound
+    /// through the load's error path instead of being orphaned (they are
+    /// registered incrementally, so teardown can reach them).
+    shutdown_token: tokio_util::sync::CancellationToken,
     // P0 (D6): ensemble plan cache, invalidated from the lifecycle single
     // collection point (unload_version / reload_model, D23).
     ensemble_plans: Option<Arc<crate::ensemble::EnsemblePlanCache>>,
@@ -146,6 +153,7 @@ impl WorkerManager {
             custom_metrics: false,
             hook_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
             model_defaults: crate::config::ModelTunables::default(),
             // P0 (D6): ensemble plan cache. None when the caller did not
             // install one (unit-test WorkerManager::new) — execute_ensemble
@@ -283,6 +291,11 @@ impl WorkerManager {
         // B1: signal all worker monitors that we're in draining mode so they
         // suppress spurious "exited unexpectedly" errors during teardown.
         self.draining.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Cancel in-flight loads FIRST: a worker stuck in setup() would
+        // otherwise hold its load_model (and the spawned process, invisible
+        // to the unload loop below until the loop finished registering)
+        // until startup_timeout.
+        self.shutdown_token.cancel();
         info!("Shutting down all workers");
         let workers = self.workers.read().await;
         let keys: Vec<String> = workers.keys().cloned().collect();

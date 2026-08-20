@@ -23,43 +23,6 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
-/// W1 hardening: explicit error-path reap for the multi-worker spawn loop in
-/// `load_model`. On any error return the guard's Drop sends the shutdown
-/// signal to every spawned-but-unregistered worker (triggering the monitor's
-/// kill arm, same as the unload path at :943) instead of relying on the
-/// incidental sender-drop → monitor-kill chain. On success the Vec is taken
-/// out via `take()` and the Drop is a no-op.
-struct SpawnedWorkersGuard(Vec<WorkerProcess>);
-
-impl std::ops::Deref for SpawnedWorkersGuard {
-    type Target = Vec<WorkerProcess>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for SpawnedWorkersGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl SpawnedWorkersGuard {
-    fn take(&mut self) -> Vec<WorkerProcess> {
-        std::mem::take(&mut self.0)
-    }
-}
-
-impl Drop for SpawnedWorkersGuard {
-    fn drop(&mut self) {
-        for proc in self.0.iter_mut() {
-            if let Some(tx) = proc.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-    }
-}
-
 /// G1: one warmup execution unit — the sample to run plus the worker it is
 /// pinned to (`None` when the version has no workers to pin; the unit then
 /// rides normal least-loaded selection).
@@ -93,14 +56,15 @@ impl WarmupFailure {
     }
 }
 
-/// L3 (leak-gap-audit-0820): fallback total budget for the DETACHED respawn
-/// re-warm — max(startup_timeout, 300s). With the default
-/// total_timeout_secs=0 a replacement worker that hangs (accepts but never
-/// answers, kill_threshold=0) would otherwise park the detached task
-/// forever: it holds an Arc<WorkerManager> + the whole ModelConfig clone,
-/// and the slot never force-ejects (that only happens on warmup FAILURE).
-/// 300s floors the budget for configs with a tiny startup_timeout.
-fn rewarm_fallback_budget(model_config: &ModelConfig) -> Duration {
+/// L3 (leak-gap-audit-0820): fallback total budget for an unbudgeted warmup
+/// (policy total_timeout_secs=0) — max(startup_timeout, 300s). Applies to the
+/// DETACHED respawn re-warm (a hung replacement would otherwise park the
+/// detached task forever: it holds an Arc<WorkerManager> + the whole
+/// ModelConfig clone, and the slot never force-ejects) and, since the
+/// shutdown-window work, to the LOAD-time warmup (a hung worker would
+/// otherwise park load_model past startup_timeout). 300s floors the budget
+/// for configs with a tiny startup_timeout.
+fn warmup_fallback_budget(model_config: &ModelConfig) -> Duration {
     Duration::from_secs_f32(model_config.startup_timeout).max(Duration::from_secs(300))
 }
 
@@ -256,7 +220,240 @@ fn validate_warmup_response(
     )))
 }
 
+/// Phase-1 output of the load spawn driver: one handshaken worker process,
+/// not yet registered. Registration (metrics / routes / monitor / maps)
+/// happens in phase 2, strictly in worker_id order.
+struct WorkerReady {
+    worker_id: usize,
+    device: String,
+    endpoint: String,
+    child: tokio::process::Child,
+    startup: WorkerStartup,
+}
+
 impl WorkerManager {
+    /// Phase 1 of the load spawn driver: spawn ONE worker process, wait for
+    /// its ready handshake (bounded by startup_timeout or the shutdown
+    /// token, whichever fires first), and start the post-ready pipe drainers
+    /// so a fast worker cannot block on a full pipe while slower siblings
+    /// are still loading. Shared registration (metrics / routes / monitor /
+    /// maps) happens in phase 2, in worker_id order. Safe to run
+    /// concurrently across worker_ids: every touched resource (socket path,
+    /// pipes, child process) is per-worker.
+    // allow: 单 worker spawn 上下文(model/version/config/dir/device 布局)
+    // 原样透传,phase-1 并发共享同一借用,引入参数结构体只增间接。
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_handshake(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        model_dir: &std::path::Path,
+        worker_id: usize,
+        devices: usize,
+        accelerator: &str,
+    ) -> Result<WorkerReady, AppError> {
+        let device = format!("{}:{}", accelerator, worker_id % devices);
+        let endpoint = worker_endpoint(model_name, version, worker_id);
+
+        // Remove stale socket (Unix only — TCP ports are released on process exit)
+        #[cfg(unix)]
+        {
+            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+            let socket_path = std::path::Path::new(socket_str);
+            let _ = tokio::fs::remove_file(socket_path).await;
+            if let Some(parent) = socket_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+        }
+
+        // Find python module path
+        let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
+        cmd.current_dir(model_dir);
+
+        let mut child = cmd
+            .arg("-m")
+            .arg("lite_server.worker.inference")
+            .arg("--model-name")
+            .arg(model_name)
+            .arg("--version")
+            .arg(version)
+            .arg("--model-py")
+            .arg(model_dir.join("model.py"))
+            .arg("--config")
+            .arg(model_dir.join("config.yaml"))
+            .arg("--device")
+            .arg(&device)
+            .arg("--worker-id")
+            .arg(worker_id.to_string())
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .arg("--log-level")
+            .arg(&self.log_level);
+
+        if model_config.continuous_batching {
+            child = child.arg("--continuous-batching");
+        }
+
+        if let Some(ref server_http) = self.server_http {
+            child = child.arg("--server-http").arg(server_http);
+        }
+
+        let mut child = child
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
+                AppError::Python(format!("failed to spawn worker: {}", e))
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+        // Option: the n==0 diagnostic below takes the pipe out for the
+        // stderr drain; the logger spawn takes it back. A bare binding
+        // moved on one branch defeats the async capture analysis.
+        let mut stderr = Some(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?,
+        );
+
+        // Wait for "ready" signal. The shutdown token outraces
+        // startup_timeout: a worker stuck in setup() unwinds the whole
+        // load (via the spawn block's error path) as soon as shutdown
+        // starts instead of holding the process until the timeout.
+        let mut reader = BufReader::new(stdout);
+        let mut ready_line = String::new();
+        let n = tokio::select! {
+            _ = self.shutdown_token.cancelled() => Err(AppError::Internal(
+                "load cancelled: server shutting down".to_string(),
+            )),
+            result = timeout(
+                Duration::from_secs_f32(model_config.startup_timeout),
+                reader.read_line(&mut ready_line),
+            ) => result
+                .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+                .and_then(|r| r.map_err(AppError::Io)),
+        }?;
+        let exited_check: Result<(), AppError> = if n == 0 {
+            let stderr_tail =
+                drain_worker_stderr(stderr.take().unwrap(), &self.server_tunables).await;
+            let msg = if stderr_tail.trim().is_empty() {
+                "worker exited before ready".to_string()
+            } else {
+                format!("worker exited before ready: {stderr_tail}")
+            };
+            Err(AppError::WorkerCrashed(msg))
+        } else {
+            Ok(())
+        };
+        exited_check?;
+        let stdout = reader.into_inner();
+
+        let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
+            .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
+
+        let not_ready: Result<(), AppError> = if startup.status != "ready" {
+            Err(AppError::WorkerCrashed(format!(
+                "worker {} startup failed: {:?}",
+                worker_id, startup.message
+            )))
+        } else {
+            Ok(())
+        };
+        not_ready?;
+
+        info!(
+            "Worker {} for {} v{} ready (pid={:?})",
+            worker_id,
+            model_name,
+            version,
+            child.id()
+        );
+
+        // Fire on_ready lifecycle hook
+        execute_hook(
+            "ready",
+            &model_config.hooks,
+            vec![
+                ("$MODEL".to_string(), model_name.to_string()),
+                ("$VERSION".to_string(), version.to_string()),
+                ("$WORKER_ID".to_string(), worker_id.to_string()),
+            ],
+            &self.hook_tasks,
+        );
+
+        // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
+        // if anything writes to stdout after the ready signal.
+        tokio::spawn(async move {
+            let mut discard = [0u8; 1024];
+            let mut stdout = stdout;
+            loop {
+                match stdout.read(&mut discard).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Start stderr logger
+        let model_name_clone = model_name.to_string();
+        let version_clone = version.to_string();
+        let worker_id_clone = worker_id;
+        // Still Some: the n==0 take above diverges via exited_check.
+        let stderr = stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::with_capacity(1024);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => {
+                        tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
+                        break;
+                    }
+                    Ok(_) => {
+                        // Strip trailing newline / carriage-return
+                        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                        let line = String::from_utf8_lossy(&buf);
+                        let level = classify_stderr_line(line.trim());
+                        let msg = strip_level_prefix(line.trim());
+                        emit_stderr_line(
+                            level,
+                            msg,
+                            worker_id_clone,
+                            &model_name_clone,
+                            &version_clone,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            worker_id = worker_id_clone,
+                            "Worker stderr read error: {}",
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(WorkerReady {
+            worker_id,
+            device,
+            endpoint,
+            child,
+            startup,
+        })
+    }
+
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
         let mut rx_guard = self.reload_rx.lock().await;
@@ -541,277 +738,174 @@ impl WorkerManager {
         };
         let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
 
-        let mut worker_infos = Vec::new();
-        let mut worker_processes = SpawnedWorkersGuard(Vec::new());
-        let mut zmq_clients_for_model = Vec::new();
-
-        for worker_id in 0..total_workers {
-            let device = format!("{}:{}", accelerator, worker_id % devices);
-            let endpoint = worker_endpoint(model_name, version, worker_id);
-
-            // Remove stale socket (Unix only — TCP ports are released on process exit)
-            #[cfg(unix)]
-            {
-                let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-                let socket_path = std::path::Path::new(socket_str);
-                let _ = tokio::fs::remove_file(socket_path).await;
-                if let Some(parent) = socket_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
+        // Incremental registration: each worker enters the workers/zmq_clients
+        // maps at the end of its loop iteration, so shutdown/unload can reach
+        // a partially-started version. The loop runs inside an async block so
+        // ANY error funnels to one mark_load_failed + teardown through the
+        // single shared teardown path (§6.5) — a failed load never leaves map
+        // entries or live worker processes behind (W1 + shutdown-window fix).
+        let key = model_version_key(model_name, version);
+        {
+            let mut outliers = self.outlier_states.write().await;
+            outliers.insert(key.clone(), outlier.clone());
+        }
+        let spawn_result: Result<(Vec<WorkerInfo>, Vec<Arc<WorkerZmqClient>>), AppError> = async {
+            // Phase 1 — concurrent spawn + handshake (startup_concurrency;
+            // 1 = legacy serial). Each future owns its child: on the first
+            // error the `?` drops the stream (in-flight handshakes die via
+            // kill_on_drop) and the completed-but-unregistered WorkerReadys
+            // in `ready` die the same way.
+            let concurrency = model_config.startup_concurrency.unwrap_or(1).max(1);
+            let mut handshakes = futures::stream::iter((0..total_workers).map(|worker_id| {
+                self.spawn_and_handshake(
+                    model_name,
+                    version,
+                    &model_config,
+                    &model_dir,
+                    worker_id,
+                    devices,
+                    accelerator,
+                )
+            }))
+            .buffer_unordered(concurrency);
+            let mut ready: Vec<Option<WorkerReady>> = (0..total_workers).map(|_| None).collect();
+            while let Some(result) = handshakes.next().await {
+                let r = result?;
+                let worker_id = r.worker_id;
+                ready[worker_id] = Some(r);
             }
+            drop(handshakes);
 
-            // Find python module path
-            let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
-            cmd.current_dir(&model_dir);
+            // Phase 2 — registration in worker_id order (worker_infos and
+            // zmq_clients are index-aligned; routing pins by Vec index).
+            // Each worker enters the maps right after its monitor is up, so
+            // shutdown/unload can reach a partially-registered version.
+            let mut worker_infos = Vec::new();
+            let mut zmq_clients_for_model = Vec::new();
+            for (worker_id, slot) in ready.iter_mut().enumerate() {
+                let WorkerReady {
+                    device,
+                    endpoint,
+                    child,
+                    startup,
+                    ..
+                } = slot.take().expect("phase 1 filled every slot");
 
-            let mut child = cmd
-                .arg("-m")
-                .arg("lite_server.worker.inference")
-                .arg("--model-name")
-                .arg(model_name)
-                .arg("--version")
-                .arg(version)
-                .arg("--model-py")
-                .arg(&model_py)
-                .arg("--config")
-                .arg(&config_yaml)
-                .arg("--device")
-                .arg(&device)
-                .arg("--worker-id")
-                .arg(worker_id.to_string())
-                .arg("--endpoint")
-                .arg(&endpoint)
-                .arg("--log-level")
-                .arg(&self.log_level);
-
-            if model_config.continuous_batching {
-                child = child.arg("--continuous-batching");
-            }
-
-            if let Some(ref server_http) = self.server_http {
-                child = child.arg("--server-http").arg(server_http);
-            }
-
-            let mut child = child
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| {
-                    warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
-                    AppError::Python(format!("failed to spawn worker: {}", e))
-                })
-                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
-                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
-                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-
-            // Wait for "ready" signal
-            let mut reader = BufReader::new(stdout);
-            let mut ready_line = String::new();
-            let n = timeout(
-                Duration::from_secs_f32(model_config.startup_timeout),
-                reader.read_line(&mut ready_line),
-            )
-            .await
-            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
-            .and_then(|r| r.map_err(AppError::Io))
-            .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-            if n == 0 {
-                self.mark_load_failed(model_name, version);
-                let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
-                let msg = if stderr_tail.trim().is_empty() {
-                    "worker exited before ready".to_string()
-                } else {
-                    format!("worker exited before ready: {stderr_tail}")
-                };
-                return Err(AppError::WorkerCrashed(msg));
-            }
-            let stdout = reader.into_inner();
-
-            let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
-                .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))
-                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
-
-            if startup.status != "ready" {
-                self.mark_load_failed(model_name, version);
-                return Err(AppError::WorkerCrashed(format!(
-                    "worker {} startup failed: {:?}",
-                    worker_id, startup.message
-                )));
-            }
-
-            // Register custom metrics from Python worker (gated by
-            // features.custom_metrics; recording no-ops on unregistered ids).
-            if self.custom_metrics {
-                if let Some(ref specs) = startup.metric_specs {
-                    let spec_refs: Vec<(&str, &str)> = specs
-                        .iter()
-                        .map(|s| (s.name.as_str(), s.metric_type.as_str()))
-                        .collect();
-                    crate::metrics::prometheus::register_custom_metrics(
-                        model_name, version, &spec_refs,
-                    );
-                }
-            }
-
-            // Store per-model policies declared in config.yaml
-            self.registry
-                .set_policies(model_name, version, policies_from_config(&model_config));
-
-            // Register custom @route declarations (phase 2)
-            self.upsert_routes(model_name, version, startup.custom_routes)
-                .await;
-
-            info!(
-                "Worker {} for {} v{} ready (pid={:?})",
-                worker_id,
-                model_name,
-                version,
-                child.id()
-            );
-
-            // Fire on_ready lifecycle hook
-            execute_hook(
-                "ready",
-                &model_config.hooks,
-                vec![
-                    ("$MODEL".to_string(), model_name.to_string()),
-                    ("$VERSION".to_string(), version.to_string()),
-                    ("$WORKER_ID".to_string(), worker_id.to_string()),
-                ],
-                &self.hook_tasks,
-            );
-
-            // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
-            // if anything writes to stdout after the ready signal.
-            tokio::spawn(async move {
-                let mut discard = [0u8; 1024];
-                let mut stdout = stdout;
-                loop {
-                    match stdout.read(&mut discard).await {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(_) => break,
+                // Register custom metrics from Python worker (gated by
+                // features.custom_metrics; recording no-ops on unregistered ids).
+                if self.custom_metrics {
+                    if let Some(ref specs) = startup.metric_specs {
+                        let spec_refs: Vec<(&str, &str)> = specs
+                            .iter()
+                            .map(|s| (s.name.as_str(), s.metric_type.as_str()))
+                            .collect();
+                        crate::metrics::prometheus::register_custom_metrics(
+                            model_name,
+                            version,
+                            &spec_refs,
+                        );
                     }
                 }
-            });
 
-            // Start stderr logger
-            let model_name_clone = model_name.to_string();
-            let version_clone = version.to_string();
-            let worker_id_clone = worker_id;
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut buf = Vec::with_capacity(1024);
-                loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf).await {
-                        Ok(0) => {
-                            tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
-                            break;
-                        }
-                        Ok(_) => {
-                            // Strip trailing newline / carriage-return
-                            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                                buf.pop();
-                            }
-                            let line = String::from_utf8_lossy(&buf);
-                            let level = classify_stderr_line(line.trim());
-                            let msg = strip_level_prefix(line.trim());
-                            emit_stderr_line(
-                                level,
-                                msg,
-                                worker_id_clone,
-                                &model_name_clone,
-                                &version_clone,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                worker_id = worker_id_clone,
-                                "Worker stderr read error: {}",
-                                e
-                            );
-                            break;
-                        }
-                    }
-                }
-            });
+                // Store per-model policies declared in config.yaml
+                self.registry
+                    .set_policies(model_name, version, policies_from_config(&model_config));
 
-            // Create ZMQ client (binds the socket, worker connects). CB
-            // workers get cb_remove notifications when a reply slot dies
-            // (B2: stops wasted generation on client disconnect/timeout).
-            let zmq_client = Arc::new(WorkerZmqClient::new_with_channel_size(
-                endpoint.clone(),
-                model_config.continuous_batching,
-                self.stream_channel_size,
-            ));
-            zmq_clients_for_model.push(zmq_client.clone());
+                // Register custom @route declarations (phase 2)
+                self.upsert_routes(model_name, version, startup.custom_routes)
+                    .await;
 
-            let pid = child.id();
-            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+                // Create ZMQ client (binds the socket, worker connects). CB
+                // workers get cb_remove notifications when a reply slot dies
+                // (B2: stops wasted generation on client disconnect/timeout).
+                let zmq_client = Arc::new(WorkerZmqClient::new_with_channel_size(
+                    endpoint.clone(),
+                    model_config.continuous_batching,
+                    self.stream_channel_size,
+                ));
+                zmq_clients_for_model.push(zmq_client.clone());
 
-            // Spawn monitor task — owns the Child, detects exits and handles
-            // cleanup. The ZMQ client is reused across a worker's kill+respawn
-            // (the bound PAIR socket outlives any single worker process), so
-            // there is no `.sock` to clean on exit. `on_exit` fails in-flight
-            // requests fast when the worker is gone: ZMQ PAIR has no
-            // peer-disconnect event, so waiters would otherwise hang until
-            // their caller-side timeouts (request_timeout, else 300s).
-            let hooks_arc = Arc::new(model_config.hooks.clone());
-            let done_rx = spawn_worker_monitor(
-                child,
-                model_name,
-                version,
-                worker_id as u32,
-                shutdown_rx,
-                crate::worker::process::crash_exit_handler(
-                    Some(zmq_client.clone()),
-                    Some(outlier.clone()),
-                    self.registry.clone(),
-                    model_name.to_string(),
-                    version.to_string(),
-                    worker_id as u32,
-                ),
-                Some(hooks_arc),
-                self.hook_tasks.clone(),
-                self.draining.clone(),
-            );
+                let pid = child.id();
+                let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-            let info = WorkerInfo {
-                worker_id: worker_id as u32,
-                device,
-                endpoint: endpoint.clone(),
-                pid,
-                status: WorkerStatus::Ready,
-                capacity: None,
-            };
-            worker_infos.push(info);
-            if let Some(pid) = pid {
-                crate::metrics::prometheus::set_worker_pid(
+                // Spawn monitor task — owns the Child, detects exits and handles
+                // cleanup. The ZMQ client is reused across a worker's kill+respawn
+                // (the bound PAIR socket outlives any single worker process), so
+                // there is no `.sock` to clean on exit. `on_exit` fails in-flight
+                // requests fast when the worker is gone: ZMQ PAIR has no
+                // peer-disconnect event, so waiters would otherwise hang until
+                // their caller-side timeouts (request_timeout, else 300s).
+                let hooks_arc = Arc::new(model_config.hooks.clone());
+                let done_rx = spawn_worker_monitor(
+                    child,
                     model_name,
                     version,
                     worker_id as u32,
-                    pid,
+                    shutdown_rx,
+                    crate::worker::process::crash_exit_handler(
+                        Some(zmq_client.clone()),
+                        Some(outlier.clone()),
+                        self.registry.clone(),
+                        model_name.to_string(),
+                        version.to_string(),
+                        worker_id as u32,
+                    ),
+                    Some(hooks_arc),
+                    self.hook_tasks.clone(),
+                    self.draining.clone(),
                 );
-            }
 
-            worker_processes.push(WorkerProcess {
-                worker_id: worker_id as u32,
-                endpoint,
-                shutdown_tx: Some(shutdown_tx),
-                done_rx: Some(done_rx),
-                kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
-            });
+                let info = WorkerInfo {
+                    worker_id: worker_id as u32,
+                    device,
+                    endpoint: endpoint.clone(),
+                    pid,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                };
+                worker_infos.push(info);
+                if let Some(pid) = pid {
+                    crate::metrics::prometheus::set_worker_pid(
+                        model_name,
+                        version,
+                        worker_id as u32,
+                        pid,
+                    );
+                }
+
+                // Incremental registration: the worker is visible to
+                // shutdown/unload from here on; a later failure tears these
+                // entries down through the shared teardown path.
+                {
+                    let mut workers = self.workers.write().await;
+                    workers.entry(key.clone()).or_default().push(WorkerProcess {
+                        worker_id: worker_id as u32,
+                        endpoint,
+                        shutdown_tx: Some(shutdown_tx),
+                        done_rx: Some(done_rx),
+                        kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
+                    });
+                }
+                {
+                    let mut clients = self.zmq_clients.write().await;
+                    clients.entry(key.clone()).or_default().push(zmq_client.clone());
+                }
+            }
+            Ok((worker_infos, zmq_clients_for_model))
         }
+        .await;
+
+        let (worker_infos, zmq_clients_for_model) = match spawn_result {
+            Ok(done) => done,
+            Err(e) => {
+                self.mark_load_failed(model_name, version);
+                // Partially-started workers are in the maps (incremental
+                // registration) — reap them through the single shared
+                // teardown path (§6.5). The registry entry stays as Failed.
+                self.teardown_version_runtime(model_name, version).await;
+                return Err(e);
+            }
+        };
 
         self.registry
             .set_workers(model_name, version, worker_infos.clone())?;
@@ -836,21 +930,11 @@ impl WorkerManager {
             version,
             &model_config,
             worker_infos,
-            zmq_clients_for_model.clone(),
+            zmq_clients_for_model,
             self.reload_tx.clone(),
             outlier.clone(),
             Some(self.respawn_tx.clone()),
         );
-
-        {
-            let mut workers = self.workers.write().await;
-            let mut clients = self.zmq_clients.write().await;
-            let mut outliers = self.outlier_states.write().await;
-            let key = model_version_key(model_name, version);
-            workers.insert(key.clone(), worker_processes.take());
-            clients.insert(key.clone(), zmq_clients_for_model);
-            outliers.insert(key, outlier);
-        }
 
         // P-WARM (§4.3): with the queue wired, drive N dummy inferences to warm
         // the engine before the version becomes Ready. The version is still
@@ -859,10 +943,16 @@ impl WorkerManager {
         // serving an unwarmed/broken model). Skipped entirely when disabled.
         if let Some(ref policy) = warmup {
             if policy.enabled {
-                match self
-                    .run_warmup(model_name, version, &model_config, policy, None)
-                    .await
-                {
+                // Shutdown cancels the warmup the same way it cancels the
+                // handshake; the teardown in the failure branch is idempotent
+                // against shutdown()'s own unload of this version.
+                let warmup_result = tokio::select! {
+                    _ = self.shutdown_token.cancelled() => {
+                        Err("load cancelled: server shutting down".to_string())
+                    }
+                    r = self.run_warmup_budgeted(model_name, version, &model_config, policy, None) => r,
+                };
+                match warmup_result {
                     Ok(()) => {
                         self.registry.mark_ready(model_name, version)?;
                         info!(
@@ -984,50 +1074,52 @@ impl WorkerManager {
         result.map_err(|e| e.reason)
     }
 
-    /// G2/L3: the respawn re-warm — run_warmup plus the L3 fallback budget
-    /// ([`rewarm_fallback_budget`]). An explicit `total_timeout_secs` already
-    /// bounds the run inside run_warmup; the fallback only covers the
-    /// default (unbudgeted) case.
-    pub(super) async fn run_rewarm_budgeted(
+    /// G2/L3 + load: run_warmup plus the L3 fallback budget
+    /// ([`warmup_fallback_budget`]) when the policy has no explicit
+    /// `total_timeout_secs` (which already bounds the run inside run_warmup).
+    /// `pin`: `Some(worker)` = respawn re-warm of one slot; `None` = the
+    /// load-time warmup over all workers — an unbudgeted load warmup would
+    /// otherwise park `load_model` forever on a hung worker.
+    pub(super) async fn run_warmup_budgeted(
         &self,
         model_name: &str,
         version: &str,
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
-        worker_id: u32,
+        pin: Option<u32>,
     ) -> Result<(), String> {
         if policy.total_timeout_secs > 0.0 {
             return self
-                .run_warmup(model_name, version, model_config, policy, Some(worker_id))
+                .run_warmup(model_name, version, model_config, policy, pin)
                 .await;
         }
-        let budget = rewarm_fallback_budget(model_config);
-        self.run_rewarm_with_budget(model_name, version, model_config, policy, worker_id, budget)
+        let budget = warmup_fallback_budget(model_config);
+        self.run_warmup_with_budget(model_name, version, model_config, policy, pin, budget)
             .await
     }
 
     /// L3: run_warmup under an outer total budget; a budget expiry concludes
-    /// as a warmup failure (the respawn path force-ejects the slot) instead
-    /// of parking the detached task forever. Split from
-    /// [`run_rewarm_budgeted`] so tests can inject a sub-second budget.
-    async fn run_rewarm_with_budget(
+    /// as a warmup failure (the load path marks the version Failed; the
+    /// respawn path force-ejects the slot) instead of parking forever. Split
+    /// from [`run_warmup_budgeted`] so tests can inject a sub-second budget.
+    async fn run_warmup_with_budget(
         &self,
         model_name: &str,
         version: &str,
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
-        worker_id: u32,
+        pin: Option<u32>,
         budget: Duration,
     ) -> Result<(), String> {
         match timeout(
             budget,
-            self.run_warmup(model_name, version, model_config, policy, Some(worker_id)),
+            self.run_warmup(model_name, version, model_config, policy, pin),
         )
         .await
         {
             Ok(r) => r,
             Err(_) => Err(format!(
-                "respawn re-warm exceeded fallback budget of {:.0}s (warmup total_timeout_secs unset)",
+                "warmup exceeded fallback budget of {:.0}s (total_timeout_secs unset)",
                 budget.as_secs_f64()
             )),
         }
@@ -2094,12 +2186,12 @@ mod tests {
         };
         let policy = rewarm_policy(0.0);
         let err = wm
-            .run_rewarm_with_budget(
+            .run_warmup_with_budget(
                 "m",
                 "1",
                 &config,
                 &policy,
-                0,
+                Some(0),
                 Duration::from_millis(200),
             )
             .await
@@ -2107,6 +2199,46 @@ mod tests {
         assert!(
             err.contains("fallback budget"),
             "the fallback budget must fail the re-warm, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// Load-time warmup (pin=None) gets the same fallback total budget as
+    /// the respawn re-warm when the policy has none — a load whose warmup
+    /// hangs must conclude as a load failure, not park load_model forever.
+    #[tokio::test]
+    async fn load_warmup_fallback_budget_terminates_on_silent_worker() {
+        let (wm, model_dir) = rewarm_harness("loadbudget").await;
+        let config = crate::config::ModelConfig {
+            startup_timeout: 1.0,
+            ..Default::default()
+        };
+        let policy = rewarm_policy(0.0);
+        let err = wm
+            .run_warmup_with_budget("m", "1", &config, &policy, None, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("fallback budget"),
+            "the fallback budget must fail the load-time warmup, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// Load-time warmup with an explicit total_timeout_secs is governed by
+    /// the policy's own budget, not the fallback.
+    #[tokio::test]
+    async fn load_warmup_explicit_total_budget_governs_over_fallback() {
+        let (wm, model_dir) = rewarm_harness("loadexplicit").await;
+        let config = crate::config::ModelConfig::default();
+        let policy = rewarm_policy(0.3);
+        let err = wm
+            .run_warmup_budgeted("m", "1", &config, &policy, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("total timeout after 0.3s"),
+            "the policy's own budget must fire inside run_warmup, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&model_dir);
     }
@@ -2119,7 +2251,7 @@ mod tests {
         let config = crate::config::ModelConfig::default();
         let policy = rewarm_policy(0.3);
         let err = wm
-            .run_rewarm_budgeted("m", "1", &config, &policy, 0)
+            .run_warmup_budgeted("m", "1", &config, &policy, Some(0))
             .await
             .unwrap_err();
         assert!(
@@ -2135,12 +2267,12 @@ mod tests {
             startup_timeout: 10.0,
             ..Default::default()
         };
-        assert_eq!(rewarm_fallback_budget(&small), Duration::from_secs(300));
+        assert_eq!(warmup_fallback_budget(&small), Duration::from_secs(300));
         let large = crate::config::ModelConfig {
             startup_timeout: 600.0,
             ..Default::default()
         };
-        assert_eq!(rewarm_fallback_budget(&large), Duration::from_secs(600));
+        assert_eq!(warmup_fallback_budget(&large), Duration::from_secs(600));
     }
 
     // ===== LRU eviction tests (§4.2) =====
@@ -2446,6 +2578,388 @@ class TestAPI(LitAPI):
             "W1: worker pid {pid} survived a failed load_model — spawned but \
              never inserted into the workers map, so unload cannot reap it \
              (orphan until server shutdown)"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== Shutdown-during-startup window (worker-startup-shutdown-and-parallel-plan §1.2) =====
+
+    /// Harness: a model whose worker writes its pid in setup() then sleeps
+    /// 30s (simulating a slow weight load), with startup_timeout=60s so the
+    /// handshake wait outlasts anything the test is willing to wait. Spawns
+    /// load_model as a task and waits until the worker process is alive and
+    /// mid-handshake. Returns (manager, repo, worker pid, load handle).
+    #[cfg(unix)]
+    async fn slow_setup_load_in_flight(
+        tag: &str,
+    ) -> (
+        Arc<WorkerManager>,
+        std::path::PathBuf,
+        i32,
+        tokio::task::JoinHandle<Result<(), AppError>>,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-shutdown-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        with open("setup_pid.txt", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(30)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+
+        let config = ModelConfig {
+            startup_timeout: 60.0,
+            ..Default::default()
+        };
+        let wm_load = wm.clone();
+        let tag_owned = tag.to_string();
+        let load = tokio::spawn(async move { wm_load.load_model(&tag_owned, "1", &config).await });
+
+        // Wait until the worker process is alive and stuck in setup() — i.e.
+        // spawned but not yet handshaken, the exact window under test.
+        let pid_path = model_dir.join("setup_pid.txt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let pid: i32 = loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = s.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never reached setup()"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        (wm, repo, pid, load)
+    }
+
+    /// Window A: a worker spawned but still mid-handshake is invisible to
+    /// `WorkerManager::shutdown()` (it is not in the workers map yet), so
+    /// without a cancellation path the process survives shutdown until its
+    /// 30s sleep ends. After the fix, shutdown cancels the in-flight load and
+    /// the spawned process is reaped promptly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shutdown_during_worker_startup_reaps_spawned_worker() {
+        let (wm, repo, pid, _load) = slow_setup_load_in_flight("reap").await;
+
+        wm.shutdown().await;
+
+        let mut reaped = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !reaped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "worker pid {pid} survived shutdown() — it was spawned but not yet \
+             in the workers map, so shutdown could not reach it"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Window B: the ready-handshake wait is bounded only by startup_timeout
+    /// (60s here) and ignores shutdown. After the fix the load task must
+    /// return promptly (with an error) once shutdown cancels it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_model_returns_promptly_when_shutdown_cancels_startup() {
+        let (wm, repo, _pid, load) = slow_setup_load_in_flight("prompt").await;
+
+        wm.shutdown().await;
+
+        let result = timeout(Duration::from_secs(10), load).await;
+        assert!(
+            result.is_ok(),
+            "load_model must return promptly after shutdown cancels it, not \
+             wait out the 30s setup + handshake window"
+        );
+        assert!(
+            result.unwrap().unwrap().is_err(),
+            "a cancelled load must fail, not report success"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The error path of a cancelled/failed load must not leave partial
+    /// entries in the zmq client map (incremental registration registers
+    /// each worker as soon as its monitor is up; teardown must clean them).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancelled_load_leaves_no_zmq_clients() {
+        let (wm, repo, _pid, load) = slow_setup_load_in_flight("clean").await;
+
+        wm.shutdown().await;
+        let _ = timeout(Duration::from_secs(10), load).await;
+
+        assert!(
+            wm.get_zmq_clients("clean", "1").await.is_none(),
+            "a cancelled load must not leave zmq clients registered"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== Parallel worker startup (worker-startup-shutdown-and-parallel-plan §2.2) =====
+
+    /// Harness: a two-worker model whose setup() sleeps `setup_secs`
+    /// (simulating weight loading). Returns (manager, registry, repo).
+    #[cfg(unix)]
+    async fn parallel_harness(
+        tag: &str,
+        setup_secs: u32,
+        startup_concurrency: Option<usize>,
+    ) -> (
+        Arc<WorkerManager>,
+        Arc<ModelRegistry>,
+        std::path::PathBuf,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-par-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        time.sleep({setup_secs})
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 2\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let config = ModelConfig {
+            devices: Some(serde_json::json!(2)),
+            startup_concurrency,
+            ..Default::default()
+        };
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load must succeed");
+        (wm, registry, repo)
+    }
+
+    /// startup_concurrency=2 overlaps the two workers' 3s setups: total load
+    /// time is ~max(setup) + spawn overhead, well under the serial floor of
+    /// 2 x 3s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_overlaps_worker_setup() {
+        let start = std::time::Instant::now();
+        let (wm, _registry, repo) = parallel_harness("overlap", 3, Some(2)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(5500),
+            "parallel load took {elapsed:?}; serial would be >= ~6s (2 x 3s setups)"
+        );
+
+        let _ = wm.unload_model("overlap", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Default (startup_concurrency unset) preserves the serial behavior:
+    /// two 3s setups run back-to-back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_startup_is_serial() {
+        let start = std::time::Instant::now();
+        let (wm, _registry, repo) = parallel_harness("serial", 3, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(5500),
+            "serial load finished in {elapsed:?} (< 2 x 3s setups) — default must stay serial"
+        );
+
+        let _ = wm.unload_model("serial", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Concurrent handshakes complete out of order, but registration must
+    /// stay index-aligned by worker_id (routing pins by Vec index).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_preserves_worker_order() {
+        let (wm, registry, repo) = parallel_harness("order", 1, Some(2)).await;
+
+        let workers = registry
+            .get("order", Some("1"))
+            .expect("version registered")
+            .workers;
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].worker_id, 0, "slot 0 must be worker 0");
+        assert_eq!(workers[1].worker_id, 1, "slot 1 must be worker 1");
+        assert_eq!(
+            wm.get_zmq_clients("order", "1").await.map(|c| c.len()),
+            Some(2),
+            "one zmq client per worker, index-aligned"
+        );
+
+        let _ = wm.unload_model("order", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A mid-load failure under concurrency must still reap every worker
+    /// that already started (W1 shape, parallel driver).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_failure_reaps_started_workers() {
+        use std::io::Read;
+
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-par-fail-{}", std::process::id()));
+        let model_dir = repo.join("par_fail").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        if device == "cpu:1":
+            # Fail AFTER worker 0 has started setup (its failure would
+            # otherwise race worker 0's interpreter startup under
+            # concurrency and the pid file might never appear).
+            time.sleep(2)
+            raise RuntimeError("device 1 refuses to start")
+        with open("setup_pid.txt", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(3)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 2\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let config = ModelConfig {
+            devices: Some(serde_json::json!(2)),
+            startup_concurrency: Some(2),
+            ..Default::default()
+        };
+
+        let err = wm.load_model("par_fail", "1", &config).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkerCrashed(_)),
+            "load must fail when worker 1 refuses to start, got {err:?}"
+        );
+
+        let mut pid_str = String::new();
+        std::fs::File::open(model_dir.join("setup_pid.txt"))
+            .expect("worker 0 must have written setup_pid.txt")
+            .read_to_string(&mut pid_str)
+            .expect("read pid file");
+        let pid: i32 = pid_str.trim().parse().expect("pid is numeric");
+
+        let mut reaped = false;
+        for _ in 0..25 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !reaped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "worker pid {pid} survived a failed parallel load — started workers \
+             must be reaped on the error path"
         );
 
         let _ = std::fs::remove_dir_all(&repo);

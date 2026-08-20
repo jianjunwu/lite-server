@@ -252,7 +252,13 @@ impl WorkerManager {
     /// report the overall "" service as NOT_SERVING (gRPC LB摘流), and an
     /// immediate sync pushes it right away rather than waiting for the next
     /// coordinator tick. No-op before the reporter is installed.
+    ///
+    /// Also cancels in-flight loads: this is the earliest shutdown signal
+    /// (sent before the HTTP/gRPC drain window), so a worker stuck in setup()
+    /// starts unwinding immediately instead of holding the load until
+    /// startup_timeout.
     pub async fn mark_draining(&self) {
+        self.shutdown_token.cancel();
         if let Some(state) = self.grpc_health.write().await.as_mut() {
             state.draining = true;
         }

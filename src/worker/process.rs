@@ -850,11 +850,11 @@ impl WorkerManager {
             let model = model_name.to_string();
             let ver = version.to_string();
             tokio::spawn(async move {
-                // L3: run_rewarm_budgeted adds a fallback total budget
+                // L3: run_warmup_budgeted adds a fallback total budget
                 // (max(startup_timeout, 300s)) when the policy has none — a
                 // hung replacement must not park this detached task forever.
                 if let Err(reason) = wm
-                    .run_rewarm_budgeted(&model, &ver, &model_config, &p, worker_id)
+                    .run_warmup_budgeted(&model, &ver, &model_config, &p, Some(worker_id))
                     .await
                 {
                     error!(
