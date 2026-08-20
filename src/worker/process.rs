@@ -57,6 +57,25 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Has the worker's reap signal already fired (the process exited on its
+/// own)? Resolved either by the monitor's send or by its end of the channel
+/// dropping. The graceful recycle path uses this to avoid queueing a stop
+/// for a dead peer — ZMQ PAIR replays it to the replacement on reconnect
+/// (H2). On a resolved channel the receiver is TAKEN OUT: a completed
+/// oneshot panics when polled again, so `stop_worker_gracefully` must find
+/// `done_rx` already gone.
+fn worker_already_reaped(proc: &mut WorkerProcess) -> bool {
+    let reaped = proc
+        .done_rx
+        .as_mut()
+        .map(|rx| !matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)))
+        .unwrap_or(false);
+    if reaped {
+        proc.done_rx.take();
+    }
+    reaped
+}
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -204,6 +223,15 @@ pub(crate) enum WorkerExitKind {
     Killed,
 }
 
+/// Grace window after a respawn during which a Clean exit is treated as a
+/// crash (H2 stale-stop replay): the replacement consumed a stop message
+/// queued for its predecessor on the reused PAIR socket and exited 0.
+/// Legitimate Clean exits never happen spontaneously — a worker exits 0 only
+/// on a stop request, and by then its monitor is torn down (unload) or the
+/// slot is mid-recycle (whose own respawn re-resets the flags it sets here).
+/// 30s covers connect → consume → teardown of a replayed stop with margin.
+const RESPAWN_CLEAN_GRACE: Duration = Duration::from_secs(30);
+
 /// The single crash-bookkeeping closure for both monitor sites (initial
 /// spawn + respawn): a non-clean exit fails in-flight requests fast, marks
 /// the slot dead so routing stops sending new work to a process that can
@@ -219,7 +247,50 @@ pub(crate) fn crash_exit_handler(
     version: String,
     worker_id: u32,
 ) -> impl FnOnce(WorkerExitKind) + Send + 'static {
+    crash_exit_handler_with_grace(
+        fail_client,
+        outlier,
+        registry,
+        model_name,
+        version,
+        worker_id,
+        None,
+    )
+}
+
+/// `crash_exit_handler` with an optional Clean-exit grace window: a Clean
+/// exit observed within `clean_grace` of handler creation is reclassified as
+/// a crash (fail_all + mark_dead + Stopped — deliberately NO auto-respawn,
+/// bounding kill→respawn loops; health-check kill escalation, when enabled,
+/// is the self-heal path). Used for respawned replacements, where a Clean
+/// exit moments after startup means the worker consumed a stale stop
+/// replayed on the reused PAIR socket (H2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn crash_exit_handler_with_grace(
+    fail_client: Option<Arc<crate::transport::zmq::WorkerZmqClient>>,
+    outlier: Option<Arc<crate::inference_queue::OutlierState>>,
+    registry: Arc<crate::registry::ModelRegistry>,
+    model_name: String,
+    version: String,
+    worker_id: u32,
+    clean_grace: Option<Duration>,
+) -> impl FnOnce(WorkerExitKind) + Send + 'static {
+    let spawned_at = std::time::Instant::now();
     move |kind| {
+        let kind = match kind {
+            WorkerExitKind::Clean
+                if clean_grace.is_some_and(|g| spawned_at.elapsed() < g) =>
+            {
+                error!(
+                    model = %model_name, version = %version, worker_id,
+                    "Replacement exited cleanly within the respawn grace window; \
+                     likely consumed a stale stop replayed on the reused PAIR \
+                     socket — treating as crash (no auto-respawn)"
+                );
+                WorkerExitKind::Crash
+            }
+            other => other,
+        };
         let reason = match kind {
             WorkerExitKind::Crash => "worker process exited unexpectedly",
             WorkerExitKind::Killed => "worker terminated by supervisor",
@@ -562,14 +633,26 @@ impl WorkerManager {
                 // because the collector only signals a recycle after the slot
                 // drained — a healthy worker consumes the stop before exiting
                 // and is reaped before the replacement spawns.
-                let client = {
-                    let clients = self.zmq_clients.read().await;
-                    clients
-                        .get(&key)
-                        .and_then(|cs| cs.get(worker_id as usize).cloned())
-                };
-                if let Some(client) = client {
-                    let _ = client.send_raw(crate::streaming::build_stop_request()).await;
+                //
+                // H2 path-a guard: if the old worker already exited on its
+                // own (crash during the drain), a stop sent now would sit
+                // unconsumed in the dead peer's PAIR buffer and be replayed
+                // to the replacement on reconnect — skip it and just reap.
+                if worker_already_reaped(&mut proc) {
+                    info!(
+                        model = %model_name, version = %version, worker_id,
+                        "Old worker already exited before recycle; skipping stop message"
+                    );
+                } else {
+                    let client = {
+                        let clients = self.zmq_clients.read().await;
+                        clients
+                            .get(&key)
+                            .and_then(|cs| cs.get(worker_id as usize).cloned())
+                    };
+                    if let Some(client) = client {
+                        let _ = client.send_raw(crate::streaming::build_stop_request()).await;
+                    }
                 }
                 let escalated = stop_worker_gracefully(&mut proc, model_name, version).await;
                 if escalated {
@@ -843,13 +926,17 @@ impl WorkerManager {
             version,
             worker_id,
             shutdown_rx,
-            crash_exit_handler(
+            crash_exit_handler_with_grace(
                 fail_client,
                 outlier,
                 self.registry.clone(),
                 model_name.to_string(),
                 version.to_string(),
                 worker_id,
+                // H2: a Clean exit moments after a respawn means the
+                // replacement consumed a stale stop replayed on the reused
+                // PAIR socket — treat it as a crash, never ignore it.
+                Some(RESPAWN_CLEAN_GRACE),
             ),
             Some(hooks_arc),
             self.hook_tasks.clone(),
@@ -1016,6 +1103,156 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // ===== H2 guard tests (stale-stop replay) =====
+
+    fn proc_with_done_rx(done_rx: Option<oneshot::Receiver<()>>) -> WorkerProcess {
+        WorkerProcess {
+            worker_id: 0,
+            endpoint: String::new(),
+            shutdown_tx: None,
+            done_rx,
+            kill_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn should_report_reaped_only_after_done_signal() {
+        let (tx, rx) = oneshot::channel::<()>();
+        let mut proc = proc_with_done_rx(Some(rx));
+        assert!(
+            !worker_already_reaped(&mut proc),
+            "reap pending → the stop is still meaningful"
+        );
+        assert!(proc.done_rx.is_some(), "pending channel stays in place");
+        let _ = tx.send(());
+        assert!(
+            worker_already_reaped(&mut proc),
+            "reap observed → a stop would be replayed to the replacement"
+        );
+        assert!(
+            proc.done_rx.is_none(),
+            "a completed oneshot panics when re-polled — it is taken out"
+        );
+    }
+
+    #[test]
+    fn should_report_reaped_when_done_channel_dropped() {
+        let (tx, rx) = oneshot::channel::<()>();
+        drop(tx);
+        let mut proc = proc_with_done_rx(Some(rx));
+        assert!(
+            worker_already_reaped(&mut proc),
+            "a resolved-by-drop channel also means the process is gone"
+        );
+        assert!(proc.done_rx.is_none(), "dead channel is taken out");
+    }
+
+    #[test]
+    fn should_report_not_reaped_without_done_rx() {
+        let mut proc = proc_with_done_rx(None);
+        assert!(
+            !worker_already_reaped(&mut proc),
+            "no reap channel → keep the legacy stop behavior"
+        );
+    }
+
+    /// Spawn a child that exits 0 immediately and run its monitor with the
+    /// given handler; returns once the monitor reaped it.
+    async fn run_clean_exit_monitor(
+        on_exit: impl FnOnce(WorkerExitKind) + Send + 'static,
+    ) {
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child,
+            "test_model",
+            "1",
+            0,
+            shutdown_rx,
+            on_exit,
+            None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor did not observe the clean exit")
+            .expect("completion channel dropped");
+    }
+
+    #[tokio::test]
+    async fn should_treat_clean_exit_within_grace_as_crash() {
+        let outlier = Arc::new(crate::inference_queue::OutlierState::new(1));
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let handler = crash_exit_handler_with_grace(
+            None,
+            Some(outlier.clone()),
+            registry,
+            "test_model".to_string(),
+            "1".to_string(),
+            0,
+            Some(Duration::from_secs(60)),
+        );
+        run_clean_exit_monitor(handler).await;
+        assert!(
+            outlier.is_dead(0),
+            "a Clean exit inside the grace window is a stale-stop replay — mark dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_ignore_clean_exit_beyond_grace_window() {
+        let outlier = Arc::new(crate::inference_queue::OutlierState::new(1));
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let handler = crash_exit_handler_with_grace(
+            None,
+            Some(outlier.clone()),
+            registry,
+            "test_model".to_string(),
+            "1".to_string(),
+            0,
+            Some(Duration::ZERO), // window already elapsed at creation
+        );
+        run_clean_exit_monitor(handler).await;
+        assert!(
+            !outlier.is_dead(0),
+            "a Clean exit outside the grace window keeps the ignore semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_ignore_clean_exit_without_grace() {
+        let outlier = Arc::new(crate::inference_queue::OutlierState::new(1));
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let handler = crash_exit_handler(
+            None,
+            Some(outlier.clone()),
+            registry,
+            "test_model".to_string(),
+            "1".to_string(),
+            0,
+        );
+        run_clean_exit_monitor(handler).await;
+        assert!(
+            !outlier.is_dead(0),
+            "initial-spawn monitors keep ignoring Clean exits (unload semantics)"
+        );
+    }
 
     /// Parallel server processes must never collide on worker IPC paths: the
     /// endpoint embeds the server pid, and stays stable within one process

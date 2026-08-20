@@ -3792,6 +3792,172 @@ class ReadyAPI(LitAPI):
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
 
+/// H2 regression (path a): the old worker dies on its own after the recycle
+/// was claimed but before the respawn runs. The graceful respawn must NOT
+/// queue a stop for the dead peer — ZMQ PAIR would replay it to the
+/// replacement on reconnect and kill it silently.
+///
+/// The kill window is created deterministically WITHOUT in-flight tricks
+/// (a worker slot executes batches serially, so a quick request can never
+/// cross the budget while a slow one is still in flight): the respawn
+/// listener is serial and global — a blocker model's slow-starting recycle
+/// (8s setup) occupies it while replay_model's recycle signal sits queued,
+/// leaving ample time to SIGKILL the already-claimed worker.
+#[tokio::test]
+async fn should_not_replay_stop_to_replacement_when_old_worker_dies_mid_recycle() {
+    let blocker_py = r#"import time
+from lite_server import LitAPI
+
+
+class BlockerAPI(LitAPI):
+    def setup(self, device):
+        time.sleep(8)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#;
+    let replay_py = r#"from lite_server import LitAPI
+
+
+class ReplayAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-replay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let blocker_dir = tmp_dir.join("blocker_model").join("1");
+    let replay_dir = tmp_dir.join("replay_model").join("1");
+    std::fs::create_dir_all(&blocker_dir).unwrap();
+    std::fs::create_dir_all(&replay_dir).unwrap();
+    std::fs::write(blocker_dir.join("model.py"), blocker_py).unwrap();
+    std::fs::write(
+        blocker_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\nmax_requests: 1\n",
+    )
+    .unwrap();
+    std::fs::write(replay_dir.join("model.py"), replay_py).unwrap();
+    std::fs::write(
+        replay_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_requests: 1\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    // Clean leftover workers from a previous failed run — replay_model's
+    // worker 0 is found by pgrep below, and a stale match would be killed
+    // instead of the real one.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "lite_server.worker.inference --model-name replay_model"])
+        .status();
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "blocker_model", "1").await;
+    load_model(&base, "replay_model", "1").await;
+
+    // replay_model's worker 0 python process, found by its command line
+    // (unique to this test's model name; /health exposes no pids).
+    let worker_pid = || {
+        let out = std::process::Command::new("pgrep")
+            .args([
+                "-f",
+                "lite_server.worker.inference --model-name replay_model .* --worker-id 0 ",
+            ])
+            .output()
+            .expect("pgrep runs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .next()
+    };
+    let infer = |model: &str, pin_worker0: bool| {
+        let client = client.clone();
+        let base = base.clone();
+        let model = model.to_string();
+        async move {
+            let mut req = client
+                .post(format!("{}/v2/models/{}/infer", base, model))
+                .timeout(Duration::from_secs(30))
+                .json(&json!({"input": 1}));
+            if pin_worker0 {
+                req = req.header("x-lite-worker-id", "0");
+            }
+            req.send().await.map(|r| r.status().as_u16())
+        }
+    };
+
+    // 1. Occupy the serial respawn listener: blocker_model crosses its
+    //    budget and its replacement takes ~8s to start.
+    let status = infer("blocker_model", false).await.expect("blocker answered");
+    assert_eq!(status, 200);
+
+    // 2. replay_model slot 0 crosses its budget; its recycle signal queues
+    //    behind blocker_model's respawn.
+    let status = infer("replay_model", true).await.expect("replay answered");
+    assert_eq!(status, 200, "the crossing request itself is served");
+
+    // 3. Kill the claimed worker while its recycle signal is still queued
+    //    (H2 path a: the old worker dies on its own before the respawn).
+    let old_pid = worker_pid().expect("replay_model worker 0 python process found");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &old_pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(killed, "must SIGKILL the claimed worker 0 (pid {old_pid})");
+
+    // 4. The replacement must come up with a fresh pid (only after the
+    //    listener finishes blocker_model's ~8s respawn)…
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut new_pid = None;
+    while tokio::time::Instant::now() < deadline {
+        match worker_pid() {
+            Some(pid) if pid != old_pid => {
+                new_pid = Some(pid);
+                break;
+            }
+            _ => sleep(Duration::from_millis(200)).await,
+        }
+    }
+    let new_pid = new_pid.expect("replacement worker 0 came up");
+
+    // …and it must SURVIVE: a replayed stop would kill it within seconds of
+    // its connect. Observe well past the startup window, then serve slot 0.
+    sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        worker_pid(),
+        Some(new_pid),
+        "replacement must not be killed by a replayed stale stop"
+    );
+    let status = infer("replay_model", true).await.expect("slot 0 answered");
+    assert_eq!(status, 200, "the recycled slot serves its replacement");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
 // ---------------------------------------------------------------------------
 // §4.2: max_loaded_versions LRU eviction
 // ---------------------------------------------------------------------------
