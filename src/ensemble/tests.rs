@@ -3696,6 +3696,7 @@ fn chain_consumer_plan() -> EnsemblePlan {
 struct ConsumerHarness {
     up_tx: tokio::sync::mpsc::Sender<pb::StreamResponse>,
     down_rx: tokio::sync::mpsc::Receiver<pb::StreamResponse>,
+    handles: Arc<std::sync::Mutex<Vec<StreamHandle>>>,
     run: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>>>>,
 }
 
@@ -3706,6 +3707,14 @@ fn chain_consumer_harness() -> ConsumerHarness {
 fn chain_consumer_harness_with(
     state: Arc<crate::http::state::AppState>,
     plan: EnsemblePlan,
+) -> ConsumerHarness {
+    chain_consumer_harness_full(state, plan, None)
+}
+
+fn chain_consumer_harness_full(
+    state: Arc<crate::http::state::AppState>,
+    plan: EnsemblePlan,
+    upstream_handle_id: Option<String>,
 ) -> ConsumerHarness {
     let plan = Arc::new(plan);
     let (up_tx, up_rx) = tokio::sync::mpsc::channel(4);
@@ -3719,14 +3728,15 @@ fn chain_consumer_harness_with(
         decoupled: false,
         dag_selector: None,
     };
+    let handles_run = handles.clone();
     let run = Box::pin(async move {
         consume_stream_consumer(
             &state, &plan, 1, "pre", up_rx, down_tx, &ctx, "req-1", &opts, None,
-            &handles, true, &snapshot,
+            &handles_run, upstream_handle_id, true, &snapshot,
         )
         .await
     });
-    ConsumerHarness { up_tx, down_rx, run }
+    ConsumerHarness { up_tx, down_rx, handles, run }
 }
 
 fn chunk_frame(data: &'static [u8]) -> pb::StreamResponse {
@@ -3868,4 +3878,272 @@ async fn chain_consumer_dead_sub_model_fails_fast_with_error_frame() {
         }
         other => panic!("expected an Error frame, got {other:?}"),
     }
+}
+
+// ===== L1: chain_handles cleanup on sub-stream termination =====
+
+fn chain_test_ipc_endpoint(tag: &str) -> String {
+    format!(
+        "ipc://{}",
+        std::env::temp_dir()
+            .join(format!("chain-l1-{}-{}.sock", tag, std::process::id()))
+            .display()
+    )
+}
+
+/// Register `model` v1 ready with one worker backed by a ZMQ stream client
+/// (test hook), so execute_stream_step can really open a sub-stream.
+async fn register_streaming_model(
+    state: &Arc<crate::http::state::AppState>,
+    model: &str,
+    endpoint: String,
+) {
+    state
+        .registry
+        .register(
+            model,
+            "1",
+            crate::config::ModelConfig::default(),
+            crate::registry::types::ModelType::LitAPI,
+            std::path::PathBuf::new(),
+        )
+        .unwrap();
+    state.registry.mark_ready(model, "1").unwrap();
+    state
+        .registry
+        .set_workers(
+            model,
+            "1",
+            vec![crate::registry::types::WorkerInfo {
+                worker_id: 0,
+                device: "cpu:0".to_string(),
+                endpoint: String::new(),
+                pid: None,
+                status: crate::registry::types::WorkerStatus::Ready,
+                capacity: None,
+            }],
+        )
+        .unwrap();
+    let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+    state
+        .worker_manager
+        .insert_zmq_clients_for_test(model, "1", vec![client])
+        .await;
+}
+
+/// PAIR worker: Open → one Chunk + Done (mirrors the stream.rs test seam).
+fn spawn_open_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+    use prost::Message;
+    std::thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let s = ctx.socket(zmq::PAIR).expect("worker socket");
+        s.connect(&endpoint).expect("worker connect");
+        let _ = s.set_rcvtimeo(5000);
+        while let Ok(bytes) = s.recv_bytes(0) {
+            let req = match pb::Request::decode(bytes.as_slice()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
+                let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                continue;
+            }
+            let mk = |payload| pb::Response {
+                payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                    stream_id: st.stream_id.clone(),
+                    payload: Some(payload),
+                })),
+                ..Default::default()
+            };
+            let _ = s.send(
+                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                    data: Bytes::from_static(b"{}"),
+                    is_final: false,
+                }))
+                .encode_to_vec(),
+                0,
+            );
+            let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(), 0);
+        }
+    })
+}
+
+/// PAIR worker: Open → one Error frame, then close.
+fn spawn_open_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+    use prost::Message;
+    std::thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let s = ctx.socket(zmq::PAIR).expect("worker socket");
+        s.connect(&endpoint).expect("worker connect");
+        let _ = s.set_rcvtimeo(5000);
+        while let Ok(bytes) = s.recv_bytes(0) {
+            let req = match pb::Request::decode(bytes.as_slice()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
+                continue;
+            }
+            let resp = pb::Response {
+                payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                    stream_id: st.stream_id.clone(),
+                    payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                        message: "boom".to_string(),
+                    })),
+                })),
+                ..Default::default()
+            };
+            let _ = s.send(resp.encode_to_vec(), 0);
+            return; // close → the forwarder observes disconnect and breaks
+        }
+    })
+}
+
+/// L1 (leak-gap-audit-0820): a chain consumer pushed one handle per upstream
+/// chunk and never removed it, so a long-lived active stream accumulated
+/// O(chunks) handles. Each sub-stream's handle must be dropped as soon as
+/// the sub-stream terminates; when the chain ends normally the list is empty.
+#[tokio::test]
+async fn chain_consumer_removes_sub_stream_handles_on_completion() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("done");
+    let _worker = spawn_open_done_worker(endpoint.clone());
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let mut h = chain_consumer_harness_with(state, plan);
+
+    for _ in 0..3 {
+        h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    }
+    drop(h.up_tx);
+
+    tokio::time::timeout(Duration::from_secs(10), h.run)
+        .await
+        .expect("consumer must finish")
+        .expect("consumer must not propagate an error");
+
+    // 3 forwarded chunks + the synthesized terminal Done.
+    for _ in 0..3 {
+        let frame = h.down_rx.recv().await.expect("a forwarded chunk");
+        assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Chunk(_))));
+    }
+    let frame = h.down_rx.recv().await.expect("the terminal Done");
+    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Done(_))));
+
+    assert_eq!(
+        h.handles.lock().unwrap().len(),
+        0,
+        "every terminated sub-stream's handle must be removed (L1)"
+    );
+}
+
+/// L1: the error exit removes the failed sub-stream's handle too.
+#[tokio::test]
+async fn chain_consumer_removes_sub_stream_handle_on_error() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("err");
+    let _worker = spawn_open_error_worker(endpoint.clone());
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let mut h = chain_consumer_harness_with(state, plan);
+
+    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(h.up_tx);
+
+    tokio::time::timeout(Duration::from_secs(10), h.run)
+        .await
+        .expect("consumer must finish")
+        .expect("hop failure terminated in-band");
+
+    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))));
+
+    assert_eq!(
+        h.handles.lock().unwrap().len(),
+        0,
+        "a failed sub-stream's handle must be removed (L1)"
+    );
+}
+
+/// Pre-seed a head-stream handle (as spawn_chain does) into the harness.
+fn seed_head_handle(h: &ConsumerHarness, stream_id: &str) {
+    let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(
+        chain_test_ipc_endpoint("head-dummy"),
+    ));
+    h.handles.lock().unwrap().push(StreamHandle {
+        stream_id: stream_id.to_string(),
+        cancel_client: client,
+        abort: tokio::spawn(async {}).abort_handle(),
+    });
+}
+
+/// L1: the head stream's handle is dropped by the first consumer once the
+/// upstream head has terminated (here: upstream channel close after a
+/// completed sub-stream).
+#[tokio::test]
+async fn chain_consumer_removes_head_handle_when_upstream_terminates() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("done-head");
+    let _worker = spawn_open_done_worker(endpoint.clone());
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let h = chain_consumer_harness_full(state, plan, Some("head-s1".to_string()));
+    seed_head_handle(&h, "head-s1");
+
+    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(h.up_tx);
+
+    tokio::time::timeout(Duration::from_secs(10), h.run)
+        .await
+        .expect("consumer must finish")
+        .expect("consumer must not propagate an error");
+
+    assert_eq!(
+        h.handles.lock().unwrap().len(),
+        0,
+        "the terminated head stream's handle must be removed (L1)"
+    );
+}
+
+/// L1 guard: a consumer-side bail (here: invalid upstream JSON) leaves the
+/// head stream LIVE — its handle must stay so cancel_chain can still reach
+/// the head worker.
+#[tokio::test]
+async fn chain_consumer_keeps_head_handle_when_consumer_bails() {
+    let state = chain_consumer_state();
+    let plan = chain_consumer_plan();
+    let mut h = chain_consumer_harness_full(state, plan, Some("head-s1".to_string()));
+    seed_head_handle(&h, "head-s1");
+
+    h.up_tx.send(chunk_frame(b"not-json{")).await.unwrap();
+    drop(h.up_tx);
+
+    tokio::time::timeout(Duration::from_secs(10), h.run)
+        .await
+        .expect("consumer must finish")
+        .expect("hop failure terminated in-band");
+
+    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))));
+
+    let ids: Vec<String> = h
+        .handles
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|hd| hd.stream_id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["head-s1".to_string()],
+        "a consumer-side bail must keep the live head's handle cancel-able"
+    );
 }

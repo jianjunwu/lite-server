@@ -71,6 +71,77 @@ fn to_status(e: AppError) -> Status {
 /// forever.
 const DOWNLOAD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Pump `file` into `tx` in 1 MiB chunks (wire 定稿) with a terminal frame
+/// carrying sha256 + size (DecoupledResponse idiom). Every send — chunk,
+/// mid-stream read error, and terminal frame — is bounded by
+/// [DOWNLOAD_SEND_TIMEOUT]: a stalled (connected but not reading) client
+/// must not park the download task, its file handle, or the pack temp-dir
+/// cleanup guard riding in the spawned task (F-13/L2).
+async fn pump_download_chunks(
+    mut file: tokio::fs::File,
+    path: std::path::PathBuf,
+    tx: tokio::sync::mpsc::Sender<Result<pb::DownloadModelChunk, Status>>,
+) {
+    let mut hasher = Sha256::new();
+    let mut sent: u64 = 0;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                sent += n as u64;
+                let chunk = pb::DownloadModelChunk {
+                    data: Bytes::copy_from_slice(&buf[..n]),
+                    is_final: false,
+                    sha256: String::new(),
+                    size: 0,
+                };
+                // Bounded send: a stalled client must not park this
+                // task (and its file handle) forever.
+                match tokio::time::timeout(DOWNLOAD_SEND_TIMEOUT, tx.send(Ok(chunk))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return, // client gone — stream ends here
+                    Err(_) => {
+                        tracing::warn!("DownloadModel: client stalled; aborting send");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "DownloadModel: read {} failed: {}",
+                    path.display(),
+                    e
+                );
+                // Surface the truncation explicitly — a clean end
+                // here would read as a successful short download.
+                let _ = tokio::time::timeout(
+                    DOWNLOAD_SEND_TIMEOUT,
+                    tx.send(Err(Status::internal(format!(
+                        "read {} failed mid-download",
+                        path.display()
+                    )))),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    // L2: the terminal frame gets the same bound as chunk sends — a client
+    // stalled exactly at EOF with a full channel must not park this task.
+    let _ = tokio::time::timeout(
+        DOWNLOAD_SEND_TIMEOUT,
+        tx.send(Ok(pb::DownloadModelChunk {
+            data: Bytes::new(),
+            is_final: true,
+            sha256: format!("{:x}", hasher.finalize()),
+            size: sent,
+        })),
+    )
+    .await;
+}
+
 /// serde `rename_all = "snake_case"` value of a [`VersionStatus`], as a plain
 /// string (mirrors the HTTP JSON `status` field exactly).
 fn version_status_str(s: &VersionStatus) -> &'static str {
@@ -999,7 +1070,7 @@ impl Admin for GrpcAdminService {
         // the RPC itself (a zero-chunk OK stream is indistinguishable from a
         // successful empty download), and a mid-stream read failure must
         // surface as an Err item instead of a silent truncation.
-        let mut file = match tokio::fs::File::open(&src.path).await {
+        let file = match tokio::fs::File::open(&src.path).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("DownloadModel: open {} failed: {}", src.path.display(), e);
@@ -1012,61 +1083,13 @@ impl Admin for GrpcAdminService {
             }
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(4);
+        let path = src.path.clone();
         tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            let mut sent: u64 = 0;
-            let mut buf = vec![0u8; 1024 * 1024];
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        hasher.update(&buf[..n]);
-                        sent += n as u64;
-                        let chunk = pb::DownloadModelChunk {
-                            data: Bytes::copy_from_slice(&buf[..n]),
-                            is_final: false,
-                            sha256: String::new(),
-                            size: 0,
-                        };
-                        // Bounded send: a stalled client must not park this
-                        // task (and its file handle) forever.
-                        match tokio::time::timeout(DOWNLOAD_SEND_TIMEOUT, tx.send(Ok(chunk))).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => return, // client gone — stream ends here
-                            Err(_) => {
-                                tracing::warn!("DownloadModel: client stalled; aborting send");
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "DownloadModel: read {} failed: {}",
-                            src.path.display(),
-                            e
-                        );
-                        // Surface the truncation explicitly — a clean end
-                        // here would read as a successful short download.
-                        let _ = tokio::time::timeout(
-                            DOWNLOAD_SEND_TIMEOUT,
-                            tx.send(Err(Status::internal(format!(
-                                "read {} failed mid-download",
-                                src.path.display()
-                            )))),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            let _ = tx
-                .send(Ok(pb::DownloadModelChunk {
-                    data: Bytes::new(),
-                    is_final: true,
-                    sha256: format!("{:x}", hasher.finalize()),
-                    size: sent,
-                }))
-                .await;
+            // The source's pack temp-dir cleanup guard rides along — it is
+            // dropped (temp dir removed) only when this task ends (stream
+            // done or client gone).
+            let _guard = src;
+            pump_download_chunks(file, path, tx).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -2226,6 +2249,45 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// L2 (leak-gap-audit-0820): the terminal frame's send must be bounded
+    /// by DOWNLOAD_SEND_TIMEOUT like every other send in the pump. A client
+    /// that stops reading with the channel exactly full at EOF must not
+    /// park the download task (file handle + pack temp-dir guard) forever.
+    #[tokio::test(start_paused = true)]
+    async fn download_terminal_frame_send_is_bounded() {
+        let tmp = unique_repo("dl-terminal-timeout");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let path = tmp.join("big.bin");
+        // Exactly 4 MiB: four 1 MiB chunks fill the 4-slot channel
+        // precisely; the pump then hits EOF with the channel full and the
+        // terminal-frame send stalls (the receiver is never polled).
+        tokio::fs::write(&path, vec![7u8; 4 * 1024 * 1024]).await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(4);
+        let task = tokio::spawn(pump_download_chunks(file, path.clone(), tx));
+
+        // Virtual clock: the pump's 60s send bound must fire long before
+        // this 300s guard; without it the task parks forever and the guard
+        // trips.
+        tokio::time::timeout(std::time::Duration::from_secs(300), task)
+            .await
+            .expect("the download task must exit once the stalled terminal send times out")
+            .unwrap();
+
+        // The 4 buffered chunks drain; the sender is gone — no terminal
+        // frame could be delivered.
+        let mut chunks = 0;
+        while let Some(item) = rx.recv().await {
+            let c = item.expect("chunks sent before the stall are valid");
+            assert!(!c.is_final);
+            chunks += 1;
+        }
+        assert_eq!(chunks, 4);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
     #[tokio::test]

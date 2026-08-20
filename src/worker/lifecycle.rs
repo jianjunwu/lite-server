@@ -93,6 +93,17 @@ impl WarmupFailure {
     }
 }
 
+/// L3 (leak-gap-audit-0820): fallback total budget for the DETACHED respawn
+/// re-warm — max(startup_timeout, 300s). With the default
+/// total_timeout_secs=0 a replacement worker that hangs (accepts but never
+/// answers, kill_threshold=0) would otherwise park the detached task
+/// forever: it holds an Arc<WorkerManager> + the whole ModelConfig clone,
+/// and the slot never force-ejects (that only happens on warmup FAILURE).
+/// 300s floors the budget for configs with a tiny startup_timeout.
+fn rewarm_fallback_budget(model_config: &ModelConfig) -> Duration {
+    Duration::from_secs_f32(model_config.startup_timeout).max(Duration::from_secs(300))
+}
+
 /// F1 (warmup-gaps audit): RAII cancel for a warmup stream. Any exit that
 /// did not observe a terminal frame (Done/Error) or a channel close drops
 /// the guard armed → a StreamCancel goes out so the worker-side generator
@@ -971,6 +982,55 @@ impl WorkerManager {
             status,
         );
         result.map_err(|e| e.reason)
+    }
+
+    /// G2/L3: the respawn re-warm — run_warmup plus the L3 fallback budget
+    /// ([`rewarm_fallback_budget`]). An explicit `total_timeout_secs` already
+    /// bounds the run inside run_warmup; the fallback only covers the
+    /// default (unbudgeted) case.
+    pub(super) async fn run_rewarm_budgeted(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        policy: &crate::config::WarmupPolicy,
+        worker_id: u32,
+    ) -> Result<(), String> {
+        if policy.total_timeout_secs > 0.0 {
+            return self
+                .run_warmup(model_name, version, model_config, policy, Some(worker_id))
+                .await;
+        }
+        let budget = rewarm_fallback_budget(model_config);
+        self.run_rewarm_with_budget(model_name, version, model_config, policy, worker_id, budget)
+            .await
+    }
+
+    /// L3: run_warmup under an outer total budget; a budget expiry concludes
+    /// as a warmup failure (the respawn path force-ejects the slot) instead
+    /// of parking the detached task forever. Split from
+    /// [`run_rewarm_budgeted`] so tests can inject a sub-second budget.
+    async fn run_rewarm_with_budget(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        policy: &crate::config::WarmupPolicy,
+        worker_id: u32,
+        budget: Duration,
+    ) -> Result<(), String> {
+        match timeout(
+            budget,
+            self.run_warmup(model_name, version, model_config, policy, Some(worker_id)),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "respawn re-warm exceeded fallback budget of {:.0}s (warmup total_timeout_secs unset)",
+                budget.as_secs_f64()
+            )),
+        }
     }
 
     async fn run_warmup_inner(
@@ -1902,6 +1962,185 @@ mod tests {
                 version: "1".to_string(),
             })
             .is_err());
+    }
+
+    // ===== L3: respawn re-warm fallback budget =====
+
+    /// A PAIR worker that accepts requests and NEVER replies — the
+    /// kill_threshold=0 "hung but not dead" shape from leak-gap-audit-0820.
+    fn spawn_silent_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while s.recv_bytes(0).is_ok() {
+                // swallow — never respond
+            }
+        })
+    }
+
+    /// WorkerManager over a real queue whose single worker is silent; the
+    /// registered model dir carries one warmup sample file.
+    async fn rewarm_harness(tag: &str) -> (Arc<WorkerManager>, std::path::PathBuf) {
+        let model_dir = std::env::temp_dir().join(format!(
+            "lite-server-rewarm-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&model_dir);
+        std::fs::create_dir_all(model_dir.join("warmup")).unwrap();
+        std::fs::write(model_dir.join("warmup").join("s1.json"), br#"{"x":1}"#).unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                model_dir.clone(),
+            )
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        registry
+            .set_workers(
+                "m",
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+
+        let queue = Arc::new(InferenceQueue::new());
+        let endpoint = format!(
+            "ipc://{}",
+            std::env::temp_dir()
+                .join(format!("rewarm-{tag}-{}.sock", std::process::id()))
+                .display()
+        );
+        let _silent = spawn_silent_worker(endpoint.clone());
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        queue.register_model(
+            "m",
+            "1",
+            &crate::config::ModelConfig::default(),
+            registry.get("m", Some("1")).unwrap().workers.clone(),
+            vec![client],
+            reload_tx,
+            outlier,
+            None,
+        );
+
+        let wm = Arc::new(WorkerManager::new(
+            registry,
+            model_dir.clone(),
+            queue,
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        (wm, model_dir)
+    }
+
+    fn rewarm_policy(total_timeout_secs: f32) -> crate::config::WarmupPolicy {
+        crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup/s1.json".to_string(),
+                ..Default::default()
+            }],
+            total_timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    /// L3 precondition (documents the hazard, passes before and after the
+    /// fix): with the default total_timeout_secs=0 the run parks on the
+    /// silent worker — no conclusion within 2s.
+    #[tokio::test]
+    async fn rewarm_without_total_budget_hangs_on_silent_worker() {
+        let (wm, model_dir) = rewarm_harness("hang").await;
+        let config = crate::config::ModelConfig::default();
+        let policy = rewarm_policy(0.0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wm.run_warmup("m", "1", &config, &policy, Some(0)),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "documented hazard: an unbudgeted re-warm must park on a hung worker"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// L3: a re-warm under the fallback budget concludes as a warmup failure
+    /// (the respawn path force-ejects the slot) instead of parking forever.
+    /// The budget is injected sub-second; rewarm_fallback_budget's own value
+    /// is pinned by the pure test below.
+    #[tokio::test]
+    async fn rewarm_fallback_budget_terminates_on_silent_worker() {
+        let (wm, model_dir) = rewarm_harness("budget").await;
+        let config = crate::config::ModelConfig {
+            startup_timeout: 1.0,
+            ..Default::default()
+        };
+        let policy = rewarm_policy(0.0);
+        let err = wm
+            .run_rewarm_with_budget(
+                "m",
+                "1",
+                &config,
+                &policy,
+                0,
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("fallback budget"),
+            "the fallback budget must fail the re-warm, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// L3: an explicit total_timeout_secs already bounds the run inside
+    /// run_warmup — the fallback must not preempt it.
+    #[tokio::test]
+    async fn rewarm_explicit_total_budget_governs_over_fallback() {
+        let (wm, model_dir) = rewarm_harness("explicit").await;
+        let config = crate::config::ModelConfig::default();
+        let policy = rewarm_policy(0.3);
+        let err = wm
+            .run_rewarm_budgeted("m", "1", &config, &policy, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("total timeout after 0.3s"),
+            "the policy's own budget must fire inside run_warmup, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    #[test]
+    fn rewarm_fallback_budget_is_max_of_startup_timeout_and_300s() {
+        let small = crate::config::ModelConfig {
+            startup_timeout: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(rewarm_fallback_budget(&small), Duration::from_secs(300));
+        let large = crate::config::ModelConfig {
+            startup_timeout: 600.0,
+            ..Default::default()
+        };
+        assert_eq!(rewarm_fallback_budget(&large), Duration::from_secs(600));
     }
 
     // ===== LRU eviction tests (§4.2) =====

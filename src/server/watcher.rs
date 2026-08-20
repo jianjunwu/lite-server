@@ -137,6 +137,12 @@ pub(super) async fn process_watch_events(
         }
     }
 
+    // L4: prune cooldown entries whose version is no longer loaded. Unload
+    // happens via entries the watcher does not own (Admin API, reconcile
+    // task, dir-gone below), so the map's owner drops stale keys on every
+    // event batch — otherwise it grows monotonically with version churn.
+    last_reload.retain(|(m, v), _| registry.get(m, Some(v)).is_some());
+
     // Reload changed models (with per-model/version cooldown)
     let cooldown = Duration::from_secs_f32(server_tunables.hot_reload_cooldown_secs);
     for (name, version) in models_to_reload {
@@ -595,6 +601,53 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "file change on a live version must go down the hot-reload path, not trigger reconcile"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// L4 (leak-gap-audit-0820): `last_reload` cooldown entries must be
+    /// dropped once the (model, version) is no longer loaded. Unload happens
+    /// via entries the watcher does not own (Admin API, reconcile task,
+    /// dir-gone), so the watcher — the map's owner — prunes stale keys on
+    /// every event batch; otherwise the map grows monotonically with version
+    /// churn.
+    #[tokio::test]
+    async fn last_reload_prunes_entries_for_unloaded_versions() {
+        let tmp = test_repo_dir("prune");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register("live", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("live").join("1"))
+            .unwrap();
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let trigger = None;
+        let flag = AtomicBool::new(true);
+
+        let mut last_reload: std::collections::HashMap<(String, String), Instant> =
+            std::collections::HashMap::new();
+        last_reload.insert(("gone".to_string(), "1".to_string()), Instant::now());
+        last_reload.insert(("live".to_string(), "1".to_string()), Instant::now());
+
+        process_watch_events(
+            Vec::new(),
+            tmp.clone(),
+            wm,
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ServerTunables::default(),
+            &flag,
+            &trigger,
+        ).await.unwrap();
+
+        assert!(
+            !last_reload.contains_key(&("gone".to_string(), "1".to_string())),
+            "the cooldown entry of an unloaded version must be pruned"
+        );
+        assert!(
+            last_reload.contains_key(&("live".to_string(), "1".to_string())),
+            "the cooldown entry of a still-loaded version must be kept"
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

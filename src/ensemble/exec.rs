@@ -1010,7 +1010,12 @@ pub(crate) fn validate_pipeline_chunk(prev_step_name: &str, data: &[u8]) -> Resu
 /// upstream chunk (chunk → 组包 → sub-stream → forward). D20: each sub-call
 /// carries request_id `{parent}:{step}:{chunk_seq}`. D18: a failed
 /// downstream send cancels this step's worker; the chain-handle list is
-/// updated per sub-stream (tail inserted at index 0, others appended).
+/// updated per sub-stream (tail inserted at index 0, others appended) and
+/// each sub-stream's handle is removed when it terminates (L1).
+/// `upstream_handle_id` is the head stream's handle id — passed only to the
+/// FIRST consumer, which drops it once the upstream head has terminated
+/// (Done/terminal Error/channel close); a consumer-side bail leaves the
+/// head live and its handle cancel-able via [`cancel_chain`].
 #[allow(clippy::too_many_arguments)] // chain-hop plumbing: state+plan+ctx+ids ride together by design
 pub(crate) async fn consume_stream_consumer(
     state: &Arc<AppState>,
@@ -1024,6 +1029,7 @@ pub(crate) async fn consume_stream_consumer(
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
     chain_handles: &Arc<std::sync::Mutex<Vec<StreamHandle>>>,
+    upstream_handle_id: Option<String>,
     is_tail: bool,
     snapshot: &Arc<VersionSnapshot>,
 ) -> Result<(), AppError> {
@@ -1034,6 +1040,12 @@ pub(crate) async fn consume_stream_consumer(
     let base_ctx = select_ctx_keys(context, &plan.step_dep_keys[step_idx]);
     let mut seq: u64 = 0;
     let mut error_terminated = false;
+    // L1: set when the upstream head stream has TERMINATED in-band — a Done
+    // or Error frame (both are terminal per §4.4). Only then may its handle
+    // be dropped; a consumer-side bail (validation/open failure below, or
+    // the early return on sub-stream error) leaves the head live and its
+    // handle must stay cancel-able via cancel_chain.
+    let mut upstream_terminal = false;
     while let Some(chunk) = upstream.recv().await {
         match &chunk.payload {
             Some(pb::stream_response::Payload::Chunk(c)) => {
@@ -1118,6 +1130,11 @@ pub(crate) async fn consume_stream_consumer(
                     &step.name,
                 )
                 .await;
+                // L1: the sub-stream has terminated (done/error/downstream
+                // closed) — drop its handle so `chain_handles` tracks only
+                // in-flight streams instead of accumulating O(chunks) over
+                // the chain's lifetime.
+                remove_chain_handle(chain_handles, &sub.stream_id);
                 if error_terminated {
                     // A node failed: cancel its worker and stop consuming
                     // upstream — the upstream sender drops with us (D18).
@@ -1138,9 +1155,18 @@ pub(crate) async fn consume_stream_consumer(
             Some(pb::stream_response::Payload::Error(_)) => {
                 let _ = downstream.send(chunk).await;
                 error_terminated = true;
+                upstream_terminal = true;
                 break;
             }
             _ => {}
+        }
+    }
+    // L1: the upstream head terminated (Done/terminal Error above, or a
+    // channel close — `!error_terminated` covers the while-let None exit)
+    // → its handle is no longer a cancel target; drop it.
+    if upstream_terminal || !error_terminated {
+        if let Some(id) = &upstream_handle_id {
+            remove_chain_handle(chain_handles, id);
         }
     }
     // Upstream exhausted (Done or channel close) = the chain finished
@@ -1159,6 +1185,18 @@ pub(crate) async fn consume_stream_consumer(
             .await;
     }
     Ok(())
+}
+
+/// L1: drop a terminated sub-stream's handle from the chain list (called at
+/// every sub-stream termination exit: done/error/cancel/downstream close).
+fn remove_chain_handle(
+    chain_handles: &Arc<std::sync::Mutex<Vec<StreamHandle>>>,
+    stream_id: &str,
+) {
+    chain_handles
+        .lock()
+        .unwrap()
+        .retain(|h| h.stream_id != stream_id);
 }
 
 /// §4.2: spawn the pipeline chain as one task tree and return the tail
@@ -1223,6 +1261,9 @@ async fn spawn_chain(
             abort: tokio::spawn(async {}).abort_handle(),
         });
     }
+    // L1: the first consumer drops the head's handle once the head stream
+    // terminates (its chunk channel reports Done/Error/close).
+    let head_handle_id = head_stream.stream_id.clone();
     // The top-level cancel_client is the head stream's client (synchronously
     // available) — adapters that only read the quick-access fields stay
     // unchanged; chain cancellation broadcasts over `chain` via
@@ -1269,10 +1310,16 @@ async fn spawn_chain(
             let handles = handles_h.clone();
             let snapshot = snapshot_h.clone();
             let prev_name = plan_h.steps[nodes[i - 1]].name.clone();
+            // L1: only the first consumer owns the head handle's cleanup.
+            let upstream_handle_id = if i == 1 {
+                Some(head_handle_id.clone())
+            } else {
+                None
+            };
             tasks.push(tokio::spawn(async move {
                 consume_stream_consumer(
                     &state, &plan, node, &prev_name, up_rx, down_tx, &ctx, &req, &opts,
-                    deadline_unix_ns, &handles, is_tail, &snapshot,
+                    deadline_unix_ns, &handles, upstream_handle_id, is_tail, &snapshot,
                 )
                 .await
             }));

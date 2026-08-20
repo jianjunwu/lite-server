@@ -28,6 +28,11 @@ pub(super) async fn auto_unpack_lma_files(
         Err(_) => return,
     };
 
+    // L5: (path, mtime) of every .lma currently on disk — `seen` is pruned
+    // against this at the end of the scan so deleted/replaced artifacts do
+    // not accumulate entries forever.
+    let mut on_disk: HashSet<(PathBuf, std::time::SystemTime)> = HashSet::new();
+
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if !path.is_file() {
@@ -40,6 +45,7 @@ pub(super) async fn auto_unpack_lma_files(
             Ok(t) => t,
             Err(_) => continue,
         };
+        on_disk.insert((path.clone(), mtime));
         if !seen.insert((path.clone(), mtime)) {
             continue;
         }
@@ -137,6 +143,10 @@ pub(super) async fn auto_unpack_lma_files(
         // Staging cleanup on every path (success move leaves it empty).
         let _ = tokio::fs::remove_dir_all(&staging).await;
     }
+
+    // L5: drop entries for artifacts no longer on disk at their recorded
+    // mtime (deleted, or replaced — the new mtime was inserted above).
+    seen.retain(|e| on_disk.contains(e));
 }
 
 /// H6: model name and version from the packer naming convention
@@ -638,6 +648,52 @@ with zipfile.ZipFile(out, "w") as zf:
             !tmp.join("escaped_evil").exists(),
             "a manifest name with '..' must not escape the staging dir — \
              content landed directly in the repo root, bypassing staging/swap"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// L5 (leak-gap-audit-0820): `seen` must be pruned against the artifacts
+    /// currently on disk after each scan. A replaced artifact (same path,
+    /// new mtime) must not leave its old (path, mtime) entry behind —
+    /// otherwise control_mode="auto" + high-churn artifact replacement grows
+    /// the set monotonically. The unpack itself fails here (fake content) —
+    /// irrelevant: the entry is recorded before the attempt.
+    #[tokio::test]
+    async fn auto_unpack_prunes_seen_entries_for_replaced_artifacts() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-seen-prune-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let artifact = tmp.join("m_v1.lma");
+        let t1 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let t2 = t1 + std::time::Duration::from_secs(1_000);
+
+        let write_with_mtime = |mtime: std::time::SystemTime| {
+            let mut f = std::fs::File::create(&artifact).unwrap();
+            f.write_all(b"not a zip").unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        };
+
+        let mut seen = HashSet::new();
+        write_with_mtime(t1);
+        auto_unpack_lma_files(&tmp, &mut seen, Duration::from_secs(30)).await;
+        assert_eq!(
+            seen.iter().cloned().collect::<Vec<_>>(),
+            vec![(artifact.clone(), t1)],
+            "the first scan must record the artifact's (path, mtime)"
+        );
+
+        write_with_mtime(t2);
+        auto_unpack_lma_files(&tmp, &mut seen, Duration::from_secs(30)).await;
+        assert_eq!(
+            seen.iter().cloned().collect::<Vec<_>>(),
+            vec![(artifact.clone(), t2)],
+            "a replaced artifact must leave only the new (path, mtime) entry"
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

@@ -483,7 +483,10 @@ policies:
                                  #   chunk — bounded cost) | drain (consume to Done)
       - input_ref: warmup/batch8.json   # another shape/batch (default iterations: 1)
     timeout_secs: 30.0           #   per-ITERATION budget (0 = fall back to request_timeout; 0 there = no bound)
-    total_timeout_secs: 0        #   whole-run budget across all units (0 = none, default)
+    total_timeout_secs: 0        #   whole-run budget across all units (0 = none, default).
+                                 #   With 0, a worker that accepts but never answers blocks the
+                                 #   load-path warmup indefinitely; the respawn re-warm is still
+                                 #   bounded by a fallback of max(startup_timeout, 300s)
     concurrency: 1               #   dummy inferences in flight per worker group (default 1 = serial)
     retries: 0                   #   retries per failed unit, 500ms apart (default 0 = fail-fast)
 
