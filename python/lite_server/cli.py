@@ -37,8 +37,8 @@ def main(argv=None):
     serve_parser.add_argument("--no-streaming-metrics", action="store_true", help="Disable streaming metrics")
 
     serve_parser.add_argument("--max-queue-size", type=int, help="Max queue size per model (overrides model config)")
-    serve_parser.add_argument("--max-requests", type=int, help="Auto-restart worker after N requests (0=disabled)")
-    serve_parser.add_argument("--max-requests-jitter", type=int, help="Jitter range for max_requests to prevent thundering herd")
+    serve_parser.add_argument("--max-requests", type=int, help="Rolling recycle: restart each worker after it serves N requests (0=disabled)")
+    serve_parser.add_argument("--max-requests-jitter", type=int, help="Per-worker jitter for max_requests to stagger recycles")
     serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
     serve_parser.add_argument("--health-check-interval", type=float, help="Active health check interval in seconds (0=disabled)")
     serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")

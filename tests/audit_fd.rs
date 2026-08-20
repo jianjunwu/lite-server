@@ -255,14 +255,12 @@ mod fd_b {
                 }],
             )
             .unwrap();
-        let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(8);
         queue.register_model(
             "m",
             "1",
             &audit_queue_config(),
             vec![],
             vec![Arc::new(WorkerZmqClient::new(endpoint))],
-            reload_tx,
             Arc::new(OutlierState::new(1)),
             None,
         );
@@ -382,15 +380,12 @@ mod fd_b {
     async fn test_f18_grpc_closed_response_channel_must_be_unavailable() {
         let (service, queue, registry) = build_grpc_service();
         register_ready(&registry, "m", "1");
-
-        let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(8);
         queue.register_model(
             "m",
             "1",
             &audit_queue_config(),
             vec![],
             vec![],
-            reload_tx,
             Arc::new(OutlierState::new(0)),
             None,
         );

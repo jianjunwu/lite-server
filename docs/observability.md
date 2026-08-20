@@ -72,10 +72,12 @@ with live requests in one batch, and all-warmup batches count toward none of
 the real-traffic series — `liteserver_inference_duration_seconds`,
 `liteserver_batch_size`, `liteserver_worker_inference_total`,
 `liteserver_queue_wait_seconds`, and `liteserver_retries_total` all stay pure
-real-traffic signals. Warmup inferences also do not consume the
-`max_requests` auto-recycle budget (worker-scope warmup multiplies the unit
-count by the worker count; counting it could auto-recycle immediately after
-every load). Respawn re-warm failures additionally count
+real-traffic signals. Warmup inferences also do not consume the per-worker
+`max_requests` recycle budget (worker-scope warmup multiplies the unit
+count by the worker count; counting it could recycle a worker immediately
+after every load). Rolling recycles surface as
+`liteserver_worker_respawns_total{reason="rolling_recycle"}` plus a transient
+per-worker ejection. Respawn re-warm failures additionally count
 `liteserver_worker_respawn_failures_total{reason="warmup"}`.
 
 ### Streaming metrics

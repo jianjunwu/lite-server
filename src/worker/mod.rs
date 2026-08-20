@@ -12,8 +12,7 @@ pub(crate) use routing::{pick_streaming_worker, PickError};
 
 use crate::callback::CallbackRunner;
 use crate::inference_queue::{
-    model_version_key, parse_model_version_key, InferenceQueue, OutlierState, ReloadSignal,
-    RespawnSignal,
+    model_version_key, parse_model_version_key, InferenceQueue, OutlierState, RespawnSignal,
 };
 use crate::registry::ModelRegistry;
 use crate::transport::zmq::WorkerZmqClient;
@@ -49,11 +48,8 @@ pub struct WorkerManager {
     // Custom @route declarations per model version (phase 2). Keyed by
     // model_version_key; upserted at worker handshake, cleared on unload.
     route_table: Arc<RwLock<HashMap<String, Vec<RouteDecl>>>>,
-    // Reload channel for max_requests auto-recycle
-    reload_tx: mpsc::Sender<ReloadSignal>,
-    reload_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ReloadSignal>>>,
 
-    // Respawn channel for health-check-kill-triggered worker restarts
+    // Respawn channel for health-check-kill / rolling-recycle worker restarts
     respawn_tx: mpsc::Sender<RespawnSignal>,
     respawn_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RespawnSignal>>>,
     // Log level passed to Python workers
@@ -128,7 +124,6 @@ impl WorkerManager {
         log_level: String,
         callback_runner: Arc<CallbackRunner>,
     ) -> Self {
-        let (reload_tx, reload_rx) = mpsc::channel::<ReloadSignal>(8);
         let (respawn_tx, respawn_rx) = mpsc::channel::<RespawnSignal>(8);
         Self {
             registry,
@@ -139,8 +134,6 @@ impl WorkerManager {
             zmq_clients: Arc::new(RwLock::new(HashMap::new())),
             outlier_states: Arc::new(RwLock::new(HashMap::new())),
             route_table: Arc::new(RwLock::new(HashMap::new())),
-            reload_tx,
-            reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
             respawn_tx,
             respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
             log_level,

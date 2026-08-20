@@ -454,51 +454,6 @@ impl WorkerManager {
         })
     }
 
-    /// Start the reload listener. Must be called once after construction.
-    pub async fn start_reload_listener(self: &Arc<Self>) {
-        let mut rx_guard = self.reload_rx.lock().await;
-        if let Some(mut rx) = rx_guard.take() {
-            let wm = Arc::downgrade(self);
-            tokio::spawn(async move {
-                let mut reloading = std::collections::HashSet::new();
-                while let Some(signal) = rx.recv().await {
-                    // Dedup per (model, version): two versions of the same
-                    // model recycle independently.
-                    let key = model_version_key(&signal.model_name, &signal.version);
-                    if !reloading.insert(key.clone()) {
-                        continue; // already reloading
-                    }
-                    if let Some(wm) = wm.upgrade() {
-                        info!(
-                            "Auto-recycling model {} version {} (max_requests reached)",
-                            signal.model_name, signal.version
-                        );
-                        let result = wm
-                            .reload_model(&signal.model_name, Some(&signal.version))
-                            .await;
-                        match result {
-                            Ok(true) => info!(
-                                "Model {} version {} auto-recycled successfully",
-                                signal.model_name, signal.version
-                            ),
-                            Ok(false) => warn!(
-                                "Model {} version {} not found for auto-recycle",
-                                signal.model_name, signal.version
-                            ),
-                            Err(e) => error!(
-                                "Model {} version {} auto-recycle failed: {}",
-                                signal.model_name, signal.version, e
-                            ),
-                        }
-                        reloading.remove(&key);
-                    } else {
-                        break; // WorkerManager dropped
-                    }
-                }
-            });
-        }
-    }
-
     /// Hot reload without restart (P3): send FILE_CHANGED to every worker of
     /// a model version so each worker's `on_file_changed` hook can refresh
     /// weights/configs in-process. Returns true only if at least one worker
@@ -931,7 +886,6 @@ impl WorkerManager {
             &model_config,
             worker_infos,
             zmq_clients_for_model,
-            self.reload_tx.clone(),
             outlier.clone(),
             Some(self.respawn_tx.clone()),
         );
@@ -1936,9 +1890,6 @@ mod tests {
     use crate::callback::CallbackRunner;
     use crate::inference_queue::InferenceQueue;
     use crate::registry::ModelRegistry;
-    use tokio::sync::mpsc;
-
-    // ===== Reload Channel tests =====
 
     /// H5: force_unload_version must clean the registry (and be a no-op
     /// for versions that never existed — the delete escalation path calls
@@ -1973,87 +1924,6 @@ mod tests {
             // Idempotent: a second call on the deleted version is a no-op.
             wm.force_unload_version("m", "1").await.unwrap();
         });
-    }
-
-    #[test]
-    fn test_reload_channel_creation() {
-        // WorkerManager creates a reload channel in its constructor
-        let (tx, mut rx) = mpsc::channel::<crate::inference_queue::ReloadSignal>(8);
-
-        // Sender should be cloneable (for multiple batch collectors)
-        let tx2 = tx.clone();
-
-        // Send a signal
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            tx.send(crate::inference_queue::ReloadSignal {
-                model_name: "test".to_string(),
-                version: "1".to_string(),
-            })
-            .await
-            .unwrap();
-
-            let signal = rx.recv().await.unwrap();
-            assert_eq!(signal.model_name, "test");
-            assert_eq!(signal.version, "1");
-
-            // Clone also works
-            tx2.send(crate::inference_queue::ReloadSignal {
-                model_name: "test2".to_string(),
-                version: "1".to_string(),
-            })
-            .await
-            .unwrap();
-            let signal2 = rx.recv().await.unwrap();
-            assert_eq!(signal2.model_name, "test2");
-        });
-    }
-
-    #[test]
-    fn test_reload_signal_dedup() {
-        // Simulate the dedup logic from start_reload_listener: the key is
-        // per (model, version) so two versions of the same model recycle
-        // independently.
-        let mut reloading = std::collections::HashSet::new();
-
-        let a1 = model_version_key("model_a", "1");
-        let a2 = model_version_key("model_a", "2");
-
-        // First signal for model_a v1 → should process
-        assert!(reloading.insert(a1.clone()));
-
-        // Second signal for model_a v1 while reloading → should skip
-        assert!(!reloading.insert(a1.clone()));
-
-        // Same model, different version → independent, should process
-        assert!(reloading.insert(a2.clone()));
-
-        // After model_a v1 finishes reloading
-        reloading.remove(&a1);
-
-        // model_a v1 can be reloaded again
-        assert!(reloading.insert(a1.clone()));
-    }
-
-    #[tokio::test]
-    async fn test_reload_channel_try_send_non_blocking() {
-        // try_send should not block even when channel is full
-        let (tx, _rx) = mpsc::channel::<crate::inference_queue::ReloadSignal>(1);
-
-        // First send succeeds
-        assert!(tx
-            .try_send(crate::inference_queue::ReloadSignal {
-                model_name: "m1".to_string(),
-                version: "1".to_string(),
-            })
-            .is_ok());
-
-        // Second send should fail (channel full) — not block
-        assert!(tx
-            .try_send(crate::inference_queue::ReloadSignal {
-                model_name: "m2".to_string(),
-                version: "1".to_string(),
-            })
-            .is_err());
     }
 
     // ===== L3: respawn re-warm fallback budget =====
@@ -2118,7 +1988,6 @@ mod tests {
         );
         let _silent = spawn_silent_worker(endpoint.clone());
         let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
         queue.register_model(
             "m",
@@ -2126,7 +1995,6 @@ mod tests {
             &crate::config::ModelConfig::default(),
             registry.get("m", Some("1")).unwrap().workers.clone(),
             vec![client],
-            reload_tx,
             outlier,
             None,
         );

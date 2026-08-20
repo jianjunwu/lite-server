@@ -261,10 +261,8 @@ impl LiteServer {
             });
         }
 
-        // Start reload listener for max_requests auto-recycle
-        self.worker_manager.start_reload_listener().await;
-
-        // Start respawn listener for health-check-kill-triggered worker restarts
+        // Start respawn listener for health-check-kill / rolling-recycle
+        // worker restarts
         self.worker_manager.start_respawn_listener().await;
 
         // H7: sweep crash leftovers (staging dirs, swap backups, stale pack
