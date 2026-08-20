@@ -1271,6 +1271,11 @@ pub struct ModelConfig {
     pub accelerator: Option<String>,
     pub devices: Option<serde_json::Value>,
     pub workers_per_device: Option<usize>,
+    /// Max number of workers spawned+handshaken concurrently at load time.
+    /// None/1 = serial (legacy). >1 overlaps weight loading across workers —
+    /// same-device workers then load concurrently, so size it against GPU
+    /// memory headroom.
+    pub startup_concurrency: Option<usize>,
     pub max_queue_size: usize,
     pub hot_reload: bool,
     pub hot_reload_patterns: Vec<String>,
@@ -1333,6 +1338,7 @@ impl Default for ModelConfig {
             accelerator: None,
             devices: None,
             workers_per_device: None,
+            startup_concurrency: None,
             max_queue_size: 1000,
             hot_reload: false,
             hot_reload_patterns: vec!["*.py".to_string()],

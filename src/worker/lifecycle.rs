@@ -220,7 +220,240 @@ fn validate_warmup_response(
     )))
 }
 
+/// Phase-1 output of the load spawn driver: one handshaken worker process,
+/// not yet registered. Registration (metrics / routes / monitor / maps)
+/// happens in phase 2, strictly in worker_id order.
+struct WorkerReady {
+    worker_id: usize,
+    device: String,
+    endpoint: String,
+    child: tokio::process::Child,
+    startup: WorkerStartup,
+}
+
 impl WorkerManager {
+    /// Phase 1 of the load spawn driver: spawn ONE worker process, wait for
+    /// its ready handshake (bounded by startup_timeout or the shutdown
+    /// token, whichever fires first), and start the post-ready pipe drainers
+    /// so a fast worker cannot block on a full pipe while slower siblings
+    /// are still loading. Shared registration (metrics / routes / monitor /
+    /// maps) happens in phase 2, in worker_id order. Safe to run
+    /// concurrently across worker_ids: every touched resource (socket path,
+    /// pipes, child process) is per-worker.
+    // allow: 单 worker spawn 上下文(model/version/config/dir/device 布局)
+    // 原样透传,phase-1 并发共享同一借用,引入参数结构体只增间接。
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_handshake(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        model_dir: &std::path::Path,
+        worker_id: usize,
+        devices: usize,
+        accelerator: &str,
+    ) -> Result<WorkerReady, AppError> {
+        let device = format!("{}:{}", accelerator, worker_id % devices);
+        let endpoint = worker_endpoint(model_name, version, worker_id);
+
+        // Remove stale socket (Unix only — TCP ports are released on process exit)
+        #[cfg(unix)]
+        {
+            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+            let socket_path = std::path::Path::new(socket_str);
+            let _ = tokio::fs::remove_file(socket_path).await;
+            if let Some(parent) = socket_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+        }
+
+        // Find python module path
+        let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
+        cmd.current_dir(model_dir);
+
+        let mut child = cmd
+            .arg("-m")
+            .arg("lite_server.worker.inference")
+            .arg("--model-name")
+            .arg(model_name)
+            .arg("--version")
+            .arg(version)
+            .arg("--model-py")
+            .arg(model_dir.join("model.py"))
+            .arg("--config")
+            .arg(model_dir.join("config.yaml"))
+            .arg("--device")
+            .arg(&device)
+            .arg("--worker-id")
+            .arg(worker_id.to_string())
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .arg("--log-level")
+            .arg(&self.log_level);
+
+        if model_config.continuous_batching {
+            child = child.arg("--continuous-batching");
+        }
+
+        if let Some(ref server_http) = self.server_http {
+            child = child.arg("--server-http").arg(server_http);
+        }
+
+        let mut child = child
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
+                AppError::Python(format!("failed to spawn worker: {}", e))
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+        // Option: the n==0 diagnostic below takes the pipe out for the
+        // stderr drain; the logger spawn takes it back. A bare binding
+        // moved on one branch defeats the async capture analysis.
+        let mut stderr = Some(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?,
+        );
+
+        // Wait for "ready" signal. The shutdown token outraces
+        // startup_timeout: a worker stuck in setup() unwinds the whole
+        // load (via the spawn block's error path) as soon as shutdown
+        // starts instead of holding the process until the timeout.
+        let mut reader = BufReader::new(stdout);
+        let mut ready_line = String::new();
+        let n = tokio::select! {
+            _ = self.shutdown_token.cancelled() => Err(AppError::Internal(
+                "load cancelled: server shutting down".to_string(),
+            )),
+            result = timeout(
+                Duration::from_secs_f32(model_config.startup_timeout),
+                reader.read_line(&mut ready_line),
+            ) => result
+                .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+                .and_then(|r| r.map_err(AppError::Io)),
+        }?;
+        let exited_check: Result<(), AppError> = if n == 0 {
+            let stderr_tail =
+                drain_worker_stderr(stderr.take().unwrap(), &self.server_tunables).await;
+            let msg = if stderr_tail.trim().is_empty() {
+                "worker exited before ready".to_string()
+            } else {
+                format!("worker exited before ready: {stderr_tail}")
+            };
+            Err(AppError::WorkerCrashed(msg))
+        } else {
+            Ok(())
+        };
+        exited_check?;
+        let stdout = reader.into_inner();
+
+        let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
+            .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
+
+        let not_ready: Result<(), AppError> = if startup.status != "ready" {
+            Err(AppError::WorkerCrashed(format!(
+                "worker {} startup failed: {:?}",
+                worker_id, startup.message
+            )))
+        } else {
+            Ok(())
+        };
+        not_ready?;
+
+        info!(
+            "Worker {} for {} v{} ready (pid={:?})",
+            worker_id,
+            model_name,
+            version,
+            child.id()
+        );
+
+        // Fire on_ready lifecycle hook
+        execute_hook(
+            "ready",
+            &model_config.hooks,
+            vec![
+                ("$MODEL".to_string(), model_name.to_string()),
+                ("$VERSION".to_string(), version.to_string()),
+                ("$WORKER_ID".to_string(), worker_id.to_string()),
+            ],
+            &self.hook_tasks,
+        );
+
+        // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
+        // if anything writes to stdout after the ready signal.
+        tokio::spawn(async move {
+            let mut discard = [0u8; 1024];
+            let mut stdout = stdout;
+            loop {
+                match stdout.read(&mut discard).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Start stderr logger
+        let model_name_clone = model_name.to_string();
+        let version_clone = version.to_string();
+        let worker_id_clone = worker_id;
+        // Still Some: the n==0 take above diverges via exited_check.
+        let stderr = stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::with_capacity(1024);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => {
+                        tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
+                        break;
+                    }
+                    Ok(_) => {
+                        // Strip trailing newline / carriage-return
+                        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                        let line = String::from_utf8_lossy(&buf);
+                        let level = classify_stderr_line(line.trim());
+                        let msg = strip_level_prefix(line.trim());
+                        emit_stderr_line(
+                            level,
+                            msg,
+                            worker_id_clone,
+                            &model_name_clone,
+                            &version_clone,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            worker_id = worker_id_clone,
+                            "Worker stderr read error: {}",
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(WorkerReady {
+            worker_id,
+            device,
+            endpoint,
+            child,
+            startup,
+        })
+    }
+
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
         let mut rx_guard = self.reload_rx.lock().await;
@@ -517,123 +750,46 @@ impl WorkerManager {
             outliers.insert(key.clone(), outlier.clone());
         }
         let spawn_result: Result<(Vec<WorkerInfo>, Vec<Arc<WorkerZmqClient>>), AppError> = async {
+            // Phase 1 — concurrent spawn + handshake (startup_concurrency;
+            // 1 = legacy serial). Each future owns its child: on the first
+            // error the `?` drops the stream (in-flight handshakes die via
+            // kill_on_drop) and the completed-but-unregistered WorkerReadys
+            // in `ready` die the same way.
+            let concurrency = model_config.startup_concurrency.unwrap_or(1).max(1);
+            let mut handshakes = futures::stream::iter((0..total_workers).map(|worker_id| {
+                self.spawn_and_handshake(
+                    model_name,
+                    version,
+                    &model_config,
+                    &model_dir,
+                    worker_id,
+                    devices,
+                    accelerator,
+                )
+            }))
+            .buffer_unordered(concurrency);
+            let mut ready: Vec<Option<WorkerReady>> = (0..total_workers).map(|_| None).collect();
+            while let Some(result) = handshakes.next().await {
+                let r = result?;
+                let worker_id = r.worker_id;
+                ready[worker_id] = Some(r);
+            }
+            drop(handshakes);
+
+            // Phase 2 — registration in worker_id order (worker_infos and
+            // zmq_clients are index-aligned; routing pins by Vec index).
+            // Each worker enters the maps right after its monitor is up, so
+            // shutdown/unload can reach a partially-registered version.
             let mut worker_infos = Vec::new();
             let mut zmq_clients_for_model = Vec::new();
-
-            for worker_id in 0..total_workers {
-                let device = format!("{}:{}", accelerator, worker_id % devices);
-                let endpoint = worker_endpoint(model_name, version, worker_id);
-
-                // Remove stale socket (Unix only — TCP ports are released on process exit)
-                #[cfg(unix)]
-                {
-                    let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-                    let socket_path = std::path::Path::new(socket_str);
-                    let _ = tokio::fs::remove_file(socket_path).await;
-                    if let Some(parent) = socket_path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                }
-
-                // Find python module path
-                let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
-                cmd.current_dir(&model_dir);
-
-                let mut child = cmd
-                    .arg("-m")
-                    .arg("lite_server.worker.inference")
-                    .arg("--model-name")
-                    .arg(model_name)
-                    .arg("--version")
-                    .arg(version)
-                    .arg("--model-py")
-                    .arg(&model_py)
-                    .arg("--config")
-                    .arg(&config_yaml)
-                    .arg("--device")
-                    .arg(&device)
-                    .arg("--worker-id")
-                    .arg(worker_id.to_string())
-                    .arg("--endpoint")
-                    .arg(&endpoint)
-                    .arg("--log-level")
-                    .arg(&self.log_level);
-
-                if model_config.continuous_batching {
-                    child = child.arg("--continuous-batching");
-                }
-
-                if let Some(ref server_http) = self.server_http {
-                    child = child.arg("--server-http").arg(server_http);
-                }
-
-                let mut child = child
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
-                        AppError::Python(format!("failed to spawn worker: {}", e))
-                    })?;
-
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
-                // Option: the n==0 diagnostic below takes the pipe out for the
-                // stderr drain; the logger spawn takes it back. A bare binding
-                // moved on one branch defeats the async capture analysis.
-                let mut stderr = Some(
-                    child
-                        .stderr
-                        .take()
-                        .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?,
-                );
-
-                // Wait for "ready" signal. The shutdown token outraces
-                // startup_timeout: a worker stuck in setup() unwinds the whole
-                // load (via the spawn block's error path) as soon as shutdown
-                // starts instead of holding the process until the timeout.
-                let mut reader = BufReader::new(stdout);
-                let mut ready_line = String::new();
-                let n = tokio::select! {
-                    _ = self.shutdown_token.cancelled() => Err(AppError::Internal(
-                        "load cancelled: server shutting down".to_string(),
-                    )),
-                    result = timeout(
-                        Duration::from_secs_f32(model_config.startup_timeout),
-                        reader.read_line(&mut ready_line),
-                    ) => result
-                        .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
-                        .and_then(|r| r.map_err(AppError::Io)),
-                }?;
-                let exited_check: Result<(), AppError> = if n == 0 {
-                    let stderr_tail =
-                        drain_worker_stderr(stderr.take().unwrap(), &self.server_tunables).await;
-                    let msg = if stderr_tail.trim().is_empty() {
-                        "worker exited before ready".to_string()
-                    } else {
-                        format!("worker exited before ready: {stderr_tail}")
-                    };
-                    Err(AppError::WorkerCrashed(msg))
-                } else {
-                    Ok(())
-                };
-                exited_check?;
-                let stdout = reader.into_inner();
-
-                let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
-                    .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
-
-                let not_ready: Result<(), AppError> = if startup.status != "ready" {
-                    Err(AppError::WorkerCrashed(format!(
-                        "worker {} startup failed: {:?}",
-                        worker_id, startup.message
-                    )))
-                } else {
-                    Ok(())
-                };
-                not_ready?;
+            for (worker_id, slot) in ready.iter_mut().enumerate() {
+                let WorkerReady {
+                    device,
+                    endpoint,
+                    child,
+                    startup,
+                    ..
+                } = slot.take().expect("phase 1 filled every slot");
 
                 // Register custom metrics from Python worker (gated by
                 // features.custom_metrics; recording no-ops on unregistered ids).
@@ -644,7 +800,9 @@ impl WorkerManager {
                             .map(|s| (s.name.as_str(), s.metric_type.as_str()))
                             .collect();
                         crate::metrics::prometheus::register_custom_metrics(
-                            model_name, version, &spec_refs,
+                            model_name,
+                            version,
+                            &spec_refs,
                         );
                     }
                 }
@@ -656,84 +814,6 @@ impl WorkerManager {
                 // Register custom @route declarations (phase 2)
                 self.upsert_routes(model_name, version, startup.custom_routes)
                     .await;
-
-                info!(
-                    "Worker {} for {} v{} ready (pid={:?})",
-                    worker_id,
-                    model_name,
-                    version,
-                    child.id()
-                );
-
-                // Fire on_ready lifecycle hook
-                execute_hook(
-                    "ready",
-                    &model_config.hooks,
-                    vec![
-                        ("$MODEL".to_string(), model_name.to_string()),
-                        ("$VERSION".to_string(), version.to_string()),
-                        ("$WORKER_ID".to_string(), worker_id.to_string()),
-                    ],
-                    &self.hook_tasks,
-                );
-
-                // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
-                // if anything writes to stdout after the ready signal.
-                tokio::spawn(async move {
-                    let mut discard = [0u8; 1024];
-                    let mut stdout = stdout;
-                    loop {
-                        match stdout.read(&mut discard).await {
-                            Ok(0) => break,
-                            Ok(_) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                });
-
-                // Start stderr logger
-                let model_name_clone = model_name.to_string();
-                let version_clone = version.to_string();
-                let worker_id_clone = worker_id;
-                // Still Some: the n==0 take above diverges via exited_check.
-                let stderr = stderr.take().unwrap();
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(stderr);
-                    let mut buf = Vec::with_capacity(1024);
-                    loop {
-                        buf.clear();
-                        match reader.read_until(b'\n', &mut buf).await {
-                            Ok(0) => {
-                                tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
-                                break;
-                            }
-                            Ok(_) => {
-                                // Strip trailing newline / carriage-return
-                                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                                    buf.pop();
-                                }
-                                let line = String::from_utf8_lossy(&buf);
-                                let level = classify_stderr_line(line.trim());
-                                let msg = strip_level_prefix(line.trim());
-                                emit_stderr_line(
-                                    level,
-                                    msg,
-                                    worker_id_clone,
-                                    &model_name_clone,
-                                    &version_clone,
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    worker_id = worker_id_clone,
-                                    "Worker stderr read error: {}",
-                                    e
-                                );
-                                break;
-                            }
-                        }
-                    }
-                });
 
                 // Create ZMQ client (binds the socket, worker connects). CB
                 // workers get cb_remove notifications when a reply slot dies
@@ -794,8 +874,8 @@ impl WorkerManager {
                 }
 
                 // Incremental registration: the worker is visible to
-                // shutdown/unload from here on; a later failure in this loop
-                // tears these entries down through the shared teardown path.
+                // shutdown/unload from here on; a later failure tears these
+                // entries down through the shared teardown path.
                 {
                     let mut workers = self.workers.write().await;
                     workers.entry(key.clone()).or_default().push(WorkerProcess {
@@ -2659,6 +2739,227 @@ class TestAPI(LitAPI):
         assert!(
             wm.get_zmq_clients("clean", "1").await.is_none(),
             "a cancelled load must not leave zmq clients registered"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== Parallel worker startup (worker-startup-shutdown-and-parallel-plan §2.2) =====
+
+    /// Harness: a two-worker model whose setup() sleeps `setup_secs`
+    /// (simulating weight loading). Returns (manager, registry, repo).
+    #[cfg(unix)]
+    async fn parallel_harness(
+        tag: &str,
+        setup_secs: u32,
+        startup_concurrency: Option<usize>,
+    ) -> (
+        Arc<WorkerManager>,
+        Arc<ModelRegistry>,
+        std::path::PathBuf,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-par-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        time.sleep({setup_secs})
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 2\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let config = ModelConfig {
+            devices: Some(serde_json::json!(2)),
+            startup_concurrency,
+            ..Default::default()
+        };
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load must succeed");
+        (wm, registry, repo)
+    }
+
+    /// startup_concurrency=2 overlaps the two workers' 3s setups: total load
+    /// time is ~max(setup) + spawn overhead, well under the serial floor of
+    /// 2 x 3s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_overlaps_worker_setup() {
+        let start = std::time::Instant::now();
+        let (wm, _registry, repo) = parallel_harness("overlap", 3, Some(2)).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(5500),
+            "parallel load took {elapsed:?}; serial would be >= ~6s (2 x 3s setups)"
+        );
+
+        let _ = wm.unload_model("overlap", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Default (startup_concurrency unset) preserves the serial behavior:
+    /// two 3s setups run back-to-back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_startup_is_serial() {
+        let start = std::time::Instant::now();
+        let (wm, _registry, repo) = parallel_harness("serial", 3, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(5500),
+            "serial load finished in {elapsed:?} (< 2 x 3s setups) — default must stay serial"
+        );
+
+        let _ = wm.unload_model("serial", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Concurrent handshakes complete out of order, but registration must
+    /// stay index-aligned by worker_id (routing pins by Vec index).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_preserves_worker_order() {
+        let (wm, registry, repo) = parallel_harness("order", 1, Some(2)).await;
+
+        let workers = registry
+            .get("order", Some("1"))
+            .expect("version registered")
+            .workers;
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].worker_id, 0, "slot 0 must be worker 0");
+        assert_eq!(workers[1].worker_id, 1, "slot 1 must be worker 1");
+        assert_eq!(
+            wm.get_zmq_clients("order", "1").await.map(|c| c.len()),
+            Some(2),
+            "one zmq client per worker, index-aligned"
+        );
+
+        let _ = wm.unload_model("order", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A mid-load failure under concurrency must still reap every worker
+    /// that already started (W1 shape, parallel driver).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_parallel_startup_failure_reaps_started_workers() {
+        use std::io::Read;
+
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-par-fail-{}", std::process::id()));
+        let model_dir = repo.join("par_fail").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        if device == "cpu:1":
+            # Fail AFTER worker 0 has started setup (its failure would
+            # otherwise race worker 0's interpreter startup under
+            # concurrency and the pid file might never appear).
+            time.sleep(2)
+            raise RuntimeError("device 1 refuses to start")
+        with open("setup_pid.txt", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(3)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 2\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let config = ModelConfig {
+            devices: Some(serde_json::json!(2)),
+            startup_concurrency: Some(2),
+            ..Default::default()
+        };
+
+        let err = wm.load_model("par_fail", "1", &config).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkerCrashed(_)),
+            "load must fail when worker 1 refuses to start, got {err:?}"
+        );
+
+        let mut pid_str = String::new();
+        std::fs::File::open(model_dir.join("setup_pid.txt"))
+            .expect("worker 0 must have written setup_pid.txt")
+            .read_to_string(&mut pid_str)
+            .expect("read pid file");
+        let pid: i32 = pid_str.trim().parse().expect("pid is numeric");
+
+        let mut reaped = false;
+        for _ in 0..25 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !reaped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "worker pid {pid} survived a failed parallel load — started workers \
+             must be reaped on the error path"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
