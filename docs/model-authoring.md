@@ -67,7 +67,7 @@ def setup(self, device):
     self.model.eval()
 ```
 
-- `device` has the format `{accelerator}:{index}` (e.g., `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, `"rocm:0"`, `"mps:0"`). It is controlled by the `accelerator` (default `"cpu"`), `devices`, and `workers_per_device` fields in `config.yaml`. The framework does **not** auto-detect hardware — `device` is an opaque label forwarded from config; your `setup()` is responsible for interpreting it.
+- `device` has the format `{accelerator}:{index}` (e.g., `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, `"rocm:0"`, `"mps:0"`). It is controlled by the `accelerator` (default `"cpu"`), `devices`, and `workers_per_device` fields in `config.yaml`. `devices` accepts an integer (`4` → devices 0-3 round-robin), a list of indices (`[1, 3]` → only those devices), or a map of per-device worker counts (`{ "1": 2, "3": 1 }`). The framework does **not** auto-detect hardware — `device` is an opaque label forwarded from config; your `setup()` is responsible for interpreting it.
 - Resources stored on `self` persist for the worker's lifetime
 
 #### `decode_request(self, request)`

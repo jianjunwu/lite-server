@@ -266,10 +266,10 @@ impl WorkerManager {
         model_config: &ModelConfig,
         model_dir: &std::path::Path,
         worker_id: usize,
-        devices: usize,
+        device_index: usize,
         accelerator: &str,
     ) -> Result<WorkerReady, AppError> {
-        let device = format!("{}:{}", accelerator, worker_id % devices);
+        let device = format!("{}:{}", accelerator, device_index);
         let endpoint = worker_endpoint(model_name, version, worker_id);
 
         // Remove stale socket (Unix only — TCP ports are released on process exit)
@@ -670,15 +670,22 @@ impl WorkerManager {
 
         // Launch workers
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
-        let devices = match &model_config.devices {
-            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,
-            Some(serde_json::Value::String(s)) if s == "auto" => 1,
-            _ => 1,
-        };
+        // worker_id → device-index table (device-placement plan); validated
+        // already by ModelConfig::validate above, so this cannot fail.
+        let device_plan = model_config
+            .resolve_device_plan()
+            .map_err(|e| AppError::Config(e.to_string()))?;
         let workers_per_device = model_config.workers_per_device.unwrap_or(1);
 
         if model_config.continuous_batching && workers_per_device != 1 {
             warn!("continuous_batching enabled; forcing workers_per_device=1");
+        }
+        if model_config.continuous_batching {
+            if let Some(serde_json::Value::Object(m)) = &model_config.devices {
+                if m.values().any(|v| v.as_u64() != Some(1)) {
+                    warn!("continuous_batching enabled; forcing per-device worker counts to 1");
+                }
+            }
         }
         if model_config.continuous_batching && model_config.stream {
             // B5: CB workers answer stream opens with an explicit terminal
@@ -690,12 +697,7 @@ impl WorkerManager {
             );
         }
 
-        let computed = if model_config.continuous_batching {
-            devices
-        } else {
-            devices * workers_per_device
-        };
-        let total_workers = computed;
+        let total_workers = device_plan.len();
 
         // Create shared OutlierState — single instance for batch_collector,
         // health_checker, and streaming. Ejection thresholds come from
@@ -735,7 +737,7 @@ impl WorkerManager {
                     &model_config,
                     &model_dir,
                     worker_id,
-                    devices,
+                    device_plan[worker_id],
                     accelerator,
                 )
             }))
