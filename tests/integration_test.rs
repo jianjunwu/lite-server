@@ -8041,7 +8041,7 @@ async fn test_cache_registry_stale_pin_blocks_auto_activation() {
                 let ready_ok = ready.iter().all(|want| {
                     versions
                         .iter()
-                        .any(|x| x["version"] == *want && x["status"] == "Ready")
+                        .any(|x| x["version"] == *want && x["status"] == "ready")
                 });
                 if ready_ok {
                     return v;
@@ -8096,7 +8096,7 @@ async fn test_cache_registry_stale_pin_blocks_auto_activation() {
         .iter()
         .find(|x| x["version"] == "1")
         .expect("v1 registered after the failed load");
-    assert_ne!(v1["status"], "Ready", "v1 must be broken after the failed load");
+    assert_eq!(v1["status"], "failed", "v1 must be broken after the failed load");
     assert_eq!(
         info["active_version"].as_str(),
         Some("2"),
