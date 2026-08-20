@@ -56,14 +56,15 @@ impl WarmupFailure {
     }
 }
 
-/// L3 (leak-gap-audit-0820): fallback total budget for the DETACHED respawn
-/// re-warm — max(startup_timeout, 300s). With the default
-/// total_timeout_secs=0 a replacement worker that hangs (accepts but never
-/// answers, kill_threshold=0) would otherwise park the detached task
-/// forever: it holds an Arc<WorkerManager> + the whole ModelConfig clone,
-/// and the slot never force-ejects (that only happens on warmup FAILURE).
-/// 300s floors the budget for configs with a tiny startup_timeout.
-fn rewarm_fallback_budget(model_config: &ModelConfig) -> Duration {
+/// L3 (leak-gap-audit-0820): fallback total budget for an unbudgeted warmup
+/// (policy total_timeout_secs=0) — max(startup_timeout, 300s). Applies to the
+/// DETACHED respawn re-warm (a hung replacement would otherwise park the
+/// detached task forever: it holds an Arc<WorkerManager> + the whole
+/// ModelConfig clone, and the slot never force-ejects) and, since the
+/// shutdown-window work, to the LOAD-time warmup (a hung worker would
+/// otherwise park load_model past startup_timeout). 300s floors the budget
+/// for configs with a tiny startup_timeout.
+fn warmup_fallback_budget(model_config: &ModelConfig) -> Duration {
     Duration::from_secs_f32(model_config.startup_timeout).max(Duration::from_secs(300))
 }
 
@@ -869,7 +870,7 @@ impl WorkerManager {
                     _ = self.shutdown_token.cancelled() => {
                         Err("load cancelled: server shutting down".to_string())
                     }
-                    r = self.run_warmup(model_name, version, &model_config, policy, None) => r,
+                    r = self.run_warmup_budgeted(model_name, version, &model_config, policy, None) => r,
                 };
                 match warmup_result {
                     Ok(()) => {
@@ -993,50 +994,52 @@ impl WorkerManager {
         result.map_err(|e| e.reason)
     }
 
-    /// G2/L3: the respawn re-warm — run_warmup plus the L3 fallback budget
-    /// ([`rewarm_fallback_budget`]). An explicit `total_timeout_secs` already
-    /// bounds the run inside run_warmup; the fallback only covers the
-    /// default (unbudgeted) case.
-    pub(super) async fn run_rewarm_budgeted(
+    /// G2/L3 + load: run_warmup plus the L3 fallback budget
+    /// ([`warmup_fallback_budget`]) when the policy has no explicit
+    /// `total_timeout_secs` (which already bounds the run inside run_warmup).
+    /// `pin`: `Some(worker)` = respawn re-warm of one slot; `None` = the
+    /// load-time warmup over all workers — an unbudgeted load warmup would
+    /// otherwise park `load_model` forever on a hung worker.
+    pub(super) async fn run_warmup_budgeted(
         &self,
         model_name: &str,
         version: &str,
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
-        worker_id: u32,
+        pin: Option<u32>,
     ) -> Result<(), String> {
         if policy.total_timeout_secs > 0.0 {
             return self
-                .run_warmup(model_name, version, model_config, policy, Some(worker_id))
+                .run_warmup(model_name, version, model_config, policy, pin)
                 .await;
         }
-        let budget = rewarm_fallback_budget(model_config);
-        self.run_rewarm_with_budget(model_name, version, model_config, policy, worker_id, budget)
+        let budget = warmup_fallback_budget(model_config);
+        self.run_warmup_with_budget(model_name, version, model_config, policy, pin, budget)
             .await
     }
 
     /// L3: run_warmup under an outer total budget; a budget expiry concludes
-    /// as a warmup failure (the respawn path force-ejects the slot) instead
-    /// of parking the detached task forever. Split from
-    /// [`run_rewarm_budgeted`] so tests can inject a sub-second budget.
-    async fn run_rewarm_with_budget(
+    /// as a warmup failure (the load path marks the version Failed; the
+    /// respawn path force-ejects the slot) instead of parking forever. Split
+    /// from [`run_warmup_budgeted`] so tests can inject a sub-second budget.
+    async fn run_warmup_with_budget(
         &self,
         model_name: &str,
         version: &str,
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
-        worker_id: u32,
+        pin: Option<u32>,
         budget: Duration,
     ) -> Result<(), String> {
         match timeout(
             budget,
-            self.run_warmup(model_name, version, model_config, policy, Some(worker_id)),
+            self.run_warmup(model_name, version, model_config, policy, pin),
         )
         .await
         {
             Ok(r) => r,
             Err(_) => Err(format!(
-                "respawn re-warm exceeded fallback budget of {:.0}s (warmup total_timeout_secs unset)",
+                "warmup exceeded fallback budget of {:.0}s (total_timeout_secs unset)",
                 budget.as_secs_f64()
             )),
         }
@@ -2103,12 +2106,12 @@ mod tests {
         };
         let policy = rewarm_policy(0.0);
         let err = wm
-            .run_rewarm_with_budget(
+            .run_warmup_with_budget(
                 "m",
                 "1",
                 &config,
                 &policy,
-                0,
+                Some(0),
                 Duration::from_millis(200),
             )
             .await
@@ -2116,6 +2119,46 @@ mod tests {
         assert!(
             err.contains("fallback budget"),
             "the fallback budget must fail the re-warm, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// Load-time warmup (pin=None) gets the same fallback total budget as
+    /// the respawn re-warm when the policy has none — a load whose warmup
+    /// hangs must conclude as a load failure, not park load_model forever.
+    #[tokio::test]
+    async fn load_warmup_fallback_budget_terminates_on_silent_worker() {
+        let (wm, model_dir) = rewarm_harness("loadbudget").await;
+        let config = crate::config::ModelConfig {
+            startup_timeout: 1.0,
+            ..Default::default()
+        };
+        let policy = rewarm_policy(0.0);
+        let err = wm
+            .run_warmup_with_budget("m", "1", &config, &policy, None, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("fallback budget"),
+            "the fallback budget must fail the load-time warmup, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&model_dir);
+    }
+
+    /// Load-time warmup with an explicit total_timeout_secs is governed by
+    /// the policy's own budget, not the fallback.
+    #[tokio::test]
+    async fn load_warmup_explicit_total_budget_governs_over_fallback() {
+        let (wm, model_dir) = rewarm_harness("loadexplicit").await;
+        let config = crate::config::ModelConfig::default();
+        let policy = rewarm_policy(0.3);
+        let err = wm
+            .run_warmup_budgeted("m", "1", &config, &policy, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("total timeout after 0.3s"),
+            "the policy's own budget must fire inside run_warmup, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&model_dir);
     }
@@ -2128,7 +2171,7 @@ mod tests {
         let config = crate::config::ModelConfig::default();
         let policy = rewarm_policy(0.3);
         let err = wm
-            .run_rewarm_budgeted("m", "1", &config, &policy, 0)
+            .run_warmup_budgeted("m", "1", &config, &policy, Some(0))
             .await
             .unwrap_err();
         assert!(
@@ -2144,12 +2187,12 @@ mod tests {
             startup_timeout: 10.0,
             ..Default::default()
         };
-        assert_eq!(rewarm_fallback_budget(&small), Duration::from_secs(300));
+        assert_eq!(warmup_fallback_budget(&small), Duration::from_secs(300));
         let large = crate::config::ModelConfig {
             startup_timeout: 600.0,
             ..Default::default()
         };
-        assert_eq!(rewarm_fallback_budget(&large), Duration::from_secs(600));
+        assert_eq!(warmup_fallback_budget(&large), Duration::from_secs(600));
     }
 
     // ===== LRU eviction tests (§4.2) =====
