@@ -141,6 +141,15 @@ struct WorkerOutlier {
     /// circuit breaker so health probing / kill escalation keep their
     /// existing semantics for dead workers.
     dead: AtomicBool,
+    /// Rolling-recycle claim (max_requests budget crossed): the slot is
+    /// draining/stopping for a planned replacement. Deliberately separate
+    /// from the ejection circuit — no backoff, never half-open, and the
+    /// status coordinator (which reads `is_ejected` only) keeps the version
+    /// Ready while the sibling slots serve. Routing avoids the slot
+    /// explicitly via `is_recycling`. Cleared by `reset` (replacement up)
+    /// or `release_recycle` (recycle failed → falls back to a plain
+    /// ejection so the impairment stays visible).
+    recycling: AtomicBool,
 }
 
 /// Configurable outlier-ejection parameters (§3). `Default` preserves the prior
@@ -196,6 +205,7 @@ impl OutlierState {
                     ejected: Mutex::new(None),
                     consecutive_kills: AtomicUsize::new(0),
                     dead: AtomicBool::new(false),
+                    recycling: AtomicBool::new(false),
                 })
                 .collect(),
             consecutive_threshold: config.error_threshold,
@@ -270,9 +280,60 @@ impl OutlierState {
             w.ejection_series.store(0, Ordering::Relaxed);
             // The replacement process is alive: clear liveness too.
             w.dead.store(false, Ordering::Relaxed);
+            // A completed rolling recycle ends here as well.
+            w.recycling.store(false, Ordering::Relaxed);
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
+    }
+
+    /// Claim a slot for rolling recycle (max_requests budget crossed). One-shot:
+    /// returns false when the slot is already recycling, ejected, or dead —
+    /// those already have a recovery path, a second claim would only
+    /// double-signal. The claim is NOT an ejection: routing avoids the slot
+    /// explicitly via `is_recycling`, while the circuit breaker (and with it
+    /// the status coordinator's Degraded derivation and the half-open probe)
+    /// is untouched.
+    pub fn claim_recycle(&self, worker_idx: usize) -> bool {
+        let Some(w) = self.workers.get(worker_idx) else {
+            return false;
+        };
+        if w.dead.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Hold the ejection guard while claiming so a concurrent record_error
+        // cannot open the circuit on a slot that is about to drain anyway.
+        let guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return false;
+        }
+        if w.recycling.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        info!("Worker {worker_idx} claimed for rolling recycle");
+        true
+    }
+
+    /// Is a rolling recycle in flight for the slot? (false for unknown index)
+    /// Routing must avoid the slot (its process is draining/stopped); the
+    /// status coordinator must NOT — it reads `is_ejected`, which a recycle
+    /// never sets.
+    pub fn is_recycling(&self, worker_idx: usize) -> bool {
+        self.workers
+            .get(worker_idx)
+            .map(|w| w.recycling.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Recycle failed (the replacement did not start): drop the claim and fall
+    /// back to a plain force-ejection so the impairment stays visible to the
+    /// status coordinator and the circuit's half-open probe keeps a recovery
+    /// path.
+    pub fn release_recycle(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.recycling.store(false, Ordering::Relaxed);
+        }
+        self.force_eject(worker_idx);
     }
 
     /// Mark the worker's process as dead (crash monitor observed a non-clean
@@ -935,9 +996,9 @@ impl InferenceQueue {
                         entry.worker_count
                     )));
                 }
-                if entry.outlier.is_ejected(w) || entry.outlier.is_dead(w) {
+                if entry.outlier.is_ejected(w) || entry.outlier.is_dead(w) || entry.outlier.is_recycling(w) {
                     return Err(QueueError::InvalidWorker(format!(
-                        "x-lite-worker-id {w} is ejected or dead for {model_name} {version}"
+                        "x-lite-worker-id {w} is ejected, dead or recycling for {model_name} {version}"
                     )));
                 }
             }
@@ -1014,7 +1075,10 @@ fn pick_worker_least_loaded(
         // them as last-resort fallback when every worker was tried.
         let slot = if exclude.contains(&i) {
             &mut best_excluded
-        } else if outlier.is_ejected(i) {
+        } else if outlier.is_ejected(i) || outlier.is_recycling(i) {
+            // Recycling slots share the ejected fallback tier: a request queued
+            // behind the replacement beats retrying a just-failed worker, but
+            // any active slot wins.
             &mut best_ejected
         } else {
             &mut best_active
@@ -1136,6 +1200,7 @@ fn pick_worker(
             if w < inflight.len()
                 && !outlier.is_ejected(w)
                 && !outlier.is_dead(w)
+                && !outlier.is_recycling(w)
                 && !exclude.contains(&w) =>
         {
             if affinity_overloaded(inflight, outlier, exclude, w, balance) {
@@ -1160,7 +1225,7 @@ fn affinity_overloaded(
 ) -> bool {
     let mut min = usize::MAX;
     for (i, c) in inflight.iter().enumerate() {
-        if i == w || outlier.is_ejected(i) || outlier.is_dead(i) || exclude.contains(&i) {
+        if i == w || outlier.is_ejected(i) || outlier.is_dead(i) || outlier.is_recycling(i) || exclude.contains(&i) {
             continue;
         }
         let l = c.load(Ordering::Relaxed);
@@ -1194,7 +1259,7 @@ fn power_of_two_pick(
     exclude: &[usize],
 ) -> usize {
     let live: Vec<usize> = (0..inflight.len())
-        .filter(|&i| !outlier.is_ejected(i) && !outlier.is_dead(i) && !exclude.contains(&i))
+        .filter(|&i| !outlier.is_ejected(i) && !outlier.is_dead(i) && !outlier.is_recycling(i) && !exclude.contains(&i))
         .collect();
     if live.len() < 2 {
         return pick_worker_least_loaded(inflight, outlier, exclude);
@@ -1229,7 +1294,7 @@ pub(crate) fn rendezvous_pick(
     use std::hash::{Hash, Hasher};
     let mut best: Option<(u64, usize)> = None;
     for i in 0..num_workers {
-        if outlier.is_ejected(i) || outlier.is_dead(i) || exclude.contains(&i) {
+        if outlier.is_ejected(i) || outlier.is_dead(i) || outlier.is_recycling(i) || exclude.contains(&i) {
             continue;
         }
         let mut h = DefaultHasher::new();
@@ -1484,6 +1549,7 @@ async fn do_send_batch(
             if w < inflight.len()
                 && !outlier.is_ejected(w)
                 && !outlier.is_dead(w)
+                && !outlier.is_recycling(w)
                 && !exclude.contains(&w) =>
         {
             w
@@ -1812,10 +1878,14 @@ async fn send_batch_with_retry(
 }
 
 /// Attribute a served batch to the slot's rolling-recycle budget; on crossing
-/// the slot's jittered threshold, claim the recycle via force_eject (an
-/// idempotent claim — concurrent crossers and in-flight recycles lose the
-/// race) and spawn the drain+respawn. No-ops when the budget is disabled
-/// (threshold 0) or no respawn channel is wired (tests).
+/// the slot's jittered threshold, claim the recycle via `claim_recycle` (a
+/// dedicated flag — deliberately NOT an ejection, so the status coordinator
+/// keeps the version Ready and no half-open probe races the respawn) and
+/// spawn the drain+respawn. No-ops when the budget is disabled (threshold 0)
+/// or no respawn channel is wired (tests). The counter re-arms only after
+/// the claim is won: a refused claim (slot already recycling/ejected/dead)
+/// keeps the crossed budget so the next completion retries instead of the
+/// cycle being silently discarded.
 fn check_worker_budget(
     dispatch: &Arc<BatchDispatch>,
     inflight: &[Arc<AtomicUsize>],
@@ -1832,13 +1902,13 @@ fn check_worker_budget(
     if prev + batch_size < budget.threshold {
         return;
     }
+    if dispatch.respawn_tx.is_none() {
+        return;
+    }
+    if !dispatch.outlier.claim_recycle(worker_idx) {
+        return;
+    }
     budget.count.store(0, Ordering::Relaxed);
-    if dispatch.respawn_tx.is_none() || dispatch.outlier.is_ejected(worker_idx) {
-        return;
-    }
-    if !dispatch.outlier.force_eject(worker_idx) {
-        return;
-    }
     info!(
         model = %dispatch.model_name, version = %dispatch.version, worker_idx,
         threshold = budget.threshold,
@@ -1852,10 +1922,10 @@ fn check_worker_budget(
 }
 
 /// Rolling recycle of one worker slot (max_requests budget crossed): the slot
-/// is already force-ejected by the caller; wait for its in-flight batches to
-/// finish (bounded — late batches are still served before the stop message,
-/// which is FIFO-ordered behind them on the reused PAIR socket), then ask the
-/// worker manager for a graceful respawn.
+/// is already claimed for recycle by the caller; wait for its in-flight
+/// batches to finish (bounded — late batches are still served before the stop
+/// message, which is FIFO-ordered behind them on the reused PAIR socket),
+/// then ask the worker manager for a graceful respawn.
 async fn recycle_worker(
     dispatch: Arc<BatchDispatch>,
     slot_inflight: Arc<AtomicUsize>,
@@ -2120,6 +2190,13 @@ async fn health_checker(
             let respawn_tx = respawn_tx.clone();
             let uid = format!("{}-{}", uid_prefix, idx);
             async move {
+                // A slot mid-rolling-recycle is about to die on purpose —
+                // probing its dead window would only accumulate phantom
+                // errors and risk a spurious kill escalation against the
+                // fresh replacement.
+                if outlier.is_recycling(idx) {
+                    return;
+                }
                 let was_ejected = outlier.is_ejected(idx);
                 let request = health_probe_request(uid);
                 let result = tokio::time::timeout(probe_timeout, client.send(request)).await;
@@ -2190,6 +2267,12 @@ async fn escalate_to_kill(
     version: &str,
 ) {
     if kill_threshold == 0 || outlier.consecutive_errors(idx) < kill_threshold {
+        return;
+    }
+    // Defense in depth: never hard-kill a slot a rolling recycle is already
+    // replacing (probes skip recycling slots, but keep the guard for any
+    // future error source reaching this path).
+    if outlier.is_recycling(idx) {
         return;
     }
     let Some(tx) = respawn_tx.as_ref() else {
@@ -3393,6 +3476,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_not_probe_or_escalate_recycling_slot() {
+        // kill_threshold=1: a single failed probe would escalate — but a slot
+        // mid-rolling-recycle is dying on purpose, so probes must skip its
+        // dead window instead of accumulating phantom errors that would
+        // hard-kill the fresh replacement.
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            health_check_interval: 0.05,
+            health_check_timeout: 0.05,
+            health_check_kill_threshold: 1,
+            ..Default::default()
+        };
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        assert!(outlier.claim_recycle(0), "test setup: slot mid-recycle");
+        let outlier_probe = outlier.clone();
+        let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("recycling")));
+        queue.register_model(
+            "m", "1", &config, vec![], vec![client], outlier,
+            Some(respawn_tx),
+        );
+
+        let result = tokio::time::timeout(Duration::from_millis(500), respawn_rx.recv()).await;
+        assert!(result.is_err(), "a recycling slot must never escalate to kill");
+        assert_eq!(
+            outlier_probe.consecutive_errors(0),
+            0,
+            "probes skip the recycling dead window — no phantom errors"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_health_checker_no_kill_when_threshold_zero() {
         // kill_threshold=0 (default) — failures eject but never respawn.
         let queue = InferenceQueue::new();
@@ -3679,11 +3795,15 @@ mod tests {
         let (dispatch, outlier, inflight) = budget_dispatch("trig", 2, &[3, 3], Some(tx));
 
         check_worker_budget(&dispatch, &inflight, 0, 2); // 2 < 3: below
-        assert!(!outlier.is_ejected(0), "below threshold: no ejection");
+        assert!(!outlier.is_recycling(0), "below threshold: no recycle claim");
 
         check_worker_budget(&dispatch, &inflight, 0, 1); // 3 >= 3: crossing
-        assert!(outlier.is_ejected(0), "crossing ejects the slot");
-        assert!(!outlier.is_ejected(1), "sibling slot stays in rotation");
+        assert!(outlier.is_recycling(0), "crossing claims the slot for recycle");
+        assert!(
+            !outlier.is_ejected(0),
+            "recycle never opens the circuit — the status coordinator keeps the version Ready"
+        );
+        assert!(!outlier.is_recycling(1), "sibling slot stays in rotation");
 
         let sig = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -3700,7 +3820,7 @@ mod tests {
         let (dispatch, outlier, inflight) = budget_dispatch("below", 2, &[5, 5], Some(tx));
 
         check_worker_budget(&dispatch, &inflight, 0, 3);
-        assert!(!outlier.is_ejected(0));
+        assert!(!outlier.is_recycling(0));
         assert!(rx.try_recv().is_err(), "no signal below threshold");
     }
 
@@ -3710,7 +3830,7 @@ mod tests {
         let (dispatch, outlier, inflight) = budget_dispatch("zero", 1, &[0], Some(tx));
 
         check_worker_budget(&dispatch, &inflight, 0, 100);
-        assert!(!outlier.is_ejected(0), "threshold 0 = disabled");
+        assert!(!outlier.is_recycling(0), "threshold 0 = disabled");
         assert!(rx.try_recv().is_err(), "no signal when disabled");
         assert_eq!(
             dispatch.budgets[0].count.load(Ordering::Relaxed),
@@ -3733,12 +3853,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_emit_single_recycle_for_repeated_crossings_while_ejected() {
+    async fn should_emit_single_recycle_for_repeated_crossings_while_recycling() {
         let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
         let (dispatch, _outlier, inflight) = budget_dispatch("dedup", 1, &[2], Some(tx));
 
-        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing → eject + signal
-        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing again while ejected
+        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing → claim + signal
+        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing again while recycling
         check_worker_budget(&dispatch, &inflight, 0, 2);
 
         let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -3746,18 +3866,145 @@ mod tests {
             .expect("first signal in time");
         assert!(
             rx.try_recv().is_err(),
-            "an in-flight recycle must not re-signal (force_eject claim is idempotent)"
+            "an in-flight recycle must not re-signal (claim_recycle is idempotent)"
         );
     }
 
     #[tokio::test]
-    async fn should_not_eject_when_respawn_channel_absent() {
+    async fn should_not_claim_when_respawn_channel_absent() {
         let (dispatch, outlier, inflight) = budget_dispatch("nochan", 1, &[2], None);
 
         check_worker_budget(&dispatch, &inflight, 0, 5);
         assert!(
+            !outlier.is_recycling(0),
+            "never claim a slot no one can respawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_crossed_budget_when_claim_is_refused() {
+        let (tx, _rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("keep", 1, &[2], Some(tx));
+        eject(&outlier, 0); // slot ejected for another (health) reason
+
+        check_worker_budget(&dispatch, &inflight, 0, 3);
+        assert!(
+            !outlier.is_recycling(0),
+            "an ejected slot already has a recovery path — no recycle claim"
+        );
+        assert_eq!(
+            dispatch.budgets[0].count.load(Ordering::Relaxed),
+            3,
+            "a refused claim must not discard the crossed budget"
+        );
+    }
+
+    // ===== Recycling claim (recycle/eject separation) tests =====
+
+    #[test]
+    fn should_claim_recycle_only_once() {
+        let outlier = OutlierState::new(2);
+        assert!(outlier.claim_recycle(0), "first claim wins");
+        assert!(outlier.is_recycling(0));
+        assert!(
+            !outlier.claim_recycle(0),
+            "an in-flight recycle rejects a second claim"
+        );
+        assert!(!outlier.is_recycling(1), "sibling unaffected");
+    }
+
+    #[test]
+    fn should_reject_recycle_claim_when_ejected_or_dead() {
+        let outlier = OutlierState::new(3);
+        eject(&outlier, 0);
+        assert!(
+            !outlier.claim_recycle(0),
+            "an ejected slot already has a recovery path"
+        );
+        outlier.mark_dead(1);
+        assert!(
+            !outlier.claim_recycle(1),
+            "a dead slot needs kill-respawn, not graceful recycle"
+        );
+        assert!(!outlier.is_recycling(0));
+        assert!(!outlier.is_recycling(1));
+    }
+
+    #[test]
+    fn should_keep_recycling_slot_out_of_circuit_breaker() {
+        let outlier = OutlierState::new(1);
+        assert!(outlier.claim_recycle(0));
+        assert!(
             !outlier.is_ejected(0),
-            "never eject a slot no one can respawn"
+            "recycle never opens the circuit: no backoff timer, no half-open probe"
+        );
+        assert!(
+            !outlier.is_ejected(0),
+            "repeat check: still no half-open transition"
+        );
+    }
+
+    #[test]
+    fn should_clear_recycling_on_reset() {
+        let outlier = OutlierState::new(1);
+        assert!(outlier.claim_recycle(0));
+        outlier.reset(0);
+        assert!(!outlier.is_recycling(0), "replacement up clears the claim");
+        assert!(
+            outlier.claim_recycle(0),
+            "slot is recyclable again after reset"
+        );
+    }
+
+    #[test]
+    fn should_release_recycle_as_ejection_on_recycle_failure() {
+        let outlier = OutlierState::new(1);
+        assert!(outlier.claim_recycle(0));
+        outlier.release_recycle(0);
+        assert!(!outlier.is_recycling(0), "failed recycle drops the claim");
+        assert!(
+            outlier.is_ejected(0),
+            "impairment stays visible via the circuit (coordinator → Degraded)"
+        );
+    }
+
+    #[test]
+    fn should_avoid_recycling_slot_in_least_loaded_pick() {
+        let outlier = OutlierState::new(3);
+        assert!(outlier.claim_recycle(1));
+        let inflight = mk_inflight(&[5, 0, 2]);
+        assert_eq!(
+            pick_worker_least_loaded(&inflight, &outlier, &[]),
+            2,
+            "recycling slot is not an active candidate even at the lowest load"
+        );
+    }
+
+    #[test]
+    fn should_prefer_recycling_slot_over_just_failed_one_as_last_resort() {
+        let outlier = OutlierState::new(2);
+        assert!(outlier.claim_recycle(0));
+        let inflight = mk_inflight(&[0, 3]);
+        assert_eq!(
+            pick_worker_least_loaded(&inflight, &outlier, &[1]),
+            0,
+            "parity with the ejected fallback tier: queued behind the replacement beats retrying a just-failed worker"
+        );
+    }
+
+    #[test]
+    fn should_skip_recycling_slot_in_rendezvous_pick() {
+        let outlier = OutlierState::new(2);
+        assert!(outlier.claim_recycle(0));
+        for seq in ["a", "b", "c", "d"] {
+            assert_eq!(rendezvous_pick(seq, 2, &outlier, &[]), Some(1));
+        }
+        let all_recycling = OutlierState::new(1);
+        assert!(all_recycling.claim_recycle(0));
+        assert_eq!(
+            rendezvous_pick("a", 1, &all_recycling, &[]),
+            None,
+            "no live worker when every slot is recycling"
         );
     }
 

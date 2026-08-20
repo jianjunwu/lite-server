@@ -409,7 +409,13 @@ startup_concurrency: null      # Max workers spawned+handshaken concurrently at 
                                # workers; same-device workers then load concurrently,
                                # so size it against GPU memory headroom.
 max_queue_size: 1000           # Max pending requests per worker
-request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
+request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled).
+                               # WARNING: with 0, a request routed to a worker that
+                               # dies without its exit being classified as a crash
+                               # (e.g. mid rolling-recycle / ejection windows) has no
+                               # client-side bound — it waits until the server-side
+                               # recovery path answers or fails it. Set a non-zero
+                               # value if callers cannot tolerate unbounded waits.
 # Overload queue control. Per request, set the
 # `x-lite-priority` header (integer; higher = dispatched first, default 0).
 queue_timeout_secs: 0.0        # Max seconds a request may wait in the queue before
