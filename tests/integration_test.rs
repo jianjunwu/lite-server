@@ -3540,6 +3540,9 @@ class ReloadAPI(LitAPI):
     }
     let v2 = v2.expect("v2 did not become ready");
     let v2_loaded_at = v2["loaded_at"].clone();
+    // L3: without this presence check a missing loaded_at would make the
+    // poll-loop equality below pass vacuously (Null == Null).
+    assert!(v2_loaded_at.as_u64().is_some(), "v2 loaded_at: {:?}", v2_loaded_at);
     let body = get_health().await;
     let v1_loaded_at = health_entry(&body, "1").expect("v1 loaded")["loaded_at"].clone();
     assert!(v1_loaded_at.as_u64().is_some(), "v1 loaded_at: {:?}", v1_loaded_at);

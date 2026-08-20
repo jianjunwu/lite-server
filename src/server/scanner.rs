@@ -32,8 +32,20 @@ pub(super) async fn auto_unpack_lma_files(
     // against this at the end of the scan so deleted/replaced artifacts do
     // not accumulate entries forever.
     let mut on_disk: HashSet<(PathBuf, std::time::SystemTime)> = HashSet::new();
+    // L2: a mid-iteration read_dir error must not prune `seen` against a
+    // partial `on_disk` — unvisited artifacts would be dropped and re-unpacked
+    // on the next scan. Only a complete scan may prune.
+    let mut scan_complete = false;
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                scan_complete = true;
+                break;
+            }
+            Err(_) => break,
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -146,7 +158,10 @@ pub(super) async fn auto_unpack_lma_files(
 
     // L5: drop entries for artifacts no longer on disk at their recorded
     // mtime (deleted, or replaced — the new mtime was inserted above).
-    seen.retain(|e| on_disk.contains(e));
+    // L2: only after a cleanly completed iteration (see above).
+    if scan_complete {
+        seen.retain(|e| on_disk.contains(e));
+    }
 }
 
 /// H6: model name and version from the packer naming convention
