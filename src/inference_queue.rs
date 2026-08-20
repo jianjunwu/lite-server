@@ -289,7 +289,8 @@ impl OutlierState {
     }
 
     /// Force-eject a worker, bypassing the error-count threshold (G2): used
-    /// when a respawned replacement fails its re-warm. Chosen over
+    /// when a respawned replacement fails its re-warm, and by rolling recycle
+    /// to stop routing to a slot being drained. Chosen over
     /// `mark_dead` deliberately — the status coordinator derives Degraded
     /// from ejection only, and the circuit's half-open probe keeps a natural
     /// recovery path (a later real request re-warms the slot lazily), while
@@ -311,7 +312,7 @@ impl OutlierState {
             half_open: false,
         });
         info!(
-            "Worker {worker_idx} force-ejected (respawn re-warm failed; series {series}, backoff {:?})",
+            "Worker {worker_idx} force-ejected (series {series}, backoff {:?})",
             self.backoff(series)
         );
         true
@@ -448,16 +449,8 @@ impl OutlierState {
     }
 }
 
-/// Signal to trigger a model version reload (worker auto-recycle).
-#[derive(Debug)]
-pub struct ReloadSignal {
-    pub model_name: String,
-    /// The version whose queue hit max_requests. The listener must recycle
-    /// exactly this version — not the model's active version.
-    pub version: String,
-}
-
-/// Signal to kill + respawn a single worker (health-check kill escalation).
+/// Signal to kill + respawn a single worker (health-check kill escalation,
+/// or rolling recycle when `graceful` is set).
 #[derive(Debug)]
 pub struct RespawnSignal {
     pub model_name: String,
@@ -465,6 +458,12 @@ pub struct RespawnSignal {
     pub worker_id: u32,
     /// Metric/log label identifying the trigger (e.g. "health_check").
     pub reason: &'static str,
+    /// Teardown mode. true (rolling recycle of a healthy, drained worker):
+    /// send the ZMQ stop message and wait out kill_timeout. false
+    /// (health-check kill escalation against a possibly-hung worker):
+    /// kill-only — a stop sent to a hung peer would be replayed to the
+    /// replacement on the reused bound socket.
+    pub graceful: bool,
 }
 
 // ===== P-FLOW B1 (§4.0.9): priority-aware bounded channel =====
@@ -784,7 +783,6 @@ impl InferenceQueue {
         config: &ModelConfig,
         workers: Vec<WorkerInfo>,
         zmq_clients: Vec<Arc<WorkerZmqClient>>,
-        reload_tx: mpsc::Sender<ReloadSignal>,
         outlier: Arc<OutlierState>,
         respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
     ) {
@@ -807,8 +805,6 @@ impl InferenceQueue {
         let min_timeout = Duration::from_secs_f64(config.min_batch_timeout as f64);
         let queue_threshold = config.adaptive_queue_threshold;
         let request_timeout = Duration::from_secs_f64(config.request_timeout as f64);
-        let max_requests = config.max_requests;
-        let max_requests_jitter = config.max_requests_jitter;
         let max_retries = config.max_retries;
         let queue_timeout = Duration::from_secs_f64(config.queue_timeout_secs.max(0.0) as f64);
         let queue_timeout_action = config.queue_timeout_action;
@@ -835,8 +831,6 @@ impl InferenceQueue {
                 min_timeout,
                 queue_threshold,
                 request_timeout,
-                max_requests,
-                max_requests_jitter,
                 max_retries,
                 queue_timeout,
                 queue_timeout_action,
@@ -846,7 +840,20 @@ impl InferenceQueue {
                 outlier: outlier.clone(),
                 model_name: model_name.to_string(),
                 version: version.to_string(),
-                reload_tx,
+                respawn_tx: respawn_tx.clone(),
+                budgets: build_worker_budgets(
+                    dispatch_workers,
+                    config.max_requests,
+                    config.max_requests_jitter,
+                ),
+                // In-flight batches on a slot are each bounded by
+                // request_timeout; when that is disabled, the graceful-stop
+                // budget bounds the wait instead.
+                recycle_drain_timeout: if config.request_timeout > 0.0 {
+                    Duration::from_secs_f32(config.request_timeout)
+                } else {
+                    Duration::from_secs_f32(config.worker_kill_timeout)
+                },
                 sequence_registry: self.sequence_registry.clone(),
                 balance: self.balance,
             }),
@@ -1332,6 +1339,30 @@ fn update_worker_saturation(model_name: &str, version: &str, inflight: &[Arc<Ato
     prometheus::set_worker_saturation(model_name, version, max as f64);
 }
 
+/// Per-slot rolling-recycle budget (max_requests): requests served by this
+/// worker since its last recycle, plus the jittered crossing threshold
+/// (`compute_jittered_max_requests` per slot at registration, so workers
+/// recycle at staggered times instead of in one herd).
+struct WorkerBudget {
+    count: AtomicUsize,
+    threshold: usize, // 0 = disabled
+}
+
+/// Build the per-slot budget table: one independently jittered threshold per
+/// worker slot.
+fn build_worker_budgets(
+    num_workers: usize,
+    max_requests: usize,
+    max_requests_jitter: usize,
+) -> Vec<WorkerBudget> {
+    (0..num_workers)
+        .map(|_| WorkerBudget {
+            count: AtomicUsize::new(0),
+            threshold: compute_jittered_max_requests(max_requests, max_requests_jitter),
+        })
+        .collect()
+}
+
 /// Dispatch-side context for the batch send path (`do_send_batch` /
 /// `send_batch_with_retry`): worker pool + routing identity. Grouped so the
 /// collector's per-dispatch spawns share one `Arc` clone instead of cloning
@@ -1341,7 +1372,15 @@ struct BatchDispatch {
     outlier: Arc<OutlierState>,
     model_name: String,
     version: String,
-    reload_tx: mpsc::Sender<ReloadSignal>,
+    /// Recycle + health-kill escalation channel. None (tests) disables
+    /// triggering — never eject a slot no one can respawn.
+    respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
+    budgets: Vec<WorkerBudget>,
+    /// Bound for the recycle drain-wait: request_timeout when set (each
+    /// in-flight batch is bounded by it), else worker_kill_timeout. Not a
+    /// correctness bound — the stop message is FIFO-ordered behind in-flight
+    /// batches on the reused PAIR socket.
+    recycle_drain_timeout: Duration,
     sequence_registry: Arc<SequenceRegistry>,
     balance: BalanceConfig,
 }
@@ -1355,8 +1394,6 @@ struct BatchTunables {
     min_timeout: Duration,
     queue_threshold: usize,
     request_timeout: Duration,
-    max_requests: usize,
-    max_requests_jitter: usize,
     max_retries: usize,
     queue_timeout: Duration,
     queue_timeout_action: crate::config::QueueTimeoutAction,
@@ -1368,7 +1405,7 @@ async fn do_send_batch(
     inflight: &[Arc<AtomicUsize>],
     request_timeout: Duration,
     exclude: &[usize],
-) -> Result<(), BatchError> {
+) -> Result<usize, BatchError> {
     let BatchDispatch {
         zmq_clients,
         outlier,
@@ -1380,7 +1417,9 @@ async fn do_send_batch(
     } = dispatch;
     let balance = *balance;
     if batch.is_empty() {
-        return Ok(());
+        // Unreachable from send_batch_with_retry (guards on is_empty), but
+        // keep the guard total: no worker served anything, attribute to 0.
+        return Ok(0);
     }
     // Audit 2026-08-14 (F-18 adjacent): a 0-worker model can still deliver a
     // batch here (queue registered with no workers, or the pool drained
@@ -1571,7 +1610,7 @@ async fn do_send_batch(
                     if all_ok {
                         outlier.record_success(worker_idx);
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
-                        Ok(())
+                        Ok(worker_idx)
                     } else {
                         if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
@@ -1638,7 +1677,7 @@ async fn do_send_batch(
                         update_worker_saturation(model_name, version, inflight);
                         outlier.record_success(worker_idx);
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
-                        Ok(())
+                        Ok(worker_idx)
                     }
                 }
                 _ => {
@@ -1685,31 +1724,28 @@ async fn do_send_batch(
 /// Send a batch with retry on failure. Retries on a different worker (if available).
 async fn send_batch_with_retry(
     mut batch: Vec<QueueItem>,
-    dispatch: &BatchDispatch,
+    dispatch: &Arc<BatchDispatch>,
     inflight: &[Arc<AtomicUsize>],
     request_timeout: Duration,
-    request_count: &AtomicUsize,
-    max_requests: usize,
     max_retries: usize,
 ) {
     let BatchDispatch {
         zmq_clients,
         model_name,
         version,
-        reload_tx,
         ..
-    } = dispatch;
+    } = &**dispatch;
     if batch.is_empty() {
         return;
     }
 
     // G6/F2/F3 (warmup-gaps audit): an all-warmup batch is synthetic load —
     // it must not touch real-traffic series (queue wait, retries) nor
-    // consume the max_requests auto-recycle budget (worker-scope warmup
+    // consume the per-slot max_requests recycle budget (worker-scope warmup
     // multiplies the unit count by the worker count; counting it could cross
-    // the threshold during load and auto-recycle immediately after every
-    // load — a reload loop, since the reload re-runs warmup against a fresh
-    // counter). The collector never mixes warmup with live items (F5), so a
+    // the threshold during load and recycle a slot immediately after every
+    // load — a recycle loop, since the respawn re-warms against a fresh
+    // budget). The collector never mixes warmup with live items (F5), so a
     // batch is homogeneous and this check is exact.
     let all_warmup = batch.iter().all(|i| i.is_warmup);
 
@@ -1730,9 +1766,9 @@ async fn send_batch_with_retry(
     if zmq_clients.len() <= 1 || max_retries == 0 {
         let result = do_send_batch(&mut batch, dispatch, inflight, request_timeout, &[]).await;
         match result {
-            Ok(()) => {
+            Ok(worker_idx) => {
                 if !all_warmup {
-                    check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                    check_worker_budget(dispatch, inflight, worker_idx, batch_size);
                 }
             }
             Err(e) => fail_batch_items(&mut batch, &e),
@@ -1747,9 +1783,9 @@ async fn send_batch_with_retry(
             prometheus::inc_retry(model_name, version);
         }
         match do_send_batch(&mut batch, dispatch, inflight, request_timeout, &excluded).await {
-            Ok(()) => {
+            Ok(worker_idx) => {
                 if !all_warmup {
-                    check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                    check_worker_budget(dispatch, inflight, worker_idx, batch_size);
                 }
                 return;
             }
@@ -1775,27 +1811,82 @@ async fn send_batch_with_retry(
     }
 }
 
-/// Check if worker hit max_requests and signal reload.
-#[inline]
-async fn check_max_requests(
-    request_count: &AtomicUsize,
+/// Attribute a served batch to the slot's rolling-recycle budget; on crossing
+/// the slot's jittered threshold, claim the recycle via force_eject (an
+/// idempotent claim — concurrent crossers and in-flight recycles lose the
+/// race) and spawn the drain+respawn. No-ops when the budget is disabled
+/// (threshold 0) or no respawn channel is wired (tests).
+fn check_worker_budget(
+    dispatch: &Arc<BatchDispatch>,
+    inflight: &[Arc<AtomicUsize>],
+    worker_idx: usize,
     batch_size: usize,
-    max_requests: usize,
-    model_name: &str,
-    version: &str,
-    reload_tx: &mpsc::Sender<ReloadSignal>,
 ) {
-    if max_requests == 0 {
+    let Some(budget) = dispatch.budgets.get(worker_idx) else {
+        return;
+    };
+    if budget.threshold == 0 {
         return;
     }
-    let prev = request_count.fetch_add(batch_size, Ordering::Relaxed);
-    if prev < max_requests && prev + batch_size >= max_requests {
-        info!("Worker hit max_requests ({}), signaling reload for {} {}", max_requests, model_name, version);
-        let _ = reload_tx.try_send(ReloadSignal {
-            model_name: model_name.to_string(),
-            version: version.to_string(),
-        });
+    let prev = budget.count.fetch_add(batch_size, Ordering::Relaxed);
+    if prev + batch_size < budget.threshold {
+        return;
     }
+    budget.count.store(0, Ordering::Relaxed);
+    if dispatch.respawn_tx.is_none() || dispatch.outlier.is_ejected(worker_idx) {
+        return;
+    }
+    if !dispatch.outlier.force_eject(worker_idx) {
+        return;
+    }
+    info!(
+        model = %dispatch.model_name, version = %dispatch.version, worker_idx,
+        threshold = budget.threshold,
+        "Worker hit max_requests; rolling recycle"
+    );
+    tokio::spawn(recycle_worker(
+        dispatch.clone(),
+        inflight[worker_idx].clone(),
+        worker_idx,
+    ));
+}
+
+/// Rolling recycle of one worker slot (max_requests budget crossed): the slot
+/// is already force-ejected by the caller; wait for its in-flight batches to
+/// finish (bounded — late batches are still served before the stop message,
+/// which is FIFO-ordered behind them on the reused PAIR socket), then ask the
+/// worker manager for a graceful respawn.
+async fn recycle_worker(
+    dispatch: Arc<BatchDispatch>,
+    slot_inflight: Arc<AtomicUsize>,
+    worker_idx: usize,
+) {
+    let wait = async {
+        while slot_inflight.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    if tokio::time::timeout(dispatch.recycle_drain_timeout, wait)
+        .await
+        .is_err()
+    {
+        warn!(
+            model = %dispatch.model_name, version = %dispatch.version, worker_idx,
+            "Recycle drain timed out; stopping worker with batches in flight"
+        );
+    }
+    let Some(tx) = &dispatch.respawn_tx else {
+        return; // unreachable: the trigger checked the channel exists
+    };
+    let _ = tx
+        .send(RespawnSignal {
+            model_name: dispatch.model_name.clone(),
+            version: dispatch.version.clone(),
+            worker_id: worker_idx as u32,
+            reason: "rolling_recycle",
+            graceful: true,
+        })
+        .await;
 }
 
 /// Compute adaptive batch timeout based on current batch size, queue depth, and config.
@@ -1853,8 +1944,6 @@ async fn batch_collector(
         min_timeout,
         queue_threshold,
         request_timeout,
-        max_requests,
-        max_requests_jitter,
         max_retries,
         queue_timeout,
         queue_timeout_action,
@@ -1862,10 +1951,6 @@ async fn batch_collector(
     let worker_inflight: Vec<Arc<AtomicUsize>> = (0..dispatch.zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
-    let request_count = Arc::new(AtomicUsize::new(0));
-
-    // Compute jittered max_requests to prevent thundering herd on recycle
-    let max_requests = compute_jittered_max_requests(max_requests, max_requests_jitter);
 
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
@@ -1883,9 +1968,8 @@ async fn batch_collector(
             let batch = vec![item];
             let dispatch = dispatch.clone();
             let worker_inflight = worker_inflight.clone();
-            let request_count = request_count.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+                send_batch_with_retry(batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
             });
         }
         return;
@@ -1921,9 +2005,8 @@ async fn batch_collector(
                     let current_batch = std::mem::take(&mut batch);
                     let dispatch = dispatch.clone();
                     let worker_inflight = worker_inflight.clone();
-                    let request_count = request_count.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
                     });
                     deadline = None;
                 }
@@ -1932,9 +2015,8 @@ async fn batch_collector(
                     let current_batch = std::mem::take(&mut batch);
                     let dispatch = dispatch.clone();
                     let worker_inflight = worker_inflight.clone();
-                    let request_count = request_count.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -1966,9 +2048,8 @@ async fn batch_collector(
                     let current_batch = std::mem::take(&mut batch);
                     let dispatch = dispatch.clone();
                     let worker_inflight = worker_inflight.clone();
-                    let request_count = request_count.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
                     });
                 }
                 deadline = None;
@@ -1982,9 +2063,8 @@ async fn batch_collector(
         let current_batch = std::mem::take(&mut batch);
         let dispatch = dispatch.clone();
         let worker_inflight = worker_inflight.clone();
-        let request_count = request_count.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
+            send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
         });
     }
 }
@@ -2134,6 +2214,7 @@ async fn escalate_to_kill(
         version: version.to_string(),
         worker_id: idx as u32,
         reason: "health_check",
+        graceful: false,
     }).await;
     outlier.record_kill(idx);
     // Throttle re-sends while the respawn is in flight: the replacement must
@@ -2378,7 +2459,6 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
         let mut clients = Vec::new();
         for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
@@ -2386,7 +2466,7 @@ mod tests {
             spawn_tagged_worker(endpoint.clone(), tag.to_vec());
             clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
         }
-        queue.register_model("m", "1", &config, vec![], clients, reload_tx, outlier.clone(), None);
+        queue.register_model("m", "1", &config, vec![], clients, outlier.clone(), None);
         tokio::time::sleep(Duration::from_millis(200)).await;
         (queue, outlier)
     }
@@ -2516,9 +2596,8 @@ mod tests {
             adaptive_queue_threshold: 0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
+        queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
 
         // has_queue should find it using the same key
         assert!(queue.has_queue("test_model", "1"));
@@ -2607,16 +2686,15 @@ mod tests {
             adaptive_queue_threshold: 0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
 
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier, None);
+        queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
         let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
+        queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
         let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2688,10 +2766,9 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        queue.register_model("m", "1", &config, vec![], vec![client], reload_tx, outlier, None);
+        queue.register_model("m", "1", &config, vec![], vec![client], outlier, None);
         // Let the PAIR connect establish.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2750,9 +2827,8 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier, None);
+        queue.register_model("m", "1", &config, vec![], vec![], outlier, None);
 
         let drain = queue.begin_drain("m", "1").expect("queue must exist");
         tokio::time::timeout(Duration::from_millis(500), drain.wait_idle())
@@ -2777,10 +2853,9 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
 
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
+        queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
         let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!handle.is_finished());
 
@@ -3291,7 +3366,6 @@ mod tests {
             health_check_kill_threshold: 2,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
         let ejection_cfg = EjectionConfig {
             error_threshold: 1,
@@ -3303,7 +3377,7 @@ mod tests {
         let outlier_probe = outlier.clone();
         let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("kill")));
         queue.register_model(
-            "m", "1", &config, vec![], vec![client], reload_tx, outlier,
+            "m", "1", &config, vec![], vec![client], outlier,
             Some(respawn_tx),
         );
 
@@ -3329,12 +3403,11 @@ mod tests {
             health_check_kill_threshold: 0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
         let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("nokill")));
         queue.register_model(
-            "m", "1", &config, vec![], vec![client], reload_tx, outlier,
+            "m", "1", &config, vec![], vec![client], outlier,
             Some(respawn_tx),
         );
 
@@ -3559,65 +3632,263 @@ mod tests {
         assert!(result.is_err(), "should timeout when response takes too long");
     }
 
-    // ===== Max Requests tests =====
+    // ===== Per-slot rolling-recycle budget tests =====
 
-    #[tokio::test]
-    async fn test_check_max_requests_sends_signal() {
-        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
-        let counter = AtomicUsize::new(0);
-
-        // First batch: counter goes from 0 to 3, max_requests=5 → no signal
-        check_max_requests(&counter, 3, 5, "model_a", "1", &tx).await;
-        assert!(rx.try_recv().is_err(), "should not signal yet");
-
-        // Second batch: counter goes from 3 to 6, crosses 5 → signal
-        check_max_requests(&counter, 3, 5, "model_a", "1", &tx).await;
-        let signal = rx.try_recv().unwrap();
-        assert_eq!(signal.model_name, "model_a");
-        // The signal must name the version that hit the threshold, so the
-        // listener recycles that version instead of the active one.
-        assert_eq!(signal.version, "1");
+    /// Build a dispatch with per-slot budgets for budget/trigger unit tests.
+    /// `tag` keeps the (bound) client endpoints unique across parallel tests.
+    fn budget_dispatch(
+        tag: &str,
+        num_workers: usize,
+        thresholds: &[usize],
+        respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
+    ) -> (Arc<BatchDispatch>, Arc<OutlierState>, Vec<Arc<AtomicUsize>>) {
+        let outlier = Arc::new(OutlierState::new(num_workers));
+        let clients = (0..num_workers)
+            .map(|i| {
+                Arc::new(WorkerZmqClient::new(drain_test_endpoint(&format!(
+                    "budget-{tag}-{i}"
+                ))))
+            })
+            .collect();
+        let dispatch = Arc::new(BatchDispatch {
+            zmq_clients: clients,
+            outlier: outlier.clone(),
+            model_name: "m".to_string(),
+            version: "1".to_string(),
+            respawn_tx,
+            budgets: thresholds
+                .iter()
+                .map(|&t| WorkerBudget {
+                    count: AtomicUsize::new(0),
+                    threshold: t,
+                })
+                .collect(),
+            recycle_drain_timeout: Duration::from_millis(100),
+            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
+            balance: BalanceConfig::default(),
+        });
+        let inflight = (0..num_workers)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        (dispatch, outlier, inflight)
     }
 
     #[tokio::test]
-    async fn test_check_max_requests_disabled_when_zero() {
-        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
-        let counter = AtomicUsize::new(0);
+    async fn should_trigger_recycle_at_slot_threshold() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("trig", 2, &[3, 3], Some(tx));
 
-        // max_requests=0 means disabled
-        for _ in 0..10 {
-            check_max_requests(&counter, 1, 0, "model_b", "1", &tx).await;
+        check_worker_budget(&dispatch, &inflight, 0, 2); // 2 < 3: below
+        assert!(!outlier.is_ejected(0), "below threshold: no ejection");
+
+        check_worker_budget(&dispatch, &inflight, 0, 1); // 3 >= 3: crossing
+        assert!(outlier.is_ejected(0), "crossing ejects the slot");
+        assert!(!outlier.is_ejected(1), "sibling slot stays in rotation");
+
+        let sig = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recycle signal in time")
+            .expect("channel open");
+        assert_eq!(sig.worker_id, 0);
+        assert_eq!(sig.reason, "rolling_recycle");
+        assert!(sig.graceful, "rolling recycle must use graceful teardown");
+    }
+
+    #[tokio::test]
+    async fn should_not_trigger_before_threshold() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("below", 2, &[5, 5], Some(tx));
+
+        check_worker_budget(&dispatch, &inflight, 0, 3);
+        assert!(!outlier.is_ejected(0));
+        assert!(rx.try_recv().is_err(), "no signal below threshold");
+    }
+
+    #[tokio::test]
+    async fn should_not_trigger_when_max_requests_zero() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("zero", 1, &[0], Some(tx));
+
+        check_worker_budget(&dispatch, &inflight, 0, 100);
+        assert!(!outlier.is_ejected(0), "threshold 0 = disabled");
+        assert!(rx.try_recv().is_err(), "no signal when disabled");
+        assert_eq!(
+            dispatch.budgets[0].count.load(Ordering::Relaxed),
+            0,
+            "counter stays untouched when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reset_slot_budget_on_trigger() {
+        let (tx, _rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, _outlier, inflight) = budget_dispatch("reset", 1, &[5], Some(tx));
+
+        check_worker_budget(&dispatch, &inflight, 0, 7);
+        assert_eq!(
+            dispatch.budgets[0].count.load(Ordering::Relaxed),
+            0,
+            "the budget re-arms from zero on trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_emit_single_recycle_for_repeated_crossings_while_ejected() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, _outlier, inflight) = budget_dispatch("dedup", 1, &[2], Some(tx));
+
+        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing → eject + signal
+        check_worker_budget(&dispatch, &inflight, 0, 2); // crossing again while ejected
+        check_worker_budget(&dispatch, &inflight, 0, 2);
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first signal in time");
+        assert!(
+            rx.try_recv().is_err(),
+            "an in-flight recycle must not re-signal (force_eject claim is idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_eject_when_respawn_channel_absent() {
+        let (dispatch, outlier, inflight) = budget_dispatch("nochan", 1, &[2], None);
+
+        check_worker_budget(&dispatch, &inflight, 0, 5);
+        assert!(
+            !outlier.is_ejected(0),
+            "never eject a slot no one can respawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_compute_independent_jittered_thresholds_per_slot() {
+        let budgets = build_worker_budgets(8, 100, 10);
+        assert_eq!(budgets.len(), 8);
+        for b in &budgets {
+            assert!(
+                (90..=110).contains(&b.threshold),
+                "threshold {} must be within max_requests ± jitter",
+                b.threshold
+            );
         }
-        assert!(rx.try_recv().is_err(), "should never signal when max_requests=0");
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "counter should not increment when disabled");
+        let disabled = build_worker_budgets(2, 0, 10);
+        assert!(
+            disabled.iter().all(|b| b.threshold == 0),
+            "max_requests 0 disables every slot"
+        );
+        let floor = build_worker_budgets(4, 1, 10);
+        assert!(
+            floor.iter().all(|b| b.threshold >= 1),
+            "the jittered threshold never drops below 1"
+        );
     }
 
     #[tokio::test]
-    async fn test_check_max_requests_only_signals_once() {
-        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
-        let counter = AtomicUsize::new(0);
-
-        // Cross threshold at batch 3
-        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
-        // Already crossed, next call should not signal again
-        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
-        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
-
-        // Only one signal should have been sent
-        assert!(rx.try_recv().is_ok(), "first signal should arrive");
-        assert!(rx.try_recv().is_err(), "should not send duplicate signals");
+    async fn should_return_serving_worker_idx_on_success() {
+        let endpoint0 = drain_test_endpoint("idx-w0");
+        let endpoint1 = drain_test_endpoint("idx-w1");
+        spawn_tagged_worker(endpoint0.clone(), b"w0".to_vec());
+        spawn_tagged_worker(endpoint1.clone(), b"w1".to_vec());
+        let (mut dispatch, _outlier, inflight) = budget_dispatch("idx", 2, &[100, 100], None);
+        Arc::get_mut(&mut dispatch).unwrap().zmq_clients = vec![
+            Arc::new(WorkerZmqClient::new(endpoint0)),
+            Arc::new(WorkerZmqClient::new(endpoint1)),
+        ];
+        let (item, rx) = hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        let mut batch = vec![item];
+        let idx = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
+            .await
+            .map_err(|_| "send must succeed")
+            .unwrap();
+        assert_eq!(idx, 1, "Ok carries the worker that actually served");
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("response in time");
     }
 
     #[tokio::test]
-    async fn test_check_max_requests_batch_size_exact() {
-        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
-        let counter = AtomicUsize::new(0);
+    async fn should_count_batch_against_serving_worker_only() {
+        let endpoint0 = drain_test_endpoint("count-w0");
+        let endpoint1 = drain_test_endpoint("count-w1");
+        spawn_tagged_worker(endpoint0.clone(), b"w0".to_vec());
+        spawn_tagged_worker(endpoint1.clone(), b"w1".to_vec());
+        let (mut dispatch, _outlier, inflight) = budget_dispatch("count", 2, &[100, 100], None);
+        Arc::get_mut(&mut dispatch).unwrap().zmq_clients = vec![
+            Arc::new(WorkerZmqClient::new(endpoint0)),
+            Arc::new(WorkerZmqClient::new(endpoint1)),
+        ];
 
-        // Single batch that exactly hits max_requests
-        check_max_requests(&counter, 10, 10, "exact", "2", &tx).await;
-        let signal = rx.try_recv().unwrap();
-        assert_eq!(signal.model_name, "exact");
-        assert_eq!(signal.version, "2");
+        let (item, rx) = hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        send_batch_with_retry(vec![item], &dispatch, &inflight, Duration::from_secs(5), 2).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("response in time");
+
+        assert_eq!(dispatch.budgets[1].count.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.budgets[0].count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn should_skip_budget_for_all_warmup_batches() {
+        let endpoint0 = drain_test_endpoint("warm-w0");
+        spawn_tagged_worker(endpoint0.clone(), b"w0".to_vec());
+        let (mut dispatch, _outlier, inflight) = budget_dispatch("warm", 1, &[100], None);
+        Arc::get_mut(&mut dispatch).unwrap().zmq_clients =
+            vec![Arc::new(WorkerZmqClient::new(endpoint0))];
+
+        let (mut item, rx) = hint_item_rx("w", meta_with_headers(&[]));
+        item.is_warmup = true;
+        send_batch_with_retry(vec![item], &dispatch, &inflight, Duration::from_secs(5), 1).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("response in time");
+
+        assert_eq!(
+            dispatch.budgets[0].count.load(Ordering::Relaxed),
+            0,
+            "warmup traffic never consumes the recycle budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_attribute_retry_success_to_final_worker_only() {
+        // w0 has no peer: the pinned first attempt times out; the retry lands
+        // on w1 and only w1's budget may advance.
+        let endpoint0 = drain_test_endpoint("retry-w0");
+        let endpoint1 = drain_test_endpoint("retry-w1");
+        spawn_tagged_worker(endpoint1.clone(), b"w1".to_vec());
+        let (mut dispatch, _outlier, inflight) = budget_dispatch("retry", 2, &[100, 100], None);
+        Arc::get_mut(&mut dispatch).unwrap().zmq_clients = vec![
+            Arc::new(WorkerZmqClient::new(endpoint0)),
+            Arc::new(WorkerZmqClient::new(endpoint1)),
+        ];
+
+        let (item, rx) = hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", "0")]));
+        send_batch_with_retry(
+            vec![item],
+            &dispatch,
+            &inflight,
+            Duration::from_millis(300),
+            2,
+        )
+        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("retry must answer")
+            .expect("channel open");
+        match resp.payload {
+            Some(pb::response::Payload::Single(s)) => {
+                assert_eq!(&s.data[..], b"w1", "the retry lands on the live worker")
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+        assert_eq!(dispatch.budgets[1].count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            dispatch.budgets[0].count.load(Ordering::Relaxed),
+            0,
+            "failed attempts never consume the budget"
+        );
     }
 
     // ===== Shared OutlierState tests =====
@@ -3632,10 +3903,9 @@ mod tests {
             health_check_interval: 0.0, // disable health checker for this test
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
 
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier.clone(), None);
+        queue.register_model("test_model", "1", &config, vec![], vec![], outlier.clone(), None);
 
         let retrieved = queue.get_outlier_state("test_model", "1").unwrap();
         // Must be the same Arc
@@ -3670,9 +3940,8 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
-        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier, None);
+        queue.register_model("m", "1", &config, vec![], vec![], outlier, None);
         assert!(queue.has_queue("m", "1"));
     }
 
@@ -3815,14 +4084,12 @@ mod tests {
             request_timeout: 5.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
         let client0 = Arc::new(WorkerZmqClient::new(ep0));
         let client1 = Arc::new(WorkerZmqClient::new(ep1));
         queue.register_model(
             "m", "1", &config, vec![],
-            vec![client0, client1],
-            reload_tx, outlier, None,
+            vec![client0, client1], outlier, None,
         );
         // Let both PAIR connections establish.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3932,10 +4199,9 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        queue.register_model(model, "1", &config, vec![], vec![client], reload_tx, outlier, None);
+        queue.register_model(model, "1", &config, vec![], vec![client], outlier, None);
         queue
     }
 
@@ -4248,13 +4514,14 @@ mod tests {
 
         let (tx, rx) = priority_channel(8);
         let (resp_tx, resp_rx) = oneshot::channel();
-        let (reload_tx, _reload_rx) = mpsc::channel::<ReloadSignal>(1);
         let dispatch = Arc::new(BatchDispatch {
             zmq_clients: vec![],
             outlier: Arc::new(OutlierState::new(1)),
             model_name: "m4_m".to_string(),
             version: "1".to_string(),
-            reload_tx,
+            respawn_tx: None,
+            budgets: build_worker_budgets(0, 1000, 0),
+            recycle_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -4265,8 +4532,6 @@ mod tests {
             min_timeout: Duration::ZERO,
             queue_threshold: 0,
             request_timeout: Duration::from_secs(2),
-            max_requests: 1000,
-            max_requests_jitter: 0,
             max_retries: 0,
             queue_timeout: Duration::from_millis(100),
             queue_timeout_action: QueueTimeoutAction::Reject,
@@ -4412,7 +4677,6 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
         let mut clients = Vec::new();
         for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
@@ -4420,7 +4684,7 @@ mod tests {
             spawn_tagged_worker(endpoint.clone(), tag.to_vec());
             clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
         }
-        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        queue.register_model(model, "1", &config, vec![], clients, outlier, None);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let read = || {
@@ -4479,11 +4743,11 @@ mod tests {
     }
 
     /// F2 (warmup-gaps audit): warmup traffic must NOT consume the
-    /// max_requests auto-recycle budget. Worker-scope warmup multiplies the
-    /// unit count by the worker count — if those counted, a big enough
-    /// sample set would cross the threshold during load and trigger an
-    /// auto-recycle immediately after every load (a reload loop, since the
-    /// reload re-runs warmup against a fresh counter).
+    /// per-slot max_requests recycle budget. Worker-scope warmup multiplies
+    /// the unit count by the worker count — if those counted, a big enough
+    /// sample set would cross the threshold during load and recycle a slot
+    /// immediately after every load (a recycle loop, since the respawn
+    /// re-warms against a fresh budget).
     #[tokio::test]
     async fn warmup_items_do_not_consume_max_requests_budget() {
         let model = "warmup_maxreq_m";
@@ -4499,7 +4763,7 @@ mod tests {
             max_requests: 2,
             ..Default::default()
         };
-        let (reload_tx, mut reload_rx) = mpsc::channel(8);
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
         let mut clients = Vec::new();
         for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
@@ -4507,12 +4771,14 @@ mod tests {
             spawn_tagged_worker(endpoint.clone(), tag.to_vec());
             clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
         }
-        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        queue.register_model(model, "1", &config, vec![], clients, outlier, Some(respawn_tx));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Three warmup items — past the max_requests=2 threshold if counted.
+        // Three warmup items pinned to worker 0 — past its max_requests=2
+        // threshold if counted.
         for i in 0..3 {
-            let (mut item, rx) = hint_item_rx(&format!("warmup_{i}"), meta_with_headers(&[]));
+            let (mut item, rx) =
+                hint_item_rx(&format!("warmup_{i}"), meta_with_headers(&[("x-lite-worker-id", "0")]));
             item.is_warmup = true;
             queue.try_submit(model, "1", item).unwrap();
             tokio::time::timeout(Duration::from_secs(5), rx)
@@ -4521,26 +4787,31 @@ mod tests {
                 .expect("channel open");
         }
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), reload_rx.recv())
+            tokio::time::timeout(Duration::from_millis(300), respawn_rx.recv())
                 .await
                 .is_err(),
-            "warmup items must not signal auto-recycle"
+            "warmup items must not trigger a recycle"
         );
 
-        // Real traffic still counts: two real items cross the threshold.
+        // Real traffic still counts: two real items on worker 0 cross its
+        // per-slot threshold.
         for i in 0..2 {
-            let (item, rx) = hint_item_rx(&format!("real_{i}"), meta_with_headers(&[]));
+            let (item, rx) =
+                hint_item_rx(&format!("real_{i}"), meta_with_headers(&[("x-lite-worker-id", "0")]));
             queue.try_submit(model, "1", item).unwrap();
             tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
                 .expect("real response in time")
                 .expect("channel open");
         }
-        let signal = tokio::time::timeout(Duration::from_secs(2), reload_rx.recv())
+        let signal = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
             .await
-            .expect("real items crossing max_requests must signal reload")
-            .expect("reload channel open");
+            .expect("real items crossing max_requests must trigger a recycle")
+            .expect("respawn channel open");
         assert_eq!(signal.model_name, model);
+        assert_eq!(signal.worker_id, 0, "the slot that served the requests recycles");
+        assert_eq!(signal.reason, "rolling_recycle");
+        assert!(signal.graceful);
     }
 
     /// F3 (warmup-gaps audit): a retrying all-warmup batch must not count
@@ -4554,7 +4825,7 @@ mod tests {
         let dead_endpoint = drain_test_endpoint("warmup-retry-dead");
         let live_endpoint = drain_test_endpoint("warmup-retry-live");
         spawn_tagged_worker(live_endpoint.clone(), b"w1".to_vec());
-        let dispatch = BatchDispatch {
+        let dispatch = Arc::new(BatchDispatch {
             zmq_clients: vec![
                 Arc::new(WorkerZmqClient::new(dead_endpoint)),
                 Arc::new(WorkerZmqClient::new(live_endpoint)),
@@ -4562,10 +4833,12 @@ mod tests {
             outlier: Arc::new(OutlierState::new(2)),
             model_name: model.to_string(),
             version: "1".to_string(),
-            reload_tx: mpsc::channel(1).0,
+            respawn_tx: None,
+            budgets: build_worker_budgets(2, 0, 0),
+            recycle_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
-        };
+        });
         let inflight: Vec<Arc<AtomicUsize>> =
             vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let retries = || {
@@ -4588,14 +4861,11 @@ mod tests {
                     enqueued_at: Instant::now(),
                     is_warmup,
                 }];
-                let request_count = Arc::new(AtomicUsize::new(0));
                 send_batch_with_retry(
                     batch,
                     dispatch,
                     inflight,
                     Duration::from_millis(150),
-                    &request_count,
-                    0,
                     2,
                 )
                 .await;
@@ -4649,7 +4919,6 @@ mod tests {
             health_check_interval: 0.0,
             ..Default::default()
         };
-        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
         let mut clients = Vec::new();
         for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
@@ -4657,7 +4926,7 @@ mod tests {
             spawn_tagged_worker(endpoint.clone(), tag.to_vec());
             clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
         }
-        queue.register_model(model, "1", &config, vec![], clients, reload_tx, outlier, None);
+        queue.register_model(model, "1", &config, vec![], clients, outlier, None);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Live item pinned to worker 1, warmup item pinned to worker 0, both
@@ -4699,7 +4968,6 @@ mod tests {
     #[tokio::test]
     async fn do_send_batch_all_dead_fails_items_with_503() {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let (reload_tx, _reload_rx) = mpsc::channel::<ReloadSignal>(1);
         let outlier = Arc::new(OutlierState::new(1));
         outlier.mark_dead(0);
         let dispatch = BatchDispatch {
@@ -4709,7 +4977,9 @@ mod tests {
             outlier,
             model_name: "m".to_string(),
             version: "1".to_string(),
-            reload_tx,
+            respawn_tx: None,
+            budgets: build_worker_budgets(1, 0, 0),
+            recycle_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         };

@@ -265,7 +265,7 @@ lite-server-core (main process)
 - Each worker is an independent Python subprocess
 - Workers communicate with the core via ZMQ PAIR sockets (UDS on Unix, TCP on Windows)
 - Workers are automatically restarted on crash
-- `max_requests` triggers periodic restart to prevent memory leaks
+- `max_requests` triggers per-worker rolling restarts (siblings keep serving) to prevent memory leaks
 - Outlier detection ejects unhealthy workers (Envoy-style consecutive error counting)
 - Heartbeat probing detects stuck workers and auto-restarts them
 - Worker lifecycle hooks (shell commands + HTTP callbacks): `on_ready`, `on_exit`, `on_error`

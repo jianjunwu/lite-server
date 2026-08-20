@@ -261,7 +261,7 @@ lite-server-core（主进程）
 - 每个 worker 是独立的 Python 子进程
 - Worker 通过 ZMQ PAIR 套接字与内核通信（Unix 上用 UDS，Windows 上用 TCP）
 - Worker 崩溃后自动重启
-- `max_requests` 触发定期重启防止内存泄漏
+- `max_requests` 触发逐 worker 滚动重启防止内存泄漏（回收期间其他 worker 继续服务）
 - 异常检测剔除不健康 worker（Envoy 风格的连续错误计数）
 - 心跳探测检测卡死 worker 并自动重启
 - Worker 生命周期钩子（shell 命令 + HTTP 回调）：`on_ready`、`on_exit`、`on_error`

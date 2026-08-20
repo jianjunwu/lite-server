@@ -369,8 +369,9 @@ queue_timeout_secs: 0.0        # 请求在队列中最长等待秒数，超过�
                                # 处理（0 = 禁用，默认）。
 queue_timeout_action: delay    # delay（默认；交给 request_timeout 兜底）| reject
                                # （超过 queue_timeout_secs 返回 503 / gRPC Unavailable）
-max_requests: 0                # worker 处理 N 个请求后自动重启（0 = 禁用）
-max_requests_jitter: 0         # max_requests 的随机抖动，防止惊群效应
+max_requests: 0                # 滚动回收：每个 worker 各自处理 N 个请求后重启
+                               # （0 = 禁用）；回收期间其他 worker 继续服务
+max_requests_jitter: 0         # max_requests 的逐 worker 随机抖动（错开各 worker 的回收时间）
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
 
 # Worker 韧性（Resilience）
@@ -538,8 +539,8 @@ lite-server serve [参数]
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | 禁用流式指标 | `features.streaming_metrics` |
 | `--max-queue-size` | 所有模型的最大队列 | `model_defaults.max_queue_size` |
-| `--max-requests` | N 个请求后自动重启 | `model_defaults.max_requests` |
-| `--max-requests-jitter` | max_requests 抖动 | `model_defaults.max_requests_jitter` |
+| `--max-requests` | 滚动回收：每个 worker 处理 N 个请求后重启 | `model_defaults.max_requests` |
+| `--max-requests-jitter` | max_requests 的逐 worker 抖动 | `model_defaults.max_requests_jitter` |
 | `--request-timeout` | 单请求超时 | `model_defaults.request_timeout` |
 | `--health-check-interval` | 健康检查间隔 | `model_defaults.health_check_interval` |
 | `--threads` | Tokio 工作线程数 | `server.threads` |
@@ -621,6 +622,8 @@ request_timeout: 120.0
 
 ```yaml
 # model_repo/my_model/1/config.yaml
+# 每个 worker 各自在处理约 500 个请求后滚动回收（±50 逐 worker 抖动）；
+# 回收期间其他 worker 继续服务
 max_requests: 500
 max_requests_jitter: 50
 

@@ -12,17 +12,19 @@ use crate::worker::protocol::*;
 /// the monitor's SIGKILL (via `shutdown_tx`) only when the worker is hung
 /// (never read the graceful-stop message). Always waits for the reap — an
 /// un-reaped worker is an orphan whose ZMQ auto-reconnect steals the
-/// re-bound socket on reload/restart.
+/// re-bound socket on reload/restart. Returns true when SIGKILL escalation
+/// fired (the worker never consumed the stop message).
 pub(super) async fn stop_worker_gracefully(
     proc: &mut super::WorkerProcess,
     model_name: &str,
     version: &str,
-) {
+) -> bool {
     match proc.done_rx.take() {
         None => {
             if let Some(tx) = proc.shutdown_tx.take() {
                 let _ = tx.send(());
             }
+            false
         }
         Some(rx) => {
             let rx = rx;
@@ -47,6 +49,7 @@ pub(super) async fn stop_worker_gracefully(
                     }
                 }
             }
+            escalated
         }
     }
 }
@@ -433,6 +436,7 @@ impl WorkerManager {
                         info!(
                             model = %signal.model_name, version = %signal.version,
                             worker_id = signal.worker_id, reason = signal.reason,
+                            graceful = signal.graceful,
                             "Respawning worker"
                         );
                         if let Err(e) = wm
@@ -441,6 +445,7 @@ impl WorkerManager {
                                 &signal.version,
                                 signal.worker_id,
                                 signal.reason,
+                                signal.graceful,
                             )
                             .await
                         {
@@ -468,9 +473,10 @@ impl WorkerManager {
         version: &str,
         worker_id: u32,
         reason: &'static str,
+        graceful: bool,
     ) -> Result<(), AppError> {
         let result = self
-            .respawn_worker_inner(model_name, version, worker_id, reason)
+            .respawn_worker_inner(model_name, version, worker_id, reason, graceful)
             .await;
         if result.is_err() {
             crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
@@ -486,6 +492,7 @@ impl WorkerManager {
         version: &str,
         worker_id: u32,
         reason: &'static str,
+        graceful: bool,
     ) -> Result<(), AppError> {
         let key = model_version_key(model_name, version);
 
@@ -514,24 +521,52 @@ impl WorkerManager {
             })
         };
         if let Some(mut proc) = old_proc {
-            // NO graceful stop here — kill escalation only. This path targets
-            // a worker that failed health probes (likely hung), so teardown
-            // would hang the respawn anyway; and a stop message sent now would
-            // be replayed to the replacement worker when it reconnects to the
-            // reused bound socket (ZMQ PAIR keeps queued messages across a
-            // dead peer's reconnect), instantly killing the replacement in a
-            // kill→respawn→kill loop. The graceful stop-then-wait sequence
-            // (stop_worker_gracefully) belongs to the unload path only, where
-            // the client socket is dropped and its queue dies with it.
-            if let Some(tx) = proc.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            if let Some(done_rx) = proc.done_rx {
-                if timeout(proc.kill_timeout, done_rx).await.is_err() {
-                    error!(
+            if graceful {
+                // Rolling recycle of a healthy, drained worker: send the ZMQ
+                // stop message (FIFO-ordered behind any in-flight batches on
+                // the reused PAIR socket, so they are still answered first)
+                // and wait out kill_timeout for a clean exit. Unlike the kill
+                // path, this is safe against the stale-stop replay hazard
+                // because the collector only signals a recycle after the slot
+                // drained — a healthy worker consumes the stop before exiting
+                // and is reaped before the replacement spawns.
+                let client = {
+                    let clients = self.zmq_clients.read().await;
+                    clients
+                        .get(&key)
+                        .and_then(|cs| cs.get(worker_id as usize).cloned())
+                };
+                if let Some(client) = client {
+                    let _ = client.send_raw(crate::streaming::build_stop_request()).await;
+                }
+                let escalated = stop_worker_gracefully(&mut proc, model_name, version).await;
+                if escalated {
+                    warn!(
                         model = %model_name, version = %version, worker_id,
-                        "Timed out waiting for old worker to die; respawning anyway"
+                        "Worker hung during graceful recycle; an unconsumed stop \
+                         message may be replayed to the replacement on the reused socket"
                     );
+                }
+            } else {
+                // NO graceful stop here — kill escalation only. This path targets
+                // a worker that failed health probes (likely hung), so teardown
+                // would hang the respawn anyway; and a stop message sent now would
+                // be replayed to the replacement worker when it reconnects to the
+                // reused bound socket (ZMQ PAIR keeps queued messages across a
+                // dead peer's reconnect), instantly killing the replacement in a
+                // kill→respawn→kill loop. The graceful stop-then-wait sequence
+                // (stop_worker_gracefully) belongs to the unload path and the
+                // rolling-recycle path, where the worker is known healthy.
+                if let Some(tx) = proc.shutdown_tx.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(done_rx) = proc.done_rx {
+                    if timeout(proc.kill_timeout, done_rx).await.is_err() {
+                        error!(
+                            model = %model_name, version = %version, worker_id,
+                            "Timed out waiting for old worker to die; respawning anyway"
+                        );
+                    }
                 }
             }
         }
@@ -556,8 +591,16 @@ impl WorkerManager {
         // A successful handshake marks it Ready again; a startup failure leaves
         // it Degraded (runtime worker loss, not a load failure — Failed is
         // load-phase only).
-        self.registry
-            .set_status(model_name, version, VersionStatus::Degraded)?;
+        //
+        // Graceful rolling recycle is the exception: the infer gate
+        // (`registry.is_ready`) is strict-Ready, so degrading the version
+        // would 503 ALL traffic for the whole stop+spawn window even though
+        // the sibling slots are healthy. The recycling slot is already
+        // ejected (routing avoids it), so the version stays Ready.
+        if !graceful {
+            self.registry
+                .set_status(model_name, version, VersionStatus::Degraded)?;
+        }
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         let devices = match &model_config.devices {
             Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,
@@ -827,9 +870,20 @@ impl WorkerManager {
             .clone()
             .filter(|p| p.enabled && p.respawn);
 
-        // Replacement worker is up: Loading → Ready (loaded_at preserved).
-        self.registry.mark_ready(model_name, version)?;
-        self.sync_grpc_health().await;
+        // Replacement worker is up: Degraded → Ready (loaded_at preserved).
+        // A graceful recycle never degraded the version, so restore Ready
+        // only when it IS currently Degraded (kill mode, or the status
+        // coordinator flipped it during a slow recycle) — never flip a
+        // version that is Degraded for another slot's sake.
+        let is_degraded = self
+            .registry
+            .get(model_name, Some(version))
+            .map(|mv| mv.status == VersionStatus::Degraded)
+            .unwrap_or(false);
+        if !graceful || is_degraded {
+            self.registry.mark_ready(model_name, version)?;
+            self.sync_grpc_health().await;
+        }
 
         // Clear the slot's ejection/error state so routing to the replacement
         // resumes immediately instead of waiting out the ejection timeout.
@@ -1421,7 +1475,7 @@ mod tests {
         let before = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
             .with_label_values(labels)
             .get();
-        wm.respawn_worker("ghost_m", "1", 0, "health_check")
+        wm.respawn_worker("ghost_m", "1", 0, "health_check", false)
             .await
             .expect_err("respawning an unknown model must fail");
         let after = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
@@ -1536,7 +1590,7 @@ class TestAPI(LitAPI):
             "load warmup: 1 worker x 1 sample x 2 iterations"
         );
 
-        wm.respawn_worker("g2_rewarm", "1", 0, "health_check")
+        wm.respawn_worker("g2_rewarm", "1", 0, "health_check", false)
             .await
             .expect("respawn must succeed");
 
@@ -1657,7 +1711,7 @@ class TestAPI(LitAPI):
         };
         assert_eq!(lines(), 2, "load warmup: 2 iterations");
 
-        wm.respawn_worker("g2_async", "1", 0, "health_check")
+        wm.respawn_worker("g2_async", "1", 0, "health_check", false)
             .await
             .expect("respawn must succeed");
 
@@ -1699,7 +1753,7 @@ class TestAPI(LitAPI):
             .with_label_values(labels)
             .get();
 
-        wm.respawn_worker("g2_rewarm_fail", "1", 0, "health_check")
+        wm.respawn_worker("g2_rewarm_fail", "1", 0, "health_check", false)
             .await
             .expect("the respawn itself succeeded — only the re-warm failed");
 
@@ -1750,6 +1804,163 @@ class TestAPI(LitAPI):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Graceful-respawn harness: an echo model whose `teardown` runs
+    /// `teardown_body`, so tests can tell a graceful stop (teardown ran)
+    /// from a SIGKILL (no teardown). Returns (manager, registry, repo, marker).
+    #[cfg(unix)]
+    async fn teardown_marker_harness(
+        tag: &str,
+        teardown_body: &str,
+        kill_timeout: f32,
+    ) -> (
+        std::sync::Arc<WorkerManager>,
+        std::sync::Arc<crate::registry::ModelRegistry>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-grace-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let marker = repo.join("teardown.txt");
+        // `{marker}` in teardown_body expands to the absolute marker path.
+        let teardown_body = teardown_body.replace("{marker}", &marker.display().to_string());
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    def teardown(self):
+        {teardown_body}
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let wm = std::sync::Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            std::sync::Arc::new(crate::inference_queue::InferenceQueue::new()),
+            "error".to_string(),
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+        ));
+        let mut config = crate::config::ModelConfig::default();
+        config.worker_kill_timeout = kill_timeout;
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load must succeed");
+        (wm, registry, repo, marker)
+    }
+
+    /// Rolling recycle: a graceful respawn must send the ZMQ stop message and
+    /// wait for the old worker, so it runs its teardown hook and exits
+    /// cleanly instead of being SIGKILLed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_run_teardown_hook_in_graceful_respawn() {
+        let (wm, registry, repo, marker) = teardown_marker_harness(
+            "grace_stop",
+            "open(r'{marker}', 'a').write('t\\n')",
+            10.0,
+        )
+        .await;
+
+        wm.respawn_worker("grace_stop", "1", 0, "rolling_recycle", true)
+            .await
+            .expect("graceful respawn must succeed");
+
+        assert!(
+            marker.exists(),
+            "graceful respawn must let the old worker run teardown"
+        );
+        let status = registry.get("grace_stop", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Ready),
+            "a successful graceful respawn returns the version to Ready"
+        );
+
+        let _ = wm.unload_model("grace_stop", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Kill mode (health-check escalation) must keep its kill-only teardown:
+    /// no stop message, no teardown hook — the worker is SIGKILLed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_not_run_teardown_hook_in_kill_respawn() {
+        let (wm, _registry, repo, marker) = teardown_marker_harness(
+            "kill_mode",
+            "open(r'{marker}', 'a').write('t\\n')",
+            10.0,
+        )
+        .await;
+
+        wm.respawn_worker("kill_mode", "1", 0, "health_check", false)
+            .await
+            .expect("kill-mode respawn must succeed");
+
+        assert!(
+            !marker.exists(),
+            "kill-mode respawn must not send a stop message (no teardown)"
+        );
+
+        let _ = wm.unload_model("kill_mode", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A worker hung inside teardown must not stall a graceful respawn:
+    /// after kill_timeout the monitor SIGKILLs it and the replacement still
+    /// comes up (the stale-stop replay hazard is warn-logged, not fatal).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_escalate_to_sigkill_when_graceful_stop_hangs() {
+        let (wm, registry, repo, _marker) = teardown_marker_harness(
+            "hang_stop",
+            "import time; time.sleep(3600)",
+            1.0,
+        )
+        .await;
+
+        timeout(
+            Duration::from_secs(30),
+            wm.respawn_worker("hang_stop", "1", 0, "rolling_recycle", true),
+        )
+        .await
+        .expect("graceful respawn must not stall on a hung worker")
+        .expect("respawn must succeed after SIGKILL escalation");
+
+        let status = registry.get("hang_stop", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Ready),
+            "the replacement must come up after the hung worker is killed"
+        );
+
+        let _ = wm.unload_model("hang_stop", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[tokio::test]
     async fn test_respawn_channel_creation() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::inference_queue::RespawnSignal>(8);
@@ -1758,6 +1969,7 @@ class TestAPI(LitAPI):
             version: "1".to_string(),
             worker_id: 0,
             reason: "health_check",
+            graceful: false,
         })
         .await
         .unwrap();

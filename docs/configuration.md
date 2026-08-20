@@ -416,8 +416,9 @@ queue_timeout_secs: 0.0        # Max seconds a request may wait in the queue bef
                                # queue_timeout_action applies (0 = disabled, default).
 queue_timeout_action: delay    # delay (default; let request_timeout govern) | reject
                                # (return 503 / gRPC Unavailable once queue_timeout_secs elapses)
-max_requests: 0                # Auto-restart worker after N requests (0 = disabled)
-max_requests_jitter: 0         # Random jitter for max_requests (prevents thundering herd)
+max_requests: 0                # Rolling recycle: each worker restarts after serving N
+                               # requests (0 = disabled); siblings keep serving
+max_requests_jitter: 0         # Per-worker jitter for max_requests (staggers recycles)
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
 
 # Worker Resilience
@@ -601,8 +602,8 @@ lite-server serve [flags]
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | Disable streaming metrics | `features.streaming_metrics` |
 | `--max-queue-size` | Max queue size for all models | `model_defaults.max_queue_size` |
-| `--max-requests` | Auto-restart after N requests | `model_defaults.max_requests` |
-| `--max-requests-jitter` | Jitter for max_requests | `model_defaults.max_requests_jitter` |
+| `--max-requests` | Rolling recycle: restart each worker after it serves N requests | `model_defaults.max_requests` |
+| `--max-requests-jitter` | Per-worker jitter for max_requests | `model_defaults.max_requests_jitter` |
 | `--request-timeout` | Per-request timeout | `model_defaults.request_timeout` |
 | `--health-check-interval` | Health check interval | `model_defaults.health_check_interval` |
 | `--threads` | Tokio worker threads | `server.threads` |
@@ -684,6 +685,8 @@ request_timeout: 120.0
 
 ```yaml
 # model_repo/my_model/1/config.yaml
+# Each worker rolls over after ~500 served requests (±50 per-worker jitter);
+# siblings keep serving during a slot's recycle
 max_requests: 500
 max_requests_jitter: 50
 

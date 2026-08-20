@@ -72,8 +72,8 @@ lite-server serve [选项]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--max-queue-size` | int | 1000 | 每个 worker 的最大待处理请求数 |
-| `--max-requests` | int | 0 | worker 处理 N 个请求后自动重启（0 = 禁用） |
-| `--max-requests-jitter` | int | 0 | `max_requests` 的随机抖动范围，防止惊群效应 |
+| `--max-requests` | int | 0 | 滚动回收：每个 worker 处理 N 个请求后重启（0 = 禁用） |
+| `--max-requests-jitter` | int | 0 | `max_requests` 的逐 worker 随机抖动范围，错开回收时间 |
 | `--request-timeout` | float | 0.0 | 单请求硬超时（秒），0 = 禁用 |
 | `--health-check-interval` | float | 15.0 | 主动健康检查间隔（秒），0 = 禁用 |
 | `--ejection-error-threshold` | int | 3 | 连续错误 N 次后剔除 worker（0 = 禁用） |

@@ -3435,14 +3435,16 @@ class TestAPI(LitAPI):
 }
 
 // ---------------------------------------------------------------------------
-// §4.1: max_requests reload must target the triggering version
+// §4.1: max_requests rolling recycle must target the triggering worker only
 // ---------------------------------------------------------------------------
 
-/// v1 hits max_requests while v2 is the active version: the auto-recycle must
-/// reload v1 and leave the active v2 untouched. (The old ReloadSignal carried
-/// only the model name, so the listener reloaded the *active* version.)
+/// v1 hits max_requests while v2 is the active version: the per-worker
+/// rolling recycle must respawn exactly one worker of v1 (one
+/// `liteserver_worker_respawns_total{reason="rolling_recycle"}` tick) and
+/// leave v1's sibling worker, the whole v2 version (loaded_at unchanged),
+/// and the active pointer untouched.
 #[tokio::test]
-async fn test_max_requests_reload_targets_triggering_version() {
+async fn test_max_requests_rolling_recycle_targets_triggering_worker() {
     let model_py = r#"from lite_server import LitAPI
 
 
@@ -3462,8 +3464,11 @@ class ReloadAPI(LitAPI):
 
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-reloadver-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    let base_cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
-    for (v, cfg) in [("1", format!("{}max_requests: 1\n", base_cfg)), ("2", base_cfg.to_string())] {
+    let base_cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
+    for (v, cfg) in [
+        ("1", format!("{}workers_per_device: 2\nmax_requests: 1\n", base_cfg)),
+        ("2", format!("{}workers_per_device: 1\n", base_cfg)),
+    ] {
         let dir = tmp_dir.join("reload_model").join(v);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model.py"), model_py).unwrap();
@@ -3471,11 +3476,13 @@ class ReloadAPI(LitAPI):
     }
 
     let port = next_test_port();
+    let metrics_port = next_test_port();
     kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
     let _server = ServerGuard::start(&[
         "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
         "--model-repo", &tmp_dir.to_string_lossy(),
-        "--no-metrics",
         "--no-grpc",
         "--log-level", "warn",
     ]);
@@ -3494,6 +3501,24 @@ class ReloadAPI(LitAPI):
     let get_health = || async {
         let resp = client.get(format!("{}/health", base)).send().await.unwrap();
         resp.json::<Value>().await.unwrap()
+    };
+    // Rolling-recycle count per version from the metrics endpoint (the
+    // series is absent until the first recycle).
+    let rolling_recycles = |body: &str, v: &str| -> f64 {
+        let needle = format!(
+            "liteserver_worker_respawns_total{{model=\"reload_model\",reason=\"rolling_recycle\",version=\"{v}\"}}"
+        );
+        body.lines()
+            .find(|l| l.starts_with(&needle))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse().ok())
+            .unwrap_or(0.0)
+    };
+    let get_metrics = || async {
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap();
+        resp.text().await.unwrap()
     };
 
     // Load both versions explicitly (default control_mode loads nothing at
@@ -3515,50 +3540,56 @@ class ReloadAPI(LitAPI):
     }
     let v2 = v2.expect("v2 did not become ready");
     let v2_loaded_at = v2["loaded_at"].clone();
-    assert!(v2_loaded_at.as_u64().is_some(), "v2 loaded_at: {:?}", v2);
     let body = get_health().await;
     let v1_loaded_at = health_entry(&body, "1").expect("v1 loaded")["loaded_at"].clone();
     assert!(v1_loaded_at.as_u64().is_some(), "v1 loaded_at: {:?}", v1_loaded_at);
 
-    // Make v2 the active version — the buggy code reloaded the active one.
+    // Make v2 the active version.
     let resp = client
         .post(format!("{}/v2/models/reload_model/versions/2/activate", base))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    // Hit v1's max_requests via the versioned path.
+    // Hit v1's per-worker max_requests via the versioned path.
     let resp = client
         .post(format!("{}/v2/models/reload_model/versions/1/infer", base))
         .json(&json!({"input": 21}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    // Poll: v1 must be observed recycling (entry briefly unregistered, or
-    // re-registered with a new loaded_at) while v2 stays ready with its
-    // original loaded_at throughout.
+    // Poll: exactly one rolling recycle for v1 (one worker only — its
+    // sibling keeps serving), none for v2, and NEITHER version is reloaded
+    // (loaded_at unchanged — a rolling recycle is not a version reload).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut v1_recycled = false;
+    let mut recycled = false;
     while tokio::time::Instant::now() < deadline {
         let body = get_health().await;
         let v2 = health_entry(&body, "2").expect("v2 must stay registered");
         assert_eq!(v2["status"], "ready", "active v2 must be untouched: {:?}", v2);
         assert_eq!(v2["loaded_at"], v2_loaded_at, "active v2 must not be reloaded");
-        match health_entry(&body, "1") {
-            None => { v1_recycled = true; break; } // unload phase of the recycle
-            Some(v1) if v1["loaded_at"] != v1_loaded_at => { v1_recycled = true; break; }
-            _ => {}
+        let v1 = health_entry(&body, "1").expect("v1 must stay registered — rolling recycle is not an unload");
+        assert_eq!(v1["loaded_at"], v1_loaded_at, "v1 must not be reloaded");
+        let m = get_metrics().await;
+        assert_eq!(rolling_recycles(&m, "2"), 0.0, "v2 must not recycle");
+        if rolling_recycles(&m, "1") == 1.0 {
+            recycled = true;
+            break;
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(v1_recycled, "v1 was not recycled within 60s of hitting max_requests");
+    assert!(recycled, "v1 did not roll a worker within 60s of hitting max_requests");
 
-    // v1 comes back ready; v2 still untouched.
+    // Exactly one slot recycled, and v1 returns to ready.
+    let m = get_metrics().await;
+    assert_eq!(
+        rolling_recycles(&m, "1"),
+        1.0,
+        "exactly one worker recycles for a single crossing"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut v1_back = false;
     while tokio::time::Instant::now() < deadline {
         let body = get_health().await;
-        let v2 = health_entry(&body, "2").expect("v2 must stay registered");
-        assert_eq!(v2["loaded_at"], v2_loaded_at, "active v2 must not be reloaded");
         if health_entry(&body, "1").is_some_and(|v1| v1["status"] == "ready") {
             v1_back = true;
             break;
@@ -3573,6 +3604,93 @@ class ReloadAPI(LitAPI):
         .send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["active_version"], "2", "active must stay v2 after v1 recycle");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// A rolling recycle must not drop traffic: with two workers and a small
+/// max_requests, a sequential burst is fully served (200s) while workers
+/// recycle underneath.
+#[tokio::test]
+async fn should_keep_serving_during_rolling_recycle() {
+    let model_py = r#"from lite_server import LitAPI
+
+
+class RollingAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-rolling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let dir = tmp_dir.join("rolling_model").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.py"), model_py).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_requests: 3\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "rolling_model", "1").await;
+
+    // Sequential burst: 8 requests against two slots with max_requests=3 —
+    // both slots cross their budget mid-burst.
+    for i in 0..8 {
+        let resp = client
+            .post(format!("{}/v2/models/rolling_model/infer", base))
+            .json(&json!({"input": i}))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {i} must be served during recycle");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["output"], json!(i * 2));
+    }
+
+    // At least one worker must have been replaced by a rolling recycle.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap();
+        let body = resp.text().await.unwrap();
+        let count = body.lines()
+            .find(|l| l.starts_with(
+                "liteserver_worker_respawns_total{model=\"rolling_model\",reason=\"rolling_recycle\",version=\"1\"}"
+            ))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if count >= 1.0 {
+            recycled = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(recycled, "at least one worker must be recycled during the burst");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }

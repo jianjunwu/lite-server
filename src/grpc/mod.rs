@@ -1418,11 +1418,9 @@ mod request_metrics_tests {
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        let (reload_tx, _rx) = mpsc::channel(8);
         queue.register_model(
             model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()],
-            reload_tx, Arc::new(OutlierState::new(1)), None,
+            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
         );
         let service = build_service(registry, queue);
         // stream/bidi 走 worker_manager.get_zmq_clients（不经 queue）——
@@ -1487,10 +1485,9 @@ mod request_metrics_tests {
             let endpoint = metric_test_endpoint(&format!("{}-v{}", model, v));
             spawn_ok_worker(endpoint.clone());
             let client = Arc::new(WorkerZmqClient::new(endpoint));
-            let (reload_tx, _rx) = mpsc::channel(8);
             queue.register_model(
                 model, v, &test_config(1, 0.0, 10), vec![],
-                vec![client], reload_tx, Arc::new(OutlierState::new(1)), None,
+                vec![client], Arc::new(OutlierState::new(1)), None,
             );
         }
         // activate = hard cutover（§4.3）：active=v1 且权重 100/0。
@@ -1668,10 +1665,8 @@ mod request_metrics_tests {
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
-        let (reload_tx, _rx) = mpsc::channel(8);
         queue.register_model(
-            model, "1", &test_config(2, 3600.0, 1), vec![], vec![],
-            reload_tx, Arc::new(OutlierState::new(0)), None,
+            model, "1", &test_config(2, 3600.0, 1), vec![], vec![], Arc::new(OutlierState::new(0)), None,
         );
         let service = build_service(registry, queue.clone());
 
@@ -1812,10 +1807,9 @@ mod request_metrics_tests {
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        let (reload_tx, _rx) = mpsc::channel(8);
         queue.register_model(
             model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()], reload_tx, Arc::new(OutlierState::new(1)), None,
+            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
         );
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
@@ -2462,11 +2456,9 @@ mod request_metrics_tests {
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        let (reload_tx, _rx) = mpsc::channel(8);
         queue.register_model(
             model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()],
-            reload_tx, Arc::new(OutlierState::new(1)), None,
+            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
         );
         let service = build_service_with_callback(registry, queue, cb);
         service
@@ -3207,11 +3199,9 @@ mod request_metrics_tests {
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        let (reload_tx, _rx) = mpsc::channel(8);
         queue.register_model(
             model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()],
-            reload_tx, Arc::new(OutlierState::new(1)), None,
+            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
         );
         let service = build_service_with_idle(registry, queue, idle);
         service
