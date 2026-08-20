@@ -737,12 +737,13 @@ impl WorkerManager {
                 .set_status(model_name, version, VersionStatus::Degraded)?;
         }
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
-        let devices = match &model_config.devices {
-            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,
-            Some(serde_json::Value::String(s)) if s == "auto" => 1,
-            _ => 1,
-        };
-        let device = format!("{}:{}", accelerator, worker_id as usize % devices);
+        // Same resolver as the initial spawn (single source of truth), so a
+        // respawned/recycled worker lands back on its original device. The
+        // config was validated at load, so resolution cannot fail here.
+        let device_plan = model_config
+            .resolve_device_plan()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        let device = format!("{}:{}", accelerator, device_plan[worker_id as usize]);
 
         let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
 
@@ -1814,6 +1815,128 @@ mod tests {
             .with_label_values(labels)
             .get();
         assert_eq!(after, before + 1.0, "a failed respawn must be counted");
+    }
+
+    /// Device-placement harness: an echo model whose `setup` appends the
+    /// device string it received to a marker file, so tests can assert which
+    /// device each spawned worker (initial or replacement) landed on.
+    /// Returns (manager, repo, marker).
+    #[cfg(unix)]
+    async fn device_marker_harness(
+        tag: &str,
+        devices: serde_json::Value,
+        continuous_batching: bool,
+    ) -> (WorkerManager, std::path::PathBuf, std::path::PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-devplan-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let marker = repo.join("devices.txt");
+        std::fs::write(
+            model_dir.join("model.py"),
+            format!(
+                r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        with open({marker:?}, "a") as f:
+            f.write(device + "\n")
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#,
+                marker = marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\n",
+        )
+        .unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry,
+            repo.clone(),
+            std::sync::Arc::new(crate::inference_queue::InferenceQueue::new()),
+            "debug".to_string(),
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+        );
+        let mut config = crate::config::ModelConfig::default();
+        config.devices = Some(devices);
+        config.continuous_batching = continuous_batching;
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load must succeed");
+        (wm, repo, marker)
+    }
+
+    /// Device placement (list form): a respawned worker must land back on
+    /// the device its slot started on — the respawn path resolves through
+    /// the same plan as the initial spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_keeps_slot_device_for_list_form() {
+        let (wm, _repo, marker) =
+            device_marker_harness("devlist", serde_json::json!([0, 1]), false).await;
+        let wm = std::sync::Arc::new(wm);
+        // Load spawned worker 0 → cpu:0, worker 1 → cpu:1.
+        wm.respawn_worker("devlist", "1", 1, "health_check", false)
+            .await
+            .expect("respawn must succeed");
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["cpu:0", "cpu:1", "cpu:1"],
+            "the replacement for worker 1 must be spawned on cpu:1 again"
+        );
+    }
+
+    /// Device placement (map form): explicit per-device counts survive a
+    /// respawn — the replacement keeps its slot's device.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_keeps_slot_device_for_map_form() {
+        let (wm, _repo, marker) =
+            device_marker_harness("devmap", serde_json::json!({ "1": 2 }), false).await;
+        let wm = std::sync::Arc::new(wm);
+        // Load spawned workers 0 and 1, both on cpu:1.
+        wm.respawn_worker("devmap", "1", 0, "health_check", false)
+            .await
+            .expect("respawn must succeed");
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["cpu:1", "cpu:1", "cpu:1"],
+            "the replacement for worker 0 must be spawned on cpu:1 again"
+        );
+    }
+
+    /// Device placement under continuous_batching: per-device counts are
+    /// forced to one worker per unique device (mirroring the
+    /// workers_per_device=1 force), so a map count of 2 yields ONE worker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cb_load_forces_one_worker_per_unique_device() {
+        let (_wm, _repo, marker) =
+            device_marker_harness("devcb", serde_json::json!({ "0": 2 }), true).await;
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["cpu:0"],
+            "continuous_batching must spawn exactly one worker for the unique device"
+        );
     }
 
     /// G2 harness: a temp repo with an echo model whose `predict` appends one

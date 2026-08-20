@@ -1392,23 +1392,138 @@ impl ModelConfig {
         check_duration_secs("health_check_timeout", self.health_check_timeout)?;
         check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
         check_duration_secs("hook_http_timeout", self.hooks.hook_http_timeout)?;
-        // devices: a Number must be a positive integer (>= 1). `0` (or `0.0`)
-        // otherwise flows into the worker spawn loop as `worker_id % devices` =
-        // `0 % 0` and panics (worker/lifecycle.rs:247). "auto"/None/other
-        // strings resolve to 1 device in the loader and stay valid.
-        if let Some(serde_json::Value::Number(n)) = &self.devices {
-            if !matches!(n.as_u64(), Some(d) if d >= 1) {
-                anyhow::bail!(
-                    "config field `devices` must be a positive integer >= 1 \
-                     (or the string \"auto\"), got {n}"
-                );
-            }
-        }
+        // devices: must resolve to a non-empty worker_id → device plan.
+        // Invalid values (0 / negative / float, empty list or map, duplicate
+        // or non-integer entries, non-"auto" strings, map form combined with
+        // workers_per_device > 1) are rejected here so no load path can hit
+        // them later — before resolve_device_plan existed, `0` panicked on
+        // `worker_id % devices` in the spawn loop and unrecognized values
+        // silently resolved to 1 device.
+        self.resolve_device_plan()?;
         // M7 迁移哨兵（与 load_model_config 同一道闸）。
         if let Some(w) = &self.policies.warmup {
             w.validate()?;
         }
         Ok(())
+    }
+
+    /// Normalize `devices` + `workers_per_device` (+ `continuous_batching`)
+    /// into an explicit worker_id → device-index table (`plan[worker_id]`).
+    ///
+    /// Backward compatible: None / "auto" / integer N expand exactly as the
+    /// legacy `worker_id % devices` round-robin did. New forms: a list of
+    /// device indices (`[1, 3]`, round-robined `workers_per_device` times in
+    /// written order) or a map of per-device worker counts
+    /// (`{ "1": 2, "3": 1 }`, grouped by ascending index; incompatible with
+    /// workers_per_device > 1). Under `continuous_batching` each unique
+    /// device gets exactly one worker, mirroring the workers_per_device=1
+    /// force. Every spawn path (initial load and respawn) uses this single
+    /// resolver so a recycled/respawned worker lands on its original device.
+    pub fn resolve_device_plan(&self) -> anyhow::Result<Vec<usize>> {
+        use serde_json::Value;
+        let wpd = self.workers_per_device.unwrap_or(1);
+        if wpd == 0 {
+            anyhow::bail!(
+                "config field `workers_per_device` must be >= 1 (0 would produce zero workers)"
+            );
+        }
+        let round_robin = |devices: &[usize]| -> Vec<usize> {
+            (0..wpd).flat_map(|_| devices.iter().copied()).collect()
+        };
+        let plan: Vec<usize> = match &self.devices {
+            None => round_robin(&[0]),
+            Some(Value::Number(n)) => {
+                let Some(n) = n.as_u64().filter(|d| *d >= 1) else {
+                    anyhow::bail!(
+                        "config field `devices` must be a positive integer >= 1 \
+                         (or \"auto\", a list of device indices, or a map of \
+                         device index → worker count), got {n}"
+                    );
+                };
+                round_robin(&(0..n as usize).collect::<Vec<_>>())
+            }
+            Some(Value::String(s)) if s == "auto" => round_robin(&[0]),
+            Some(Value::String(s)) => {
+                anyhow::bail!(
+                    "config field `devices` only supports the string \"auto\", got \"{s}\""
+                );
+            }
+            Some(Value::Array(items)) => {
+                if items.is_empty() {
+                    anyhow::bail!("config field `devices` must not be an empty list");
+                }
+                let mut devices = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(d) = item.as_u64() else {
+                        anyhow::bail!(
+                            "config field `devices` list entries must be a device index \
+                             (non-negative integer), got {item}"
+                        );
+                    };
+                    if devices.contains(&(d as usize)) {
+                        anyhow::bail!(
+                            "config field `devices` list has duplicate device index {d}; \
+                             for multiple workers on one device use the map form \
+                             (e.g. devices: {{ \"{d}\": 2 }})"
+                        );
+                    }
+                    devices.push(d as usize);
+                }
+                round_robin(&devices)
+            }
+            Some(Value::Object(map)) => {
+                if map.is_empty() {
+                    anyhow::bail!("config field `devices` must not be an empty map");
+                }
+                if wpd != 1 {
+                    anyhow::bail!(
+                        "config field `devices` map form carries explicit per-device \
+                         worker counts and cannot be combined with \
+                         workers_per_device > 1"
+                    );
+                }
+                let mut slots: Vec<(usize, usize)> = Vec::with_capacity(map.len());
+                for (key, count) in map {
+                    let d: usize = key.parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "config field `devices` map keys must be a device index \
+                             (non-negative integer), got \"{key}\""
+                        )
+                    })?;
+                    let Some(c) = count.as_u64().filter(|c| *c >= 1) else {
+                        anyhow::bail!(
+                            "config field `devices` map values must be a positive integer \
+                             worker count, got {count} for device \"{key}\""
+                        );
+                    };
+                    slots.push((d, c as usize));
+                }
+                // Expand grouped by ascending device index, independent of the
+                // map's iteration/insertion order.
+                slots.sort_unstable_by_key(|(d, _)| *d);
+                slots
+                    .iter()
+                    .flat_map(|(d, c)| std::iter::repeat_n(*d, *c))
+                    .collect()
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "config field `devices` has unsupported value {other}; expected a \
+                     positive integer, \"auto\", a list of device indices, or a map \
+                     of device index → worker count"
+                );
+            }
+        };
+        if self.continuous_batching {
+            // One worker per unique device (written/ascending order preserved).
+            let mut seen = std::collections::HashSet::new();
+            Ok(plan
+                .into_iter()
+                .filter(|d| seen.insert(*d))
+                .collect())
+        } else {
+            Ok(plan)
+        }
     }
 }
 
@@ -2923,6 +3038,129 @@ policies:
         // Sanity: a positive devices value stays valid.
         let cfg_ok: ModelConfig = serde_yaml::from_str("devices: 1\n").expect("parses");
         assert!(cfg_ok.validate().is_ok());
+    }
+
+    // ===== Device placement: resolve_device_plan =====
+
+    fn plan(yaml: &str) -> Vec<usize> {
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).expect("parses");
+        cfg.resolve_device_plan().expect("valid plan")
+    }
+
+    fn plan_err(yaml: &str) -> String {
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).expect("parses");
+        cfg.resolve_device_plan().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn device_plan_legacy_forms_match_modulo_round_robin() {
+        // Backward-compat acceptance criterion: integer N expands exactly as
+        // the legacy `worker_id % devices` round-robin did.
+        assert_eq!(plan("devices: 1\n"), vec![0]);
+        assert_eq!(plan("devices: 3\n"), vec![0, 1, 2]);
+        assert_eq!(
+            plan("devices: 4\nworkers_per_device: 2\n"),
+            vec![0, 1, 2, 3, 0, 1, 2, 3]
+        );
+        // None / "auto" resolve to a single device 0.
+        assert_eq!(plan(""), vec![0]);
+        assert_eq!(plan("devices: auto\n"), vec![0]);
+        assert_eq!(plan("devices: \"auto\"\nworkers_per_device: 2\n"), vec![0, 0]);
+    }
+
+    #[test]
+    fn device_plan_list_form_round_robins_listed_devices() {
+        assert_eq!(plan("devices: [1, 3]\n"), vec![1, 3]);
+        assert_eq!(
+            plan("devices: [1, 3]\nworkers_per_device: 2\n"),
+            vec![1, 3, 1, 3]
+        );
+        // Written order is the round-robin order (not sorted).
+        assert_eq!(plan("devices: [3, 1]\n"), vec![3, 1]);
+    }
+
+    #[test]
+    fn device_plan_map_form_groups_workers_per_device_index() {
+        // Map keys are device indices (quoted strings), values are explicit
+        // per-device worker counts; expansion groups by ascending index.
+        assert_eq!(
+            plan("devices: { \"1\": 2, \"3\": 1 }\n"),
+            vec![1, 1, 3]
+        );
+        // Ascending-device expansion holds regardless of YAML key order.
+        assert_eq!(
+            plan("devices: { \"3\": 1, \"1\": 2 }\n"),
+            vec![1, 1, 3]
+        );
+    }
+
+    #[test]
+    fn device_plan_continuous_batching_gets_one_worker_per_unique_device() {
+        assert_eq!(
+            plan("continuous_batching: true\ndevices: 4\nworkers_per_device: 2\n"),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            plan("continuous_batching: true\ndevices: [1, 3]\nworkers_per_device: 2\n"),
+            vec![1, 3]
+        );
+        assert_eq!(
+            plan("continuous_batching: true\ndevices: { \"1\": 2, \"3\": 1 }\n"),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn device_plan_rejects_invalid_values() {
+        assert!(plan_err("devices: 0\n").contains("positive integer"));
+        assert!(plan_err("devices: -1\n").contains("positive integer"));
+        assert!(plan_err("devices: 1.5\n").contains("positive integer"));
+        assert!(plan_err("devices: []\n").contains("empty"));
+        assert!(plan_err("devices: {}\n").contains("empty"));
+        assert!(plan_err("devices: [1, \"x\"]\n").contains("device index"));
+        assert!(plan_err("devices: [1, 1]\n").contains("duplicate"));
+        assert!(plan_err("devices: { \"x\": 1 }\n").contains("device index"));
+        assert!(plan_err("devices: { \"1\": 0 }\n").contains("positive integer"));
+        // Non-"auto" strings were silently treated as 1 device; now rejected.
+        assert!(plan_err("devices: \"gpu\"\n").contains("auto"));
+        assert!(plan_err("devices: true\n").contains("unsupported"));
+    }
+
+    #[test]
+    fn device_plan_rejects_map_form_with_workers_per_device() {
+        let err = plan_err("devices: { \"1\": 2 }\nworkers_per_device: 2\n");
+        assert!(err.contains("workers_per_device"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn device_plan_rejects_empty_plan_from_zero_workers_per_device() {
+        // devices * workers_per_device = N * 0 = 0 workers would load a Ready
+        // version with no routing target (traffic blackhole).
+        assert!(plan_err("devices: 1\nworkers_per_device: 0\n").contains("workers_per_device"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_device_forms() {
+        // validate() is the gate every load path calls; it must surface the
+        // same errors as resolve_device_plan.
+        for bad in [
+            "devices: 0\n",
+            "devices: []\n",
+            "devices: {}\n",
+            "devices: [1, 1]\n",
+            "devices: { \"1\": 2 }\nworkers_per_device: 2\n",
+            "devices: \"gpu\"\n",
+        ] {
+            let cfg: ModelConfig = serde_yaml::from_str(bad).expect("parses");
+            assert!(cfg.validate().is_err(), "must reject: {bad}");
+        }
+        for good in [
+            "devices: [1, 3]\nworkers_per_device: 2\n",
+            "devices: { \"1\": 2, \"3\": 1 }\n",
+        ] {
+            let cfg: ModelConfig = serde_yaml::from_str(good).expect("parses");
+            assert!(cfg.validate().is_ok(), "must accept: {good}");
+        }
     }
 
     // ===== P5-1: TLS/mTLS config validation =====

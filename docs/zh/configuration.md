@@ -359,7 +359,16 @@ continuous_batching: false     # 启用 continuous batching 模式
 
 # Worker 管理
 accelerator: null              # 设备类型标签，透传到 device 字符串（如 "cuda:0"）；null = cpu
-devices: null                  # 设备分配（null = 自动，或整数如 1）
+devices: null                  # 设备分配。支持的形式:
+                               #   null / "auto"   → 单设备 0
+                               #   4               → 设备 0-3,轮询分配
+                               #   [1, 3]          → 只用设备 1 和 3
+                               #   { "1": 2 }      → 设备 1 起 2 个 worker(显式
+                               #                     按卡计数;不能与 workers_per_device > 1
+                               #                     组合)
+                               # 除 map 形式外均乘以 workers_per_device。
+                               # continuous_batching 下每个去重设备恰好 1 个 worker。
+                               # respawn/滚动回收的 worker 总是落回原来的设备。
 workers_per_device: null       # 每设备 worker 数（null = 1）
 max_queue_size: 1000           # 每个 worker 的最大待处理请求数
 request_timeout: 0.0           # 单请求硬超时（秒），0 = 禁用

@@ -402,7 +402,17 @@ continuous_batching: false     # Enable continuous batching mode
 
 # Worker Management
 accelerator: null              # Device type label, passed through to device string (e.g. "cuda:0"); null = cpu
-devices: null                  # Device assignment (null = auto, or integer like 1)
+devices: null                  # Device assignment. Forms:
+                               #   null / "auto"   → single device 0
+                               #   4               → devices 0-3, round-robin
+                               #   [1, 3]          → only devices 1 and 3
+                               #   { "1": 2 }      → 2 workers on device 1 (explicit
+                               #                     per-device counts; cannot combine
+                               #                     with workers_per_device > 1)
+                               # Each form is multiplied by workers_per_device except
+                               # the map form. Under continuous_batching each unique
+                               # device gets exactly one worker. A respawned/recycled
+                               # worker always lands back on its original device.
 workers_per_device: null       # Workers per device (null = 1)
 startup_concurrency: null      # Max workers spawned+handshaken concurrently at load
                                # (null = 1, serial). >1 overlaps weight loading across
