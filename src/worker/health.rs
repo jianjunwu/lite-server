@@ -341,6 +341,18 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_ready_with_recycling_worker_stays_ready() {
+        // Rolling recycle claims the slot WITHOUT ejecting it (H1): the
+        // version must not flap to Degraded for a planned, healthy-sibling
+        // worker swap.
+        let reg = ready_registry(2);
+        let outlier = OutlierState::new(2);
+        assert!(outlier.claim_recycle(0));
+        assert!(!outlier.is_ejected(0), "test setup: recycle never ejects");
+        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+    }
+
+    #[test]
     fn reconcile_degraded_recovers_to_ready() {
         let reg = ready_registry(2);
         reg.set_status("m", "1", VersionStatus::Degraded).unwrap();

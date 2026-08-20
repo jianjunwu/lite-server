@@ -475,6 +475,27 @@ impl WorkerManager {
         reason: &'static str,
         graceful: bool,
     ) -> Result<(), AppError> {
+        // A non-graceful (health-kill) signal for a slot already claimed by a
+        // rolling recycle is stale: the recycle is replacing that very
+        // process, and the listener is serial — acting now would hard-kill
+        // the draining worker, or worse its fresh replacement.
+        if !graceful {
+            let key = model_version_key(model_name, version);
+            let recycling = {
+                let outliers = self.outlier_states.read().await;
+                outliers
+                    .get(&key)
+                    .map(|o| o.is_recycling(worker_id as usize))
+                    .unwrap_or(false)
+            };
+            if recycling {
+                info!(
+                    model = %model_name, version = %version, worker_id,
+                    "Dropping stale health-kill signal; slot is mid-rolling-recycle"
+                );
+                return Ok(());
+            }
+        }
         let result = self
             .respawn_worker_inner(model_name, version, worker_id, reason, graceful)
             .await;
@@ -482,6 +503,17 @@ impl WorkerManager {
             crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
                 .with_label_values(&[model_name, version, reason])
                 .inc();
+            // A failed rolling recycle must not strand the slot in the
+            // recycling claim: fall back to a plain ejection so the
+            // impairment stays visible (coordinator → Degraded) and the
+            // circuit's half-open probe keeps a recovery path.
+            if graceful {
+                let key = model_version_key(model_name, version);
+                let outliers = self.outlier_states.read().await;
+                if let Some(outlier) = outliers.get(&key) {
+                    outlier.release_recycle(worker_id as usize);
+                }
+            }
         }
         result
     }
@@ -870,6 +902,18 @@ impl WorkerManager {
             .clone()
             .filter(|p| p.enabled && p.respawn);
 
+        // Clear the slot's ejection/recycling/error state so routing to the
+        // replacement resumes immediately instead of waiting out the ejection
+        // timeout. This must run BEFORE the Ready restore below: a status
+        // coordinator tick landing in between must not re-flip the version to
+        // Degraded on stale ejection state.
+        {
+            let outliers = self.outlier_states.read().await;
+            if let Some(outlier) = outliers.get(&key) {
+                outlier.reset(worker_id as usize);
+            }
+        }
+
         // Replacement worker is up: Degraded → Ready (loaded_at preserved).
         // A graceful recycle never degraded the version, so restore Ready
         // only when it IS currently Degraded (kill mode, or the status
@@ -883,15 +927,6 @@ impl WorkerManager {
         if !graceful || is_degraded {
             self.registry.mark_ready(model_name, version)?;
             self.sync_grpc_health().await;
-        }
-
-        // Clear the slot's ejection/error state so routing to the replacement
-        // resumes immediately instead of waiting out the ejection timeout.
-        {
-            let outliers = self.outlier_states.read().await;
-            if let Some(outlier) = outliers.get(&key) {
-                outlier.reset(worker_id as usize);
-            }
         }
 
         // Record metric

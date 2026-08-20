@@ -3695,6 +3695,103 @@ class RollingAPI(LitAPI):
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
 
+/// H1 regression: with the status coordinator running (health_check_interval
+/// > 0), a rolling recycle must NEVER flip the version to Degraded — every
+/// request during the recycle window is served (200), because the recycle
+/// claims the slot without ejecting it. setup() sleeps 2s so the recycle
+/// window spans many coordinator (0.2s) ticks; a 0.5s predict keeps several
+/// request admissions inside that window.
+#[tokio::test]
+async fn should_stay_ready_during_rolling_recycle_with_health_checks() {
+    let model_py = r#"import time
+from lite_server import LitAPI
+
+
+class ReadyAPI(LitAPI):
+    def setup(self, device):
+        time.sleep(2)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        time.sleep(0.5)
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-ready-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let dir = tmp_dir.join("ready_model").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.py"), model_py).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_requests: 3\nhealth_check_interval: 0.2\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "ready_model", "1").await;
+
+    // Sequential burst: 8 slow requests (≈4s) against two slots with
+    // max_requests=3 — both slots cross their budget mid-burst, and the
+    // 0.2s coordinator ticks many times inside each recycle window.
+    for i in 0..8 {
+        let resp = client
+            .post(format!("{}/v2/models/ready_model/infer", base))
+            .json(&json!({"input": i}))
+            .send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i} must be served: a rolling recycle must not degrade the version"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["output"], json!(i * 2));
+    }
+
+    // Sanity: the burst really did trigger at least one rolling recycle.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap();
+        let body = resp.text().await.unwrap();
+        let count = body.lines()
+            .find(|l| l.starts_with(
+                "liteserver_worker_respawns_total{model=\"ready_model\",reason=\"rolling_recycle\",version=\"1\"}"
+            ))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if count >= 1.0 {
+            recycled = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(recycled, "the burst must have triggered a rolling recycle");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
 // ---------------------------------------------------------------------------
 // §4.2: max_loaded_versions LRU eviction
 // ---------------------------------------------------------------------------
