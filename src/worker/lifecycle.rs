@@ -23,6 +23,22 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
+/// M1 (S3b): may phase-2 registration continue for this version? False once
+/// a concurrent unload removed the registry entry or flipped its status out
+/// of Loading, or shutdown was requested — continuing would re-create
+/// just-torn-down map entries and strand live workers nobody will ever stop.
+fn load_registration_alive(
+    registry: &crate::registry::ModelRegistry,
+    shutdown_token: &tokio_util::sync::CancellationToken,
+    model_name: &str,
+    version: &str,
+) -> bool {
+    !shutdown_token.is_cancelled()
+        && registry
+            .get(model_name, Some(version))
+            .is_some_and(|mv| mv.status == VersionStatus::Loading)
+}
+
 /// G1: one warmup execution unit — the sample to run plus the worker it is
 /// pinned to (`None` when the version has no workers to pin; the unit then
 /// rides normal least-loaded selection).
@@ -526,6 +542,7 @@ impl WorkerManager {
     }
 
     pub async fn load_model(
+
         &self,
         model_name: &str,
         version: &str,
@@ -738,6 +755,18 @@ impl WorkerManager {
             let mut worker_infos = Vec::new();
             let mut zmq_clients_for_model = Vec::new();
             for (worker_id, slot) in ready.iter_mut().enumerate() {
+                // M1 (S3b): a concurrent unload/shutdown tears down through
+                // the same maps this loop populates. Once the registry entry
+                // is gone (or no longer Loading) or shutdown was requested,
+                // bail out — continuing would re-create just-removed entries
+                // and strand live workers nobody will ever stop. The error
+                // funnel below reaps the partially-registered set.
+                if !load_registration_alive(&self.registry, &self.shutdown_token, model_name, version)
+                {
+                    return Err(AppError::Internal(format!(
+                        "load of {model_name} {version} aborted: torn down concurrently"
+                    )));
+                }
                 let WorkerReady {
                     device,
                     endpoint,
@@ -831,8 +860,28 @@ impl WorkerManager {
                 // Incremental registration: the worker is visible to
                 // shutdown/unload from here on; a later failure tears these
                 // entries down through the shared teardown path.
+                //
+                // M1 (S3b): the aliveness check and both pushes run under the
+                // SAME lock pair teardown_version_runtime takes (same order),
+                // so a concurrent teardown either runs entirely before this
+                // block (check fails → bail, nothing re-created) or entirely
+                // after (it removes and reaps what we just pushed). A check
+                // outside the locks would leave a check→push race, and
+                // separate blocks would let teardown land between the two
+                // pushes and orphan the client entry (bound socket).
                 {
                     let mut workers = self.workers.write().await;
+                    let mut clients = self.zmq_clients.write().await;
+                    if !load_registration_alive(
+                        &self.registry,
+                        &self.shutdown_token,
+                        model_name,
+                        version,
+                    ) {
+                        return Err(AppError::Internal(format!(
+                            "load of {model_name} {version} aborted: torn down concurrently"
+                        )));
+                    }
                     workers.entry(key.clone()).or_default().push(WorkerProcess {
                         worker_id: worker_id as u32,
                         endpoint,
@@ -840,9 +889,6 @@ impl WorkerManager {
                         done_rx: Some(done_rx),
                         kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
                     });
-                }
-                {
-                    let mut clients = self.zmq_clients.write().await;
                     clients.entry(key.clone()).or_default().push(zmq_client.clone());
                 }
             }
@@ -862,21 +908,33 @@ impl WorkerManager {
             }
         };
 
-        self.registry
-            .set_workers(model_name, version, worker_infos.clone())?;
-
+        // M1 (S3a): these post-registration steps fail precisely when a
+        // concurrent unload/shutdown removed the registry entry mid-load —
+        // funnel them into the same cleanup so the phase-2-registered
+        // workers are never stranded.
+        //
         // P-WARM (§4.3): if warmup is enabled the version enters WarmingUp
         // (NOT_SERVING) here; the final Ready transition is deferred until the
         // dummy warmup below completes. Disabled → straight to Ready (legacy).
         let warmup = model_config.policies.warmup.clone();
-        if let Some(ref p) = warmup {
-            if p.enabled {
-                self.registry.mark_warming_up(model_name, version)?;
-            } else {
-                self.registry.mark_ready(model_name, version)?;
+        let finalize: Result<(), AppError> = async {
+            self.registry
+                .set_workers(model_name, version, worker_infos.clone())?;
+            match warmup {
+                Some(ref p) if p.enabled => {
+                    self.registry.mark_warming_up(model_name, version)?;
+                }
+                _ => {
+                    self.registry.mark_ready(model_name, version)?;
+                }
             }
-        } else {
-            self.registry.mark_ready(model_name, version)?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = finalize {
+            self.mark_load_failed(model_name, version);
+            self.teardown_version_runtime(model_name, version).await;
+            return Err(e);
         }
 
         // Register inference queue for batching
@@ -908,7 +966,14 @@ impl WorkerManager {
                 };
                 match warmup_result {
                     Ok(()) => {
-                        self.registry.mark_ready(model_name, version)?;
+                        // S3a (warmup path): a concurrent unload may have
+                        // removed the entry while the warmup ran — tear down
+                        // the runtime state instead of stranding it.
+                        if let Err(e) = self.registry.mark_ready(model_name, version) {
+                            self.mark_load_failed(model_name, version);
+                            self.teardown_version_runtime(model_name, version).await;
+                            return Err(e);
+                        }
                         info!(
                             model = %model_name, version = %version,
                             scope = ?policy.scope,
@@ -921,7 +986,9 @@ impl WorkerManager {
                             reason = %reason,
                             "warmup failed; marking version Failed"
                         );
-                        self.registry.mark_failed(model_name, version, &reason)?;
+                        // No `?`: the teardown below must run even when the
+                        // entry is already gone (concurrent unload).
+                        let _ = self.registry.mark_failed(model_name, version, &reason);
                         // L5: workers were spawned and the queue/client/
                         // routing state registered BEFORE warmup ran — tear
                         // that runtime state down through the single shared
@@ -1890,6 +1957,168 @@ mod tests {
     use crate::callback::CallbackRunner;
     use crate::inference_queue::InferenceQueue;
     use crate::registry::ModelRegistry;
+
+    // ===== M1 guard tests (phase-2 registration leak) =====
+
+    #[test]
+    fn should_report_registration_alive_only_while_loading_and_not_cancelled() {
+        let registry = ModelRegistry::new();
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry
+            .set_status("m", "1", VersionStatus::Loading)
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        assert!(
+            load_registration_alive(&registry, &token, "m", "1"),
+            "Loading version + live token → registration may proceed"
+        );
+
+        token.cancel();
+        assert!(
+            !load_registration_alive(&registry, &token, "m", "1"),
+            "cancelled shutdown token → stop registering"
+        );
+
+        let token2 = tokio_util::sync::CancellationToken::new();
+        registry.mark_ready("m", "1").unwrap();
+        assert!(
+            !load_registration_alive(&registry, &token2, "m", "1"),
+            "status flipped out of Loading → stop registering"
+        );
+        assert!(
+            !load_registration_alive(&registry, &token2, "m", "2"),
+            "registry entry gone (concurrent unload) → stop registering"
+        );
+    }
+
+    /// M1: a version unloaded while its load is still mid-flight must not
+    /// have its map entries re-created by the load's phase-2 registration
+    /// (which runs AFTER the unload's teardown removed them), and no worker
+    /// process may survive. Deterministic: the unload runs while phase 1 is
+    /// blocked in a slow setup(), so the whole of phase 2 executes after the
+    /// unload completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_leave_no_residue_when_unload_lands_mid_load() {
+        let tag = "midload";
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-midload-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        with open(f"setup_pid_{os.getpid()}.txt", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(3)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nstartup_concurrency: 2\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+
+        let config = ModelConfig {
+            startup_timeout: 60.0,
+            ..Default::default()
+        };
+        let wm_load = wm.clone();
+        let tag_owned = tag.to_string();
+        let mut load =
+            tokio::spawn(async move { wm_load.load_model(&tag_owned, "1", &config).await });
+
+        // Wait until at least one worker is alive in setup() (phase 1 well
+        // under way), then unload the version out from under the load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let spawned = std::fs::read_dir(&model_dir)
+                .unwrap()
+                .any(|e| e.unwrap().file_name().into_string().unwrap().starts_with("setup_pid_"));
+            if spawned {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never reached setup()"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        wm.unload_version(tag, "1")
+            .await
+            .expect("unload of a mid-load version must succeed");
+
+        let result = (&mut load).await.expect("load task panicked");
+        assert!(
+            result.is_err(),
+            "the load must not report success for a version unloaded underneath it"
+        );
+
+        // The phase-2 registration runs after the unload's teardown — it
+        // must NOT re-create the torn-down entries (M1).
+        let key = model_version_key(tag, "1");
+        assert!(
+            wm.workers.read().await.get(&key).is_none(),
+            "phase-2 re-created worker entries torn down by the concurrent unload"
+        );
+        assert!(
+            wm.zmq_clients.read().await.get(&key).is_none(),
+            "phase-2 re-created zmq client entries torn down by the concurrent unload"
+        );
+
+        // No python worker of this model may survive, registered or not.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for entry in std::fs::read_dir(&model_dir).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if let Some(pid_str) = name
+                .strip_prefix("setup_pid_")
+                .and_then(|s| s.strip_suffix(".txt"))
+            {
+                let pid: i32 = pid_str.parse().unwrap();
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                assert!(!alive, "worker pid {pid} survived the mid-load unload");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     /// H5: force_unload_version must clean the registry (and be a no-op
     /// for versions that never existed — the delete escalation path calls
