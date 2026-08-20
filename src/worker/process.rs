@@ -501,33 +501,53 @@ impl WorkerManager {
         let mut rx_guard = self.respawn_rx.lock().await;
         if let Some(mut rx) = rx_guard.take() {
             let wm = Arc::downgrade(self);
+            let shutdown = self.shutdown_token.clone();
             tokio::spawn(async move {
-                while let Some(signal) = rx.recv().await {
-                    if let Some(wm) = wm.upgrade() {
-                        info!(
-                            model = %signal.model_name, version = %signal.version,
-                            worker_id = signal.worker_id, reason = signal.reason,
-                            graceful = signal.graceful,
-                            "Respawning worker"
-                        );
-                        if let Err(e) = wm
-                            .respawn_worker(
-                                &signal.model_name,
-                                &signal.version,
-                                signal.worker_id,
-                                signal.reason,
-                                signal.graceful,
-                            )
-                            .await
-                        {
-                            error!(
-                                model = %signal.model_name, version = %signal.version,
-                                worker_id = signal.worker_id,
-                                "Worker respawn failed: {}", e
-                            );
+                // M5: exit on shutdown — a rolling-recycle signal can arrive
+                // up to recycle_drain_timeout after its trigger, i.e. while
+                // the unload sweep is running; spawning a worker then would
+                // leak it past the sweep. The is_cancelled re-check covers a
+                // signal that raced the token in the same select iteration.
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        signal = rx.recv() => {
+                            let Some(signal) = signal else { break };
+                            if shutdown.is_cancelled() {
+                                info!(
+                                    model = %signal.model_name, version = %signal.version,
+                                    worker_id = signal.worker_id,
+                                    "Dropping respawn signal; server is shutting down"
+                                );
+                                continue;
+                            }
+                            if let Some(wm) = wm.upgrade() {
+                                info!(
+                                    model = %signal.model_name, version = %signal.version,
+                                    worker_id = signal.worker_id, reason = signal.reason,
+                                    graceful = signal.graceful,
+                                    "Respawning worker"
+                                );
+                                if let Err(e) = wm
+                                    .respawn_worker(
+                                        &signal.model_name,
+                                        &signal.version,
+                                        signal.worker_id,
+                                        signal.reason,
+                                        signal.graceful,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        model = %signal.model_name, version = %signal.version,
+                                        worker_id = signal.worker_id,
+                                        "Worker respawn failed: {}", e
+                                    );
+                                }
+                            } else {
+                                break; // WorkerManager dropped
+                            }
                         }
-                    } else {
-                        break; // WorkerManager dropped
                     }
                 }
             });
@@ -1251,6 +1271,46 @@ mod tests {
         assert!(
             !outlier.is_dead(0),
             "initial-spawn monitors keep ignoring Clean exits (unload semantics)"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_drop_respawn_signals_after_shutdown() {
+        // M5: a rolling-recycle signal can arrive up to recycle_drain_timeout
+        // after its trigger — i.e. mid-shutdown. The listener must exit on
+        // the shutdown token instead of spawning a worker that races the
+        // unload sweep. Observed via the failure metric: a processed signal
+        // for a nonexistent model increments it, a dropped one cannot.
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry,
+            std::env::temp_dir(),
+            Arc::new(crate::inference_queue::InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(crate::callback::CallbackRunner::new()),
+        ));
+        wm.start_respawn_listener().await;
+
+        wm.shutdown().await;
+
+        let metric = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+            .with_label_values(&["m-shutdown-drop", "1", "health_check"]);
+        let before = metric.get();
+        let _ = wm
+            .respawn_tx
+            .send(crate::inference_queue::RespawnSignal {
+                model_name: "m-shutdown-drop".to_string(),
+                version: "1".to_string(),
+                worker_id: 0,
+                reason: "health_check",
+                graceful: false,
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            metric.get(),
+            before,
+            "a respawn signal sent after shutdown must be dropped, not processed"
         );
     }
 
