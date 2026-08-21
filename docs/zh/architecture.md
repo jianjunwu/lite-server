@@ -513,7 +513,8 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
   （`503` / gRPC `Unavailable` + `Retry-After`）。**health/admin 端点豁免**——
   探活不能挂。由 HTTP admission 中间件（observability 内、按路径分类）与各 gRPC
   推理 handler 顶部的 guard 强制。`0` = 无限（默认，行为不变）。guard 对 unary 覆盖
-  全程；对 SSE/WS/gRPC 流式在开流时释放（与在途计数中间件一致的 header 语义）。
+  全程；对 SSE/WS/gRPC 流式在响应产生前获取并占位**整个流生命周期**（RN-13）——
+  在途流在结束前一直计入上限。
 - **队列 load shedding**：per-version 队列满 → `503` / `Unavailable` + `Retry-After`
   （HTTP header / gRPC metadata）。`ResourceExhausted` 专给限流（P3-1）——过载落 5xx 族。
 - **请求大小上限**（`server.max_request_body_bytes`）：超限 → `413`（HTTP）/

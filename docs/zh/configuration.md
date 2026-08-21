@@ -381,6 +381,9 @@ queue_timeout_action: delay    # delay（默认；交给 request_timeout 兜底�
                                # （超过 queue_timeout_secs 返回 503 / gRPC Unavailable）
 max_requests: 0                # 滚动回收：每个 worker 各自处理 N 个请求后重启
                                # （0 = 禁用）；回收期间其他 worker 继续服务。
+                               # 流式请求同样计数（每次开流计 1，ensemble 按 DAG
+                               # 节点计）；回收 drain 会等待槽位上的在途流结束
+                               # （见 recycle_stream_drain_timeout_secs）。
                                # 同时回收的 worker 数受 recycle_max_percent 限制，
                                # 超限的已越阈 worker 继续服务并排队等待，替代
                                # worker 就绪后自动接力（回收慢于越阈速度时
@@ -388,6 +391,18 @@ max_requests: 0                # 滚动回收：每个 worker 各自处理 N 个
 max_requests_jitter: 0         # max_requests 的逐 worker 随机抖动（错开各 worker 的回收时间）
 recycle_max_percent: 10        # 同时滚动回收的 worker 比例上限（1-100）；
                                # 并发上限 = worker 数 × 百分比 / 100，至少 1 个
+count_streams_toward_max_requests: true
+                               # 流式请求是否计入 max_requests（默认 true）：
+                               # 每次开流计 1（SSE/WS/gRPC/bidi/decoupled/自定义路由，
+                               # ensemble 按 DAG 节点逐次计数）。false = 旧行为
+                               # （纯流式负载的 worker 永不滚动回收）。
+recycle_stream_drain_timeout_secs: 60.0
+                               # 回收 drain 等待槽位上在途**流**结束的秒数，
+                               # 超时后强制驱逐（客户端收到终态错误帧）并停止
+                               # worker。与批次 drain 上界相互独立。
+max_concurrent_streams: 0      # 每版本并发流上限（0 = 无限，默认）。流式绕过
+                               # 队列，不设上限则流式洪水无内存界。超限的开流
+                               # 拒绝 429 / ResourceExhausted + Retry-After。
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
 
 # Worker 韧性（Resilience）

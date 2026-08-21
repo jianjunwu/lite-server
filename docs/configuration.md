@@ -435,6 +435,11 @@ queue_timeout_action: delay    # delay (default; let request_timeout govern) | r
                                # (return 503 / gRPC Unavailable once queue_timeout_secs elapses)
 max_requests: 0                # Rolling recycle: each worker restarts after serving N
                                # requests (0 = disabled); siblings keep serving.
+                               # Streaming requests count too: one per stream open
+                               # (SSE/WS/gRPC/bidi/decoupled/custom-route, and one
+                               # per ensemble DAG node). The recycle drain waits for
+                               # in-flight streams on the slot (see
+                               # recycle_stream_drain_timeout_secs).
                                # Crossed workers beyond the recycle_max_percent cap
                                # keep serving and wait their turn, relaying once a
                                # replacement is ready (workers may serve over budget
@@ -443,6 +448,20 @@ max_requests: 0                # Rolling recycle: each worker restarts after ser
 max_requests_jitter: 0         # Per-worker jitter for max_requests (staggers recycles)
 recycle_max_percent: 10        # Max % of workers roll-recycling at once (1-100);
                                # cap = workers × percent / 100, at least 1
+count_streams_toward_max_requests: true
+                               # Count streaming requests toward max_requests at
+                               # stream open (default true). false = legacy behavior
+                               # (pure-streaming workers never roll-recycle).
+recycle_stream_drain_timeout_secs: 60.0
+                               # Seconds the recycle drain waits for in-flight
+                               # STREAMS on the slot before force-evicting them
+                               # (client-visible terminal error frame) and stopping
+                               # the worker. Independent of the batch drain bound.
+max_concurrent_streams: 0      # Max concurrent streams per version (0 = unlimited,
+                               # default). Streams bypass the queue, so without a
+                               # cap a stream flood has no memory bound. Over-cap
+                               # opens are rejected 429 / ResourceExhausted +
+                               # Retry-After.
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
 
 # Worker Resilience

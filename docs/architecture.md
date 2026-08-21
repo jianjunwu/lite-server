@@ -536,8 +536,9 @@ cascade-fail under pressure (§4.0.9). P-FLOW lands these:
   reachable under load. Enforced by the HTTP admission middleware (inside
   observability, classifies the path) and a guard at the top of each gRPC
   inference handler. `0` = unlimited (default, behaviour unchanged). The guard
-  spans the call for unary RPCs; for SSE/WS/gRPC streaming it releases on
-  stream-open (the same header-semantic as the in-flight accounting middleware).
+  spans the call for unary RPCs; for SSE/WS/gRPC streaming it is taken before
+  the response is produced and held for the WHOLE stream lifetime (RN-13) —
+  in-flight streams count against the cap until they end.
 - **Queue load shedding**: a full per-version queue returns `503` / `Unavailable`
   + `Retry-After` (HTTP header / gRPC metadata). `ResourceExhausted` is reserved
   for rate limiting (P3-1) — overload stays in the 5xx family.

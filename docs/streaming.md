@@ -226,6 +226,42 @@ the socket.
 | Metrics label | `"grpc"` | `"sse"` | `"websocket"` |
 | Feature gate | `features.grpc_streaming` | `streaming && sse && decoupled` | `streaming && websocket_streaming && decoupled` |
 
+## Rolling Recycle and In-Flight Streams
+
+Streams bypass the inference queue, so the worker lifecycle interacts with
+them explicitly:
+
+- **Budget**: streams count toward `max_requests` — one per stream open, and
+  one per ensemble DAG node for ensemble streams (set
+  `count_streams_toward_max_requests: false` for the legacy behavior where
+  pure-streaming workers never roll-recycle).
+- **Drain**: when a slot crosses its budget, the recycle drain waits for its
+  in-flight streams to finish, up to `recycle_stream_drain_timeout_secs`
+  (default 60s, independent of the batch drain bound). Routing keeps NEW
+  streams off the recycling slot in the meantime; a direct pin
+  (`x-lite-worker-id`) to a recycling slot is rejected with `503` +
+  `Retry-After` / gRPC `Unavailable` + retry-after metadata — transient, so
+  the same request may be retried as-is.
+- **Forced eviction**: if streams are still in flight when the drain timeout
+  elapses, they are evicted — every such stream ends with a terminal error
+  frame (`worker recycling: evicting in-flight streams`), counted by
+  `liteserver_recycle_streams_evicted_total`. Long decoupled streams
+  (minutes) will hit this unless the timeout is raised for them.
+- **Worker death mid-stream** (recycle, health-check kill, unload, hot
+  reload): never a silent EOF. The client always gets a terminal error —
+  SSE `data: {"error":"worker exited mid-stream"}`, WS
+  `{"error":...}` text frame, gRPC `Unavailable`, h2 bidi LPM Error frame —
+  and the close is recorded in the `5xx` family (`worker_eof`), never as a
+  clean `2xx` end.
+- **Concurrency cap**: `max_concurrent_streams` (per version, default 0 =
+  unlimited) rejects over-cap opens with `429` / `ResourceExhausted` +
+  `Retry-After`.
+
+**Client guidance**: browser `EventSource` reconnects SSE automatically. WS
+and gRPC clients should treat `worker_recycling` / `worker exited
+mid-stream` / `Unavailable` as retryable and reconnect with backoff — the
+replacement worker is usually up within seconds.
+
 ## Observability
 
 - Streaming metrics (`record_stream_open/ttft/tbt/chunk/close`) carry the
