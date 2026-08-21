@@ -11,18 +11,31 @@ try:
 except Exception:
     __version__ = "0.0.0"
 
-try:
-    from _lite_server import (
-        serve,
-        stop_server,
-        validate_model_config,
-        validate_server_config,
-    )
-except ImportError:
-    serve = None  # fallback when extension is not built
-    stop_server = None
-    validate_server_config = None
-    validate_model_config = None
+_EXTENSION_EXPORTS = (
+    "serve",
+    "stop_server",
+    "validate_model_config",
+    "validate_server_config",
+)
+
+
+def __getattr__(name):
+    """Lazy-load the native extension on first access (PEP 562).
+
+    ``_lite_server`` is a ~100MB un stripped debug dylib in dev builds; every
+    inference worker imports ``lite_server`` for ``LitAPI`` but never calls
+    ``serve`` — an eager import here made every worker spawn pay the dyld
+    load/rebase/bind cost for nothing. ``from lite_server import serve``
+    keeps working identically for callers that need it.
+    """
+    if name in _EXTENSION_EXPORTS:
+        try:
+            import _lite_server
+        except ImportError:
+            return None  # fallback when extension is not built
+        return getattr(_lite_server, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 from lite_server.api import BidiStreamHandler, LitAPI
 from lite_server.callbacks import Callback
