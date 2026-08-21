@@ -4098,6 +4098,39 @@ fn write_auto_poll_server_yaml(tmp_dir: &std::path::Path, port: u16, grpc_port: 
     server_yaml
 }
 
+/// Auto-mode server.yaml with a per-model strategy entry. Unlike
+/// `write_auto_poll_server_yaml` (no strategy → legacy load-all default),
+/// this exercises the documented load_policy paths under reconcile.
+fn write_auto_poll_strategy_yaml(
+    tmp_dir: &std::path::Path,
+    port: u16,
+    grpc_port: u16,
+    metrics_port: u16,
+    load_policy: &str,
+    versions_to_load: &[&str],
+) -> std::path::PathBuf {
+    let versions_yaml = versions_to_load
+        .iter()
+        .map(|v| format!("\"{}\"", v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\norchestration:\n  control_mode: auto\n  poll_interval: 1\n  load_models:\n    - poll_model\n  models:\n    - name: poll_model\n      load_policy: {}\n      versions_to_load: [{}]\n",
+            port,
+            grpc_port,
+            metrics_port,
+            tmp_dir.to_string_lossy(),
+            load_policy,
+            versions_yaml
+        ),
+    )
+    .unwrap();
+    server_yaml
+}
+
 /// Versions of poll_model listed in a /health response body.
 fn poll_model_versions(body: &Value) -> Vec<String> {
     body["models"].as_array().unwrap().iter()
@@ -4198,6 +4231,93 @@ async fn test_auto_poll_unloads_removed_version() {
         sleep(Duration::from_millis(500)).await;
     }
     assert!(removed, "poller did not unload removed v2 within 30s");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// control_mode=auto + load_policy=latest: when a newer version directory
+/// appears, reconcile loads it AND unloads the superseded version (the
+/// target set is the single latest version).
+#[tokio::test]
+async fn test_auto_poll_latest_unloads_superseded_version() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-latest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    write_poll_model_version(&tmp_dir, "1");
+
+    let port = next_test_port();
+    let server_yaml = write_auto_poll_strategy_yaml(&tmp_dir, port, 18115, 18116, "latest", &[]);
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    // v1 is the latest on disk at startup.
+    assert!(
+        wait_model_ready(&base, "poll_model", 30).await,
+        "v1 did not become ready at startup"
+    );
+
+    // A newer version appears; reconcile must load v2 and unload v1.
+    write_poll_model_version(&tmp_dir, "2");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut swapped = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{}/health", base)).send().await {
+            let body: Value = resp.json().await.unwrap();
+            if poll_model_versions(&body) == vec!["2".to_string()] {
+                swapped = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        swapped,
+        "latest policy did not swap to v2 (load v2 + unload v1) within 30s"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// control_mode=auto + load_policy=explicit: a version directory that is not
+/// in versions_to_load must NOT be loaded, no matter how many poll ticks pass.
+#[tokio::test]
+async fn test_auto_poll_explicit_ignores_unlisted_version() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-expl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    write_poll_model_version(&tmp_dir, "1");
+
+    let port = next_test_port();
+    let server_yaml = write_auto_poll_strategy_yaml(&tmp_dir, port, 18117, 18118, "explicit", &["1"]);
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    assert!(
+        wait_model_ready(&base, "poll_model", 30).await,
+        "v1 did not become ready at startup"
+    );
+
+    // v2 is not in versions_to_load; it must stay unloaded across several
+    // poll ticks (poll_interval = 1s).
+    write_poll_model_version(&tmp_dir, "2");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            poll_model_versions(&body),
+            vec!["1".to_string()],
+            "explicit policy must not load unlisted v2: {:?}",
+            body["models"]
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
