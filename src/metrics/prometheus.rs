@@ -1289,25 +1289,27 @@ pub enum StreamCloseReason {
 }
 
 impl StreamCloseReason {
-    /// D7 family 映射:done/worker_eof/cancel→2xx;error/deadline/idle/panic→5xx;
+    /// D7 family 映射:done/cancel→2xx;error/deadline/idle/panic/worker_eof→5xx;
     /// protocol→4xx。gRPC 的 Error 帧除外(按其 grpc code 映射)。
+    /// G5:worker_eof 自 2xx 移入 5xx——worker 中途死亡(回收/健康强杀/unload)
+    /// 是服务端故障,不得在指标上与正常结束(Done)混淆。
     pub fn status_family(self) -> &'static str {
         match self {
             StreamCloseReason::Done
-            | StreamCloseReason::WorkerEof
             | StreamCloseReason::Cancel => "2xx",
             StreamCloseReason::Error
             | StreamCloseReason::Deadline
             | StreamCloseReason::Idle
             | StreamCloseReason::Panic
+            | StreamCloseReason::WorkerEof
             | StreamCloseReason::TypeMismatch => "5xx",
             StreamCloseReason::Protocol => "4xx",
         }
     }
 
     /// S4:errors kind 映射——error→worker_error、deadline→deadline、
-    /// idle→idle、protocol→protocol、panic→panic(仅 WS 可达);
-    /// cancel/done/worker_eof 不进 errors(None)。
+    /// idle→idle、protocol→protocol、panic→panic(仅 WS 可达)、
+    /// worker_eof→worker_eof(G5);cancel/done 不进 errors(None)。
     pub fn error_kind(self) -> Option<&'static str> {
         match self {
             StreamCloseReason::Error => Some("worker_error"),
@@ -1316,6 +1318,7 @@ impl StreamCloseReason {
             StreamCloseReason::Protocol => Some("protocol"),
             StreamCloseReason::Panic => Some("panic"),
             StreamCloseReason::TypeMismatch => Some("type_mismatch"),
+            StreamCloseReason::WorkerEof => Some("worker_eof"),
             _ => None,
         }
     }
@@ -2544,7 +2547,9 @@ mod tests {
     fn stream_close_reason_maps_status_family() {
         use StreamCloseReason::*;
         assert_eq!(Done.status_family(), "2xx");
-        assert_eq!(WorkerEof.status_family(), "2xx");
+        // G5: a worker dying mid-stream is a server-side failure, NOT a
+        // clean end — it must be distinguishable from Done in the metrics.
+        assert_eq!(WorkerEof.status_family(), "5xx");
         assert_eq!(Cancel.status_family(), "2xx");
         assert_eq!(Error.status_family(), "5xx");
         assert_eq!(Deadline.status_family(), "5xx");
@@ -3136,7 +3141,8 @@ mod tests {
         assert_eq!(Protocol.error_kind(), Some("protocol"));
         assert_eq!(Panic.error_kind(), Some("panic"));
         assert_eq!(Done.error_kind(), None);
-        assert_eq!(WorkerEof.error_kind(), None);
+        // G5: worker EOF mid-stream counts as an error (kind=worker_eof).
+        assert_eq!(WorkerEof.error_kind(), Some("worker_eof"));
         assert_eq!(Cancel.error_kind(), None);
     }
 

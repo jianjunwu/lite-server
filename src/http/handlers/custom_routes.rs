@@ -184,12 +184,12 @@ pub async fn dispatch_custom_route(
         .get_zmq_clients(model_name, &resolved_version)
         .await
         .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", model_name, resolved_version)))?;
-    let worker_id = match state
+    let outlier = state
         .worker_manager
         .get_outlier_state(model_name, &resolved_version)
-        .await
-    {
-        Some(outlier) => crate::worker::pick_worker_skip_ejected(num_workers, &outlier),
+        .await;
+    let worker_id = match &outlier {
+        Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
         None => crate::worker::pick_worker_random(num_workers),
     };
     if worker_id >= clients.len() {
@@ -278,6 +278,11 @@ pub async fn dispatch_custom_route(
         )),
         RouteReply::Stream(frame) => match frame.payload {
             Some(pb::stream_response::Payload::Start(start_frame)) => {
+                // G1/G3: the reply shape is known only now — count the
+                // in-flight stream on its slot from here; the guard rides
+                // the response body like the admission guard below.
+                let inflight_guard = outlier
+                    .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
                 // Stream route: InferenceResponse fires on the terminal frame
                 // inside the body (aligned with SSE/WS), not here at Start.
                 build_route_stream_http_response(
@@ -293,6 +298,7 @@ pub async fn dispatch_custom_route(
                     admission_slot.take(),
                     client.clone(),
                     stream_id,
+                    inflight_guard,
                 )
             }
             _ => Err(AppError::WorkerCrashed(
@@ -361,6 +367,7 @@ fn build_route_stream_http_response(
     // cancelled the worker-side generator (SSE/WS/gRPC/bidi all do).
     cancel_client: std::sync::Arc<crate::transport::zmq::WorkerZmqClient>,
     stream_id: String,
+    inflight_guard: Option<crate::streaming::StreamInflightGuard>,
 ) -> Result<Response, AppError> {
     let is_sse = start.media_type.starts_with("text/event-stream");
     let content_type = if start.media_type.is_empty() {
@@ -384,6 +391,8 @@ fn build_route_stream_http_response(
             // closure's environment — the unfold stream owns the closure, so
             // the slot is released exactly when the body stream ends/drops.
             let _hold = &admission_guard;
+            // G1/G3: same for the per-slot in-flight stream count.
+            let _hold_inflight = &inflight_guard;
             async move {
             if ended {
                 return None;
@@ -788,6 +797,7 @@ mod route_match_tests {
             None,
             client.clone(),
             uid.clone(),
+            None,
         )
         .expect("stream response builds");
 

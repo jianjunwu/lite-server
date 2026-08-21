@@ -150,6 +150,14 @@ struct WorkerOutlier {
     /// or `release_recycle` (recycle failed → falls back to a plain
     /// ejection so the impairment stays visible).
     recycling: AtomicBool,
+    /// In-flight streams on this slot (SSE/WS/gRPC/bidi/decoupled/ensemble —
+    /// everything that bypasses the queue and is therefore invisible to the
+    /// batch inflight counters). The recycle drain waits on this reaching
+    /// zero (bounded by the drain timeout) so a rolling recycle does not
+    /// kill streams mid-flight. Paired inc/dec via
+    /// [`crate::streaming::StreamInflightGuard`]; `dec` saturates at 0 so an
+    /// unpaired call can never wrap the counter and block the drain forever.
+    stream_inflight: AtomicUsize,
 }
 
 /// Configurable outlier-ejection parameters (§3). `Default` preserves the prior
@@ -225,6 +233,7 @@ impl OutlierState {
                     consecutive_kills: AtomicUsize::new(0),
                     dead: AtomicBool::new(false),
                     recycling: AtomicBool::new(false),
+                    stream_inflight: AtomicUsize::new(0),
                 })
                 .collect(),
             recycling_claims: AtomicUsize::new(0),
@@ -363,6 +372,38 @@ impl OutlierState {
             .get(worker_idx)
             .map(|w| w.recycling.load(Ordering::Relaxed))
             .unwrap_or(false)
+    }
+
+    /// In-flight stream count for the slot (0 for unknown index). Read by the
+    /// recycle drain: a slot is fully drained only when its batches AND its
+    /// streams are done.
+    pub fn stream_inflight(&self, worker_idx: usize) -> usize {
+        self.workers
+            .get(worker_idx)
+            .map(|w| w.stream_inflight.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// A stream opened on the slot. Unknown index is a no-op (stale pick
+    /// after a fleet shrink) — the stream proceeds uncounted rather than
+    /// panicking the request path.
+    pub fn stream_inflight_inc(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.stream_inflight.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A stream on the slot ended (any exit: terminal frame, disconnect,
+    /// timeout, panic, worker EOF). Saturates at 0 — an unpaired dec must
+    /// never wrap the counter (that would block the recycle drain forever).
+    pub fn stream_inflight_dec(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            let _ = w.stream_inflight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |c| Some(c.saturating_sub(1)),
+            );
+        }
     }
 
     /// Is the rolling-recycle concurrency ticket fully taken? Diagnostics
@@ -4238,6 +4279,42 @@ mod tests {
         let outlier = OutlierState::new(3);
         assert!(outlier.claim_recycle(0));
         assert!(!outlier.claim_recycle(1));
+    }
+
+    // ===== Per-slot in-flight stream accounting (G1/G3 地基) =====
+    // Streaming bypasses the queue, so the batch inflight counters never see
+    // it; the recycle drain needs its own per-slot stream count.
+
+    #[test]
+    fn should_track_stream_inflight_per_slot() {
+        let outlier = OutlierState::new(2);
+        assert_eq!(outlier.stream_inflight(0), 0);
+        outlier.stream_inflight_inc(0);
+        outlier.stream_inflight_inc(0);
+        outlier.stream_inflight_inc(1);
+        assert_eq!(outlier.stream_inflight(0), 2);
+        assert_eq!(outlier.stream_inflight(1), 1);
+        outlier.stream_inflight_dec(0);
+        assert_eq!(outlier.stream_inflight(0), 1);
+    }
+
+    #[test]
+    fn should_return_zero_stream_inflight_for_unknown_slot() {
+        let outlier = OutlierState::new(1);
+        assert_eq!(outlier.stream_inflight(7), 0);
+        // Inc/dec on an unknown slot must not panic (guard against a stale
+        // worker_idx after a fleet shrink).
+        outlier.stream_inflight_inc(7);
+        outlier.stream_inflight_dec(7);
+    }
+
+    #[test]
+    fn should_saturate_stream_inflight_dec_at_zero() {
+        let outlier = OutlierState::new(1);
+        // An unpaired dec (bug) must not wrap the counter to usize::MAX —
+        // that would block the recycle drain forever.
+        outlier.stream_inflight_dec(0);
+        assert_eq!(outlier.stream_inflight(0), 0);
     }
 
     #[test]

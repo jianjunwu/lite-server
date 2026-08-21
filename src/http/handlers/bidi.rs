@@ -263,7 +263,7 @@ async fn h2_bidi_entry_impl(
     // (client→worker chunk forwarding) is spawned ONLY on the non-ensemble
     // path — ensemble aggregates the upstream inline and half-close (body
     // EOF) ends input, so no frames can follow (h2 semantics, D33).
-    let (worker_client, mut chunk_rx, incoming_task) = if is_ensemble {
+    let (worker_client, mut chunk_rx, incoming_task, inflight_guard) = if is_ensemble {
         let max_body = state
             .config
             .server
@@ -415,7 +415,9 @@ async fn h2_bidi_entry_impl(
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
-                (s.cancel_client, s.chunk_rx, None)
+                // Ensemble streams are counted per DAG node at the worker
+                // open inside the executor; the guard rides EnsembleStream.
+                (s.cancel_client, s.chunk_rx, None, s.inflight_guard)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
                 return Err(AppError::InvalidRequestBody(
@@ -425,7 +427,7 @@ async fn h2_bidi_entry_impl(
             }
         }
     } else {
-        let (wc, rx) = open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
+        let (wc, rx, inflight_guard) = open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
             .await?;
         // Incoming task: decode LPM frames from the request body → worker
         // (fire-and-forget). The body stream is OWNED here for the whole
@@ -488,7 +490,7 @@ async fn h2_bidi_entry_impl(
                     .await;
             }
         });
-        (wc, rx, Some(incoming_task))
+        (wc, rx, Some(incoming_task), inflight_guard)
     };
 
     // Task D: fire InferenceRequest.
@@ -615,6 +617,9 @@ async fn h2_bidi_entry_impl(
             // P10 (D40): held for the outgoing task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
+            // G1/G3: per-slot in-flight stream count, held for the session's
+            // lifetime; dropped when this outgoing task ends (any exit).
+            let _inflight_guard = inflight_guard;
             // RN-13 (D9-A, O1): the admission slot is held for the session's
             // lifetime.
             let _admission_guard = admission_guard;
@@ -640,7 +645,27 @@ async fn h2_bidi_entry_impl(
                     {
                         Ok(Some(c)) => c,
                         Ok(None) => {
+                            // G5: the worker died mid-stream — terminal: an
+                            // LPM error frame + close (mirror the worker
+                            // Error arm), so a killed worker is
+                            // distinguishable from the worker's normal EOF.
                             reason = prometheus::StreamCloseReason::WorkerEof;
+                            let frame = lpm::encode_frame(&pb::BidiChunk {
+                                stream_id: stream_id_out.clone(),
+                                payload: Some(pb::bidi_chunk::Payload::Error(
+                                    pb::BidiError {
+                                        message: "worker exited mid-stream".to_string(),
+                                        error_type: String::new(),
+                                    },
+                                )),
+                            });
+                            // Bounded, same as the D35 reclaim path.
+                            let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                            crate::callback::fire_inference_response(
+                                &cb_runner,
+                                &req_ctx,
+                                open_time,
+                            );
                             break;
                         }
                         Err(elapsed) => {
@@ -868,7 +893,14 @@ async fn open_worker_stream_bidi(
     resolved_version: &str,
     meta: pb::RequestMeta,
     stream_id: &str,
-) -> Result<(Arc<WorkerZmqClient>, mpsc::Receiver<pb::StreamResponse>), AppError> {
+) -> Result<
+    (
+        Arc<WorkerZmqClient>,
+        mpsc::Receiver<pb::StreamResponse>,
+        Option<crate::streaming::StreamInflightGuard>,
+    ),
+    AppError,
+> {
     let mv = state
         .registry
         .get(model_name, Some(resolved_version))
@@ -914,6 +946,11 @@ async fn open_worker_stream_bidi(
         crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
 
+    // G1/G3: count the in-flight stream on its slot; the caller moves the
+    // guard into the chunk-consuming task (see the guard's doc).
+    let inflight_guard = outlier
+        .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
@@ -930,7 +967,7 @@ async fn open_worker_stream_bidi(
     );
 
     let chunk_rx = client.send_stream(open_req, stream_id.to_string()).await?;
-    Ok((Arc::clone(client), chunk_rx))
+    Ok((Arc::clone(client), chunk_rx, inflight_guard))
 }
 
 /// Read the first LPM frame from a body data stream, bounded by an idle

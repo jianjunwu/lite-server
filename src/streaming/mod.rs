@@ -250,6 +250,41 @@ impl Drop for StreamCancelGuard {
     }
 }
 
+/// G1/G3 地基: RAII per-slot in-flight stream count. Constructing increments
+/// the slot's `stream_inflight`; dropping decrements — every exit shape
+/// (terminal frame, client disconnect, idle/deadline reclaim, panic unwind
+/// inside `catch_forward_panic`, worker EOF) releases the count with no
+/// call-site bookkeeping. The recycle drain waits on this counter reaching
+/// zero (bounded by the drain timeout), so a rolling recycle stops killing
+/// in-flight streams. Dec saturates at 0 (see
+/// [`crate::inference_queue::OutlierState::stream_inflight_dec`]), so a
+/// double-drop can never wrap the counter and block the drain forever.
+///
+/// The guard must live in the task/future that consumes the stream's chunks
+/// (the detached forward task for SSE/gRPC, the writer task for WS) — NOT in
+/// the handler scope that returns right after open, or the count would
+/// release while the stream is still running.
+pub(crate) struct StreamInflightGuard {
+    outlier: std::sync::Arc<crate::inference_queue::OutlierState>,
+    worker_idx: usize,
+}
+
+impl StreamInflightGuard {
+    pub(crate) fn new(
+        outlier: std::sync::Arc<crate::inference_queue::OutlierState>,
+        worker_idx: usize,
+    ) -> Self {
+        outlier.stream_inflight_inc(worker_idx);
+        Self { outlier, worker_idx }
+    }
+}
+
+impl Drop for StreamInflightGuard {
+    fn drop(&mut self) {
+        self.outlier.stream_inflight_dec(self.worker_idx);
+    }
+}
+
 /// Run a streaming forward-task body with a uniform panic收口. The SSE /
 /// gRPC-server-stream / h2-bidi forward tasks are DETACHED spawns — nobody
 /// joins their handle, so a panicking body would silently lose its terminal
@@ -297,6 +332,68 @@ pub(crate) async fn observe_or_abort(mut task: tokio::task::JoinHandle<()>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- StreamInflightGuard (T7: 收口穷尽) ---
+
+    #[test]
+    fn should_increment_on_construct_and_decrement_on_drop() {
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(2));
+        {
+            let _g = StreamInflightGuard::new(outlier.clone(), 1);
+            assert_eq!(outlier.stream_inflight(1), 1);
+            {
+                let _g2 = StreamInflightGuard::new(outlier.clone(), 1);
+                assert_eq!(outlier.stream_inflight(1), 2);
+            }
+            assert_eq!(outlier.stream_inflight(1), 1);
+        }
+        assert_eq!(outlier.stream_inflight(1), 0, "all guards dropped → slot drains to zero");
+    }
+
+    #[tokio::test]
+    async fn should_decrement_when_forward_task_panics() {
+        // The forward tasks are detached spawns; a panic unwinds the body and
+        // must still release the count, or the recycle drain blocks forever.
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(1));
+        let o = outlier.clone();
+        let task = tokio::spawn(async move {
+            catch_forward_panic(
+                "test",
+                async move {
+                    let _g = StreamInflightGuard::new(o, 0);
+                    panic!("boom");
+                },
+                || async {},
+            )
+            .await;
+        });
+        task.await.unwrap();
+        assert_eq!(outlier.stream_inflight(0), 0, "panic unwind must release the count");
+    }
+
+    #[tokio::test]
+    async fn should_decrement_when_consumer_future_is_dropped_mid_poll() {
+        // Client disconnect drops the HTTP body → the consumer future is
+        // dropped mid-poll; Drop must run without a terminal frame.
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(1));
+        let o = outlier.clone();
+        let task = tokio::spawn(async move {
+            let _g = StreamInflightGuard::new(o, 0);
+            std::future::pending::<()>().await;
+        });
+        // Sync point: wait until the task has actually been polled (spawn
+        // does not guarantee the body has started when we continue).
+        for _ in 0..100 {
+            if outlier.stream_inflight(0) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(outlier.stream_inflight(0), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(outlier.stream_inflight(0), 0, "abort/drop mid-poll must release the count");
+    }
 
     // --- observe_or_abort ---
 

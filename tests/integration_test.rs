@@ -11479,3 +11479,111 @@ async fn test_telemetry_traceparent_e2e_grpc() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// G5: WorkerEof terminal frame (T5)
+// ---------------------------------------------------------------------------
+
+/// A worker dying mid-stream must reach the SSE client as an explicit error
+/// frame — never a silent EOF indistinguishable from a normal [DONE] end
+/// (G5: recycle / health kill / unload all produce WorkerEof).
+#[tokio::test]
+async fn should_send_terminal_error_frame_when_worker_dies_mid_stream() {
+    let eof_py = r#"import time
+from lite_server import LitAPI
+
+
+class EofAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 1)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def stream_predict(self, request):
+        for i in range(30):
+            yield {"index": i}
+            time.sleep(0.2)
+
+    def encode_response(self, output):
+        return output
+"#;
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-worker-eof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let model_dir = tmp_dir.join("eof_model").join("1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("model.py"), eof_py).unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    // Clean leftover workers from a previous failed run — the worker is
+    // found by pgrep on its unique model name below.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "lite_server.worker.inference --model-name eof_model"])
+        .status();
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    load_model(&base, "eof_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/eof_model/events", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // SIGKILL the worker mid-stream (the model yields a chunk every 0.2s for
+    // 6s total, so the stream is in flight when the kill lands).
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "lite_server.worker.inference --model-name eof_model"])
+        .output()
+        .expect("pgrep runs");
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .next()
+        .expect("eof_model worker process found");
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(killed, "must SIGKILL the worker (pid {pid})");
+
+    // The stream must terminate with an explicit error frame, bounded. Two
+    // server paths can produce it, both G5-correct: the forwarder's
+    // WorkerEof arm ("worker exited mid-stream") when the dead peer is
+    // detected as a channel close, or a synthesized worker Error frame when
+    // a send to the dead worker fails first (EAGAIN) — the race between
+    // them is inherent; what matters is the client never sees a silent EOF.
+    let body = tokio::time::timeout(Duration::from_secs(20), resp.text())
+        .await
+        .expect("SSE body must close promptly after the worker dies")
+        .unwrap();
+    assert!(
+        body.contains("\"error\""),
+        "G5: a killed worker must surface as an error frame, not a silent EOF: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "a killed worker must not look like a normal completion: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

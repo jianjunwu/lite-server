@@ -228,6 +228,12 @@ pub struct EnsembleStream {
     /// dropped (terminal frame / adapter task end), the same single path as
     /// D18's teardown. None = capacity not configured (0/unlimited).
     pub permit: Option<StreamingPermit>,
+    /// G1/G3: per-slot in-flight stream count for the tail worker — the
+    /// adapter moves this into its forward task so the count releases
+    /// exactly when the stream ends (any exit). Counted per DAG node at the
+    /// worker-stream open (Q4: budget/drain semantics track worker
+    /// invocations, not client streams).
+    pub(crate) inflight_guard: Option<crate::streaming::StreamInflightGuard>,
 }
 
 /// P10 (D40): global streaming-DAG capacity — the semaphore that bounds
@@ -1295,6 +1301,10 @@ async fn spawn_chain(
         // hop i's channel (or the tail channel).
         let mut tasks: Vec<tokio::task::JoinHandle<Result<(), AppError>>> = Vec::new();
         let mut prev_rx = head_stream.chunk_rx;
+        // G1/G3: the head stream outlives spawn_chain (its chunks flow into
+        // the first consumer) — move its in-flight count into that consumer,
+        // or the count would release here while the stream is still running.
+        let mut head_inflight = Some(head_stream.inflight_guard);
         for (i, &node) in nodes.iter().enumerate().skip(1) {
             let is_tail = i == nodes.len() - 1;
             let down_tx = if is_tail {
@@ -1317,7 +1327,14 @@ async fn spawn_chain(
             } else {
                 None
             };
+            // G1/G3: the first consumer also holds the head stream's count.
+            let upstream_inflight = if i == 1 {
+                head_inflight.take().flatten()
+            } else {
+                None
+            };
             tasks.push(tokio::spawn(async move {
+                let _upstream_inflight = upstream_inflight;
                 consume_stream_consumer(
                     &state, &plan, node, &prev_name, up_rx, down_tx, &ctx, &req, &opts,
                     deadline_unix_ns, &handles, upstream_handle_id, is_tail, &snapshot,
@@ -1358,6 +1375,9 @@ async fn spawn_chain(
         // disconnect as the teardown backstop.
         abort: root.abort_handle(),
         permit: None,
+        // Synthetic chain wrapper — no worker stream of its own; each hop's
+        // count lives in its consumer (head) or its `sub` stream (mid/tail).
+        inflight_guard: None,
     })
 }
 
@@ -1662,14 +1682,20 @@ async fn execute_stream_step(
     // (can land on a healthy instance), each attempt a fresh stream_id.
     // Chunk/Start/Done commits the stream (no replay — P5/§6.3). retries == 0
     // keeps the historical no-peek path byte-for-byte.
-    let (chunk_rx, stream_id, cancel_client, wrapper_abort) = if step.retries == 0 {
+    let (chunk_rx, stream_id, cancel_client, wrapper_abort, inflight_guard) = if step.retries == 0 {
         let client = &clients[worker_id];
         let stream_id = format!("stream-{}", Uuid::new_v4());
         let open_req = crate::streaming::build_stream_open(
             stream_id.clone(), payload_bytes.clone(), Some(meta.clone()), opts.decoupled,
         );
         let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
-        (chunk_rx, stream_id, Arc::clone(client), None)
+        // G1/G3: count the in-flight stream on its slot (per DAG node).
+        let guard = state
+            .worker_manager
+            .get_outlier_state(&step.model, &resolved_version)
+            .await
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+        (chunk_rx, stream_id, Arc::clone(client), None, guard)
     } else {
         open_stream_with_retry(
             state, step, &resolved_version, payload_bytes.clone(), &meta, opts,
@@ -1715,6 +1741,7 @@ async fn execute_stream_step(
         abort,
         // P10: filled by execute_ensemble after open_tail_stream returns.
         permit: None,
+        inflight_guard,
     })
 }
 
@@ -1748,6 +1775,7 @@ async fn open_stream_with_retry(
         String,
         Arc<crate::transport::zmq::WorkerZmqClient>,
         Option<tokio::task::AbortHandle>,
+        Option<crate::streaming::StreamInflightGuard>,
     ),
     AppError,
 > {
@@ -1780,6 +1808,15 @@ async fn open_stream_with_retry(
                 return Err(e);
             }
         };
+        // G1/G3: count this attempt's stream on its slot. Retry continues
+        // cancel the stream and drop the guard with it; the committed
+        // attempt's guard moves into the first-frame forwarder (or rides the
+        // returned tuple when no forwarder runs).
+        let attempt_guard = state
+            .worker_manager
+            .get_outlier_state(&step.model, resolved_version)
+            .await
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
 
         // Peek the first frame (bounded). Committed frames: Chunk/Start/Done.
         let first = match peek_bound {
@@ -1798,7 +1835,7 @@ async fn open_stream_with_retry(
                         worker_id = repick_streaming_worker(state, step, resolved_version, meta, clients).await?;
                         continue;
                     }
-                    return Ok((rx, stream_id, Arc::clone(client), None));
+                    return Ok((rx, stream_id, Arc::clone(client), None, attempt_guard));
                 }
             },
             None => rx.recv().await,
@@ -1828,6 +1865,9 @@ async fn open_stream_with_retry(
         // forwarder — capacity aligned with STREAM_CHANNEL_SIZE (D2).
         let (tx, out_rx) = mpsc::channel(64);
         let task = tokio::spawn(async move {
+            // The in-flight count releases when this forwarder ends — the
+            // stream is over by then (rx closed or the consumer gone).
+            let _attempt_guard = attempt_guard;
             if let Some(f) = first {
                 if tx.send(f).await.is_err() {
                     return;
@@ -1839,7 +1879,7 @@ async fn open_stream_with_retry(
                 }
             }
         });
-        return Ok((out_rx, stream_id, Arc::clone(client), Some(task.abort_handle())));
+        return Ok((out_rx, stream_id, Arc::clone(client), Some(task.abort_handle()), None));
     }
 }
 

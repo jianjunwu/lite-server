@@ -173,6 +173,10 @@ impl GrpcService {
                 err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
             }
         })?;
+        // G1/G3: count the in-flight stream on its slot; the guard moves
+        // into the forward task below (see the guard's doc).
+        let inflight_guard = outlier
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
         let client = clients[worker_id].clone();
         crate::metrics::prometheus::record_worker_inference(
             model_name,
@@ -236,6 +240,9 @@ impl GrpcService {
         let panic_start = start;
         tokio::spawn(async move {
             crate::streaming::catch_forward_panic("grpc_decoupled", async move {
+            // G1/G3: per-slot in-flight stream count, held for the stream's
+            // lifetime; dropped when this forward task ends (any exit).
+            let _inflight_guard = inflight_guard;
             // RN-13 (O2): the admission slot is held for the stream's
             // lifetime (the wrapper acquired it before open; early open
             // failures dropped it back).
@@ -259,8 +266,19 @@ impl GrpcService {
                 {
                     Ok(Some(c)) => c,
                     Ok(None) => {
+                        // G5: the actor dropped the route (worker died
+                        // mid-stream) — terminal: end with an Err(Status)
+                        // item so a killed worker is distinguishable from
+                        // the worker's normal EOF.
                         reason = crate::metrics::prometheus::StreamCloseReason::WorkerEof;
-                        break; // actor dropped the route (Done/Error forwarded)
+                        stream_family = "5xx";
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(err(Status::unavailable("worker exited mid-stream")))),
+                        )
+                        .await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
+                        break;
                     }
                     Err(elapsed) => {
                         tracing::warn!(

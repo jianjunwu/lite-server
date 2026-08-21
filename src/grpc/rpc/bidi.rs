@@ -223,7 +223,7 @@ impl GrpcService {
         // dispatch precedes the stream_deadline computation) and folded into
         // the recv overall bound below.
         let mut ensemble_step_deadline: Option<std::time::Instant> = None;
-        let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
+        let (stream_id, mut chunk_rx, cancel_client, inflight_guard) = if is_ensemble {
             let max_body = self
                 .app_state
                 .config
@@ -335,7 +335,9 @@ impl GrpcService {
                     ensemble_chain = Some(s.chain.clone());
                     ensemble_abort = Some(s.abort.clone());
                     ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
-                    (s.stream_id, s.chunk_rx, s.cancel_client)
+                    // Ensemble streams are counted per DAG node at the worker
+                    // open inside the executor; the guard rides EnsembleStream.
+                    (s.stream_id, s.chunk_rx, s.cancel_client, s.inflight_guard)
                 }
                 crate::ensemble::EnsembleOutcome::Unary(_) => {
                     return Err(err(Status::invalid_argument(
@@ -381,6 +383,10 @@ impl GrpcService {
                 err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
             }
         })?;
+        // G1/G3: count the in-flight stream on its slot; the guard moves
+        // into the forward task below (see the guard's doc).
+        let inflight_guard = outlier
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
         let client = clients[worker_id].clone();
         // P6 GetModelStats: one bidi inference dispatched to this worker.
         crate::metrics::prometheus::record_worker_inference(
@@ -397,7 +403,7 @@ impl GrpcService {
             .send_stream(open_req, stream_id.clone())
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
-        (stream_id, chunk_rx, client.clone())
+        (stream_id, chunk_rx, client.clone(), inflight_guard)
         };
 
         // Task D: fire InferenceRequest once the worker stream opened and arm
@@ -463,6 +469,9 @@ impl GrpcService {
         let incoming_slot_panic = incoming_slot.clone();
         tokio::spawn(async move {
             crate::streaming::catch_forward_panic("grpc_bidi", async move {
+            // G1/G3: per-slot in-flight stream count, held for the session's
+            // lifetime; dropped when this forward task ends (any exit).
+            let _inflight_guard = inflight_guard;
             // P10 (D40): held for the forward task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
@@ -555,8 +564,18 @@ impl GrpcService {
                 {
                     Ok(Some(c)) => c,
                     Ok(None) => {
+                        // G5: the worker died mid-stream — terminal: the tonic
+                        // stream ends with an Err item (Unavailable), so a
+                        // killed worker is distinguishable from a clean EOF.
                         reason = crate::metrics::prometheus::StreamCloseReason::WorkerEof;
-                        break; // worker closed the stream
+                        stream_family = "5xx";
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(Status::unavailable("worker exited mid-stream"))),
+                        )
+                        .await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
+                        break;
                     }
                     Err(elapsed) => {
                         // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.

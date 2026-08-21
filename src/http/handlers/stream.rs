@@ -30,7 +30,15 @@ async fn open_worker_stream(
     meta: pb::RequestMeta,
     payload_bytes: bytes::Bytes,
     decoupled: bool,
-) -> Result<(String, Arc<WorkerZmqClient>, mpsc::Receiver<pb::StreamResponse>), AppError> {
+) -> Result<
+    (
+        String,
+        Arc<WorkerZmqClient>,
+        mpsc::Receiver<pb::StreamResponse>,
+        Option<crate::streaming::StreamInflightGuard>,
+    ),
+    AppError,
+> {
     let mv = state
         .registry
         .get(model_name, Some(resolved_version))
@@ -66,6 +74,12 @@ async fn open_worker_stream(
         crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
 
+    // G1/G3: count the in-flight stream on its slot from open until the
+    // consumer drops the guard — the recycle drain waits on this. The caller
+    // must move the guard into the chunk-consuming task (see the guard's doc).
+    let inflight_guard = outlier
+        .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
@@ -79,7 +93,7 @@ async fn open_worker_stream(
     let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
-    Ok((stream_id, Arc::clone(client), chunk_rx))
+    Ok((stream_id, Arc::clone(client), chunk_rx, inflight_guard))
 }
 
 // ===== SSE Streaming =====
@@ -472,7 +486,7 @@ async fn sse_infer_impl(
     // §4.1 指标行: the streaming step's latency is recorded at stream close
     // (record_ensemble_step_latency); the tail labels ride the forward task.
     let mut ensemble_tail: Option<(String, String, String)> = None;
-    let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
+    let (stream_id, worker_client, mut chunk_rx, inflight_guard) = if is_ensemble {
         let ensemble_input = super::inference::ensemble_input_from_body(&body)?;
         // E8-1 (D38): the dag selector rides the HTTP request header.
         let opts = crate::ensemble::EnsembleExecOpts {
@@ -492,7 +506,9 @@ async fn sse_infer_impl(
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
-                (s.stream_id, s.cancel_client, s.chunk_rx)
+                // Ensemble streams are counted per DAG node at the worker
+                // open inside the executor; the guard rides EnsembleStream.
+                (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
                 return Err(AppError::InvalidRequestBody(
@@ -562,6 +578,9 @@ async fn sse_infer_impl(
     let panic_open_time = std::time::Instant::now();
     tokio::spawn(async move {
         streaming::catch_forward_panic("sse", async move {
+        // G1/G3: hold the per-slot in-flight count for the stream's whole
+        // lifetime; dropped when this task ends (any exit).
+        let _inflight_guard = inflight_guard;
         // P10 (D40): held for the forward task's lifetime — released on drop
         // (terminal frame / idle / disconnect; same path as D18 teardown).
         let _ensemble_permit = ensemble_permit;
@@ -614,8 +633,26 @@ async fn sse_infer_impl(
             } {
                 Ok(Some(c)) => c,
                 Ok(None) => {
+                    // G5: the worker died mid-stream (recycle / health kill /
+                    // unload) — terminal for the client: an error frame +
+                    // close (the status is already committed), so a killed
+                    // worker is distinguishable from a normal [DONE] end.
                     reason = prometheus::StreamCloseReason::WorkerEof;
-                    break; // worker closed the stream
+                    let msg = "worker exited mid-stream";
+                    let data = if matches!(frame, SseFrameStyle::Openai) {
+                        json!({"error": {"message": msg}}).to_string()
+                    } else {
+                        json!({"error": msg}).to_string()
+                    };
+                    // Bounded, same as the D35 reclaim path: a stopped client
+                    // must not hang the teardown.
+                    let _ = tokio::time::timeout(
+                        streaming::TERMINAL_SEND_TIMEOUT,
+                        event_tx.send(Ok(Event::default().data(data))),
+                    )
+                    .await;
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
+                    break;
                 }
                 Err(elapsed) => {
                     // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
@@ -1474,7 +1511,7 @@ async fn handle_ws_stream(
     let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
-    let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
+    let (stream_id, worker_client, mut chunk_rx, inflight_guard) = if is_ensemble {
         let max_body = state
             .config
             .server
@@ -1642,7 +1679,9 @@ async fn handle_ws_stream(
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
-                (s.stream_id, s.cancel_client, s.chunk_rx)
+                // Ensemble streams are counted per DAG node at the worker
+                // open inside the executor; the guard rides EnsembleStream.
+                (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
             }
             Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
                 prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
@@ -1832,6 +1871,9 @@ async fn handle_ws_stream(
         // P10 (D40): held for the writer task's lifetime — released on drop
         // (terminal frame / idle / disconnect; D18 teardown path).
         let _ensemble_permit = ensemble_permit;
+        // G1/G3: per-slot in-flight stream count, held for the stream's
+        // lifetime; dropped when this writer task ends (any exit).
+        let _inflight_guard = inflight_guard;
         // RN-13 (D9-A): the admission slot is held for the stream's lifetime
         // (taken synchronously by the upgrade handler before the 101 was
         // produced; None when the path did not carry one — cap 0 / unit
@@ -1905,8 +1947,20 @@ async fn handle_ws_stream(
             let chunk = match chunk {
                 Ok(Some(c)) => c,
                 Ok(None) => {
+                    // G5: the worker died mid-stream (recycle / health kill /
+                    // unload) — terminal: an error message + close, so a
+                    // killed worker is distinguishable from {"done":true}.
                     reason = prometheus::StreamCloseReason::WorkerEof;
-                    break; // worker closed the stream
+                    // Bounded, same as the D35 reclaim path.
+                    let _ = tokio::time::timeout(
+                        streaming::TERMINAL_SEND_TIMEOUT,
+                        ws_sink.send(Message::Text(
+                            json!({"error": "worker exited mid-stream"}).to_string(),
+                        )),
+                    )
+                    .await;
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
+                    break;
                 }
                 Err(elapsed) => {
                     // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
