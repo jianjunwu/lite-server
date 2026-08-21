@@ -3041,21 +3041,21 @@ policies:
 
     #[test]
     fn test_recycle_max_percent_validate_range() {
-        let mut cfg = ModelConfig::default();
-        cfg.recycle_max_percent = 0;
+        let validate = |recycle_max_percent| ModelConfig {
+            recycle_max_percent,
+            ..Default::default()
+        }
+        .validate();
         assert!(
-            cfg.validate().is_err(),
+            validate(0).is_err(),
             "0% would silently floor to one concurrent recycle via .max(1)"
         );
-        cfg.recycle_max_percent = 101;
         assert!(
-            cfg.validate().is_err(),
+            validate(101).is_err(),
             ">100% re-enables the all-workers-recycling herd"
         );
-        cfg.recycle_max_percent = 1;
-        assert!(cfg.validate().is_ok());
-        cfg.recycle_max_percent = 100;
-        assert!(cfg.validate().is_ok());
+        assert!(validate(1).is_ok());
+        assert!(validate(100).is_ok());
     }
 
     // --- Worker Hooks ---
