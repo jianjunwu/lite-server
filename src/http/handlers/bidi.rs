@@ -946,10 +946,12 @@ async fn open_worker_stream_bidi(
         crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
 
+    // G4: stream concurrency cap — rejected pre-open (429 / ResourceExhausted).
+    let permit = state.inference_queue.try_acquire_stream_permit(model_name, resolved_version)?;
     // G1/G3: count the in-flight stream on its slot; the caller moves the
     // guard into the chunk-consuming task (see the guard's doc).
     let inflight_guard = outlier
-        .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+        .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
 
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));

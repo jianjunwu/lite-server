@@ -793,6 +793,8 @@ pub struct ModelTunables {
     pub count_streams_toward_max_requests: Option<bool>,
     /// Stream drain bound (seconds) for rolling recycle (see ModelConfig).
     pub recycle_stream_drain_timeout_secs: Option<f32>,
+    /// Per-version stream concurrency cap (see ModelConfig).
+    pub max_concurrent_streams: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
     // Worker resilience (§3).
@@ -829,6 +831,9 @@ impl ModelTunables {
         }
         if let Some(v) = self.recycle_stream_drain_timeout_secs {
             model.recycle_stream_drain_timeout_secs = v;
+        }
+        if let Some(v) = self.max_concurrent_streams {
+            model.max_concurrent_streams = v;
         }
         if let Some(v) = self.request_timeout {
             model.request_timeout = v;
@@ -877,6 +882,7 @@ impl ModelTunables {
         if other.recycle_max_percent.is_some() { self.recycle_max_percent = other.recycle_max_percent; }
         if other.count_streams_toward_max_requests.is_some() { self.count_streams_toward_max_requests = other.count_streams_toward_max_requests; }
         if other.recycle_stream_drain_timeout_secs.is_some() { self.recycle_stream_drain_timeout_secs = other.recycle_stream_drain_timeout_secs; }
+        if other.max_concurrent_streams.is_some() { self.max_concurrent_streams = other.max_concurrent_streams; }
         if other.request_timeout.is_some() { self.request_timeout = other.request_timeout; }
         if other.health_check_interval.is_some() { self.health_check_interval = other.health_check_interval; }
         if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
@@ -1323,6 +1329,11 @@ pub struct ModelConfig {
     /// and stopping the worker. Independent from the batch drain bound,
     /// which stays on request_timeout / worker_kill_timeout.
     pub recycle_stream_drain_timeout_secs: f32,
+    /// Max concurrent streams (SSE/WS/gRPC/bidi/decoupled/custom-route,
+    /// per ensemble DAG node) per version. Streams bypass the queue, so
+    /// without this cap a stream flood has no memory bound. 0 = unlimited
+    /// (default). Over-cap opens are rejected 429 / ResourceExhausted.
+    pub max_concurrent_streams: usize,
     /// Active health check interval in seconds. 0 = disabled.
     pub health_check_interval: f32,
     /// Worker lifecycle hooks (shell commands and HTTP callbacks).
@@ -1386,6 +1397,7 @@ impl Default for ModelConfig {
             recycle_max_percent: 10,
             count_streams_toward_max_requests: true,
             recycle_stream_drain_timeout_secs: 60.0,
+            max_concurrent_streams: 0,
             health_check_interval: 15.0,
             hooks: WorkerHooksConfig::default(),
             policies: ModelPolicies::default(),

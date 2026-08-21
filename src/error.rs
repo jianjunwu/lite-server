@@ -377,9 +377,14 @@ impl AppError {
         // Retry-After:QueueFull 恒 1 秒;RateLimitExceeded 取配置秒数;
         // BadGateway(上游崩溃/回收,F-18)恒 1 秒——与 gRPC Unavailable +
         // retry-after metadata 对齐。WorkerRecycling 同为瞬态,恒 1 秒。
+        // StreamingCapacityExceeded(ensemble DAG 阀 / max_concurrent_streams)
+        // 同为可重试的容量拒绝,恒 1 秒。
         let headers = if matches!(
             self,
-            AppError::QueueFull(_) | AppError::BadGateway(_) | AppError::WorkerRecycling(_)
+            AppError::QueueFull(_)
+                | AppError::BadGateway(_)
+                | AppError::WorkerRecycling(_)
+                | AppError::StreamingCapacityExceeded(_)
         ) {
             Some(HashMap::from([("retry-after".to_string(), "1".to_string())]))
         } else if let AppError::RateLimitExceeded { retry_after_secs } = &self {

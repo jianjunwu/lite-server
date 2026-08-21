@@ -281,8 +281,23 @@ pub async fn dispatch_custom_route(
                 // G1/G3: the reply shape is known only now — count the
                 // in-flight stream on its slot from here; the guard rides
                 // the response body like the admission guard below.
+                // G4: stream concurrency cap. The worker stream is already
+                // open (the reply shape is known only at the first frame), so
+                // a rejection must cancel it before returning the 429.
+                let permit = match state
+                    .inference_queue
+                    .try_acquire_stream_permit(model_name, &resolved_version)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = client
+                            .send_raw(crate::streaming::build_stream_cancel(stream_id.clone()))
+                            .await;
+                        return Err(e);
+                    }
+                };
                 let inflight_guard = outlier
-                    .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+                    .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
                 // G3: count the stream toward the slot's max_requests budget.
                 state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
                 // Stream route: InferenceResponse fires on the terminal frame

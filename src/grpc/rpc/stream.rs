@@ -231,10 +231,16 @@ impl GrpcService {
                     err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
                 }
             })?;
+            // G4: stream concurrency cap — rejected pre-open (ResourceExhausted).
+            let permit = self
+                .app_state
+                .inference_queue
+                .try_acquire_stream_permit(model_name, &resolved_version)
+                .map_err(|e| err(app_error_to_grpc_status(&e)))?;
             // G1/G3: count the in-flight stream on its slot; the guard moves
             // into the forward task below (see the guard's doc).
             let inflight_guard = outlier
-                .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+                .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
             let client = clients[worker_id].clone();
             // P6 GetModelStats: one streaming inference dispatched to this worker.
             crate::metrics::prometheus::record_worker_inference(

@@ -11860,3 +11860,100 @@ class TailAPI(LitAPI):
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
+
+// ---------------------------------------------------------------------------
+// G4: max_concurrent_streams (T6)
+// ---------------------------------------------------------------------------
+
+/// Over-cap stream opens are rejected 429 + Retry-After; a closing stream
+/// re-admits. The model streams ~3s so two concurrent streams fill the cap
+/// while a third is attempted.
+#[tokio::test]
+async fn should_reject_streams_over_max_concurrent_streams() {
+    let slow_py = r#"import time
+from lite_server import LitAPI
+
+
+class SlowStreamAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 1)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def stream_predict(self, request):
+        for i in range(6):
+            yield {"index": i}
+            time.sleep(0.5)
+
+    def encode_response(self, output):
+        return output
+"#;
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-stream-cap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let dir = tmp_dir.join("cap_model").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.py"), slow_py).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_concurrent_streams: 2\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc", "--no-metrics",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 60).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    load_model(&base, "cap_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let open_stream = || {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{}/v2/models/cap_model/events", base))
+                .json(&json!({"input": 1}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Two concurrent streams fill the cap; confirm each is actually
+    // streaming (first chunk arrived) before probing the cap.
+    let mut s1 = open_stream().await;
+    let mut s2 = open_stream().await;
+    assert_eq!(s1.status(), 200);
+    assert_eq!(s2.status(), 200);
+    let _ = tokio::time::timeout(Duration::from_secs(10), s1.chunk())
+        .await.expect("s1 first chunk").unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), s2.chunk())
+        .await.expect("s2 first chunk").unwrap();
+
+    // Third concurrent open → 429 + Retry-After.
+    let s3 = open_stream().await;
+    assert_eq!(s3.status(), 429, "over-cap stream must be rejected");
+    assert!(
+        s3.headers().get("retry-after").is_some(),
+        "a capacity rejection must tell the client to retry"
+    );
+
+    // Drain both streams to completion (natural end releases the permits),
+    // then a new stream is admitted again.
+    let _ = tokio::time::timeout(Duration::from_secs(20), s1.text()).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(20), s2.text()).await.unwrap();
+    let s4 = open_stream().await;
+    assert_eq!(s4.status(), 200, "a closed stream's permit must re-admit");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}

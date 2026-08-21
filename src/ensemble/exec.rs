@@ -1691,12 +1691,16 @@ async fn execute_stream_step(
         let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
         // G3: count the stream toward the slot's max_requests budget (per DAG node).
         state.inference_queue.record_stream_served(&step.model, &resolved_version, worker_id);
+        // G4: stream concurrency cap for this DAG node's model version.
+        let permit = state
+            .inference_queue
+            .try_acquire_stream_permit(&step.model, &resolved_version)?;
         // G1/G3: count the in-flight stream on its slot (per DAG node).
         let guard = state
             .worker_manager
             .get_outlier_state(&step.model, &resolved_version)
             .await
-            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
         (chunk_rx, stream_id, Arc::clone(client), None, guard)
     } else {
         open_stream_with_retry(
@@ -1812,6 +1816,11 @@ async fn open_stream_with_retry(
         };
         // G3: count this attempt toward the slot's max_requests budget.
         state.inference_queue.record_stream_served(&step.model, resolved_version, worker_id);
+        // G4: stream concurrency cap for this attempt (a capacity rejection
+        // is not a worker fault — no retry).
+        let attempt_permit = state
+            .inference_queue
+            .try_acquire_stream_permit(&step.model, resolved_version)?;
         // G1/G3: count this attempt's stream on its slot. Retry continues
         // cancel the stream and drop the guard with it; the committed
         // attempt's guard moves into the first-frame forwarder (or rides the
@@ -1820,7 +1829,7 @@ async fn open_stream_with_retry(
             .worker_manager
             .get_outlier_state(&step.model, resolved_version)
             .await
-            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(attempt_permit));
 
         // Peek the first frame (bounded). Committed frames: Chunk/Start/Done.
         let first = match peek_bound {

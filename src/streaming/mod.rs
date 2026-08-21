@@ -267,6 +267,9 @@ impl Drop for StreamCancelGuard {
 pub(crate) struct StreamInflightGuard {
     outlier: std::sync::Arc<crate::inference_queue::OutlierState>,
     worker_idx: usize,
+    /// G4: stream-concurrency slot (max_concurrent_streams), released with
+    /// the guard so the count and the permit share one teardown path.
+    permit: Option<crate::inference_queue::StreamPermit>,
 }
 
 impl StreamInflightGuard {
@@ -275,7 +278,16 @@ impl StreamInflightGuard {
         worker_idx: usize,
     ) -> Self {
         outlier.stream_inflight_inc(worker_idx);
-        Self { outlier, worker_idx }
+        Self { outlier, worker_idx, permit: None }
+    }
+
+    /// Fold the G4 concurrency permit into this guard (single Drop path).
+    pub(crate) fn with_permit(
+        mut self,
+        permit: Option<crate::inference_queue::StreamPermit>,
+    ) -> Self {
+        self.permit = permit;
+        self
     }
 }
 

@@ -874,6 +874,8 @@ struct VersionQueue {
     worker_inflight: Vec<Arc<AtomicUsize>>,
     /// G3 escape hatch: when false, streams never touch the budget (legacy).
     count_streams_budget: bool,
+    /// G4: per-version stream concurrency cap (limit 0 = unlimited).
+    stream_concurrency: Arc<StreamConcurrency>,
 }
 
 /// Handle to a draining queue (§4.2). The collector stays alive so
@@ -1075,6 +1077,7 @@ impl InferenceQueue {
                 dispatch,
                 worker_inflight,
                 count_streams_budget: config.count_streams_toward_max_requests,
+                stream_concurrency: Arc::new(StreamConcurrency::new(config.max_concurrent_streams)),
             },
         );
         info!(
@@ -1193,6 +1196,33 @@ impl InferenceQueue {
             return;
         }
         check_worker_budget(&entry.dispatch, &entry.worker_inflight, worker_idx, 1);
+    }
+
+    /// G4: take one stream-concurrency slot for the version
+    /// (`max_concurrent_streams`). The returned permit releases on drop —
+    /// callers fold it into the stream's RAII guard so every exit shape
+    /// returns the slot. Errors with `StreamingCapacityExceeded` (429 /
+    /// ResourceExhausted, retryable) when the cap is reached; `Ok(None)`
+    /// for an unregistered version (the open fails downstream anyway) and
+    /// `Ok(Some(_))` otherwise, including limit 0 (unlimited).
+    pub(crate) fn try_acquire_stream_permit(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Result<Option<StreamPermit>, AppError> {
+        let key = model_version_key(model_name, version);
+        let Some(entry) = self.queues.get(&key) else {
+            return Ok(None);
+        };
+        entry
+            .stream_concurrency
+            .try_acquire()
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::StreamingCapacityExceeded(format!(
+                    "max_concurrent_streams reached for {model_name} {version}"
+                ))
+            })
     }
 }
 
@@ -1563,6 +1593,54 @@ struct WorkerBudget {
     /// first ticket-exhausted claim refusal of a crossed episode, re-armed
     /// when the claim finally lands (the budget resets).
     waiting_logged: AtomicBool,
+}
+
+/// G4: per-version stream concurrency cap. Streaming bypasses the queue, so
+/// without this a flood of concurrent streams (each = a ZMQ route + mpsc +
+/// worker-side generator/thread) has no memory bound — the ensemble DAG
+/// semaphore (max_concurrent_streaming_dags) never covered plain streams.
+/// limit 0 = unlimited (default, backward compatible).
+pub(crate) struct StreamConcurrency {
+    limit: usize,
+    in_use: AtomicUsize,
+}
+
+impl StreamConcurrency {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            in_use: AtomicUsize::new(0),
+        }
+    }
+
+    /// Take one slot. The fetch_add is the single atomic decision point: at
+    /// most `limit` callers ever observe prev < limit, so concurrent
+    /// acquires cannot overshoot; losers roll back and get None.
+    fn try_acquire(self: &Arc<Self>) -> Option<StreamPermit> {
+        if self.limit > 0 {
+            let prev = self.in_use.fetch_add(1, Ordering::Relaxed);
+            if prev >= self.limit {
+                self.in_use.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        Some(StreamPermit {
+            owner: self.clone(),
+        })
+    }
+}
+
+/// RAII stream-concurrency slot: dropping returns it. Held by
+/// [`crate::streaming::StreamInflightGuard`] so every stream-exit shape
+/// releases the slot with no call-site bookkeeping.
+pub(crate) struct StreamPermit {
+    owner: Arc<StreamConcurrency>,
+}
+
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        self.owner.in_use.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Build the per-slot budget table: one independently jittered threshold per
@@ -4501,6 +4579,71 @@ mod tests {
             queue.record_stream_served("m", "1", 0);
         }
         assert!(!outlier.is_recycling(0), "flag off: streams never cross the budget");
+    }
+
+    // ===== G4: max_concurrent_streams (per-version stream concurrency cap) =====
+
+    /// T6 (unit half): the cap admits up to `limit` concurrent streams and
+    /// rejects the next one; a released permit re-admits.
+    #[tokio::test]
+    async fn should_cap_concurrent_streams_per_version() {
+        let (queue, _outlier, _rx) = streaming_capped_queue("scap", 2).await;
+        let p1 = queue
+            .try_acquire_stream_permit("m", "1")
+            .expect("first stream admitted")
+            .expect("permit present for a registered version");
+        let _p2 = queue
+            .try_acquire_stream_permit("m", "1")
+            .expect("second stream admitted");
+        assert!(
+            queue.try_acquire_stream_permit("m", "1").is_err(),
+            "third concurrent stream must be rejected (429)"
+        );
+        drop(p1);
+        assert!(
+            queue.try_acquire_stream_permit("m", "1").is_ok(),
+            "a released permit re-admits a stream"
+        );
+    }
+
+    /// T6 (default): limit 0 = unlimited (backward compatible).
+    #[tokio::test]
+    async fn should_not_cap_streams_when_limit_is_zero() {
+        let (queue, _outlier, _rx) = streaming_capped_queue("snocap", 0).await;
+        for _ in 0..100 {
+            let _p = queue.try_acquire_stream_permit("m", "1").expect("admitted");
+        }
+    }
+
+    /// Unknown versions are not capped (the open fails downstream anyway).
+    #[tokio::test]
+    async fn should_admit_stream_permit_for_unknown_version() {
+        let queue = InferenceQueue::new();
+        assert!(queue.try_acquire_stream_permit("nope", "1").is_ok());
+    }
+
+    /// Register a 1-worker version with a stream concurrency cap.
+    async fn streaming_capped_queue(
+        name: &str,
+        max_concurrent_streams: usize,
+    ) -> (InferenceQueue, Arc<OutlierState>, mpsc::Receiver<RespawnSignal>) {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            health_check_interval: 0.0,
+            max_concurrent_streams,
+            ..Default::default()
+        };
+        let outlier = Arc::new(OutlierState::new(1));
+        let endpoint = drain_test_endpoint(name);
+        spawn_tagged_worker(endpoint.clone(), b"w".to_vec());
+        let clients = vec![Arc::new(WorkerZmqClient::new(endpoint))];
+        let (tx, rx) = mpsc::channel::<RespawnSignal>(8);
+        queue.register_model("m", "1", &config, vec![], clients, outlier.clone(), Some(tx));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (queue, outlier, rx)
     }
 
     /// Register a 1-worker version whose budget counts streams per the flag.

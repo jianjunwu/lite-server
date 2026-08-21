@@ -145,6 +145,7 @@ pub fn run_server(
             recycle_max_percent: None,
             count_streams_toward_max_requests: None,
             recycle_stream_drain_timeout_secs: None,
+            max_concurrent_streams: None,
             request_timeout,
             health_check_interval,
             ejection_error_threshold,
