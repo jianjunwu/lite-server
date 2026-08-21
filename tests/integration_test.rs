@@ -11957,3 +11957,121 @@ class SlowStreamAPI(LitAPI):
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
+
+// ---------------------------------------------------------------------------
+// Q2: negotiated close on recycle eviction (grace cancel)
+// ---------------------------------------------------------------------------
+
+/// A long decoupled stream crossing a rolling recycle must NOT be cut with
+/// an eviction error when the model cooperates: the grace cancel flags
+/// `sender.closing`, the model pushes a final chunk and closes — the client
+/// sees a normal [DONE], and the worker still recycles.
+#[tokio::test]
+async fn should_close_decoupled_stream_cleanly_within_recycle_grace() {
+    let grace_py = r#"import asyncio
+from lite_server import LitAPI
+
+
+class GraceAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return x
+
+    async def predict_decoupled(self, data, sender):
+        async def _push():
+            for i in range(600):
+                if sender.closing:
+                    await sender.send({"final": True})
+                    await sender.close()
+                    return
+                await sender.send({"index": i})
+                await asyncio.sleep(0.5)
+        asyncio.create_task(_push())
+
+    def encode_response(self, output):
+        return output
+"#;
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-recycle-grace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let dir = tmp_dir.join("grace_model").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.py"), grace_py).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\nmax_requests: 1\nrecycle_stream_drain_timeout_secs: 1\nrecycle_stream_grace_ms: 3000\n",
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 60).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    load_model(&base, "grace_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/grace_model/decoupled", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // max_requests=1: this very stream crosses the budget at open → drain
+    // (1s) times out → grace cancel (3s) → the model sees `closing`, pushes
+    // {"final": true} and closes → the client ends with a normal [DONE].
+    let body = tokio::time::timeout(Duration::from_secs(30), resp.text())
+        .await
+        .expect("stream closes within the grace window")
+        .unwrap();
+    assert!(
+        body.contains("\"final\": true") || body.contains("\"final\":true"),
+        "the model's wrap-up chunk must reach the client: {body}"
+    );
+    assert!(
+        body.contains("[DONE]"),
+        "a cooperative model ends the stream with a normal [DONE]: {body}"
+    );
+    assert!(
+        !body.contains("worker recycling"),
+        "a cooperative close must NOT surface the eviction error: {body}"
+    );
+
+    // The rolling recycle still happened (the worker is replaced afterwards).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let body = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap().text().await.unwrap();
+        let count = body.lines()
+            .find(|l| l.starts_with(
+                "liteserver_worker_respawns_total{model=\"grace_model\",reason=\"rolling_recycle\",version=\"1\"}"
+            ))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if count >= 1.0 {
+            recycled = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(recycled, "the worker must still roll-recycle after the graceful close");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}

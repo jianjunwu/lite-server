@@ -814,6 +814,13 @@ class MyModel(LitAPI):
 - Call ``sender.send(payload)`` to push a chunk; call ``sender.close()``
   to signal completion.
 - The method returns immediately — chunk delivery is asynchronous.
+- ``sender.closed`` is set on a server-side cancel (client disconnect,
+  idle reclaim, shutdown) — poll it to stop pushing. ``sender.closing`` is
+  set by a grace cancel (rolling-recycle eviction): the server asks the
+  model to wrap up within `recycle_stream_grace_ms` — push any final chunk
+  and call ``close()`` itself, and the client still sees a normal stream
+  end instead of an eviction error. Long-running push loops should poll
+  both flags.
 
 Implementing ``predict_decoupled`` is all that's needed — sessions are
 detected from the method itself and served over:

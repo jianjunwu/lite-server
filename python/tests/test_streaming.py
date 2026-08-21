@@ -829,6 +829,75 @@ class TestRunAsyncLoopStream:
         # Only the first chunk arrives; the consume task is cancelled while waiting
         assert len(chunks) == 1
 
+    @pytest.mark.asyncio
+    async def test_grace_cancel_lets_uni_stream_finish(self):
+        """Uni-stream grace cancel (recycle): the generator keeps producing
+        within the window and finishes with a normal Done; the deferred hard
+        cancel lands on an already-completed task (no-op)."""
+        class QuickStreamAPI(EchoAPI):
+            async def stream_predict(self, x):
+                yield "first"
+                await asyncio.sleep(0.05)  # cancel lands here, well within grace
+                yield "second"
+
+        async def cancel_after_first_chunk():
+            while not any(
+                r.HasField("stream") and r.stream.HasField("chunk")
+                and r.stream.chunk.data == b'first'
+                for r in sock.sent
+            ):
+                await asyncio.sleep(0.005)
+            return Request(
+                uid="cancel-s-gu",
+                stream=StreamRequest(
+                    stream_id="s-gu",
+                    cancel=StreamCancel(reason="recycle", grace_ms=5000),
+                ),
+            ).SerializeToString()
+
+        sock = _LoopSocket([_open_bytes("s-gu"), cancel_after_first_chunk])
+        await inference.run_async_loop(QuickStreamAPI(), sock, "test-model", log)
+        stream_resps = [r for r in sock.sent if r.HasField("stream") and r.stream.stream_id == "s-gu"]
+        chunks = [r for r in stream_resps if r.stream.HasField("chunk")]
+        dones = [r for r in stream_resps if r.stream.HasField("done")]
+        assert len(chunks) == 2, "grace cancel must not cut the stream mid-window"
+        assert len(dones) == 1, "a stream finishing within grace ends with Done"
+
+    @pytest.mark.asyncio
+    async def test_grace_cancel_expires_for_blocked_uni_stream(self):
+        """Uni-stream grace cancel: a generator still blocked when the window
+        elapses is hard-cancelled by the deferred cancel — no Done."""
+        block_generator = asyncio.Event()
+
+        class BlockedStreamAPI(EchoAPI):
+            async def stream_predict(self, x):
+                yield "first"
+                await block_generator.wait()
+                yield "second"
+
+        async def cancel_after_first_chunk():
+            while not any(
+                r.HasField("stream") and r.stream.HasField("chunk")
+                and r.stream.chunk.data == b'first'
+                for r in sock.sent
+            ):
+                await asyncio.sleep(0.005)
+            return Request(
+                uid="cancel-s-gx",
+                stream=StreamRequest(
+                    stream_id="s-gx",
+                    cancel=StreamCancel(reason="recycle", grace_ms=50),
+                ),
+            ).SerializeToString()
+
+        sock = _LoopSocket([_open_bytes("s-gx"), cancel_after_first_chunk])
+        await inference.run_async_loop(BlockedStreamAPI(), sock, "test-model", log)
+        stream_resps = [r for r in sock.sent if r.HasField("stream") and r.stream.stream_id == "s-gx"]
+        chunks = [r for r in stream_resps if r.stream.HasField("chunk")]
+        dones = [r for r in stream_resps if r.stream.HasField("done")]
+        assert len(chunks) == 1, "the deferred cancel must stop the blocked generator"
+        assert len(dones) == 0
+
 
 # ---------------------------------------------------------------------------
 # F2: Stream thread isolation — sync generator consumption stays off the loop
@@ -1386,6 +1455,84 @@ class TestDecoupledStreaming:
         assert sender.closed is True
         assert "s-cn" not in active
         assert not any(_is_done(r, "s-cn") for r in sock.stream_responses("s-cn"))
+
+    @pytest.mark.asyncio
+    async def test_grace_cancel_marks_closing_and_allows_clean_close(self):
+        """Rolling-recycle eviction sends cancel(reason="recycle", grace_ms=N):
+        the sender is flagged `closing` (NOT closed), the session stays
+        registered, send() keeps working, and a model that wraps up with
+        close() gets a normal Done — the deferred hard cancel must not fire
+        a second terminal afterwards."""
+        class GraceAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                async def _push():
+                    await asyncio.sleep(0.05)  # let the grace cancel land
+                    assert sender.closing is True
+                    assert sender.closed is False
+                    await sender.send({"chunk": "final"})
+                    await sender.close()
+                asyncio.create_task(_push())
+
+        sock = AsyncSocket()
+        active = {}
+        api = GraceAPI()
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("s-gr"), sock, active, log
+        )
+        assert "s-gr" in active
+        sender = active["s-gr"].sender
+
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="s-gr",
+            cancel=StreamCancel(reason="recycle", grace_ms=5000),
+        ))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        # Grace: sender still open, session retained, no terminal yet.
+        assert sender.closed is False
+        assert sender.closing is True
+        assert "s-gr" in active
+
+        await sock.wait_for(lambda r: _is_done(r, "s-gr"))
+        responses = sock.stream_responses("s-gr")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        assert any(
+            json.loads(c.stream.chunk.data)["chunk"] == "final" for c in chunks
+        )
+        assert "s-gr" not in active
+        # The deferred hard cancel is disarmed by close(): no second terminal.
+        await asyncio.sleep(0.05)
+        assert sum(1 for r in sock.stream_responses("s-gr") if r.stream.HasField("done")) == 1
+
+    @pytest.mark.asyncio
+    async def test_grace_cancel_expires_into_hard_cancel(self):
+        """A model that ignores `closing`: the grace window elapses → hard
+        cancel — closed, session popped, no Done (cancel semantics)."""
+        class StubbornAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                async def _push():
+                    for i in range(100):
+                        await asyncio.sleep(0.02)
+                        await sender.send({"chunk": i})
+                    await sender.close()
+                asyncio.create_task(_push())
+
+        sock = AsyncSocket()
+        active = {}
+        api = StubbornAPI()
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("s-ex"), sock, active, log
+        )
+        sender = active["s-ex"].sender
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="s-ex",
+            cancel=StreamCancel(reason="recycle", grace_ms=50),
+        ))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        assert sender.closing is True and sender.closed is False
+        await asyncio.sleep(0.3)
+        assert sender.closed is True
+        assert "s-ex" not in active
+        assert not any(_is_done(r, "s-ex") for r in sock.stream_responses("s-ex"))
 
 
 # ---------------------------------------------------------------------------

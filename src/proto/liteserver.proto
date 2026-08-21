@@ -123,6 +123,16 @@ message StreamClose {
 }
 
 message StreamCancel {
+  // Why the stream is being cancelled (e.g. "client_disconnect",
+  // "idle_timeout", "deadline", "panic", "shutdown", "recycle").
+  // Informational; absent = legacy hard cancel.
+  optional string reason = 1;
+  // Grace window in milliseconds before the worker hard-cancels the
+  // stream (reason "recycle" from the rolling-recycle eviction path).
+  // Within the window the model may keep pushing and close() itself —
+  // the client then sees a normal Done instead of an eviction error.
+  // 0 / absent = immediate cancel (legacy behavior).
+  optional uint32 grace_ms = 2;
 }
 
 // ===== Response Payloads =====

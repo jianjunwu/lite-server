@@ -179,6 +179,10 @@ class _ResponseSender:
         self._ctx = ctx
         self._active_streams = active_streams
         self.closed = False
+        # Grace cancel (rolling-recycle eviction): the model should wrap up
+        # and close() itself within the window; hard cancel fires on expiry.
+        self.closing = False
+        self._hard_cancel_handle: asyncio.TimerHandle | None = None
         # S3:per-stream chunk 计数(近似 tokens_generated 口径,close 时上报)。
         self._chunk_count = 0
 
@@ -238,6 +242,11 @@ class _ResponseSender:
         if self.closed:
             return
         self.closed = True
+        # A clean close within the grace window disarms the hard cancel —
+        # the terminal already went out as a normal Done (single fire).
+        if self._hard_cancel_handle is not None:
+            self._hard_cancel_handle.cancel()
+            self._hard_cancel_handle = None
         # B3(审计):terminal-first——先摘会话再 await;否则 cancel 在 close
         # 挂起期间落地会对同一流再 fire 一次 on_stream_close(与 send() 错误
         # 路径同模式;server cancel 路径先 pop 再 fire,此处先 pop 则其找不到
@@ -247,11 +256,33 @@ class _ResponseSender:
         await self._socket.send(_make_stream_done(self._stream_id, metrics).SerializeToString())
         await self._pipe.run_on_stream_close(self._ctx, "done")
 
-    def cancel(self) -> None:
-        """Cooperative cancel (client disconnect / shutdown). Subsequent
-        send()/close() are no-ops. No StreamDone is sent (cancel semantics
+    def cancel(self, reason: str | None = None, grace_ms: int = 0) -> None:
+        """Cooperative cancel. ``grace_ms > 0`` (rolling-recycle eviction):
+        flag ``closing`` and give the model a grace window to wrap up and
+        close() itself — the client then sees a normal Done; the hard
+        cancel fires on expiry. ``grace_ms == 0`` (default, e.g. client
+        disconnect / shutdown): immediate — subsequent send()/close() are
+        no-ops. No StreamDone is sent on a hard cancel (cancel semantics
         match bidi/uni streams)."""
+        if self.closed or self.closing:
+            return
+        if grace_ms and grace_ms > 0:
+            self.closing = True
+            loop = asyncio.get_running_loop()
+            self._hard_cancel_handle = loop.call_later(
+                grace_ms / 1000, self._expire_grace)
+            return
         self.closed = True
+
+    def _expire_grace(self) -> None:
+        """Grace window elapsed without the model closing: hard cancel —
+        same terminal shape as the immediate-cancel branch (session popped,
+        on_stream_close("cancel") fired exactly once, no Done)."""
+        if self.closed:
+            return  # the model closed within the window
+        self.closed = True
+        self._active_streams.pop(self._stream_id, None)
+        asyncio.ensure_future(self._pipe.run_on_stream_close(self._ctx, "cancel"))
 
 
 async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> Any:
@@ -350,6 +381,14 @@ async def _handle_stream_error(
     await pipe.run_on_stream_close(ctx, "error")
 
 
+def _grace_ms(cancel) -> int:
+    """StreamCancel.grace_ms with proto3 optional presence: absent = 0
+    (immediate cancel, the legacy semantic every old server relies on)."""
+    if cancel is not None and cancel.HasField("grace_ms"):
+        return cancel.grace_ms
+    return 0
+
+
 async def _handle_stream_async(
     lit_api: LitAPI,
     request: Request,
@@ -367,6 +406,23 @@ async def _handle_stream_async(
     elif action == "chunk":
         await _handle_stream_chunk_async(lit_api, stream_req, socket, active_streams, log)
     elif action in ("close", "cancel"):
+        # Grace cancel (rolling-recycle eviction): do NOT pop/fire — the
+        # stream gets a window to wrap up and end itself with a normal Done.
+        # uni-stream: defer the task cancel; decoupled: flag sender.closing.
+        if action == "cancel" and _grace_ms(stream_req.cancel) > 0:
+            grace_ms = _grace_ms(stream_req.cancel)
+            reason = stream_req.cancel.reason or "recycle"
+            entry = active_streams.get(stream_id)
+            if isinstance(entry, _DecoupledSession):
+                entry.sender.cancel(reason=reason, grace_ms=grace_ms)
+            elif isinstance(entry, asyncio.Task):
+                def _deferred_uni_cancel(sid=stream_id, task=entry):
+                    active_streams.pop(sid, None)
+                    task.cancel()
+                asyncio.get_running_loop().call_later(
+                    grace_ms / 1000, _deferred_uni_cancel)
+                log.info("uni-stream %s grace-cancel (%s, %dms)", stream_id, reason, grace_ms)
+            return
         entry = active_streams.pop(stream_id, None)
         pipe = _get_pipeline(lit_api)
         if isinstance(entry, _BidiSession):

@@ -1029,6 +1029,7 @@ impl InferenceQueue {
             recycle_stream_drain_timeout: Duration::from_secs_f32(
                 config.recycle_stream_drain_timeout_secs,
             ),
+            recycle_stream_grace: Duration::from_millis(config.recycle_stream_grace_ms as u64),
             sequence_registry: self.sequence_registry.clone(),
             balance: self.balance,
         });
@@ -1682,6 +1683,11 @@ struct BatchDispatch {
     /// visible terminal error frame via `fail_all`) and stopping the worker.
     /// Long streams get a grace window without slowing the batch drain.
     recycle_stream_drain_timeout: Duration,
+    /// Q2: negotiated-close window after the stream drain times out — the
+    /// slot's streams get a grace cancel asking the model to wrap up and
+    /// close itself (client sees a normal Done); survivors are evicted.
+    /// ZERO = evict immediately.
+    recycle_stream_grace: Duration,
     sequence_registry: Arc<SequenceRegistry>,
     balance: BalanceConfig,
 }
@@ -2212,21 +2218,40 @@ async fn recycle_worker(
         .await
         .is_err()
     {
+        // Q2: negotiated close — before evicting, give the slot's streams a
+        // grace window to wrap up and end themselves (client sees a normal
+        // Done; the routes stay open so wrap-up output still forwards).
+        if dispatch.outlier.stream_inflight(worker_idx) > 0
+            && dispatch.recycle_stream_grace > Duration::ZERO
+        {
+            dispatch.zmq_clients[worker_idx].graceful_cancel_all(
+                "recycle",
+                dispatch.recycle_stream_grace.as_millis() as u32,
+            );
+            let grace_wait = async {
+                while dispatch.outlier.stream_inflight(worker_idx) > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            let _ = tokio::time::timeout(dispatch.recycle_stream_grace, grace_wait).await;
+        }
         let evicted = dispatch.outlier.stream_inflight(worker_idx);
-        warn!(
-            model = %dispatch.model_name, version = %dispatch.version, worker_idx, evicted,
-            "Recycle stream drain timed out; evicting in-flight streams"
-        );
-        crate::metrics::prometheus::record_recycle_streams_evicted(
-            &dispatch.model_name,
-            &dispatch.version,
-            evicted as u64,
-        );
-        // Client-visible eviction: every in-flight stream on the slot gets a
-        // bounded terminal Error frame (worker-side generators die with the
-        // graceful stop that follows). Idempotent when the worker already
-        // died (routes are gone).
-        dispatch.zmq_clients[worker_idx].fail_all("worker recycling: evicting in-flight streams");
+        if evicted > 0 {
+            warn!(
+                model = %dispatch.model_name, version = %dispatch.version, worker_idx, evicted,
+                "Recycle stream drain timed out; evicting in-flight streams"
+            );
+            crate::metrics::prometheus::record_recycle_streams_evicted(
+                &dispatch.model_name,
+                &dispatch.version,
+                evicted as u64,
+            );
+            // Client-visible eviction: every in-flight stream on the slot gets a
+            // bounded terminal Error frame (worker-side generators die with the
+            // graceful stop that follows). Idempotent when the worker already
+            // died (routes are gone).
+            dispatch.zmq_clients[worker_idx].fail_all("worker recycling: evicting in-flight streams");
+        }
     }
     let Some(tx) = &dispatch.respawn_tx else {
         return; // unreachable: the trigger checked the channel exists
@@ -4451,6 +4476,17 @@ mod tests {
         respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
         stream_drain: Duration,
     ) -> (Arc<BatchDispatch>, Arc<OutlierState>, Vec<Arc<AtomicUsize>>) {
+        budget_dispatch_grace(tag, thresholds, respawn_tx, stream_drain, Duration::ZERO)
+    }
+
+    /// Full builder: stream drain bound + eviction grace window.
+    fn budget_dispatch_grace(
+        tag: &str,
+        thresholds: &[usize],
+        respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
+        stream_drain: Duration,
+        grace: Duration,
+    ) -> (Arc<BatchDispatch>, Arc<OutlierState>, Vec<Arc<AtomicUsize>>) {
         let outlier = Arc::new(OutlierState::new(thresholds.len()));
         let clients = (0..thresholds.len())
             .map(|i| {
@@ -4475,6 +4511,7 @@ mod tests {
                 .collect(),
             recycle_drain_timeout: Duration::from_millis(100),
             recycle_stream_drain_timeout: stream_drain,
+            recycle_stream_grace: grace,
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -4555,6 +4592,144 @@ mod tests {
         let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("respawn after eviction")
+            .expect("channel open");
+        assert_eq!(sig.worker_id, 0);
+    }
+
+    /// Q2: before evicting, the slot's streams get a grace cancel
+    /// (reason=recycle + grace_ms); a stream whose model wraps up within the
+    /// window ends with its own chunk + Done — no eviction error, and the
+    /// respawn proceeds once the count drains.
+    #[tokio::test]
+    async fn should_let_stream_close_cleanly_within_recycle_grace() {
+        use prost::Message;
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch_grace(
+            "streamgrace",
+            &[1],
+            Some(tx),
+            Duration::from_millis(150),
+            Duration::from_secs(2),
+        );
+        // Mock worker: on the grace cancel, push a final chunk + Done (the
+        // model wrapping up within the window).
+        let endpoint = drain_test_endpoint("budget-streamgrace-0");
+        let sid_w = "s-grace".to_string();
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
+                if let Some(pb::stream_request::Action::Cancel(c)) = st.action {
+                    assert_eq!(c.reason.as_deref(), Some("recycle"));
+                    assert!(c.grace_ms.unwrap_or(0) > 0, "the grace window rides the cancel");
+                    let mk = |payload: pb::stream_response::Payload, uid: &str| pb::Response {
+                        uid: uid.to_string(),
+                        payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                            stream_id: sid_w.clone(),
+                            payload: Some(payload),
+                        })),
+                        metrics: None,
+                    };
+                    let chunk = mk(
+                        pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                            data: bytes::Bytes::from_static(b"final"),
+                            is_final: false,
+                        }),
+                        "c1",
+                    );
+                    let done = mk(
+                        pb::stream_response::Payload::Done(pb::StreamDone { metrics: None }),
+                        "d1",
+                    );
+                    let _ = s.send(chunk.encode_to_vec(), 0);
+                    let _ = s.send(done.encode_to_vec(), 0);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sid = "s-grace".to_string();
+        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let mut chunk_rx = dispatch.zmq_clients[0]
+            .send_stream(open, sid.clone())
+            .await
+            .expect("stream opens");
+        outlier.stream_inflight_inc(0);
+
+        check_worker_budget(&dispatch, &inflight, 0, 1);
+
+        // The client sees the wrap-up chunk + Done; the (simulated) forwarder
+        // guard releases the count on the terminal, unblocking the respawn.
+        let mut got_done = false;
+        while let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv()).await {
+            match f.payload {
+                Some(pb::stream_response::Payload::Done(_)) => {
+                    got_done = true;
+                    outlier.stream_inflight_dec(0);
+                    break;
+                }
+                Some(pb::stream_response::Payload::Error(e)) => {
+                    panic!("grace must not evict a wrapping-up stream: {}", e.message)
+                }
+                _ => {}
+            }
+        }
+        assert!(got_done, "the model's own Done reaches the client within grace");
+        let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("respawn once the count drains")
+            .expect("channel open");
+        assert_eq!(sig.worker_id, 0);
+    }
+
+    /// Q2: a stream that ignores the grace cancel (model keeps pushing past
+    /// the window) is evicted after the grace elapses — same client-visible
+    /// error frame as the no-grace path.
+    #[tokio::test]
+    async fn should_evict_stream_that_ignores_recycle_grace() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch_grace(
+            "streamignore",
+            &[1],
+            Some(tx),
+            Duration::from_millis(150),
+            Duration::from_millis(200),
+        );
+        spawn_silent_worker(drain_test_endpoint("budget-streamignore-0"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sid = "s-ignore".to_string();
+        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let mut chunk_rx = dispatch.zmq_clients[0]
+            .send_stream(open, sid.clone())
+            .await
+            .expect("stream opens");
+        outlier.stream_inflight_inc(0);
+
+        check_worker_budget(&dispatch, &inflight, 0, 1);
+
+        let frame = tokio::time::timeout(Duration::from_secs(4), chunk_rx.recv())
+            .await
+            .expect("eviction frame in time")
+            .expect("route channel open");
+        match frame.payload {
+            Some(pb::stream_response::Payload::Error(e)) => assert!(
+                e.message.contains("recycl"),
+                "post-grace eviction keeps the recycle reason: {}",
+                e.message
+            ),
+            other => panic!("expected eviction Error frame, got {other:?}"),
+        }
+        let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("respawn after the grace window")
             .expect("channel open");
         assert_eq!(sig.worker_id, 0);
     }
@@ -5552,6 +5727,7 @@ mod tests {
             budgets: build_worker_budgets(0, 1000, 0),
             recycle_drain_timeout: Duration::from_secs(1),
             recycle_stream_drain_timeout: Duration::from_secs(1),
+            recycle_stream_grace: Duration::ZERO,
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -5869,6 +6045,7 @@ mod tests {
             budgets: build_worker_budgets(2, 0, 0),
             recycle_drain_timeout: Duration::from_secs(1),
             recycle_stream_drain_timeout: Duration::from_secs(1),
+            recycle_stream_grace: Duration::ZERO,
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -6014,6 +6191,7 @@ mod tests {
             budgets: build_worker_budgets(1, 0, 0),
             recycle_drain_timeout: Duration::from_secs(1),
             recycle_stream_drain_timeout: Duration::from_secs(1),
+            recycle_stream_grace: Duration::ZERO,
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         };

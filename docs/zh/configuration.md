@@ -403,6 +403,9 @@ recycle_stream_drain_timeout_secs: 60.0
 max_concurrent_streams: 0      # 每版本并发流上限（0 = 无限，默认）。流式绕过
                                # 队列，不设上限则流式洪水无内存界。超限的开流
                                # 拒绝 429 / ResourceExhausted + Retry-After。
+recycle_stream_grace_ms: 2000  # 回收流 drain 超时后的宽限窗口（毫秒）：在途流
+                               # 收到宽限取消，模型自行收尾关闭（客户端看到正常
+                               # 结束而非驱逐错误）。0 = 立即驱逐。
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
 
 # Worker 韧性（Resilience）

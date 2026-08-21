@@ -59,6 +59,12 @@ enum ZmqCommand {
     /// routes get a terminal Error frame. The transport itself stays up —
     /// the bound socket outlives the worker and a respawned peer reconnects.
     FailAll { reason: String },
+    /// Q2 (negotiated close): send every in-flight stream on this worker a
+    /// grace cancel (`reason` + `grace_ms`) WITHOUT dropping its route —
+    /// wrap-up chunks and the model's own Done still forward to the client
+    /// within the window. Used by the rolling-recycle eviction path, which
+    /// follows with `FailAll` for whatever survives the grace.
+    GracefulCancelAll { reason: String, grace_ms: u32 },
     /// RN-10: explicit actor shutdown (unload waits for the actor to exit
     /// before deleting the socket file). Drain-equivalent to the channel
     /// closing, but issuable through a shared &self handle.
@@ -569,6 +575,25 @@ impl WorkerZmqClient {
         }
     }
 
+    /// Q2: send every in-flight stream on this worker a grace cancel
+    /// (`reason` + `grace_ms`), keeping the routes so wrap-up output still
+    /// reaches the client. Best-effort like [`Self::fail_all`].
+    pub fn graceful_cancel_all(&self, reason: &str, grace_ms: u32) {
+        match self.cmd_tx.try_send(ZmqCommand::GracefulCancelAll {
+            reason: reason.to_string(),
+            grace_ms,
+        }) {
+            Ok(()) => self.wake_actor(),
+            Err(e) => warn!(
+                "ZMQ graceful_cancel_all dropped ({})",
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "command channel full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "command channel closed",
+                }
+            ),
+        }
+    }
+
     /// Interrupt the actor's blocking poll so it drains the command channel
     /// now instead of at the next backstop tick. Best-effort: a full wake
     /// pipe means the actor is already awake. Skipped entirely when the
@@ -762,6 +787,22 @@ fn drain_commands(
                         "ZMQ fail_all ({}): released {} pending + {} stream(s)",
                         reason, n_pending, n_streams
                     );
+                }
+            }
+            Ok(ZmqCommand::GracefulCancelAll { reason, grace_ms }) => {
+                // Q2: grace-cancel every in-flight stream, KEEPING the routes
+                // — the worker's wrap-up chunks and the model's own Done
+                // still forward to the client within the window (the Done is
+                // terminal, so the route cleans itself up normally).
+                for sid in stream_routes.keys() {
+                    let req = crate::streaming::build_stream_cancel_with(
+                        sid.clone(),
+                        Some(&reason),
+                        grace_ms,
+                    );
+                    if let Err(e) = socket.send(req.encode_to_vec(), 0) {
+                        warn!("ZMQ grace-cancel send failed for {}: {}", sid, e);
+                    }
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => return DrainOutcome::Continue,

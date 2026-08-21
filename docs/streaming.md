@@ -242,11 +242,21 @@ them explicitly:
   (`x-lite-worker-id`) to a recycling slot is rejected with `503` +
   `Retry-After` / gRPC `Unavailable` + retry-after metadata — transient, so
   the same request may be retried as-is.
-- **Forced eviction**: if streams are still in flight when the drain timeout
-  elapses, they are evicted — every such stream ends with a terminal error
-  frame (`worker recycling: evicting in-flight streams`), counted by
-  `liteserver_recycle_streams_evicted_total`. Long decoupled streams
-  (minutes) will hit this unless the timeout is raised for them.
+- **Negotiated close (grace)**: when the drain timeout elapses with streams
+  still in flight, the server first sends every such stream a grace cancel
+  (`reason=recycle`, `grace_ms` from `recycle_stream_grace_ms`, default
+  2000). The worker flags the model's sender (`sender.closing` on decoupled
+  streams) or defers the generator cancel (coupled streams), so a model that
+  wraps up and closes within the window ends the stream with a normal
+  `Done` — the client never sees an error. Wrap-up output keeps forwarding:
+  the routes stay open for the whole window.
+- **Forced eviction**: whatever survives the grace window is evicted — every
+  remaining stream ends with a terminal error frame (`worker recycling:
+  evicting in-flight streams`), counted by
+  `liteserver_recycle_streams_evicted_total`. Set
+  `recycle_stream_grace_ms: 0` to skip the negotiation and evict
+  immediately. Bidi sessions are always cancelled immediately (interactive
+  sessions have no self-close path).
 - **Worker death mid-stream** (recycle, health-check kill, unload, hot
   reload): never a silent EOF. The client always gets a terminal error —
   SSE `data: {"error":"worker exited mid-stream"}`, WS

@@ -36,9 +36,16 @@ class ResponseSender(Protocol):
     end the stream. After ``close()`` or a server-side cancel, ``closed`` is
     True and further ``send``/``close`` calls are no-ops. The concrete worker
     implementation lives in ``lite_server.worker.streaming``.
+
+    ``closing`` is set by a grace cancel (rolling-recycle eviction): the
+    server asks the model to wrap up within a grace window — keep pushing
+    any final chunks and ``close()`` itself, and the client still sees a
+    normal stream end. Models driving long streams should poll it in their
+    push loop. After the window the stream is hard-cancelled.
     """
 
     closed: bool
+    closing: bool
 
     async def send(self, obj: Any) -> None: ...
     async def close(self) -> None: ...

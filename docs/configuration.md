@@ -462,6 +462,11 @@ max_concurrent_streams: 0      # Max concurrent streams per version (0 = unlimit
                                # cap a stream flood has no memory bound. Over-cap
                                # opens are rejected 429 / ResourceExhausted +
                                # Retry-After.
+recycle_stream_grace_ms: 2000  # Grace window (ms) after the recycle stream-drain
+                               # timeout: in-flight streams are asked to wrap up
+                               # and close themselves (client sees a normal Done
+                               # instead of an eviction error). 0 = evict
+                               # immediately.
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
 
 # Worker Resilience

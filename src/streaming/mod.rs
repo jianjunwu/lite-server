@@ -70,12 +70,28 @@ pub fn build_stop_request() -> pb::Request {
 
 /// Build a protobuf StreamRequest::Cancel.
 pub fn build_stream_cancel(stream_id: String) -> pb::Request {
+    build_stream_cancel_with(stream_id, None, 0)
+}
+
+/// Build a protobuf StreamRequest::Cancel with an optional reason and grace
+/// window. `grace_ms > 0` (rolling-recycle eviction) asks the worker to let
+/// the model wrap up and close the stream itself within the window — the
+/// client then sees a normal Done; the hard cancel fires on expiry.
+/// `grace_ms == 0` and no reason = the legacy immediate cancel.
+pub fn build_stream_cancel_with(
+    stream_id: String,
+    reason: Option<&str>,
+    grace_ms: u32,
+) -> pb::Request {
     pb::Request {
         uid: format!("stream-cancel-{}", stream_id),
         meta: None,
         payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
             stream_id,
-            action: Some(pb::stream_request::Action::Cancel(pb::StreamCancel {})),
+            action: Some(pb::stream_request::Action::Cancel(pb::StreamCancel {
+                reason: reason.map(|s| s.to_string()),
+                grace_ms: (grace_ms > 0).then_some(grace_ms),
+            })),
         })),
     }
 }
