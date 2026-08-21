@@ -60,7 +60,12 @@ pub fn pick_worker_random(num_workers: usize) -> usize {
     rand::thread_rng().gen_range(0..num_workers.max(1))
 }
 
-/// Pick a random non-ejected worker index. Falls back to any worker if all are ejected.
+/// Pick a random non-ejected, non-recycling worker index. Falls back to any
+/// worker if all are ejected/recycling.
+///
+/// Recycling slots are skipped for the same reason as ejected ones (queue-path
+/// parity): the slot is draining toward a stop, so a request routed onto it —
+/// above all a freshly opened stream — is killed moments later.
 pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> usize {
     use rand::Rng;
     if num_workers <= 1 {
@@ -70,10 +75,10 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
     let mut rng = rand::thread_rng();
     let start = rng.gen_range(0..num_workers);
 
-    // Try to find a non-ejected, live worker starting from random offset
+    // Try to find a non-ejected, non-recycling, live worker starting from random offset
     for i in 0..num_workers {
         let idx = (start + i) % num_workers;
-        if !outlier.is_ejected(idx) && !outlier.is_dead(idx) {
+        if !outlier.is_ejected(idx) && !outlier.is_dead(idx) && !outlier.is_recycling(idx) {
             return idx;
         }
     }
@@ -94,6 +99,11 @@ pub(crate) enum PickError {
     /// Every worker process has exited — callers map to 503 / Unavailable
     /// (server-side, retryable after operator intervention).
     NoLiveWorkers(String),
+    /// A direct pin named a slot mid rolling-recycle — callers map to 503 +
+    /// Retry-After / Unavailable (transient server state, NOT a client error:
+    /// the pin becomes valid again once the recycle completes, so unlike
+    /// [`PickError::InvalidPin`] the same request may be retried as-is).
+    WorkerRecycling(String),
 }
 
 /// Streaming worker selection (task F): one shared pick replacing the four
@@ -146,6 +156,11 @@ pub(crate) fn pick_streaming_worker(
                 "x-lite-worker-id {w} is ejected or dead for {model} {version}"
             )));
         }
+        if outlier.map(|o| o.is_recycling(w)).unwrap_or(false) {
+            return Err(PickError::WorkerRecycling(format!(
+                "x-lite-worker-id {w} is rolling-recycling for {model} {version}"
+            )));
+        }
         return Ok(w);
     }
 
@@ -157,7 +172,7 @@ pub(crate) fn pick_streaming_worker(
     let preferred = seq_normalized.and_then(|seq| {
         let w = seq_registry.lookup(seq, model, version)?;
         let unusable = outlier
-            .map(|o| o.is_ejected(w) || o.is_dead(w))
+            .map(|o| o.is_ejected(w) || o.is_dead(w) || o.is_recycling(w))
             .unwrap_or(false);
         (w < num_workers && !unusable).then_some(w)
     });
@@ -458,5 +473,94 @@ mod tests {
             reg.is_empty(),
             "empty sequence_id must be treated as absent — no registry entry may be created"
         );
+    }
+
+    // ===== Rolling-recycle routing gates (G2) =====
+    // A slot claimed for rolling recycle is draining/stopping; routing a new
+    // stream onto it gets the stream killed moments after open. The queue path
+    // already skips recycling slots — streaming picks must too.
+
+    /// OutlierState whose recycle-ticket cap allows claiming every slot.
+    fn recycling_outlier(num_workers: usize) -> OutlierState {
+        OutlierState::with_config(
+            num_workers,
+            &crate::inference_queue::EjectionConfig {
+                recycle_max_percent: 100,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn should_skip_recycling_worker_in_skip_ejected_pick() {
+        let outlier = recycling_outlier(3);
+        assert!(outlier.claim_recycle(0));
+        for _ in 0..100 {
+            let idx = pick_worker_skip_ejected(3, &outlier);
+            assert_ne!(
+                idx, 0,
+                "a recycling worker must never be picked while a serving one exists"
+            );
+        }
+    }
+
+    #[test]
+    fn should_fall_back_to_random_when_all_workers_recycling() {
+        let outlier = recycling_outlier(2);
+        assert!(outlier.claim_recycle(0));
+        assert!(outlier.claim_recycle(1));
+        for _ in 0..20 {
+            assert!(
+                pick_worker_skip_ejected(2, &outlier) < 2,
+                "all recycling: fall back to any in-range worker (ejected-fallback parity)"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_direct_pin_to_recycling_worker_as_retryable() {
+        let outlier = recycling_outlier(2);
+        assert!(outlier.claim_recycle(1));
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[("x-lite-worker-id", "1")], None);
+        let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
+        match err {
+            PickError::WorkerRecycling(msg) => assert!(
+                msg.contains("x-lite-worker-id"),
+                "the error must name the rejected pin: {msg}"
+            ),
+            other => panic!("expected WorkerRecycling (retryable), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_fall_through_when_sticky_sequence_worker_is_recycling() {
+        let outlier = recycling_outlier(2);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[], Some("seq-sticky"));
+        let first = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+        assert!(outlier.claim_recycle(first));
+        let second = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+        assert_ne!(
+            second, first,
+            "stickiness must not pin a new stream onto a recycling worker"
+        );
+        assert_eq!(
+            reg.lookup("seq-sticky", "m", "1"),
+            Some(second),
+            "the replacement pick must re-record the sticky mapping"
+        );
+    }
+
+    #[test]
+    fn should_avoid_recycling_worker_in_streaming_fallback_pick() {
+        let outlier = recycling_outlier(2);
+        assert!(outlier.claim_recycle(0));
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[], None);
+        for _ in 0..100 {
+            let w = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+            assert_eq!(w, 1, "fallback pick must avoid the recycling worker");
+        }
     }
 }

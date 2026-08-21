@@ -169,6 +169,9 @@ impl GrpcService {
             crate::worker::PickError::NoLiveWorkers(msg) => {
                 err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
             }
+            crate::worker::PickError::WorkerRecycling(msg) => {
+                err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
+            }
         })?;
         let client = clients[worker_id].clone();
         crate::metrics::prometheus::record_worker_inference(

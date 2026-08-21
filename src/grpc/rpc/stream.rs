@@ -225,6 +225,9 @@ impl GrpcService {
                 crate::worker::PickError::NoLiveWorkers(msg) => {
                     err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
                 }
+                crate::worker::PickError::WorkerRecycling(msg) => {
+                    err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
+                }
             })?;
             let client = clients[worker_id].clone();
             // P6 GetModelStats: one streaming inference dispatched to this worker.

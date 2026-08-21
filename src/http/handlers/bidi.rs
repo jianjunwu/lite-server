@@ -911,6 +911,7 @@ async fn open_worker_stream_bidi(
     .map_err(|e| match e {
         crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
         crate::worker::PickError::NoLiveWorkers(msg) => AppError::ModelNotReady(msg),
+        crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
 
     if worker_id >= clients.len() {

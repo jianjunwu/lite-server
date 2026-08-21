@@ -98,6 +98,13 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimitExceeded { retry_after_secs: u64 },
 
+    /// A direct worker pin (`x-lite-worker-id`) named a slot mid rolling-recycle
+    /// — HTTP 503 with Retry-After. Transient server state: the same request
+    /// succeeds once the recycle completes, so unlike Validation the detail
+    /// (model/version/slot only, server-generated) is safe to pass through.
+    #[error("worker recycling: {0}")]
+    WorkerRecycling(String),
+
     /// P10 (D40): streaming ensemble DAG concurrency cap reached — HTTP 429
     /// / gRPC ResourceExhausted, immediate rejection (no queueing).
     #[error("{0}")]
@@ -168,6 +175,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => "payload too large",
             AppError::UnsupportedMediaType(_) => "unsupported media type",
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
+            AppError::WorkerRecycling(_) => "worker recycling",
             AppError::StreamingCapacityExceeded(_) => "streaming capacity exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError is handled specially in IntoResponse
@@ -203,6 +211,8 @@ impl AppError {
             }
             AppError::UnsupportedMediaType(detail) => detail.clone(),
             AppError::Unauthorized(detail) => detail.clone(),
+            // Server-generated, names only model/version/slot — safe like Conflict.
+            AppError::WorkerRecycling(detail) => detail.clone(),
             _ => self.pub_error_message().to_string(),
         }
     }
@@ -235,6 +245,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => "payload_too_large",
             AppError::UnsupportedMediaType(_) => "unsupported_media_type",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
+            AppError::WorkerRecycling(_) => "worker_recycling",
             AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError code comes from the Python worker; fallback to its error_type
@@ -285,6 +296,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AppError::WorkerRecycling(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::StreamingCapacityExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::ModelError(_) => unreachable!(), // 上面早返
@@ -357,14 +369,18 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => "invalid_request_error",
             AppError::UnsupportedMediaType(_) => "invalid_request_error",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
+            AppError::WorkerRecycling(_) => "worker_recycling",
             AppError::Unauthorized(_) => "authentication_error",
             // 上面早返,应不可达。
             AppError::ModelError(_) => unreachable!(),
         };
         // Retry-After:QueueFull 恒 1 秒;RateLimitExceeded 取配置秒数;
         // BadGateway(上游崩溃/回收,F-18)恒 1 秒——与 gRPC Unavailable +
-        // retry-after metadata 对齐。
-        let headers = if matches!(self, AppError::QueueFull(_) | AppError::BadGateway(_)) {
+        // retry-after metadata 对齐。WorkerRecycling 同为瞬态,恒 1 秒。
+        let headers = if matches!(
+            self,
+            AppError::QueueFull(_) | AppError::BadGateway(_) | AppError::WorkerRecycling(_)
+        ) {
             Some(HashMap::from([("retry-after".to_string(), "1".to_string())]))
         } else if let AppError::RateLimitExceeded { retry_after_secs } = &self {
             Some(HashMap::from([(
@@ -534,6 +550,25 @@ mod tests {
         let response = err.into_response();
         assert!(response.headers().get("retry-after").is_none(),
             "non-QueueFull errors should not have Retry-After header");
+    }
+
+    #[tokio::test]
+    async fn should_return_503_with_retry_after_when_worker_recycling() {
+        use axum::response::IntoResponse;
+        let err = AppError::WorkerRecycling(
+            "x-lite-worker-id 0 is rolling-recycling for m/1".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a recycling rejection is transient — the client must be told to retry"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "worker_recycling");
+        // Server-generated detail names only model/version/worker — safe to surface.
+        assert!(body["error"]["message"].as_str().unwrap().contains("rolling-recycling"));
     }
 
     // ===== ModelError tests =====

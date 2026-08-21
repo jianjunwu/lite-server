@@ -896,6 +896,7 @@ async fn tail_stream_preflight(
     ).map_err(|e| match e {
         crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
         crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+        crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -1626,6 +1627,7 @@ async fn execute_stream_step(
             ).map_err(|e| match e {
         crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
         crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+        crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
             if worker_id >= clients.len() {
                 return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -1862,6 +1864,7 @@ async fn repick_streaming_worker(
     .map_err(|e| match e {
         crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
         crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+        crate::worker::PickError::WorkerRecycling(msg) => AppError::WorkerRecycling(msg),
     })?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
