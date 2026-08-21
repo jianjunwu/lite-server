@@ -25,6 +25,8 @@ pub mod streaming;
 pub mod telemetry;
 #[cfg(feature = "python")]
 pub mod test_support;
+#[cfg(test)]
+mod test_tracing;
 pub mod tls;
 pub mod transport;
 pub mod validation;

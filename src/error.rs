@@ -786,52 +786,7 @@ mod tests {
 
     // ===== C7: client errors (incl. 429) log at info, server errors at error =====
 
-    #[derive(Default, Clone)]
-    struct Counters {
-        error: u64,
-        warn: u64,
-        info: u64,
-    }
-
-    /// A `tracing` layer that tallies emitted events by level, so tests can
-    /// assert which log macro the IntoResponse path actually invoked.
-    struct LevelCounter {
-        inner: std::sync::Arc<std::sync::Mutex<Counters>>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut c = self.inner.lock().unwrap();
-            match *event.metadata().level() {
-                tracing::Level::ERROR => c.error += 1,
-                tracing::Level::WARN => c.warn += 1,
-                tracing::Level::INFO => c.info += 1,
-                _ => {}
-            }
-        }
-    }
-
-    fn event_counts<F: FnOnce()>(run: F) -> Counters {
-        use tracing_subscriber::prelude::*;
-        let counters = std::sync::Arc::new(std::sync::Mutex::new(Counters::default()));
-        let layer = LevelCounter { inner: counters.clone() };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, || {
-            // Determinism: a parallel test may have cached this callsite's
-            // interest as NEVER (the macro then short-circuits and the
-            // scoped dispatch is never consulted). Rebuild while the scoped
-            // default is active so events reach this layer (same pattern as
-            // g5/G3, bce5f33).
-            tracing::callsite::rebuild_interest_cache();
-            run();
-        });
-        let c = counters.lock().unwrap().clone();
-        c
-    }
+    use crate::test_tracing::event_counts;
 
     #[tokio::test]
     async fn test_client_errors_log_at_info_not_error() {
