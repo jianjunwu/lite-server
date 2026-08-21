@@ -528,10 +528,14 @@ async fn h2_bidi_entry_impl(
     // S5 (§4.4): declared-inputs ensemble — data frames after the envelope
     // trigger are a protocol violation; answer the first one with ONE LPM
     // Error frame on the response stream, then stop reading.
-    if let Some((mut late_buf, mut late_stream)) = post_trigger_body {
+    // B11 (leak-gap-audit-0821): keep the handle — a detached reader holds a
+    // tx clone, so the response body never EOFs after the terminal frame,
+    // and the task parks in late_stream.next() until the client half-closes.
+    // The outgoing task's terminal path (and the Panic臂) reaps it.
+    let violation_task = if let Some((mut late_buf, mut late_stream)) = post_trigger_body {
         let tx_violation = tx.clone();
         let stream_id_violation = stream_id.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             loop {
                 match lpm::try_decode_frame(&mut late_buf) {
                     Ok(Some(chunk)) => {
@@ -554,8 +558,10 @@ async fn h2_bidi_entry_impl(
                     Err(_) => break,
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
     let stream_id_out = stream_id.clone();
     let cancel_client = Arc::clone(&worker_client);
     let metrics_model = model_name.to_string();
@@ -601,6 +607,7 @@ async fn h2_bidi_entry_impl(
     let panic_stream_id = stream_id_out.clone();
     let panic_cancel_client = cancel_client.clone();
     let panic_incoming_abort = incoming_task.as_ref().map(|t| t.abort_handle());
+    let panic_violation_abort = violation_task.as_ref().map(|t| t.abort_handle());
     let panic_open_time = std::time::Instant::now();
     tokio::spawn(
         async move {
@@ -800,6 +807,11 @@ async fn h2_bidi_entry_impl(
             if let Some(task) = incoming_task {
                 streaming::observe_or_abort(task).await;
             }
+            // B11: reap the post-trigger violation reader — its tx clone
+            // otherwise keeps the response body from ever reaching EOF.
+            if let Some(task) = violation_task {
+                streaming::observe_or_abort(task).await;
+            }
             }, move || async move {
                 // Panic臂 (WS 同款):补记 Panic 终态 + 取消 worker 流 +
                 // 回收 incoming 任务(正常尾部 observe_or_abort 的兜底)。
@@ -826,6 +838,9 @@ async fn h2_bidi_entry_impl(
                 } else {
                     let cancel_req = streaming::build_stream_cancel(panic_stream_id);
                     let _ = panic_cancel_client.send_raw(cancel_req).await;
+                }
+                if let Some(h) = panic_violation_abort {
+                    h.abort();
                 }
                 if let Some(h) = panic_incoming_abort {
                     h.abort();

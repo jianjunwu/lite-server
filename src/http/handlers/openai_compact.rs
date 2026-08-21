@@ -339,18 +339,29 @@ mod audit_tests {
     /// B8(观测缺失):/events 早期拒绝经 record_stream_rejected →
     /// record_request_end 计数(stream.rs:242-249);/v1 流式臂零计数,
     /// 拒绝在 liteserver_requests_total 中完全隐形。
+    /// A2 (leak-gap-audit-0821): 未注册模型的拒绝记常量 ~unknown~ label
+    /// (其 series 永不随 unload 清除,原始 label 会被枚举攻击无限放大)。
     #[tokio::test]
     async fn test_audit_v1_stream_rejection_recorded() {
         let state = make_state();
         let app = v1_router(state);
         let counter = crate::metrics::prometheus::REQUESTS_TOTAL
+            .with_label_values(&[crate::metrics::prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
+        let raw_counter = crate::metrics::prometheus::REQUESTS_TOTAL
             .with_label_values(&["audit-v1-rej", "", "4xx"]);
         let before = counter.get();
+        let before_raw = raw_counter.get();
         let resp = app.oneshot(chat_req("audit-v1-rej", true)).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
         assert!(
             counter.get() > before,
-            "SSE parity: early rejection must be counted via record_stream_rejected"
+            "SSE parity: early rejection must be counted via record_stream_rejected \
+             (under the constant label for never-registered models)"
+        );
+        assert_eq!(
+            raw_counter.get(),
+            before_raw,
+            "a never-registered model name must not create its own series"
         );
     }
 

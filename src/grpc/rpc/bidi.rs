@@ -440,7 +440,26 @@ impl GrpcService {
             ensemble_step_deadline,
         );
         let stream_idle = self.decoupled_idle_timeout;
+        // B10 (leak-gap-audit-0821): Panic收口 — the forward task is a
+        // DETACHED spawn; without catch_forward_panic a body panic becomes a
+        // clean client EOF, loses the Panic terminal, skips the worker
+        // cancel, and strands the incoming forwarder. Mirrors grpc_stream's
+        // wrapper; the incoming task handle rides a shared slot so the
+        // Panic臂 can reap it too.
+        let panic_model = metrics_model.clone();
+        let panic_version = metrics_version.clone();
+        let panic_stream_id = stream_id.clone();
+        let panic_cancel_client = cancel_client.clone();
+        let panic_chain = ensemble_chain.clone();
+        let panic_abort = ensemble_abort.clone();
+        let panic_start = start;
+        let incoming_slot: std::sync::Arc<
+            tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let incoming_slot_body = incoming_slot.clone();
+        let incoming_slot_panic = incoming_slot.clone();
         tokio::spawn(async move {
+            crate::streaming::catch_forward_panic("grpc_bidi", async move {
             // P10 (D40): held for the forward task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
@@ -510,6 +529,8 @@ impl GrpcService {
                     }
                 })
             };
+
+            *incoming_slot_body.lock().await = Some(incoming_task);
 
             // Forward worker chunks -> gRPC
             let open_time = std::time::Instant::now();
@@ -706,7 +727,42 @@ impl GrpcService {
 
             // #8: observe the incoming task so a panic is logged, not silently
             // dropped by a bare abort().
-            streaming::observe_or_abort(incoming_task).await;
+            if let Some(t) = incoming_slot_body.lock().await.take() {
+                streaming::observe_or_abort(t).await;
+            }
+            }, move || async move {
+                // B10 Panic臂: Panic terminal + worker cancel + reap the
+                // incoming forwarder (a body panic previously stranded it
+                // reading the client stream into a dead session).
+                crate::metrics::prometheus::record_stream_terminal(
+                    &panic_model,
+                    &panic_version,
+                    "grpc",
+                    "grpc_bidi",
+                    panic_start,
+                    crate::metrics::prometheus::StreamCloseReason::Panic.status_family(),
+                    crate::metrics::prometheus::StreamCloseReason::Panic,
+                    stream_metrics,
+                    0,
+                    0,
+                );
+                if is_ensemble {
+                    crate::ensemble::cancel_chain(
+                        panic_chain.as_ref(),
+                        panic_abort.as_ref(),
+                        &panic_stream_id,
+                        &panic_cancel_client,
+                    )
+                    .await;
+                } else {
+                    let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                    let _ = panic_cancel_client.send_raw(cancel_req).await;
+                }
+                if let Some(t) = incoming_slot_panic.lock().await.take() {
+                    streaming::observe_or_abort(t).await;
+                }
+            })
+            .await
         }
         .instrument(span.clone()));
 

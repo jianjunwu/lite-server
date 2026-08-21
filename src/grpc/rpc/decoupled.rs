@@ -222,7 +222,17 @@ impl GrpcService {
         } else {
             None
         };
+        // B10 (leak-gap-audit-0821): Panic收口 — the forward task is a
+        // DETACHED spawn; without catch_forward_panic a body panic becomes a
+        // clean client EOF (D35 violation), loses the Panic terminal metric,
+        // and never cancels the worker stream. Mirrors grpc_stream's wrapper.
+        let panic_model = metrics_model.clone();
+        let panic_version = metrics_version.clone();
+        let panic_stream_id = stream_id.clone();
+        let panic_cancel_client = cancel_client.clone();
+        let panic_start = start;
         tokio::spawn(async move {
+            crate::streaming::catch_forward_panic("grpc_decoupled", async move {
             // RN-13 (O2): the admission slot is held for the stream's
             // lifetime (the wrapper acquired it before open; early open
             // failures dropped it back).
@@ -381,6 +391,26 @@ impl GrpcService {
             // 300s await of send() (对齐 HTTP stream.rs cancel path).
             let cancel_req = streaming::build_stream_cancel(stream_id);
             let _ = cancel_client.send_raw(cancel_req).await;
+            }, move || async move {
+                // B10 Panic臂: record the Panic terminal + cancel the worker
+                // stream (the decoupled model's async generator otherwise
+                // pushes into a dead channel until IT decides to close).
+                crate::metrics::prometheus::record_stream_terminal(
+                    &panic_model,
+                    &panic_version,
+                    "grpc",
+                    "grpc_decoupled",
+                    panic_start,
+                    crate::metrics::prometheus::StreamCloseReason::Panic.status_family(),
+                    crate::metrics::prometheus::StreamCloseReason::Panic,
+                    stream_metrics,
+                    0,
+                    0,
+                );
+                let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                let _ = panic_cancel_client.send_raw(cancel_req).await;
+            })
+            .await
         }
         .instrument(span));
 

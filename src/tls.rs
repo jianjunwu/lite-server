@@ -658,11 +658,17 @@ pub fn tls_incoming(
 /// content-hash poll. The poll reads through symlinks, so k8s secret-volume
 /// rotations (atomic symlink swap) are covered without `notify`. Rotation
 /// applies to new connections only; established sessions are untouched.
-pub fn spawn_cert_reloader(stores: Vec<Arc<TlsConfigStore>>, poll_interval: Duration) {
+/// B13 (leak-gap-audit-0821): returns the task handle so the server's
+/// shutdown path can abort it — an uncoordinated reloader kept its SIGHUP
+/// handler armed through the drain window.
+pub fn spawn_cert_reloader(
+    stores: Vec<Arc<TlsConfigStore>>,
+    poll_interval: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
     if stores.is_empty() {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         #[cfg(unix)]
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -702,7 +708,7 @@ pub fn spawn_cert_reloader(stores: Vec<Arc<TlsConfigStore>>, poll_interval: Dura
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]

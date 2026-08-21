@@ -250,7 +250,6 @@ mod otel {
 
     use super::*;
     use crate::config::TelemetryProtocol;
-    use once_cell::sync::OnceCell;
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
@@ -258,10 +257,20 @@ mod otel {
 
     /// Held in a static so [`super::shutdown`] can force_flush + shutdown without
     /// threading the provider through every call site.
-    static TRACER_PROVIDER: OnceCell<SdkTracerProvider> = OnceCell::new();
+    ///
+    /// B3 (leak-gap-audit-0821): RwLock<Option<>>, NOT OnceCell. A
+    /// serve/stop/serve cycle must install a FRESH provider after the old
+    /// one was shut down — the OnceCell swallowed the second `set` (error
+    /// discarded with `let _ =`), leaving the just-built provider to die in
+    /// Drop while every span of the second server run went into the dead
+    /// one: total silent telemetry loss after any restart.
+    pub(super) static TRACER_PROVIDER: std::sync::RwLock<Option<SdkTracerProvider>> =
+        std::sync::RwLock::new(None);
 
     /// C4 (OTel metrics SDK): held for force_flush/shutdown at graceful stop.
-    static METER_PROVIDER: OnceCell<opentelemetry_sdk::metrics::SdkMeterProvider> = OnceCell::new();
+    pub(super) static METER_PROVIDER: std::sync::RwLock<
+        Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+    > = std::sync::RwLock::new(None);
 
     /// OTLP auth metadata (评审低#17) built once from `telemetry.otlp_headers`.
     fn build_metadata(cfg: &TelemetryConfig) -> tonic::metadata::MetadataMap {
@@ -452,7 +461,7 @@ mod otel {
 
         use opentelemetry::trace::TracerProvider;
         let tracer = provider.tracer("lite-server");
-        let _ = TRACER_PROVIDER.set(provider);
+        *TRACER_PROVIDER.write().unwrap_or_else(|e| e.into_inner()) = Some(provider);
 
         // ---- global propagator: W3C tracecontext + baggage (D21 single-source) ----
         use opentelemetry::propagation::TextMapCompositePropagator;
@@ -496,7 +505,8 @@ mod otel {
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_meter_provider(meter_provider.clone());
-                    let _ = METER_PROVIDER.set(meter_provider);
+                    *METER_PROVIDER.write().unwrap_or_else(|e| e.into_inner()) =
+                        Some(meter_provider);
                     if cfg.exemplars_enabled {
                         tracing::info!(
                             "telemetry: exemplars requested — opentelemetry_sdk 0.30 stubs \
@@ -518,21 +528,31 @@ mod otel {
         // provider is held in a static; clone (Arc-backed) so the closure is 'static.
         // spawn_blocking avoids occupying a runtime worker while the BSP drains, and
         // the timeout bounds the graceful-shutdown window (蓝图 §4.3 force_flush 带超时).
-        if let Some(provider) = TRACER_PROVIDER.get().cloned() {
+        // B3: take the provider OUT — the slot must be empty so a later
+        // re-init installs a fresh one (OnceCell semantics kept the corpse).
+        let tracer_provider = TRACER_PROVIDER
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(provider) = tracer_provider.clone() {
             let flush = tokio::task::spawn_blocking(move || {
                 let _ = provider.force_flush();
             });
             let _ = tokio::time::timeout(Duration::from_secs(5), flush).await;
         }
         // Final shutdown releases the exporter; also bounded.
-        if let Some(provider) = TRACER_PROVIDER.get().cloned() {
+        if let Some(provider) = tracer_provider {
             let stop = tokio::task::spawn_blocking(move || {
                 let _ = provider.shutdown();
             });
             let _ = tokio::time::timeout(Duration::from_secs(5), stop).await;
         }
         // C4: flush + shut down the OTel metrics provider (own-thread reader).
-        if let Some(provider) = METER_PROVIDER.get().cloned() {
+        let meter_provider = METER_PROVIDER
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(provider) = meter_provider {
             let stop = tokio::task::spawn_blocking(move || {
                 let _ = provider.force_flush();
                 let _ = provider.shutdown();
@@ -737,6 +757,57 @@ mod tests {
         let class = |c: &str| vec![opentelemetry::KeyValue::new("endpoint.class", c.to_string())];
         assert_eq!(sample_decision(&sampler, &class("health")), RecordAndSample);
         assert_eq!(sample_decision(&sampler, &class("inference")), Drop);
+    }
+
+    /// B3 (leak-gap-audit-0821): a serve/stop/serve cycle must be able to
+    /// install a FRESH provider. With the old OnceCell storage, shutdown()
+    /// left the dead provider in the slot and the second init's `set` was
+    /// silently discarded — the entire second server run exported nothing.
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn reinit_after_shutdown_installs_a_fresh_provider() {
+        let cfg = crate::config::TelemetryConfig {
+            enabled: true,
+            // Never actually dialed: the exporter builds lazily; spans just
+            // fail to export in the background.
+            otlp_endpoint: "http://127.0.0.1:1".to_string(),
+            metrics_enabled: true,
+            ..Default::default()
+        };
+        let _layer1 = super::otel::init(&cfg);
+        assert!(
+            super::otel::TRACER_PROVIDER
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "first init installs the tracer provider"
+        );
+        super::otel::shutdown().await;
+        assert!(
+            super::otel::TRACER_PROVIDER
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "shutdown must TAKE the provider out — a corpse in the slot is \
+             what silently kills the second server run's telemetry"
+        );
+        assert!(
+            super::otel::METER_PROVIDER
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "same for the meter provider"
+        );
+        let _layer2 = super::otel::init(&cfg);
+        assert!(
+            super::otel::TRACER_PROVIDER
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "the second init installs a FRESH provider"
+        );
+        // Leave no live provider behind for other tests.
+        super::otel::shutdown().await;
     }
 
     #[test]

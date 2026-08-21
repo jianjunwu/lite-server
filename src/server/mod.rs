@@ -231,7 +231,9 @@ impl LiteServer {
         let rate_limiter = std::sync::Arc::new(crate::rate_limit::RateLimiter::new(
             self.config.rate_limit.max_buckets,
         ));
-        {
+        // B13: handles kept for the shutdown abort list below — these
+        // maintenance loops must not outlive the drain window.
+        let rate_limit_sweep_handle = {
             let limiter = rate_limiter.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -242,12 +244,12 @@ impl LiteServer {
                         tracing::debug!(removed, "rate limiter: evicted stale buckets");
                     }
                 }
-            });
-        }
+            })
+        };
 
         // P8-1: reap expired / over-cap sequence→worker affinity entries every
         // 60s so unauthenticated sequence hints cannot grow the map unbounded.
-        {
+        let sequence_sweep_handle = {
             let seq_reg = self.inference_queue.sequence_registry().clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -258,8 +260,8 @@ impl LiteServer {
                         tracing::debug!(removed, "sequence registry: reaped stale affinity entries");
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Start respawn listener for health-check-kill / rolling-recycle
         // worker restarts
@@ -412,7 +414,7 @@ impl LiteServer {
 
         // P5-1 证书热轮换（蓝图 D28）：SIGHUP 立即触发 + 10s 内容轮询兜底
         // （覆盖 k8s secret symlink 交换）；任何一侧启用 TLS 才启动。
-        crate::tls::spawn_cert_reloader(
+        let cert_reloader_handle = crate::tls::spawn_cert_reloader(
             [http_tls.clone(), grpc_tls.clone()]
                 .into_iter()
                 .flatten()
@@ -642,6 +644,11 @@ impl LiteServer {
         watcher_handle.abort();
         timeline_handle.abort();
         reload_handle.abort();
+        rate_limit_sweep_handle.abort();
+        sequence_sweep_handle.abort();
+        if let Some(h) = cert_reloader_handle {
+            h.abort();
+        }
         if let Some(h) = poller_handle {
             h.abort();
         }

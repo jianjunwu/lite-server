@@ -378,12 +378,13 @@ impl WorkerManager {
         let worker_id_clone = worker_id;
         // Still Some: the n==0 take above diverges via exited_check.
         let stderr = stderr.take().unwrap();
+        // B14: per-line buffer cap (host memory bound for newline-less prints).
+        let stderr_line_cap = self.server_tunables.worker_stderr_tail_bytes;
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::with_capacity(1024);
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
+                match super::process::read_stderr_line_bounded(&mut reader, &mut buf, stderr_line_cap).await {
                     Ok(0) => {
                         tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
                         break;
@@ -868,6 +869,11 @@ impl WorkerManager {
                 // registration) — reap them through the single shared
                 // teardown path (§6.5). The registry entry stays as Failed.
                 self.teardown_version_runtime(model_name, version).await;
+                // B6: a Failed version is never unloaded, so without this
+                // its custom-metric families (registered in phase 2) would
+                // leak forever. Built-in series stay — they are the live
+                // observability of the Failed-kept version (D33).
+                crate::metrics::prometheus::remove_custom_version_metrics(model_name, version);
                 return Err(e);
             }
         };
@@ -898,6 +904,8 @@ impl WorkerManager {
         if let Err(e) = finalize {
             self.mark_load_failed(model_name, version);
             self.teardown_version_runtime(model_name, version).await;
+            // B6: deregister custom families, same as the spawn-failure arm.
+            crate::metrics::prometheus::remove_custom_version_metrics(model_name, version);
             return Err(e);
         }
 
@@ -960,6 +968,9 @@ impl WorkerManager {
                         // Failed (D33: /health must show why the version is
                         // not serving); only its runtime footprint is freed.
                         self.teardown_version_runtime(model_name, version).await;
+                        // B6: deregister the version's custom families —
+                        // a Failed version never sees an unload-time purge.
+                        crate::metrics::prometheus::remove_custom_version_metrics(model_name, version);
                         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
                         self.sync_grpc_health().await;
                         crate::metrics::prometheus::record_model_load(model_name, version, false);
@@ -2230,6 +2241,103 @@ class TestAPI(LitAPI):
             "force_unload_version must invalidate the ensemble plan cache, \
              same as the graceful unload path (P0/D23)"
         );
+    }
+
+    /// B6 (leak-gap-audit-0821): a FAILED load whose workers declared custom
+    /// metrics must deregister those families — the only deregistration path
+    /// was remove_version_metrics on UNLOAD, and a version that fails its
+    /// load stays in the registry as Failed (D33) without ever being
+    /// unloaded, so every failed version permanently accumulated one family
+    /// per declared metric name.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(custom_metrics)]
+    async fn failed_load_deregisters_custom_metric_families() {
+        let key = "loadfail_gauge:gauge";
+        assert!(
+            !crate::metrics::prometheus::custom_family_registered_for_test(key),
+            "precondition: loadfail_gauge must be unregistered"
+        );
+        let tag = "loadfail";
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-loadfail-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        self.register_metric("loadfail_gauge", "gauge")
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = Arc::new(
+            WorkerManager::new(
+                registry.clone(),
+                repo.clone(),
+                Arc::new(InferenceQueue::new()),
+                "error".to_string(),
+                Arc::new(CallbackRunner::new()),
+            )
+            .with_custom_metrics(true),
+        );
+        // Warmup enabled with a sample file that does not exist — the warmup
+        // fails AFTER phase-2 registered the worker's custom metrics.
+        let config = ModelConfig {
+            startup_timeout: 60.0,
+            policies: crate::config::ModelPolicies {
+                warmup: Some(crate::config::WarmupPolicy {
+                    enabled: true,
+                    samples: vec![crate::config::WarmupSample {
+                        input_ref: "warmup/missing.json".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = wm.load_model(tag, "1", &config).await;
+        assert!(result.is_err(), "a missing warmup sample must fail the load");
+        assert_eq!(
+            registry.get(tag, Some("1")).map(|mv| mv.status),
+            Some(VersionStatus::Failed),
+            "D33: the version stays visible as Failed"
+        );
+
+        assert!(
+            !crate::metrics::prometheus::custom_family_registered_for_test(key),
+            "B6: the failed version's custom family and phantom refs must be              deregistered"
+        );
+        assert!(
+            !crate::metrics::prometheus::REGISTRY
+                .gather()
+                .iter()
+                .any(|f| f.get_name() == "lite_server_loadfail_gauge"),
+            "B6: the family must not be exported after the failed load"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     // ===== L3: respawn re-warm fallback budget =====

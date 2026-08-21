@@ -1036,7 +1036,7 @@ pub fn remove_model_ready(model: &str, version: &str) {
 /// the step's sub-model and age out with the *sub-model's* unload — this
 /// purge IS that aging path). Deliberately excluded: MODEL_LOAD_TOTAL (the
 /// load/unload event log — the one series operators query *after* an
-/// unload), VERSION_SWITCHES_TOTAL (routing history).
+/// unload), VERSION_SWITCHES_TOTAL (routing history, aged per B16).
 pub fn remove_version_metrics(model: &str, version: &str) {
     let families = REGISTRY.gather();
     macro_rules! purge {
@@ -1091,8 +1091,6 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
     purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
     purge!(WORKER_RESPAWN_FAILURES_TOTAL, "liteserver_worker_respawn_failures_total", ["model", "version", "reason"]);
-    purge!(MODEL_WARMUP_TOTAL, "liteserver_model_warmup_total", ["model", "version", "status"]);
-    purge!(MODEL_WARMUP_DURATION, "liteserver_model_warmup_duration_seconds", ["model", "version"]);
     purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
     purge!(QUEUE_WAIT_SECONDS, "liteserver_queue_wait_seconds", ["model", "version"]);
     purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);
@@ -1134,10 +1132,79 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let _ = vec.remove_label_values(&[model, version]);
     }
+    purge!(MODEL_WARMUP_TOTAL, "liteserver_model_warmup_total", ["model", "version", "status"]);
+    purge!(MODEL_WARMUP_DURATION, "liteserver_model_warmup_duration_seconds", ["model", "version"]);
+    // B16: routing history ages out for the unloaded version — purge
+    // VERSION_SWITCHES_TOTAL series whose from OR to names it (the standard
+    // purge's model+version filter can't match its label shape). Series
+    // between surviving versions stay.
+    if let Some(mf) = families
+        .iter()
+        .find(|f| f.get_name() == "liteserver_version_switches_total")
+    {
+        for m in mf.get_metric() {
+            let labels = m.get_label();
+            let get = |name: &str| {
+                labels
+                    .iter()
+                    .find(|l| l.get_name() == name)
+                    .map(|l| l.get_value())
+                    .unwrap_or("")
+            };
+            if get("model") == model && (get("from") == version || get("to") == version) {
+                let _ = VERSION_SWITCHES_TOTAL.remove_label_values(&[
+                    get("model"),
+                    get("from"),
+                    get("to"),
+                ]);
+            }
+        }
+    }
     // M6b: deregister pre-registered custom FAMILY OBJECTS whose last live
     // (model, version) reference just unloaded (series purge above only
     // drops the label sets).
     deregister_unreferenced_custom_families(model, version);
+}
+
+/// B6 (leak-gap-audit-0821): deregister ONLY the custom-metric state of a
+/// version — the failed-load funnels use this instead of the full
+/// remove_version_metrics purge: a Failed version stays in the registry
+/// (D33) and its built-in series (warmup outcome, rejects) are live
+/// observability, but its custom FAMILY OBJECTS and refs must not leak
+/// (a Failed version never sees the unload-time purge).
+pub(crate) fn remove_custom_version_metrics(model: &str, version: &str) {
+    for vec in CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_HISTOGRAMS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    deregister_unreferenced_custom_families(model, version);
+}
+
+/// Test seam: is a custom metric family still registered (index or refs)?
+#[cfg(test)]
+pub(crate) fn custom_family_registered_for_test(key: &str) -> bool {
+    CUSTOM_METRIC_INDEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(key)
+        || CUSTOM_FAMILY_REFS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {
@@ -2179,6 +2246,45 @@ mod tests {
                 .iter()
                 .any(|f| f.get_name() == "lite_server_sharedfam_gauge"),
             "shared family still exported in /metrics after both versions unloaded"
+        );
+    }
+
+    /// B16 (leak-gap-audit-0821): VERSION_SWITCHES_TOTAL is excluded from
+    /// the standard purge because its from/to labels don't match the
+    /// version filter — but with N versions churning, N² series then stay
+    /// forever. The routing-history argument holds only for LIVE versions:
+    /// series touching the unloaded version (from==v or to==v) must age
+    /// out, series between surviving versions stay.
+    #[test]
+    fn remove_version_metrics_purges_switches_touching_the_version() {
+        let _ = register_metrics();
+        let model = "b16_switch_m";
+        record_version_switch(model, "1", "2");
+        record_version_switch(model, "2", "1");
+        record_version_switch(model, "1", "3");
+
+        remove_version_metrics(model, "2");
+
+        assert_eq!(
+            VERSION_SWITCHES_TOTAL
+                .with_label_values(&[model, "1", "3"])
+                .get(),
+            1.0,
+            "switches between surviving versions stay (routing history)"
+        );
+        assert_eq!(
+            VERSION_SWITCHES_TOTAL
+                .with_label_values(&[model, "1", "2"])
+                .get(),
+            0.0,
+            "switches TO the unloaded version must age out"
+        );
+        assert_eq!(
+            VERSION_SWITCHES_TOTAL
+                .with_label_values(&[model, "2", "1"])
+                .get(),
+            0.0,
+            "switches FROM the unloaded version must age out"
         );
     }
 

@@ -340,6 +340,70 @@ pub(crate) fn crash_exit_handler_with_grace(
     }
 }
 
+/// B14 (leak-gap-audit-0821): read ONE line from a perpetual stderr pipe,
+/// capping the buffered bytes at `cap`. The startup-time drain has the
+/// `worker_stderr_tail_bytes` cap, but the long-lived loggers used a bare
+/// `read_until(b'\n')` — a worker printing a huge object without a newline
+/// (tensor repr, minified JSON) made the host accumulate the entire line in
+/// RAM per worker. An overlong line is truncated to `cap` bytes plus a
+/// marker, and the remainder up to the newline is discarded so the next
+/// call starts at the next line. Returns Ok(0) on EOF.
+pub(super) async fn read_stderr_line_bounded<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    buf.clear();
+    let n = (&mut *reader)
+        .take(cap as u64 + 1)
+        .read_until(b'\n', buf)
+        .await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    if !buf.ends_with(b"\n") {
+        // Overlong line: truncate, then discard through the newline.
+        buf.truncate(cap);
+        buf.extend_from_slice(b"...[truncated]");
+        let mut scratch = Vec::new();
+        loop {
+            scratch.clear();
+            let m = reader.read_until(b'\n', &mut scratch).await?;
+            if m == 0 || scratch.ends_with(b"\n") {
+                break;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// B8 (leak-gap-audit-0821): does the registry's CURRENT entry for this
+/// slot still name the process `pid`? A detached respawn re-warm completes
+/// after a possible reload swapped every map under the same key — acting on
+/// a map lookup at completion time would force-eject / mark Degraded the
+/// NEW generation for the OLD one's failure. Same pid-guard shape as the
+/// B5 late-on_exit guard.
+pub(super) fn slot_occupied_by(
+    registry: &crate::registry::ModelRegistry,
+    model_name: &str,
+    version: &str,
+    worker_id: u32,
+    pid: Option<u32>,
+) -> bool {
+    registry
+        .get(model_name, Some(version))
+        .and_then(|mv| {
+            mv.workers
+                .iter()
+                .find(|w| w.worker_id == worker_id)
+                .and_then(|w| w.pid)
+        })
+        == pid
+}
+
 /// Spawn a background task that monitors a worker child process.
 /// - If the process exits on its own (crash, OOM kill), logs the event and runs cleanup.
 /// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
@@ -792,6 +856,11 @@ impl WorkerManager {
         let device = format!("{}:{}", accelerator, device_index);
 
         let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
+        // Parity with the load-time spawn: the worker's CWD is its model
+        // dir — a model reading relative-path weights/configs must see the
+        // same layout after a respawn (found via leak-gap-audit-0821's B7
+        // test: the replacement silently ran with the server's CWD).
+        cmd.current_dir(&model_dir);
 
         let mut child = cmd
             .arg("-m")
@@ -874,6 +943,22 @@ impl WorkerManager {
             )));
         }
 
+        // B7 (leak-gap-audit-0821): an unload landing mid-respawn already
+        // tore this version down (registry entry gone, metrics purged,
+        // routes removed) — registering metrics/policies/routes now would
+        // re-create just-purged state for a dead version (phantom family
+        // refs pin the family forever; orphaned route entries linger until
+        // a same-key reload). The load path has the M1 aliveness guard;
+        // respawn needs the same. Bail — the child self-heals: shutdown_tx
+        // drops with this scope and the monitor SIGKILLs it.
+        if self.registry.get(model_name, Some(version)).is_none()
+            || self.shutdown_token.is_cancelled()
+        {
+            return Err(AppError::Internal(format!(
+                "respawn of {model_name} {version} aborted: torn down concurrently"
+            )));
+        }
+
         // Register custom metrics from Python worker (gated by
         // features.custom_metrics; recording no-ops on unregistered ids).
         if self.custom_metrics {
@@ -933,12 +1018,13 @@ impl WorkerManager {
         let model_name_clone = model_name.to_string();
         let version_clone = version.to_string();
         let worker_id_clone = worker_id;
+        // B14: per-line buffer cap (host memory bound for newline-less prints).
+        let stderr_line_cap = self.server_tunables.worker_stderr_tail_bytes;
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::with_capacity(1024);
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
+                match read_stderr_line_bounded(&mut reader, &mut buf, stderr_line_cap).await {
                     Ok(0) => break,
                     Ok(_) => {
                         while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
@@ -996,7 +1082,7 @@ impl WorkerManager {
             shutdown_rx,
             crash_exit_handler_with_grace(
                 fail_client,
-                outlier,
+                outlier.clone(),
                 self.registry.clone(),
                 model_name.to_string(),
                 version.to_string(),
@@ -1094,10 +1180,26 @@ impl WorkerManager {
             let wm = Arc::clone(self);
             let model = model_name.to_string();
             let ver = version.to_string();
+            // B8: pin the task to THIS generation — the outlier Arc captured
+            // now (a reload replaces the map entry with a fresh Arc, so
+            // ejecting the captured one can never poison the new
+            // generation) and a pid check before any registry mutation.
+            let outlier_for_slot = outlier.clone();
             tokio::spawn(async move {
                 // L3: run_warmup_budgeted adds a fallback total budget
                 // (max(startup_timeout, 300s)) when the policy has none — a
                 // hung replacement must not park this detached task forever.
+                //
+                // B8: if a reload swapped the generation while this task was
+                // queued, its warmup would run against the NEW workers with
+                // the OLD generation's sample payloads — exit instead.
+                if !slot_occupied_by(&wm.registry, &model, &ver, worker_id, worker_pid) {
+                    info!(
+                        model = %model, version = %ver, worker_id,
+                        "Dropping re-warm for a superseded generation"
+                    );
+                    return;
+                }
                 if let Err(reason) = wm
                     .run_warmup_budgeted(&model, &ver, &model_config, &p, Some(worker_id))
                     .await
@@ -1107,24 +1209,26 @@ impl WorkerManager {
                         reason = %reason,
                         "respawn re-warm failed; force-ejecting the cold replacement"
                     );
-                    let newly_ejected = {
-                        let outliers = wm.outlier_states.read().await;
-                        outliers
-                            .get(&key)
-                            .map(|o| o.force_eject(worker_id as usize))
-                            .unwrap_or(false)
-                    };
+                    let newly_ejected = outlier_for_slot
+                        .as_ref()
+                        .map(|o| o.force_eject(worker_id as usize))
+                        .unwrap_or(false);
                     if newly_ejected {
                         crate::metrics::prometheus::inc_worker_ejection(&model, &ver);
                     }
                     crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
                         .with_label_values(&[&model, &ver, "warmup"])
                         .inc();
-                    // The slot left rotation — flip to Degraded event-driven
-                    // (there is no periodic coordinator when
-                    // health_check_interval == 0).
-                    wm.mark_degraded(&model, &ver);
-                    wm.sync_grpc_health().await;
+                    // B8: only flip the version Degraded when the slot still
+                    // belongs to this generation — a reload must not inherit
+                    // the old generation's failure.
+                    if slot_occupied_by(&wm.registry, &model, &ver, worker_id, worker_pid) {
+                        // The slot left rotation — flip to Degraded
+                        // event-driven (there is no periodic coordinator
+                        // when health_check_interval == 0).
+                        wm.mark_degraded(&model, &ver);
+                        wm.sync_grpc_health().await;
+                    }
                 }
             });
         }
@@ -1905,6 +2009,104 @@ mod tests {
         );
     }
 
+    /// B14: an overlong single line is truncated at the cap (host memory
+    /// stays bounded) and the stream resumes at the NEXT line.
+    #[tokio::test]
+    async fn read_stderr_line_bounded_caps_overlong_lines() {
+        let cap = 64;
+        let huge = "x".repeat(1024 * 1024);
+        let input = format!("{huge}\nshort line\nnext\n");
+        let mut cursor = std::io::Cursor::new(input.into_bytes());
+        let mut buf = Vec::new();
+
+        let n = read_stderr_line_bounded(&mut cursor, &mut buf, cap)
+            .await
+            .unwrap();
+        assert!(n > 0);
+        assert!(
+            buf.len() <= cap + b"...[truncated]".len(),
+            "the buffered line must stay bounded, got {} bytes",
+            buf.len()
+        );
+        assert!(
+            buf.ends_with(b"...[truncated]"),
+            "an overlong line carries the truncation marker"
+        );
+
+        // The discard consumed through the newline: the next read is the
+        // following line, not the remainder of the huge one.
+        read_stderr_line_bounded(&mut cursor, &mut buf, cap)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"short line\n");
+        read_stderr_line_bounded(&mut cursor, &mut buf, cap)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"next\n");
+    }
+
+    /// B14: a line exactly at the cap (newline inside the window) is not
+    /// touched.
+    #[tokio::test]
+    async fn read_stderr_line_bounded_keeps_exact_fit() {
+        let cap = 8;
+        let input = b"12345678\n".to_vec(); // 8 bytes + newline
+        let mut cursor = std::io::Cursor::new(input);
+        let mut buf = Vec::new();
+        read_stderr_line_bounded(&mut cursor, &mut buf, cap)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"12345678\n");
+    }
+
+    /// B8 (leak-gap-audit-0821): the re-warm generation check — true only
+    /// when the registry's CURRENT slot entry names the same pid.
+    #[test]
+    fn slot_occupied_by_matches_only_the_same_generation_pid() {
+        let registry = crate::registry::ModelRegistry::new();
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        registry
+            .set_workers(
+                "m",
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: Some(2222),
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            slot_occupied_by(&registry, "m", "1", 0, Some(2222)),
+            "same generation: the replacement still owns the slot"
+        );
+        assert!(
+            !slot_occupied_by(&registry, "m", "1", 0, Some(1111)),
+            "a stale re-warm (old pid) must not act on the new generation"
+        );
+        assert!(
+            !slot_occupied_by(&registry, "m", "2", 0, Some(2222)),
+            "entry gone (unload) → not ours"
+        );
+        assert!(
+            !slot_occupied_by(&registry, "m", "1", 1, Some(2222)),
+            "a different slot → not ours"
+        );
+    }
+
     /// B5 (leak-gap-audit-0821): after a reap-timeout respawn the OLD worker
     /// eventually dies and its load-time monitor fires a LATE exit event.
     /// The replacement already occupies the slot — same shared ZMQ client,
@@ -1986,6 +2188,160 @@ mod tests {
         );
     }
 
+    /// B7 (leak-gap-audit-0821): an unload landing while a respawn's
+    /// replacement is still in setup() must not let the respawn re-create
+    /// torn-down state (custom-metric refs/families, route entries) for the
+    /// dead version. Deterministic: the unload runs while the replacement
+    /// is blocked in its slow setup(), so registration would happen AFTER
+    /// the unload completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(custom_metrics)]
+    async fn unload_landing_mid_respawn_leaves_no_metric_residue() {
+        let key = "respawnrace_gauge:gauge";
+        assert!(
+            !crate::metrics::prometheus::custom_family_registered_for_test(key),
+            "precondition: respawnrace_gauge must be unregistered"
+        );
+        let tag = "respawnrace";
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-respawnrace-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+import time
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        self.register_metric("respawnrace_gauge", "gauge")
+        with open(f"setup_pid_{os.getpid()}.txt", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(3)
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n",
+        )
+        .unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let wm = std::sync::Arc::new(
+            WorkerManager::new(
+                registry.clone(),
+                repo.clone(),
+                std::sync::Arc::new(crate::inference_queue::InferenceQueue::new()),
+                "error".to_string(),
+                std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+            )
+            .with_custom_metrics(true),
+        );
+        let config = crate::config::ModelConfig {
+            startup_timeout: 60.0,
+            worker_kill_timeout: 1.0,
+            ..Default::default()
+        };
+        wm.load_model(tag, "1", &config)
+            .await
+            .expect("load must succeed");
+        // The load registered the worker's custom metric.
+        assert!(
+            crate::metrics::prometheus::custom_family_registered_for_test(key),
+            "setup: load registered the custom metric"
+        );
+        let pids_seen = || {
+            std::fs::read_dir(&model_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .into_string()
+                        .unwrap()
+                        .starts_with("setup_pid_")
+                })
+                .count()
+        };
+
+        // Start a kill-mode respawn; wait for the REPLACEMENT's setup marker
+        // (a second pid file), then unload mid-setup.
+        let wm_respawn = wm.clone();
+        let mut respawn = tokio::spawn(async move {
+            wm_respawn
+                .respawn_worker(tag, "1", 0, "health_check", false)
+                .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if pids_seen() >= 2 {
+                break;
+            }
+            if respawn.is_finished() {
+                let r = (&mut respawn).await.expect("respawn task panicked");
+                let contents: Vec<_> = std::fs::read_dir(&model_dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok().map(|x| x.file_name()))
+                    .collect();
+                panic!(
+                    "respawn finished before the replacement reached setup: {r:?}; dir: {contents:?}"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement never reached setup()"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        wm.unload_version(tag, "1")
+            .await
+            .expect("unload mid-respawn must succeed");
+
+        let result = (&mut respawn).await.expect("respawn task panicked");
+        assert!(
+            result.is_err(),
+            "the respawn must not report success for a version unloaded underneath it"
+        );
+        assert!(
+            !crate::metrics::prometheus::custom_family_registered_for_test(key),
+            "B7: the mid-respawn unload must not leave re-registered metric state"
+        );
+        assert!(
+            wm.route_table.read().await.get(&model_version_key(tag, "1")).is_none(),
+            "B7: no route-table residue for the torn-down version"
+        );
+
+        // No worker of this model may survive (registered or not).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for entry in std::fs::read_dir(&model_dir).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if let Some(pid_str) = name
+                .strip_prefix("setup_pid_")
+                .and_then(|s| s.strip_suffix(".txt"))
+            {
+                let pid: i32 = pid_str.parse().unwrap();
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                assert!(!alive, "worker pid {pid} survived the mid-respawn unload");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// Device-placement harness: an echo model whose `setup` appends the
     /// device string it received to a marker file, so tests can assert which
     /// device each spawned worker (initial or replacement) landed on.
@@ -2039,9 +2395,11 @@ class TestAPI(LitAPI):
             "debug".to_string(),
             std::sync::Arc::new(crate::callback::CallbackRunner::new()),
         );
-        let mut config = crate::config::ModelConfig::default();
-        config.devices = Some(devices);
-        config.continuous_batching = continuous_batching;
+        let config = crate::config::ModelConfig {
+            devices: Some(devices),
+            continuous_batching,
+            ..Default::default()
+        };
         wm.load_model(tag, "1", &config)
             .await
             .expect("load must succeed");
@@ -2488,8 +2846,10 @@ class TestAPI(LitAPI):
             "error".to_string(),
             std::sync::Arc::new(crate::callback::CallbackRunner::new()),
         ));
-        let mut config = crate::config::ModelConfig::default();
-        config.worker_kill_timeout = kill_timeout;
+        let config = crate::config::ModelConfig {
+            worker_kill_timeout: kill_timeout,
+            ..Default::default()
+        };
         wm.load_model(tag, "1", &config)
             .await
             .expect("load must succeed");

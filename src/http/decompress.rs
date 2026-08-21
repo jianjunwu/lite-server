@@ -18,7 +18,7 @@ fn gzip_decoded_body(body: axum::body::Body) -> axum::body::Body {
     use tokio_util::io::{ReaderStream, StreamReader};
     let byte_stream = body
         .into_data_stream() // trailers dropped (unused in this codebase)
-        .map(|frame| frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        .map(|frame| frame.map_err(std::io::Error::other));
     let decoder = async_compression::tokio::bufread::GzipDecoder::new(StreamReader::new(byte_stream));
     axum::body::Body::from_stream(ReaderStream::new(decoder))
 }

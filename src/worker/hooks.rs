@@ -136,15 +136,29 @@ pub fn execute_hook(
             .spawn(async move {
             // Per-call client so the timeout is configurable (§3). reqwest::Client
             // is Arc internally, so building it per firing is cheap.
-            let client = reqwest::Client::builder()
+            // B15: on a client build failure (TLS backend init), fall back
+            // LOUDLY — and apply the timeout per request too, so even the
+            // fallback client (which carries no default timeout) stays
+            // bounded instead of silently losing the one safety knob.
+            let client = match reqwest::Client::builder()
                 .timeout(hook_timeout)
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Hook '{}' HTTP client build failed ({}); using the \
+                         fallback client with a per-request timeout",
+                        hook_name, e
+                    );
+                    reqwest::Client::default()
+                }
+            };
             let result = match method.to_uppercase().as_str() {
-                "GET" => client.get(&url).send().await,
+                "GET" => client.get(&url).timeout(hook_timeout).send().await,
                 _ => {
                     let b = body.unwrap_or_default();
-                    client.post(&url).body(b).send().await
+                    client.post(&url).timeout(hook_timeout).body(b).send().await
                 }
             };
             match result {

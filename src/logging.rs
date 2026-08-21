@@ -281,12 +281,28 @@ fn cleanup_old_logs(parent: &std::path::Path, file_name: &str, backup_count: usi
 /// exceeding backup_count. A plain std thread is used because logging is
 /// initialized before the tokio runtime exists; the thread is detached and
 /// exits with the process.
+///
+/// B12 (leak-gap-audit-0821): idempotent per (dir, file_name, interval) —
+/// logging::init is idempotent via try_init, but this side effect ran
+/// unconditionally, so every serve()/stop/serve() cycle leaked one immortal
+/// thread per file output. Returns true when THIS call spawned the thread.
 fn spawn_log_cleanup(
     dir: PathBuf,
     file_name: String,
     backup_count: usize,
     interval: std::time::Duration,
-) {
+) -> bool {
+    static SPAWNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String, std::time::Duration)>>,
+    > = std::sync::OnceLock::new();
+    let spawned = SPAWNED.get_or_init(Default::default);
+    if !spawned
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((dir.clone(), file_name.clone(), interval))
+    {
+        return false;
+    }
     let result = std::thread::Builder::new()
         .name("log-cleanup".to_string())
         .spawn(move || loop {
@@ -295,7 +311,9 @@ fn spawn_log_cleanup(
         });
     if let Err(e) = result {
         eprintln!("failed to spawn log cleanup thread: {}", e);
+        return false;
     }
+    true
 }
 
 // ===== SizeRotatingAppender =====
@@ -599,6 +617,32 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B12 (leak-gap-audit-0821): the cleanup thread spawns at most once per
+    /// (dir, file_name, interval) — repeated logging::init calls across
+    /// serve()/stop/serve() cycles must not accumulate immortal threads.
+    #[test]
+    fn spawn_log_cleanup_is_idempotent_per_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "lite-server-logcleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let interval = std::time::Duration::from_secs(24 * 3600);
+        assert!(
+            spawn_log_cleanup(dir.clone(), "info.log".to_string(), 3, interval),
+            "the first call spawns the thread"
+        );
+        assert!(
+            !spawn_log_cleanup(dir.clone(), "info.log".to_string(), 3, interval),
+            "a serve()-restart repeat must NOT spawn a second thread"
+        );
+        assert!(
+            spawn_log_cleanup(dir.clone(), "error.log".to_string(), 3, interval),
+            "a different file output is a different registration"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
