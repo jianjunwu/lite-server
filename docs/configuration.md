@@ -180,6 +180,7 @@ model_defaults:                # CLI-level defaults applied to all models
   max_queue_size: null         # Override max_queue_size for all models
   max_requests: null           # Override max_requests for all models
   max_requests_jitter: null    # Override max_requests_jitter for all models
+  recycle_max_percent: null    # Override recycle_max_percent for all models
   request_timeout: null        # Override request_timeout for all models
   health_check_interval: null  # Override health_check_interval for all models
   max_retries: null            # Override max_retries for all models
@@ -433,8 +434,15 @@ queue_timeout_secs: 0.0        # Max seconds a request may wait in the queue bef
 queue_timeout_action: delay    # delay (default; let request_timeout govern) | reject
                                # (return 503 / gRPC Unavailable once queue_timeout_secs elapses)
 max_requests: 0                # Rolling recycle: each worker restarts after serving N
-                               # requests (0 = disabled); siblings keep serving
+                               # requests (0 = disabled); siblings keep serving.
+                               # Crossed workers beyond the recycle_max_percent cap
+                               # keep serving and wait their turn, relaying once a
+                               # replacement is ready (workers may serve over budget
+                               # when recycling is slower than crossing, but requests
+                               # are never rejected because of a recycle)
 max_requests_jitter: 0         # Per-worker jitter for max_requests (staggers recycles)
+recycle_max_percent: 10        # Max % of workers roll-recycling at once (1-100);
+                               # cap = workers × percent / 100, at least 1
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
 
 # Worker Resilience

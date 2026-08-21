@@ -787,6 +787,8 @@ pub struct ModelTunables {
     pub max_requests: Option<usize>,
     /// Jitter range for max_requests to prevent thundering herd on worker recycle.
     pub max_requests_jitter: Option<usize>,
+    /// Max % of workers that may roll-recycle at once (1-100).
+    pub recycle_max_percent: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
     // Worker resilience (§3).
@@ -814,6 +816,9 @@ impl ModelTunables {
         }
         if let Some(v) = self.max_requests_jitter {
             model.max_requests_jitter = v;
+        }
+        if let Some(v) = self.recycle_max_percent {
+            model.recycle_max_percent = v;
         }
         if let Some(v) = self.request_timeout {
             model.request_timeout = v;
@@ -859,6 +864,7 @@ impl ModelTunables {
         if other.max_queue_size.is_some() { self.max_queue_size = other.max_queue_size; }
         if other.max_requests.is_some() { self.max_requests = other.max_requests; }
         if other.max_requests_jitter.is_some() { self.max_requests_jitter = other.max_requests_jitter; }
+        if other.recycle_max_percent.is_some() { self.recycle_max_percent = other.recycle_max_percent; }
         if other.request_timeout.is_some() { self.request_timeout = other.request_timeout; }
         if other.health_check_interval.is_some() { self.health_check_interval = other.health_check_interval; }
         if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
@@ -1292,6 +1298,9 @@ pub struct ModelConfig {
     pub max_requests: usize,
     /// Random jitter added to max_requests to prevent thundering herd. 0 = disabled.
     pub max_requests_jitter: usize,
+    /// Max % of workers that may roll-recycle at once (1-100); crossed
+    /// workers beyond the cap keep serving and relay in as tickets free up.
+    pub recycle_max_percent: usize,
     /// Active health check interval in seconds. 0 = disabled.
     pub health_check_interval: f32,
     /// Worker lifecycle hooks (shell commands and HTTP callbacks).
@@ -1352,6 +1361,7 @@ impl Default for ModelConfig {
             request_timeout: 0.0,
             max_requests: 0,
             max_requests_jitter: 0,
+            recycle_max_percent: 10,
             health_check_interval: 15.0,
             hooks: WorkerHooksConfig::default(),
             policies: ModelPolicies::default(),
@@ -1396,6 +1406,14 @@ impl ModelConfig {
         check_duration_secs("health_check_timeout", self.health_check_timeout)?;
         check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
         check_duration_secs("hook_http_timeout", self.hooks.hook_http_timeout)?;
+        // 0 would silently floor to one concurrent recycle via .max(1); >100
+        // could claim every slot at once (the herd the cap exists to prevent).
+        if !(1..=100).contains(&self.recycle_max_percent) {
+            anyhow::bail!(
+                "config field `recycle_max_percent` must be within 1-100, got {}",
+                self.recycle_max_percent
+            );
+        }
         // devices: must resolve to a non-empty worker_id → device plan.
         // Invalid values (0 / negative / float, empty list or map, duplicate
         // or non-integer entries, non-"auto" strings, map form combined with
@@ -2989,6 +3007,55 @@ policies:
         let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.max_requests, 100);
         assert_eq!(parsed.max_requests_jitter, 10);
+    }
+
+    // --- recycle_max_percent ---
+
+    #[test]
+    fn test_recycle_max_percent_default() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.recycle_max_percent, 10);
+    }
+
+    #[test]
+    fn test_recycle_max_percent_yaml_roundtrip() {
+        let cfg = ModelConfig {
+            recycle_max_percent: 25,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.recycle_max_percent, 25);
+    }
+
+    #[test]
+    fn test_recycle_max_percent_model_defaults_override() {
+        let mut model = ModelConfig::default();
+        let tunables = ModelTunables {
+            recycle_max_percent: Some(30),
+            ..Default::default()
+        };
+        tunables.apply_to(&mut model);
+        assert_eq!(model.recycle_max_percent, 30);
+    }
+
+    #[test]
+    fn test_recycle_max_percent_validate_range() {
+        let mut cfg = ModelConfig::default();
+        cfg.recycle_max_percent = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "0% would silently floor to one concurrent recycle via .max(1)"
+        );
+        cfg.recycle_max_percent = 101;
+        assert!(
+            cfg.validate().is_err(),
+            ">100% re-enables the all-workers-recycling herd"
+        );
+        cfg.recycle_max_percent = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.recycle_max_percent = 100;
+        assert!(cfg.validate().is_ok());
     }
 
     // --- Worker Hooks ---

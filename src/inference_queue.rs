@@ -166,6 +166,11 @@ pub struct EjectionConfig {
     pub max_percent: usize,
     /// Cap for the exponential ejection backoff (per-worker 熔断器, B1).
     pub max_timeout: Duration,
+    /// Max % of workers that may roll-recycle at once (1-100); the concurrent
+    /// claim cap is `(workers × percent / 100).max(1)`, mirroring
+    /// `max_percent`. Not ejection-driven, but carried here because this is
+    /// the single config bag [`OutlierState::with_config`] receives.
+    pub recycle_max_percent: usize,
 }
 
 impl Default for EjectionConfig {
@@ -175,6 +180,7 @@ impl Default for EjectionConfig {
             timeout: Duration::from_secs(30),
             max_percent: 50,
             max_timeout: Duration::from_secs(300),
+            recycle_max_percent: 10,
         }
     }
 }
@@ -182,6 +188,19 @@ impl Default for EjectionConfig {
 /// Shared outlier detection state for a model version's workers.
 pub struct OutlierState {
     workers: Vec<WorkerOutlier>,
+    /// Rolling-recycle concurrency ticket: how many slots are currently
+    /// claimed for recycle. Bounded by `max_recycling` — without the bound,
+    /// uniform load crosses every slot's max_requests budget together
+    /// (jitter=0), all slots get claimed, routing finds no active worker and
+    /// falls back to a slot whose process is mid-respawn: the send out-waits
+    /// its sndtimeo and the client sees EAGAIN (model_not_ready). A refused
+    /// claim keeps the crossed budget, so the next completion retries and
+    /// recycles self-pace instead of herding.
+    recycling_claims: AtomicUsize,
+    /// Max concurrent recycle claims: `(workers × recycle_max_percent /
+    /// 100).max(1)` — the ejection_max_percent formula, so a tiny fleet
+    /// still recycles one slot at a time.
+    max_recycling: usize,
     // Precomputed thresholds (read-only after construction)
     consecutive_threshold: usize,
     base_ejection_time: Duration,
@@ -208,6 +227,8 @@ impl OutlierState {
                     recycling: AtomicBool::new(false),
                 })
                 .collect(),
+            recycling_claims: AtomicUsize::new(0),
+            max_recycling: (num_workers * config.recycle_max_percent / 100).max(1),
             consecutive_threshold: config.error_threshold,
             base_ejection_time: config.timeout,
             max_ejection_percent: config.max_percent,
@@ -280,8 +301,11 @@ impl OutlierState {
             w.ejection_series.store(0, Ordering::Relaxed);
             // The replacement process is alive: clear liveness too.
             w.dead.store(false, Ordering::Relaxed);
-            // A completed rolling recycle ends here as well.
-            w.recycling.store(false, Ordering::Relaxed);
+            // A completed rolling recycle ends here as well — return the
+            // concurrency ticket so a crossed sibling may claim next.
+            if w.recycling.swap(false, Ordering::Relaxed) {
+                self.recycling_claims.fetch_sub(1, Ordering::SeqCst);
+            }
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
@@ -290,7 +314,11 @@ impl OutlierState {
     /// Claim a slot for rolling recycle (max_requests budget crossed). One-shot:
     /// returns false when the slot is already recycling, ejected, or dead —
     /// those already have a recovery path, a second claim would only
-    /// double-signal. The claim is NOT an ejection: routing avoids the slot
+    /// double-signal. Also returns false when `max_recycling` tickets are
+    /// already taken: the caller keeps the crossed budget and retries on the
+    /// next completion, so recycles self-pace instead of herding every slot
+    /// out of rotation at once.
+    /// The claim is NOT an ejection: routing avoids the slot
     /// explicitly via `is_recycling`, while the circuit breaker (and with it
     /// the status coordinator's Degraded derivation and the half-open probe)
     /// is untouched.
@@ -308,6 +336,18 @@ impl OutlierState {
             return false;
         }
         if w.recycling.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        // Cross-slot gate AFTER the per-slot flag, rolled back on refusal: the
+        // fetch_update is the single atomic decision point, so concurrent
+        // claims on different slots cannot both win the ticket.
+        let ticket = self.recycling_claims.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |c| (c < self.max_recycling).then_some(c + 1),
+        );
+        if ticket.is_err() {
+            w.recycling.store(false, Ordering::Relaxed);
             return false;
         }
         info!("Worker {worker_idx} claimed for rolling recycle");
@@ -331,7 +371,9 @@ impl OutlierState {
     /// path.
     pub fn release_recycle(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
-            w.recycling.store(false, Ordering::Relaxed);
+            if w.recycling.swap(false, Ordering::Relaxed) {
+                self.recycling_claims.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         self.force_eject(worker_idx);
     }
@@ -3362,6 +3404,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_percent: 50,
             max_timeout: Duration::from_secs(300),
+            recycle_max_percent: 10,
         };
         let outlier = OutlierState::with_config(2, &cfg);
         for _ in 0..10 {
@@ -3378,6 +3421,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_percent: 50,
             max_timeout: Duration::from_secs(300),
+            recycle_max_percent: 10,
         };
         let outlier = OutlierState::with_config(1, &cfg);
         assert!(!outlier.record_error(0)); // 1st error, below threshold 2
@@ -3439,6 +3483,7 @@ mod tests {
             timeout: Duration::from_millis(200),
             max_percent: 50,
             max_timeout: Duration::from_millis(2_000),
+            recycle_max_percent: 10,
         }
     }
 
@@ -3510,6 +3555,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             max_percent: 50,
             max_timeout: Duration::from_millis(120),
+            recycle_max_percent: 10,
         };
         let outlier = OutlierState::with_config(1, &cfg);
         // series: 1→50ms, 2→100ms, 3→min(200,120)=120ms, 4→cap 120ms
@@ -3574,6 +3620,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             max_percent: 100,
             max_timeout: Duration::from_secs(300),
+            recycle_max_percent: 10,
         };
         let outlier = Arc::new(OutlierState::with_config(1, &ejection_cfg));
         let outlier_probe = outlier.clone();
@@ -3990,6 +4037,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_keep_fleet_routable_when_herd_crosses_during_slow_recycle() {
+        // Production scenario: 12 workers, max_requests crossed by every slot
+        // while the first recycle's replacement is still in its 10-30s setup
+        // (its PAIR peer connects only after setup, so a send to that slot
+        // EAGAINs). The recycle ticket must keep N-1 slots routable instead
+        // of letting the herd claim every slot — the all-recycling state
+        // routed requests to a peer-less slot and surfaced model_not_ready.
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("herd", 12, &[2; 12], Some(tx));
+
+        for w in 0..12 {
+            check_worker_budget(&dispatch, &inflight, w, 2); // every slot crosses
+        }
+        let recycling: Vec<usize> = (0..12).filter(|&w| outlier.is_recycling(w)).collect();
+        assert_eq!(
+            recycling.len(),
+            1,
+            "at most one slot recycles at a time, got {recycling:?}"
+        );
+        let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
+        assert!(
+            !outlier.is_recycling(picked),
+            "least-loaded must always land on an active slot while a slow recycle runs"
+        );
+
+        // The first replacement comes up; the next crossed slot takes the
+        // ticket on its retry — recycling relays slot by slot.
+        outlier.reset(recycling[0]);
+        let next = (recycling[0] + 1) % 12;
+        check_worker_budget(&dispatch, &inflight, next, 1); // already crossed: retry only
+        assert!(outlier.is_recycling(next), "freed ticket passes to a crossed sibling");
+
+        // Exactly two recycle signals: the initial claim and the relay.
+        for expected in [recycling[0], next] {
+            let sig = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recycle signal in time")
+                .expect("channel open");
+            assert_eq!(sig.worker_id as usize, expected);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "refused claims must not enqueue respawn signals"
+        );
+    }
+
+    #[tokio::test]
     async fn should_not_claim_when_respawn_channel_absent() {
         let (dispatch, outlier, inflight) = budget_dispatch("nochan", 1, &[2], None);
 
@@ -4019,6 +4113,69 @@ mod tests {
     }
 
     // ===== Recycling claim (recycle/eject separation) tests =====
+
+    #[test]
+    fn should_refuse_second_concurrent_recycle_claim() {
+        let outlier = OutlierState::new(3);
+        assert!(outlier.claim_recycle(0), "first claim wins the ticket");
+        assert!(
+            !outlier.claim_recycle(1),
+            "a second slot must not recycle while one is mid-recycle — \
+             an unbounded herd leaves routing with no active worker"
+        );
+        assert!(!outlier.is_recycling(1), "refused claim leaves no flag behind");
+
+        // The freed ticket lets the crossed sibling claim on its retry.
+        outlier.reset(0);
+        assert!(
+            outlier.claim_recycle(1),
+            "after the first replacement is up, the next slot may recycle"
+        );
+    }
+
+    #[test]
+    fn should_bound_concurrent_recycles_by_configured_percent() {
+        // 12 slots, 25% → cap (12 × 25 / 100).max(1) = 3, mirroring the
+        // ejection_max_percent formula.
+        let cfg = EjectionConfig {
+            recycle_max_percent: 25,
+            ..Default::default()
+        };
+        let outlier = OutlierState::with_config(12, &cfg);
+        assert!(outlier.claim_recycle(0));
+        assert!(outlier.claim_recycle(1));
+        assert!(outlier.claim_recycle(2));
+        assert!(
+            !outlier.claim_recycle(3),
+            "the percent cap refuses the 4th concurrent claim"
+        );
+        assert!(!outlier.is_recycling(3), "refused claim leaves no flag behind");
+        outlier.reset(0);
+        assert!(
+            outlier.claim_recycle(3),
+            "a freed ticket relays to the next crossed slot"
+        );
+    }
+
+    #[test]
+    fn should_floor_percent_cap_to_one() {
+        // 3 slots, 10% → (3 × 10 / 100) = 0 → .max(1) = 1: a tiny fleet still
+        // recycles, one slot at a time.
+        let outlier = OutlierState::new(3);
+        assert!(outlier.claim_recycle(0));
+        assert!(!outlier.claim_recycle(1));
+    }
+
+    #[test]
+    fn should_free_recycle_ticket_on_release() {
+        let outlier = OutlierState::new(2);
+        assert!(outlier.claim_recycle(0));
+        outlier.release_recycle(0);
+        assert!(
+            outlier.claim_recycle(1),
+            "a failed recycle returns the ticket so the herd can proceed"
+        );
+    }
 
     #[test]
     fn should_claim_recycle_only_once() {

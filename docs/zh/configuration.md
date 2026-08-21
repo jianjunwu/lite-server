@@ -164,6 +164,7 @@ model_defaults:                # CLI 级别默认值，应用于所有模型
   max_queue_size: null         # 覆盖所有模型的 max_queue_size
   max_requests: null           # 覆盖所有模型的 max_requests
   max_requests_jitter: null    # 覆盖所有模型的 max_requests_jitter
+  recycle_max_percent: null    # 覆盖所有模型的 recycle_max_percent
   request_timeout: null        # 覆盖所有模型的 request_timeout
   health_check_interval: null  # 覆盖所有模型的 health_check_interval
   max_retries: null            # 覆盖所有模型的 max_retries
@@ -379,8 +380,14 @@ queue_timeout_secs: 0.0        # 请求在队列中最长等待秒数，超过�
 queue_timeout_action: delay    # delay（默认；交给 request_timeout 兜底）| reject
                                # （超过 queue_timeout_secs 返回 503 / gRPC Unavailable）
 max_requests: 0                # 滚动回收：每个 worker 各自处理 N 个请求后重启
-                               # （0 = 禁用）；回收期间其他 worker 继续服务
+                               # （0 = 禁用）；回收期间其他 worker 继续服务。
+                               # 同时回收的 worker 数受 recycle_max_percent 限制，
+                               # 超限的已越阈 worker 继续服务并排队等待，替代
+                               # worker 就绪后自动接力（回收慢于越阈速度时
+                               # worker 会超预算继续服务，但不会因回收拒绝请求）
 max_requests_jitter: 0         # max_requests 的逐 worker 随机抖动（错开各 worker 的回收时间）
+recycle_max_percent: 10        # 同时滚动回收的 worker 比例上限（1-100）；
+                               # 并发上限 = worker 数 × 百分比 / 100，至少 1 个
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
 
 # Worker 韧性（Resilience）

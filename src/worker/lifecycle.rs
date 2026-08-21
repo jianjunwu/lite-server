@@ -671,6 +671,7 @@ impl WorkerManager {
             timeout: Duration::from_secs_f32(model_config.ejection_timeout),
             max_percent: model_config.ejection_max_percent,
             max_timeout: Duration::from_secs_f32(model_config.ejection_max_timeout),
+            recycle_max_percent: model_config.recycle_max_percent,
         };
         let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
 
