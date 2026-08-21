@@ -255,6 +255,8 @@ impl GrpcService {
                 .send_stream(open_req, stream_id.clone())
                 .await
                 .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+            // G3: count the stream toward the slot's max_requests budget.
+            self.app_state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
             (stream_id, chunk_rx, client.clone(), inflight_guard)
         };
         // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。

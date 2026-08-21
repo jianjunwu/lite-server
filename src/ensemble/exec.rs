@@ -1689,6 +1689,8 @@ async fn execute_stream_step(
             stream_id.clone(), payload_bytes.clone(), Some(meta.clone()), opts.decoupled,
         );
         let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+        // G3: count the stream toward the slot's max_requests budget (per DAG node).
+        state.inference_queue.record_stream_served(&step.model, &resolved_version, worker_id);
         // G1/G3: count the in-flight stream on its slot (per DAG node).
         let guard = state
             .worker_manager
@@ -1808,6 +1810,8 @@ async fn open_stream_with_retry(
                 return Err(e);
             }
         };
+        // G3: count this attempt toward the slot's max_requests budget.
+        state.inference_queue.record_stream_served(&step.model, resolved_version, worker_id);
         // G1/G3: count this attempt's stream on its slot. Retry continues
         // cancel the stream and drop the guard with it; the committed
         // attempt's guard moves into the first-frame forwarder (or rides the

@@ -789,6 +789,10 @@ pub struct ModelTunables {
     pub max_requests_jitter: Option<usize>,
     /// Max % of workers that may roll-recycle at once (1-100).
     pub recycle_max_percent: Option<usize>,
+    /// Count streaming requests toward the max_requests budget (see ModelConfig).
+    pub count_streams_toward_max_requests: Option<bool>,
+    /// Stream drain bound (seconds) for rolling recycle (see ModelConfig).
+    pub recycle_stream_drain_timeout_secs: Option<f32>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
     // Worker resilience (§3).
@@ -819,6 +823,12 @@ impl ModelTunables {
         }
         if let Some(v) = self.recycle_max_percent {
             model.recycle_max_percent = v;
+        }
+        if let Some(v) = self.count_streams_toward_max_requests {
+            model.count_streams_toward_max_requests = v;
+        }
+        if let Some(v) = self.recycle_stream_drain_timeout_secs {
+            model.recycle_stream_drain_timeout_secs = v;
         }
         if let Some(v) = self.request_timeout {
             model.request_timeout = v;
@@ -865,6 +875,8 @@ impl ModelTunables {
         if other.max_requests.is_some() { self.max_requests = other.max_requests; }
         if other.max_requests_jitter.is_some() { self.max_requests_jitter = other.max_requests_jitter; }
         if other.recycle_max_percent.is_some() { self.recycle_max_percent = other.recycle_max_percent; }
+        if other.count_streams_toward_max_requests.is_some() { self.count_streams_toward_max_requests = other.count_streams_toward_max_requests; }
+        if other.recycle_stream_drain_timeout_secs.is_some() { self.recycle_stream_drain_timeout_secs = other.recycle_stream_drain_timeout_secs; }
         if other.request_timeout.is_some() { self.request_timeout = other.request_timeout; }
         if other.health_check_interval.is_some() { self.health_check_interval = other.health_check_interval; }
         if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
@@ -1301,6 +1313,16 @@ pub struct ModelConfig {
     /// Max % of workers that may roll-recycle at once (1-100); crossed
     /// workers beyond the cap keep serving and relay in as tickets free up.
     pub recycle_max_percent: usize,
+    /// Count streaming requests (SSE/WS/gRPC/bidi/decoupled, per ensemble
+    /// DAG node) toward the max_requests budget at stream open. true =
+    /// pure-streaming workers roll-recycle like batch workers; false =
+    /// legacy behavior (streams never trigger a recycle).
+    pub count_streams_toward_max_requests: bool,
+    /// Seconds the rolling-recycle drain waits for in-flight STREAMS on the
+    /// slot before force-evicting them (client-visible terminal error frame)
+    /// and stopping the worker. Independent from the batch drain bound,
+    /// which stays on request_timeout / worker_kill_timeout.
+    pub recycle_stream_drain_timeout_secs: f32,
     /// Active health check interval in seconds. 0 = disabled.
     pub health_check_interval: f32,
     /// Worker lifecycle hooks (shell commands and HTTP callbacks).
@@ -1362,6 +1384,8 @@ impl Default for ModelConfig {
             max_requests: 0,
             max_requests_jitter: 0,
             recycle_max_percent: 10,
+            count_streams_toward_max_requests: true,
+            recycle_stream_drain_timeout_secs: 60.0,
             health_check_interval: 15.0,
             hooks: WorkerHooksConfig::default(),
             policies: ModelPolicies::default(),
@@ -1400,6 +1424,7 @@ impl ModelConfig {
         check_duration_secs("batch_timeout", self.batch_timeout)?;
         check_duration_secs("min_batch_timeout", self.min_batch_timeout)?;
         check_duration_secs("request_timeout", self.request_timeout)?;
+        check_duration_secs("recycle_stream_drain_timeout_secs", self.recycle_stream_drain_timeout_secs)?;
         check_duration_secs("health_check_interval", self.health_check_interval)?;
         check_duration_secs("ejection_timeout", self.ejection_timeout)?;
         check_duration_secs("startup_timeout", self.startup_timeout)?;
@@ -3044,6 +3069,47 @@ policies:
         };
         tunables.apply_to(&mut model);
         assert_eq!(model.recycle_max_percent, 30);
+    }
+
+    // --- count_streams_toward_max_requests / recycle_stream_drain_timeout_secs (G3) ---
+
+    #[test]
+    fn should_default_to_counting_streams_and_a_60s_stream_drain() {
+        let cfg = ModelConfig::default();
+        assert!(cfg.count_streams_toward_max_requests);
+        assert_eq!(cfg.recycle_stream_drain_timeout_secs, 60.0);
+    }
+
+    #[test]
+    fn should_parse_stream_budget_fields_from_yaml() {
+        let parsed: ModelConfig = serde_yaml::from_str(
+            "count_streams_toward_max_requests: false\nrecycle_stream_drain_timeout_secs: 5.5\n",
+        )
+        .unwrap();
+        assert!(!parsed.count_streams_toward_max_requests);
+        assert_eq!(parsed.recycle_stream_drain_timeout_secs, 5.5);
+    }
+
+    #[test]
+    fn should_apply_stream_budget_tunables_as_model_defaults() {
+        let mut model = ModelConfig::default();
+        let tunables = ModelTunables {
+            count_streams_toward_max_requests: Some(false),
+            recycle_stream_drain_timeout_secs: Some(12.0),
+            ..Default::default()
+        };
+        tunables.apply_to(&mut model);
+        assert!(!model.count_streams_toward_max_requests);
+        assert_eq!(model.recycle_stream_drain_timeout_secs, 12.0);
+    }
+
+    #[test]
+    fn should_reject_negative_stream_drain_timeout() {
+        let cfg = ModelConfig {
+            recycle_stream_drain_timeout_secs: -1.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

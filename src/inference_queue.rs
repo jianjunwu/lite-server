@@ -866,6 +866,14 @@ struct VersionQueue {
     inflight_requests: Arc<AtomicUsize>,
     /// Worker count at registration — bounds-checks B3 direct pins at submit.
     worker_count: usize,
+    /// G3: dispatch handle + per-slot batch inflight counters, retained so
+    /// the streaming direct path (which bypasses this queue) can still count
+    /// its opens toward the max_requests budget via
+    /// [`InferenceQueue::record_stream_served`].
+    dispatch: Arc<BatchDispatch>,
+    worker_inflight: Vec<Arc<AtomicUsize>>,
+    /// G3 escape hatch: when false, streams never touch the budget (legacy).
+    count_streams_budget: bool,
 }
 
 /// Handle to a draining queue (§4.2). The collector stays alive so
@@ -991,6 +999,37 @@ impl InferenceQueue {
         // B3 direct-pin 边界检查口径：dispatch 索引空间是 zmq_clients（生产上
         // 与 worker_infos 等长；单测常传空 worker_infos + 真实 clients）。
         let dispatch_workers = zmq_clients.len();
+        // G3: per-slot batch inflight counters live here (not inside the
+        // collector) so the streaming direct path can reuse them for its own
+        // budget accounting via the retained VersionQueue handle.
+        let worker_inflight: Vec<Arc<AtomicUsize>> = (0..dispatch_workers)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        let dispatch = Arc::new(BatchDispatch {
+            zmq_clients: zmq_clients.clone(),
+            outlier: outlier.clone(),
+            model_name: model_name.to_string(),
+            version: version.to_string(),
+            respawn_tx: respawn_tx.clone(),
+            budgets: build_worker_budgets(
+                dispatch_workers,
+                config.max_requests,
+                config.max_requests_jitter,
+            ),
+            // In-flight batches on a slot are each bounded by
+            // request_timeout; when that is disabled, the graceful-stop
+            // budget bounds the wait instead.
+            recycle_drain_timeout: if config.request_timeout > 0.0 {
+                Duration::from_secs_f32(config.request_timeout)
+            } else {
+                Duration::from_secs_f32(config.worker_kill_timeout)
+            },
+            recycle_stream_drain_timeout: Duration::from_secs_f32(
+                config.recycle_stream_drain_timeout_secs,
+            ),
+            sequence_registry: self.sequence_registry.clone(),
+            balance: self.balance,
+        });
         let handle = tokio::spawn(batch_collector(
             rx,
             BatchTunables {
@@ -1004,28 +1043,8 @@ impl InferenceQueue {
                 queue_timeout,
                 queue_timeout_action,
             },
-            Arc::new(BatchDispatch {
-                zmq_clients: zmq_clients.clone(),
-                outlier: outlier.clone(),
-                model_name: model_name.to_string(),
-                version: version.to_string(),
-                respawn_tx: respawn_tx.clone(),
-                budgets: build_worker_budgets(
-                    dispatch_workers,
-                    config.max_requests,
-                    config.max_requests_jitter,
-                ),
-                // In-flight batches on a slot are each bounded by
-                // request_timeout; when that is disabled, the graceful-stop
-                // budget bounds the wait instead.
-                recycle_drain_timeout: if config.request_timeout > 0.0 {
-                    Duration::from_secs_f32(config.request_timeout)
-                } else {
-                    Duration::from_secs_f32(config.worker_kill_timeout)
-                },
-                sequence_registry: self.sequence_registry.clone(),
-                balance: self.balance,
-            }),
+            dispatch.clone(),
+            worker_inflight.clone(),
         ));
 
         // Spawn health checker if interval > 0
@@ -1053,6 +1072,9 @@ impl InferenceQueue {
                 health_checker: health_handle,
                 inflight_requests: Arc::new(AtomicUsize::new(0)),
                 worker_count: dispatch_workers,
+                dispatch,
+                worker_inflight,
+                count_streams_budget: config.count_streams_toward_max_requests,
             },
         );
         info!(
@@ -1153,6 +1175,24 @@ impl InferenceQueue {
     pub fn get_outlier_state(&self, model_name: &str, version: &str) -> Option<Arc<OutlierState>> {
         let key = model_version_key(model_name, version);
         self.queues.get(&key).map(|entry| entry.outlier.clone())
+    }
+
+    /// G3: count one streaming request toward the slot's max_requests budget.
+    /// Called at stream open by the direct streaming paths (SSE/WS/gRPC/bidi/
+    /// decoupled, custom routes, per ensemble DAG node) — they bypass this
+    /// queue, so without this hook a pure-streaming worker would never
+    /// roll-recycle. No-op when the version is unknown, the slot is stale
+    /// (check_worker_budget bounds-checks), or the
+    /// `count_streams_toward_max_requests` escape hatch is off.
+    pub fn record_stream_served(&self, model_name: &str, version: &str, worker_idx: usize) {
+        let key = model_version_key(model_name, version);
+        let Some(entry) = self.queues.get(&key) else {
+            return;
+        };
+        if !entry.count_streams_budget {
+            return;
+        }
+        check_worker_budget(&entry.dispatch, &entry.worker_inflight, worker_idx, 1);
     }
 }
 
@@ -1559,6 +1599,11 @@ struct BatchDispatch {
     /// correctness bound — the stop message is FIFO-ordered behind in-flight
     /// batches on the reused PAIR socket.
     recycle_drain_timeout: Duration,
+    /// Bound for the STREAM drain-wait (G1): how long the recycle waits for
+    /// in-flight streams on the slot before force-evicting them (client-
+    /// visible terminal error frame via `fail_all`) and stopping the worker.
+    /// Long streams get a grace window without slowing the batch drain.
+    recycle_stream_drain_timeout: Duration,
     sequence_registry: Arc<SequenceRegistry>,
     balance: BalanceConfig,
 }
@@ -2076,6 +2121,35 @@ async fn recycle_worker(
             "Recycle drain timed out; stopping worker with batches in flight"
         );
     }
+    // G1: streams bypass the queue, so the batch inflight counter above never
+    // sees them — wait for the slot's streams separately (G2 already keeps
+    // NEW streams off the recycling slot, so this only drains the ones open
+    // at claim time).
+    let wait_streams = async {
+        while dispatch.outlier.stream_inflight(worker_idx) > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    if tokio::time::timeout(dispatch.recycle_stream_drain_timeout, wait_streams)
+        .await
+        .is_err()
+    {
+        let evicted = dispatch.outlier.stream_inflight(worker_idx);
+        warn!(
+            model = %dispatch.model_name, version = %dispatch.version, worker_idx, evicted,
+            "Recycle stream drain timed out; evicting in-flight streams"
+        );
+        crate::metrics::prometheus::record_recycle_streams_evicted(
+            &dispatch.model_name,
+            &dispatch.version,
+            evicted as u64,
+        );
+        // Client-visible eviction: every in-flight stream on the slot gets a
+        // bounded terminal Error frame (worker-side generators die with the
+        // graceful stop that follows). Idempotent when the worker already
+        // died (routes are gone).
+        dispatch.zmq_clients[worker_idx].fail_all("worker recycling: evicting in-flight streams");
+    }
     let Some(tx) = &dispatch.respawn_tx else {
         return; // unreachable: the trigger checked the channel exists
     };
@@ -2137,6 +2211,7 @@ async fn batch_collector(
     rx: PriorityReceiver,
     tunables: BatchTunables,
     dispatch: Arc<BatchDispatch>,
+    worker_inflight: Vec<Arc<AtomicUsize>>,
 ) {
     let BatchTunables {
         max_batch_size,
@@ -2149,9 +2224,6 @@ async fn batch_collector(
         queue_timeout,
         queue_timeout_action,
     } = tunables;
-    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..dispatch.zmq_clients.len())
-        .map(|_| Arc::new(AtomicUsize::new(0)))
-        .collect();
 
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
@@ -3995,36 +4067,9 @@ mod tests {
         thresholds: &[usize],
         respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
     ) -> (Arc<BatchDispatch>, Arc<OutlierState>, Vec<Arc<AtomicUsize>>) {
-        let outlier = Arc::new(OutlierState::new(num_workers));
-        let clients = (0..num_workers)
-            .map(|i| {
-                Arc::new(WorkerZmqClient::new(drain_test_endpoint(&format!(
-                    "budget-{tag}-{i}"
-                ))))
-            })
-            .collect();
-        let dispatch = Arc::new(BatchDispatch {
-            zmq_clients: clients,
-            outlier: outlier.clone(),
-            model_name: "m".to_string(),
-            version: "1".to_string(),
-            respawn_tx,
-            budgets: thresholds
-                .iter()
-                .map(|&t| WorkerBudget {
-                    count: AtomicUsize::new(0),
-                    threshold: t,
-                    waiting_logged: AtomicBool::new(false),
-                })
-                .collect(),
-            recycle_drain_timeout: Duration::from_millis(100),
-            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
-            balance: BalanceConfig::default(),
-        });
-        let inflight = (0..num_workers)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect();
-        (dispatch, outlier, inflight)
+        assert_eq!(num_workers, thresholds.len());
+        // Generous stream drain: only the batch path may time out here.
+        budget_dispatch_stream_drain(tag, thresholds, respawn_tx, Duration::from_secs(5))
     }
 
     #[tokio::test]
@@ -4315,6 +4360,173 @@ mod tests {
         // that would block the recycle drain forever.
         outlier.stream_inflight_dec(0);
         assert_eq!(outlier.stream_inflight(0), 0);
+    }
+
+    // ===== G1/G3: stream-aware recycle drain + stream budget counting =====
+
+    /// budget_dispatch with an explicit stream drain bound (the drain tests
+    /// need it short; the default helper keeps it long enough that only the
+    /// batch path can time out).
+    fn budget_dispatch_stream_drain(
+        tag: &str,
+        thresholds: &[usize],
+        respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
+        stream_drain: Duration,
+    ) -> (Arc<BatchDispatch>, Arc<OutlierState>, Vec<Arc<AtomicUsize>>) {
+        let outlier = Arc::new(OutlierState::new(thresholds.len()));
+        let clients = (0..thresholds.len())
+            .map(|i| {
+                Arc::new(WorkerZmqClient::new(drain_test_endpoint(&format!(
+                    "budget-{tag}-{i}"
+                ))))
+            })
+            .collect();
+        let dispatch = Arc::new(BatchDispatch {
+            zmq_clients: clients,
+            outlier: outlier.clone(),
+            model_name: "m".to_string(),
+            version: "1".to_string(),
+            respawn_tx,
+            budgets: thresholds
+                .iter()
+                .map(|&t| WorkerBudget {
+                    count: AtomicUsize::new(0),
+                    threshold: t,
+                    waiting_logged: AtomicBool::new(false),
+                })
+                .collect(),
+            recycle_drain_timeout: Duration::from_millis(100),
+            recycle_stream_drain_timeout: stream_drain,
+            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
+            balance: BalanceConfig::default(),
+        });
+        let inflight = (0..thresholds.len())
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        (dispatch, outlier, inflight)
+    }
+
+    /// PAIR worker that discards every frame and never replies — holds a
+    /// stream open indefinitely so the drain must wait (or evict).
+    fn spawn_silent_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            while s.recv_bytes(0).is_ok() {} // discard; exit when the peer is gone
+        })
+    }
+
+    /// T2: an in-flight stream on the slot holds the recycle drain — the
+    /// respawn signal must not fire until the stream ends.
+    #[tokio::test]
+    async fn should_wait_for_inflight_streams_before_recycle_respawn() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) =
+            budget_dispatch_stream_drain("streamwait", &[1, 1], Some(tx), Duration::from_secs(5));
+        outlier.stream_inflight_inc(0);
+        check_worker_budget(&dispatch, &inflight, 0, 1); // crosses → claim + spawn
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "respawn must wait for the in-flight stream on the slot"
+        );
+        outlier.stream_inflight_dec(0);
+        let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("respawn once the stream ends")
+            .expect("channel open");
+        assert_eq!(sig.worker_id, 0);
+        assert_eq!(sig.reason, "rolling_recycle");
+    }
+
+    /// T3: the stream drain bound elapsed with a stream still in flight →
+    /// the slot's streams are evicted (client-visible terminal Error frame
+    /// naming the recycle) and the respawn proceeds.
+    #[tokio::test]
+    async fn should_evict_inflight_streams_when_stream_drain_times_out() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) =
+            budget_dispatch_stream_drain("streamto", &[1], Some(tx), Duration::from_millis(150));
+        // A silent worker holds the stream open; the route registers on send.
+        spawn_silent_worker(drain_test_endpoint("budget-streamto-0"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sid = "s-evict".to_string();
+        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let mut chunk_rx = dispatch.zmq_clients[0]
+            .send_stream(open, sid.clone())
+            .await
+            .expect("stream opens against the silent worker");
+        outlier.stream_inflight_inc(0);
+
+        check_worker_budget(&dispatch, &inflight, 0, 1);
+
+        let frame = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv())
+            .await
+            .expect("eviction frame in time")
+            .expect("route channel open");
+        match frame.payload {
+            Some(pb::stream_response::Payload::Error(e)) => assert!(
+                e.message.contains("recycl"),
+                "the eviction reason must reach the client: {}",
+                e.message
+            ),
+            other => panic!("expected eviction Error frame, got {other:?}"),
+        }
+        let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("respawn after eviction")
+            .expect("channel open");
+        assert_eq!(sig.worker_id, 0);
+    }
+
+    /// T4 (unit half): streams count toward max_requests when the flag is
+    /// on; the second stream on the slot crosses a threshold of 2.
+    #[tokio::test]
+    async fn should_count_streams_toward_max_requests_when_enabled() {
+        let (queue, outlier, _rx) = streaming_budget_queue("scount", 2, true).await;
+        queue.record_stream_served("m", "1", 0);
+        assert!(!outlier.is_recycling(0), "first stream below threshold 2");
+        queue.record_stream_served("m", "1", 0);
+        assert!(outlier.is_recycling(0), "second stream crosses max_requests=2");
+    }
+
+    /// T4 (escape hatch): with the flag off, streams never touch the budget
+    /// (legacy behavior preserved).
+    #[tokio::test]
+    async fn should_not_count_streams_when_flag_disabled() {
+        let (queue, outlier, _rx) = streaming_budget_queue("snocount", 2, false).await;
+        for _ in 0..5 {
+            queue.record_stream_served("m", "1", 0);
+        }
+        assert!(!outlier.is_recycling(0), "flag off: streams never cross the budget");
+    }
+
+    /// Register a 1-worker version whose budget counts streams per the flag.
+    async fn streaming_budget_queue(
+        name: &str,
+        max_requests: usize,
+        count_streams: bool,
+    ) -> (InferenceQueue, Arc<OutlierState>, mpsc::Receiver<RespawnSignal>) {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            health_check_interval: 0.0,
+            max_requests,
+            count_streams_toward_max_requests: count_streams,
+            ..Default::default()
+        };
+        let outlier = Arc::new(OutlierState::new(1));
+        let endpoint = drain_test_endpoint(name);
+        spawn_tagged_worker(endpoint.clone(), b"w".to_vec());
+        let clients = vec![Arc::new(WorkerZmqClient::new(endpoint))];
+        let (tx, rx) = mpsc::channel::<RespawnSignal>(8);
+        queue.register_model("m", "1", &config, vec![], clients, outlier.clone(), Some(tx));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (queue, outlier, rx)
     }
 
     #[test]
@@ -5196,6 +5408,7 @@ mod tests {
             respawn_tx: None,
             budgets: build_worker_budgets(0, 1000, 0),
             recycle_drain_timeout: Duration::from_secs(1),
+            recycle_stream_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -5222,7 +5435,9 @@ mod tests {
             is_warmup: false,
         };
         tx.try_send(item, 0).unwrap();
-        let collector = tokio::spawn(batch_collector(rx, tunables, dispatch));
+        let collector = tokio::spawn(batch_collector(rx, tunables, dispatch, vec![
+            Arc::new(AtomicUsize::new(0)),
+        ]));
 
         // The reject path replies 503 to the client...
         let _resp = resp_rx.await.expect("queue-timeout reject must reply");
@@ -5510,6 +5725,7 @@ mod tests {
             respawn_tx: None,
             budgets: build_worker_budgets(2, 0, 0),
             recycle_drain_timeout: Duration::from_secs(1),
+            recycle_stream_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         });
@@ -5654,6 +5870,7 @@ mod tests {
             respawn_tx: None,
             budgets: build_worker_budgets(1, 0, 0),
             recycle_drain_timeout: Duration::from_secs(1),
+            recycle_stream_drain_timeout: Duration::from_secs(1),
             sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
             balance: BalanceConfig::default(),
         };

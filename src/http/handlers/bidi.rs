@@ -967,6 +967,8 @@ async fn open_worker_stream_bidi(
     );
 
     let chunk_rx = client.send_stream(open_req, stream_id.to_string()).await?;
+    // G3: count the stream toward the slot's max_requests budget.
+    state.inference_queue.record_stream_served(model_name, resolved_version, worker_id);
     Ok((Arc::clone(client), chunk_rx, inflight_guard))
 }
 

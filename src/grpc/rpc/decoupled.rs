@@ -193,6 +193,8 @@ impl GrpcService {
             .send_stream(open_req, stream_id.clone())
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+        // G3: count the stream toward the slot's max_requests budget.
+        self.app_state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
 
         // Task D: fire InferenceRequest once the worker stream opened (streaming
         // bypasses the queue) and arm the response callback. `self` is not

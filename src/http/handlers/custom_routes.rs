@@ -283,6 +283,8 @@ pub async fn dispatch_custom_route(
                 // the response body like the admission guard below.
                 let inflight_guard = outlier
                     .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
+                // G3: count the stream toward the slot's max_requests budget.
+                state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
                 // Stream route: InferenceResponse fires on the terminal frame
                 // inside the body (aligned with SSE/WS), not here at Start.
                 build_route_stream_http_response(

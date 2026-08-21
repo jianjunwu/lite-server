@@ -228,6 +228,8 @@ fn main() {
                     max_requests_jitter,
                     // No CLI flag: tunable via config file / model_defaults only.
                     recycle_max_percent: None,
+                    count_streams_toward_max_requests: None,
+                    recycle_stream_drain_timeout_secs: None,
                     request_timeout,
                     health_check_interval,
                     ejection_error_threshold,

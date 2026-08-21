@@ -993,7 +993,7 @@ async fn test_readyz_503_when_no_models() {
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     let client = reqwest::Client::new();
 
@@ -1608,7 +1608,7 @@ async fn test_http_response_compression() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -1767,7 +1767,7 @@ async fn test_grpc_uds_infer_health_default_mode() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -1841,7 +1841,7 @@ async fn test_grpc_uds_custom_socket_mode() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
 
     // Connecting + a Health round-trip proves the socket is live; no model is
     // loaded here, so the overall status is NOT_SERVING (we only require Ok).
@@ -1893,7 +1893,7 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
     )
     .unwrap();
     let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "slow_model", "1").await;
 
@@ -1979,7 +1979,7 @@ async fn test_graceful_shutdown_aborts_inflight_after_timeout() {
         )
         .unwrap();
         let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
-        wait_for_server(http_port, 20).await;
+        wait_for_server(http_port, 60).await;
         let base = format!("http://127.0.0.1:{}", http_port);
         load_model(&base, "slow_model", "1").await;
 
@@ -2072,7 +2072,7 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
     )
     .unwrap();
     let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "slow_model", "1").await;
 
@@ -2165,7 +2165,7 @@ async fn test_shutdown_health_goes_unavailable() {
     )
     .unwrap();
     let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -3486,7 +3486,7 @@ class ReloadAPI(LitAPI):
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -3655,7 +3655,7 @@ class RollingAPI(LitAPI):
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     load_model(&base, "rolling_model", "1").await;
@@ -3747,7 +3747,7 @@ class ReadyAPI(LitAPI):
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     load_model(&base, "ready_model", "1").await;
@@ -3875,7 +3875,9 @@ class ReplayAPI(LitAPI):
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(port, 30).await;
+    // 60s: dedicated-server startup is the suite's bottleneck under full
+    // parallel load (30s proved flaky there).
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     load_model(&base, "blocker_model", "1").await;
@@ -4010,7 +4012,7 @@ class LruAPI(LitAPI):
 
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4153,7 +4155,7 @@ async fn test_auto_poll_discovers_new_version() {
     let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18111, 18112);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4196,7 +4198,7 @@ async fn test_auto_poll_unloads_removed_version() {
     let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18113, 18114);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4248,7 +4250,7 @@ async fn test_auto_poll_latest_unloads_superseded_version() {
     let server_yaml = write_auto_poll_strategy_yaml(&tmp_dir, port, 18115, 18116, "latest", &[]);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4293,7 +4295,7 @@ async fn test_auto_poll_explicit_ignores_unlisted_version() {
     let server_yaml = write_auto_poll_strategy_yaml(&tmp_dir, port, 18117, 18118, "explicit", &["1"]);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4379,7 +4381,7 @@ async fn test_weighted_routing_canary() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4507,7 +4509,7 @@ async fn test_weighted_routing_canary_sse() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -4681,7 +4683,7 @@ async fn test_weighted_routing_canary_h2_bidi() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
@@ -4970,7 +4972,7 @@ async fn test_canary_override_default_off_ignores_pin() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(port, 30).await;
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     load_model(&base, "canary_model", "1").await;
@@ -5060,7 +5062,7 @@ async fn test_grpc_infer_aggregates_into_batch() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, BATCH_MODEL, "1").await;
 
@@ -5123,7 +5125,7 @@ async fn test_grpc_decoupled_infer_pushes_chunks_then_final() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, DECOUPLED_MODEL, "1").await;
 
@@ -5192,7 +5194,7 @@ async fn test_grpc_decoupled_infer_not_implemented_is_failed_precondition() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -5296,7 +5298,7 @@ async fn test_grpc_decoupled_client_disconnect_reclaims_stream() {
         "--no-metrics",
         "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "slow_decoupled", "1").await;
 
@@ -5416,7 +5418,7 @@ class NeverPushAPI(LitAPI):
     .unwrap();
 
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "never_push", "1").await;
 
@@ -5495,7 +5497,7 @@ async fn test_grpc_infer_records_request_metrics() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -5600,7 +5602,7 @@ async fn test_grpc_infer_echoes_request_id() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -5699,7 +5701,7 @@ async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "policy_model", "1").await;
     assert!(
@@ -5772,7 +5774,7 @@ async fn test_grpc_health_service() {
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
 
     let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", grpc_port))
@@ -5866,7 +5868,7 @@ async fn test_grpc_response_compression_gzip() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -5931,7 +5933,7 @@ async fn test_grpc_http2_keepalive_assembly_smoke() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, MODEL, "1").await;
 
@@ -6052,7 +6054,7 @@ ensemble:
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
 
     // Preload sub-models so execute_step skips auto-load; the timeout must
@@ -7051,7 +7053,7 @@ class StickyAPI(LitAPI):
         "--log-level",
         "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "sticky_model", "1").await;
 
@@ -8010,7 +8012,7 @@ class BidiAPI(LitAPI):
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "h2bidi", "1").await;
     (base, server, repo)
@@ -8846,7 +8848,7 @@ async fn test_worker_spawn_works_with_python3_only_path() {
     let _guard = ServerGuard(Some(child));
 
     let base = format!("http://127.0.0.1:{http_port}");
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     assert!(
         wait_model_ready(&base, MODEL, 20).await,
         "model must become ready with only `python3` on PATH — the worker \
@@ -8964,7 +8966,7 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
     let _guard = ServerGuard(Some(child));
 
     let base = format!("http://127.0.0.1:{http_port}");
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     load_model(&base, "route_model", "1").await;
 
     let client = reqwest::Client::new();
@@ -9327,7 +9329,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "echo", "1").await;
     load_model(&base, "summer", "1").await;
@@ -9383,7 +9385,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "echo", "1").await;
     load_model(&base, "ensemble_model", "1").await;
@@ -9479,7 +9481,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "badmt", "1").await;
     load_model(&base, "ensemble_model", "1").await;
@@ -9555,7 +9557,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "vision", "1").await;
     load_model(&base, "classifier", "1").await;
@@ -9657,7 +9659,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "binout", "1").await;
     load_model(&base, "echo", "1").await;
@@ -9720,7 +9722,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "binout", "1").await;
     load_model(&base, "ensemble_model", "1").await;
@@ -9908,7 +9910,7 @@ async fn test_unary_413_body_too_large() {
     )
     .unwrap();
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -10023,7 +10025,7 @@ async fn test_unary_triton_binary_e2e() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "triton_split", "1").await;
 
@@ -10074,7 +10076,7 @@ async fn test_unary_triton_binary_byte_identical() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "triton_echo", "1").await;
 
@@ -10121,7 +10123,7 @@ async fn test_unary_triton_binary_metrics() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "triton_echo", "1").await;
 
@@ -10170,7 +10172,7 @@ async fn test_unary_triton_binary_400_mismatch() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "triton_echo", "1").await;
 
@@ -10238,7 +10240,7 @@ class BoomAPI(LitAPI):
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "boom", "1").await;
 
@@ -10314,7 +10316,7 @@ class EnvAPI(LitAPI):
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "env_model", "1").await;
 
@@ -10404,7 +10406,7 @@ ensemble:
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "echo", "1").await;
     load_model(&base, "ensemble_model", "1").await;
@@ -10555,7 +10557,7 @@ async fn test_v2_bare_load_alias() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     let client = reqwest::Client::new();
 
@@ -10834,7 +10836,7 @@ class GenErrAPI(LitAPI):
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "gen_err", "1").await;
 
@@ -10931,7 +10933,7 @@ async fn test_chat_completions_unary() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "chat", "1").await;
 
@@ -10985,7 +10987,7 @@ async fn test_v1_gate_scoped_to_openai_compact() {
     .unwrap();
 
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "chat", "1").await;
 
@@ -11096,7 +11098,7 @@ async fn test_chat_completions_sse() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "chat", "1").await;
 
@@ -11143,7 +11145,7 @@ async fn test_completions_and_embeddings() {
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "chat", "1").await;
 
@@ -11281,7 +11283,7 @@ class ErrAPI(LitAPI):
         "--model-repo", &repo.to_string_lossy(),
         "--no-grpc", "--no-metrics", "--log-level", "warn",
     ]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
     load_model(&base, "chat", "1").await;
 
@@ -11385,7 +11387,7 @@ async fn test_telemetry_traceparent_e2e_and_sigterm_flush_http() {
     .unwrap();
 
     let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "tp_echo", "1").await;
 
@@ -11453,7 +11455,7 @@ async fn test_telemetry_traceparent_e2e_grpc() {
     .unwrap();
 
     let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 20).await;
+    wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
     load_model(&base, "tp_echo", "1").await;
 
@@ -11535,7 +11537,9 @@ class EofAPI(LitAPI):
         "--no-grpc",
         "--log-level", "warn",
     ]);
-    wait_for_server(port, 30).await;
+    // 60s: dedicated-server startup is the suite's bottleneck under full
+    // parallel load (30s proved flaky there; ~3s standalone).
+    wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
     load_model(&base, "eof_model", "1").await;
 
@@ -11586,4 +11590,273 @@ class EofAPI(LitAPI):
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// G3: streams count toward max_requests (T4) + ensemble per-node counting (T4b)
+// ---------------------------------------------------------------------------
+
+const QUICK_STREAM_PY: &str = r#"from lite_server import LitAPI
+
+
+class QuickStreamAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 1)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def stream_predict(self, request):
+        yield {"chunk": 1}
+        yield {"chunk": 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+/// T4: pure streaming load must roll-recycle a worker (G3) — streams count
+/// toward max_requests at open. The sibling model with
+/// count_streams_toward_max_requests: false proves the escape hatch keeps
+/// legacy behavior. 5 sequential streams over 2 slots with threshold 2:
+/// some slot opens ≥3 streams (pigeonhole) and crosses.
+#[tokio::test]
+async fn should_roll_recycle_on_pure_streaming_load() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-stream-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    for (name, extra) in [
+        ("stream_counted", ""),
+        ("stream_legacy", "count_streams_toward_max_requests: false\n"),
+    ] {
+        let dir = tmp_dir.join(name).join("1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), QUICK_STREAM_PY).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_requests: 2\n{extra}"
+            ),
+        )
+        .unwrap();
+    }
+
+    let port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 60).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "stream_counted", "1").await;
+    load_model(&base, "stream_legacy", "1").await;
+
+    for model in ["stream_counted", "stream_legacy"] {
+        for i in 0..5 {
+            let resp = client
+                .post(format!("{}/v2/models/{}/events", base, model))
+                .json(&json!({"input": i}))
+                .send().await.unwrap();
+            assert_eq!(resp.status(), 200, "{model} stream {i} must be served");
+            let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+                .await
+                .expect("stream body closes")
+                .unwrap();
+            assert!(body.contains("data:"), "{model} stream {i} has chunks: {body}");
+        }
+    }
+
+    let rolling_recycle_count = |body: &str, model: &str| {
+        body.lines()
+            .find(|l| l.starts_with(&format!(
+                "liteserver_worker_respawns_total{{model=\"{model}\",reason=\"rolling_recycle\",version=\"1\"}}"
+            )))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+
+    // The counted model must have roll-recycled at least one worker.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let body = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap().text().await.unwrap();
+        if rolling_recycle_count(&body, "stream_counted") >= 1.0 {
+            recycled = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(recycled, "G3: pure streaming load must trigger a rolling recycle");
+
+    // The escape-hatch model must NOT have recycled (the counted model's
+    // recycle window above gave it ample time to prove the negative).
+    let body = client
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .send().await.unwrap().text().await.unwrap();
+    assert_eq!(
+        rolling_recycle_count(&body, "stream_legacy"),
+        0.0,
+        "count_streams_toward_max_requests: false must keep legacy behavior"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// T4b: ensemble streams count toward the budget PER DAG NODE (Q4) — the
+/// streaming tail's workers roll-recycle on ensemble load alone.
+#[tokio::test]
+async fn should_count_ensemble_streams_per_dag_node_toward_max_requests() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-ens-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    // Unary pre-layer.
+    let pre_dir = tmp_dir.join("ens_pre").join("1");
+    std::fs::create_dir_all(&pre_dir).unwrap();
+    std::fs::write(
+        pre_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class PreAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("text", "")
+
+    def predict(self, x):
+        return {"pre": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pre_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    // Streaming tail: two workers, budget 2.
+    let tail_dir = tmp_dir.join("ens_tail").join("1");
+    std::fs::create_dir_all(&tail_dir).unwrap();
+    std::fs::write(
+        tail_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class TailAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("pre", "")
+
+    def predict(self, x):
+        return {"tokens": x}
+
+    def stream_predict(self, request):
+        for w in request.split():
+            yield {"token": w}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tail_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\nmax_requests: 2\n",
+    )
+    .unwrap();
+
+    // Ensemble: pre → tail (streaming step).
+    let ens_dir = tmp_dir.join("ens_budget_model").join("1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"ensemble:
+  steps:
+    - name: pre
+      model: ens_pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: ens_tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$pre.pre"
+"#,
+    )
+    .unwrap();
+
+    let port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 60).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "ens_pre", "1").await;
+    load_model(&base, "ens_tail", "1").await;
+    load_model(&base, "ens_budget_model", "1").await;
+
+    // 5 sequential ensemble streams over 2 tail slots with threshold 2 —
+    // pigeonhole forces some tail slot to open ≥3 node streams and cross.
+    for i in 0..5 {
+        let resp = client
+            .post(format!("{}/v2/models/ens_budget_model/events", base))
+            .json(&json!({"text": "a b"}))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200, "ensemble stream {i} must be served");
+        let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+            .await
+            .expect("ensemble stream body closes")
+            .unwrap();
+        assert!(body.contains("data:"), "ensemble stream {i} has chunks: {body}");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let body = client
+            .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+            .send().await.unwrap().text().await.unwrap();
+        let count = body.lines()
+            .find(|l| l.starts_with(
+                "liteserver_worker_respawns_total{model=\"ens_tail\",reason=\"rolling_recycle\",version=\"1\"}"
+            ))
+            .and_then(|l| l.rsplit_once(' '))
+            .and_then(|(_, n)| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if count >= 1.0 {
+            recycled = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(recycled, "T4b: ensemble streams must count per DAG node — the tail must roll-recycle");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }

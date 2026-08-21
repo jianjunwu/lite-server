@@ -248,6 +248,14 @@ lazy_static! {
         &["model", "version", "worker_id"]
     ).unwrap();
 
+    pub static ref RECYCLE_STREAMS_EVICTED_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_recycle_streams_evicted_total",
+            "In-flight streams force-evicted by a rolling-recycle stream-drain timeout"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
     pub static ref WORKER_RESPAWNS_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
             "liteserver_worker_respawns_total",
@@ -491,6 +499,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
     REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(RECYCLE_STREAMS_EVICTED_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWN_FAILURES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
@@ -1763,6 +1772,15 @@ pub fn worker_inference_count(model: &str, version: &str, worker_id: usize) -> u
     WORKER_INFERENCE_TOTAL
         .with_label_values(&[model, version, &id_str])
         .get() as u64
+}
+
+/// G1/Q1 observability: streams force-evicted by a rolling-recycle
+/// stream-drain timeout. A rising value means long streams are being cut —
+/// tune `recycle_stream_drain_timeout_secs` or `max_requests`.
+pub fn record_recycle_streams_evicted(model: &str, version: &str, count: u64) {
+    RECYCLE_STREAMS_EVICTED_TOTAL
+        .with_label_values(&[model, version])
+        .inc_by(count as f64);
 }
 
 #[cfg(test)]

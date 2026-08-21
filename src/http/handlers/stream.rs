@@ -93,6 +93,9 @@ async fn open_worker_stream(
     let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+    // G3: count the stream toward the slot's max_requests budget (no-op when
+    // the escape-hatch flag is off or the budget is disabled).
+    state.inference_queue.record_stream_served(model_name, resolved_version, worker_id);
     Ok((stream_id, Arc::clone(client), chunk_rx, inflight_guard))
 }
 
