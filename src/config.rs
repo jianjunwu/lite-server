@@ -1766,9 +1766,9 @@ impl Config {
             }
         }
         match self.orchestration.control_mode.as_str() {
-            "explicit" | "auto" => {}
+            "explicit" | "auto" | "all" => {}
             other => anyhow::bail!(
-                "config field `orchestration.control_mode` must be \"explicit\" or \"auto\", got \"{other}\""
+                "config field `orchestration.control_mode` must be \"explicit\", \"auto\" or \"all\", got \"{other}\""
             ),
         }
         // B6（蓝图 §4.3，本期 gRPC only）：protocol=http 被 serde 接受但未实现——
@@ -2389,6 +2389,13 @@ mod tests {
         assert!(
             bad_mode.validate().is_err(),
             "an unrecognized control_mode must fail validation, not silently select manual mode"
+        );
+
+        let all_mode: Config =
+            serde_yaml::from_str("orchestration:\n  control_mode: \"all\"\n").unwrap();
+        assert!(
+            all_mode.validate().is_ok(),
+            "\"all\" (load every model in the repo at boot) is a documented control_mode"
         );
     }
 
