@@ -102,6 +102,7 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # accelerator: null            # Accelerator type: cpu, cuda, mps, tpu, auto (null = cpu)
     # devices: null                # Device assignment (null = auto, or integer like 1)
     # workers_per_device: null     # Workers per device (null = 1)
+    # startup_concurrency: null    # Workers spawned+handshaken concurrently at startup (null = 1, serial)
 
     # ===== Queue & Timeout =====
     # max_queue_size: 1000         # Max pending requests per worker
