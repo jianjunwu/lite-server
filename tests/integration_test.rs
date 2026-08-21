@@ -5422,9 +5422,17 @@ async fn test_grpc_infer_records_request_metrics() {
         body.contains("liteserver_requests_total{model=\"test_model\",status=\"2xx\",version=\"1\"}"),
         "2xx series missing: {}", body
     );
+    // A2 (leak-gap-audit-0821): a never-registered model's reject records
+    // under the constant ~unknown~ label — nothing ever unloads such a pair,
+    // so raw-label recording is a permanent series per probe (enumeration
+    // cardinality attack). Registered models keep their real labels.
     assert!(
-        body.contains("liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"),
-        "4xx series missing: {}", body
+        body.contains("liteserver_requests_total{model=\"~unknown~\",status=\"4xx\",version=\"\"}"),
+        "4xx series under the constant unknown-model label missing: {}", body
+    );
+    assert!(
+        !body.contains("liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"),
+        "a never-registered model name must not create its own series: {}", body
     );
     // GIE/EPP 语义 gauge（默认 namespace `liteserver`）：TotalQueuedRequests
     // 映射既有 queue depth；KVCacheUtilization 无 KV 概念上报 N/A (NaN)。

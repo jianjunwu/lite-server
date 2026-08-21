@@ -597,6 +597,30 @@ impl LiteServer {
 
         info!("{} received, starting graceful shutdown", shutdown_reason);
 
+        // B4 (leak-gap-audit-0821): a second signal during teardown
+        // force-quits. The first signal future has already resolved (tokio's
+        // registry swallows repeats into a resolved future — a wedged
+        // teardown would otherwise leave SIGKILL as the only way out, e.g.
+        // a hung on_model_unload before workers ever get the stop message).
+        #[cfg(unix)]
+        tokio::spawn(async {
+            let ctrl_c = async {
+                let _ = signal::ctrl_c().await;
+            };
+            let terminate = async {
+                let _ = signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .expect("failed to install signal handler")
+                    .recv()
+                    .await;
+            };
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = terminate => {},
+            }
+            warn!("second signal received during shutdown; forcing exit");
+            std::process::exit(130);
+        });
+
         // Fire ServerEnd callbacks
         self.callback_runner.on_server_end(&ServerContext {
             http_port: self.config.server.http_port,

@@ -236,7 +236,14 @@ impl LiteServer for GrpcService {
             .infer_impl(request, &mut version_label, &mut request_id)
             .instrument(span)
             .await;
-        record_grpc_request_end(&model_label, &version_label, start, &result);
+        {
+            let registered = result.is_ok()
+                || self
+                    .registry
+                    .get(&model_label, Some(&version_label))
+                    .is_some();
+            record_grpc_request_end(&model_label, &version_label, registered, start, &result);
+        }
         echo_grpc_response_headers(result, &request_id, start)
     }
 
@@ -295,7 +302,14 @@ impl LiteServer for GrpcService {
             .batch_infer_impl(request, &mut version_label, &mut request_id)
             .instrument(span)
             .await;
-        record_grpc_request_end(&model_label, &version_label, start, &result);
+        {
+            let registered = result.is_ok()
+                || self
+                    .registry
+                    .get(&model_label, Some(&version_label))
+                    .is_some();
+            record_grpc_request_end(&model_label, &version_label, registered, start, &result);
+        }
         echo_grpc_response_headers(result, &request_id, start)
     }
 
@@ -367,9 +381,21 @@ impl LiteServer for GrpcService {
             .instrument(span)
             .await;
         if let Err(s) = &result {
-            crate::metrics::prometheus::record_request_end(
+            // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+            // that resolved to a registry entry — never-registered pairs
+            // record under the constant label (permanent series otherwise).
+            let registered = self
+                .registry
+                .get(&model_label, Some(&version_label))
+                .is_some();
+            let (m, v) = crate::metrics::prometheus::reject_labels(
+                registered,
                 &model_label,
                 &version_label,
+            );
+            crate::metrics::prometheus::record_request_end(
+                m,
+                v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
             );
@@ -444,9 +470,21 @@ impl LiteServer for GrpcService {
             .instrument(span)
             .await;
         if let Err(s) = &result {
-            crate::metrics::prometheus::record_request_end(
+            // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+            // that resolved to a registry entry — never-registered pairs
+            // record under the constant label (permanent series otherwise).
+            let registered = self
+                .registry
+                .get(&model_label, Some(&version_label))
+                .is_some();
+            let (m, v) = crate::metrics::prometheus::reject_labels(
+                registered,
                 &model_label,
                 &version_label,
+            );
+            crate::metrics::prometheus::record_request_end(
+                m,
+                v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
             );
@@ -489,9 +527,21 @@ impl LiteServer for GrpcService {
             )
             .await;
         if let Err(s) = &result {
-            crate::metrics::prometheus::record_request_end(
+            // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+            // that resolved to a registry entry — never-registered pairs
+            // record under the constant label (permanent series otherwise).
+            let registered = self
+                .registry
+                .get(&model_label, Some(&version_label))
+                .is_some();
+            let (m, v) = crate::metrics::prometheus::reject_labels(
+                registered,
                 &model_label,
                 &version_label,
+            );
+            crate::metrics::prometheus::record_request_end(
+                m,
+                v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
             );
@@ -1462,12 +1512,26 @@ mod request_metrics_tests {
     async fn should_record_4xx_when_model_not_found() {
         let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
 
-        let counter = REQUESTS_TOTAL.with_label_values(&["met_404", "", "4xx"]);
+        // A2: model-not-found records under the constant ~unknown~ label
+        // (shared across tests → assert at-least-one); the requested name
+        // must NOT get its own series.
+        let counter = REQUESTS_TOTAL
+            .with_label_values(&[crate::metrics::prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
+        let raw_counter = REQUESTS_TOTAL.with_label_values(&["met_404", "", "4xx"]);
         let before = counter.get();
+        let before_raw = raw_counter.get();
 
         let err = service.infer(infer_request("met_404", "")).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
-        assert_eq!(counter.get(), before + 1.0, "model-not-found must record one 4xx request");
+        assert!(
+            counter.get() >= before + 1.0,
+            "model-not-found must record one 4xx request under the constant label"
+        );
+        assert_eq!(
+            raw_counter.get(),
+            before_raw,
+            "a never-registered model name must not create its own series"
+        );
     }
 
     // --- P5-2: handler 级 canary pin（蓝图 §4.4：metadata 优先，fallback proto headers map）---

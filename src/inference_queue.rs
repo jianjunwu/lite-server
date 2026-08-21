@@ -746,6 +746,24 @@ fn check_queue_timeout(
     }
 }
 
+/// A8 (leak-gap-audit-0821): drop an item whose waiter is already gone —
+/// the gateway's per-request deadline fired first and dropped `response_rx`
+/// (or the client disconnected). Dispatching it would burn worker compute
+/// and a batch slot for a result nobody can receive: the same
+/// "no compute for dead clients" contract the B2 CbRemove sweep enforces on
+/// the ZMQ side. `queue_timeout=Reject` measures enqueue AGE, so any client
+/// deadline shorter than it is only caught here. The dec pairs the
+/// collector's dequeue-side `inc_queue_depth`, same as check_queue_timeout.
+fn drop_if_waiter_gone(item: QueueItem, model: &str, version: &str) -> Option<QueueItem> {
+    if item.response_tx.is_closed() {
+        debug!(uid = %item.uid, "dropping queued item: waiter already gone");
+        prometheus::dec_queue_depth(model, version);
+        None
+    } else {
+        Some(item)
+    }
+}
+
 /// Per-(model, version) queue state held in [`InferenceQueue::queues`].
 /// Factored out of an anonymous tuple so the field types are self-documenting.
 struct VersionQueue {
@@ -2035,6 +2053,10 @@ async fn batch_collector(
             ) else {
                 continue;
             };
+            let Some(item) = drop_if_waiter_gone(item, &dispatch.model_name, &dispatch.version)
+            else {
+                continue;
+            };
             let batch = vec![item];
             let dispatch = dispatch.clone();
             let worker_inflight = worker_inflight.clone();
@@ -2060,6 +2082,11 @@ async fn batch_collector(
                     &dispatch.model_name,
                     &dispatch.version,
                 ) else {
+                    continue;
+                };
+                let Some(item) =
+                    drop_if_waiter_gone(item, &dispatch.model_name, &dispatch.version)
+                else {
                     continue;
                 };
                 // F5 (warmup-gaps audit): never batch warmup items with live
@@ -2633,6 +2660,98 @@ mod tests {
     }
 
     // ===== Key pre-computation tests =====
+
+    /// Dead-waiter dispatch (audit 2026-08-20): when the gateway's
+    /// per-request deadline fires first (http/handlers/inference.rs drops
+    /// response_rx on timeout), the QueueItem stays queued and is STILL
+    /// dispatched — a dead item occupies a max_batch_size slot, the worker
+    /// executes it, and the result send fails silently (let _ = at the
+    /// dispatch site). queue_timeout=Reject measures enqueue AGE, so any
+    /// client deadline shorter than it still dispatches dead requests. The
+    /// collector must prune items whose waiter is gone
+    /// (response_tx.is_closed()) BEFORE dispatch — the same
+    /// "don't burn worker compute on dead clients" contract the B2 CbRemove
+    /// sweep enforces on the ZMQ side.
+    #[tokio::test]
+    async fn collector_must_not_dispatch_items_whose_waiter_timed_out() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let outlier = Arc::new(OutlierState::new(1));
+        let endpoint = drain_test_endpoint("dead-waiter-0");
+        let received = spawn_recording_worker(endpoint.clone());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        queue.register_model("m", "1", &config, vec![], vec![client], outlier, None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A's waiter goes away (gateway deadline) before the collector
+        // dispatches it. try_submit is sync and this is a current-thread
+        // runtime, so the collector cannot interleave between the submit
+        // and the drop — the item is provably dead-waiter at dispatch time.
+        let (dead, dead_rx) = hint_item_rx("dead", meta_with_headers(&[]));
+        queue.try_submit("m", "1", dead).unwrap();
+        drop(dead_rx);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (live, live_rx) = hint_item_rx("live", meta_with_headers(&[]));
+        queue.try_submit("m", "1", live).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), live_rx)
+            .await
+            .expect("live request answered in time")
+            .expect("live channel open");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let got = received.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|u| u == "live"),
+            "the live request must be dispatched; received: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|u| u == "dead"),
+            "the dead-waiter item must be pruned before dispatch, not executed \
+             by the worker; received: {got:?}"
+        );
+    }
+
+    /// PAIR worker: records every received uid, replies with an empty Single.
+    fn spawn_recording_worker(endpoint: String) -> Arc<std::sync::Mutex<Vec<String>>> {
+        use prost::Message;
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = received.clone();
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                rec.lock().unwrap().push(req.uid.clone());
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(
+                        pb::SingleResponse::default(),
+                    )),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        });
+        received
+    }
+
 
     #[test]
     fn model_version_key_format() {

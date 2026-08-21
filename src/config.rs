@@ -41,15 +41,17 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CallbacksConfig {
-    /// Per-callback execution timeout in seconds. 0 (default) = off —
-    /// dispatch concurrency is still bounded (fixed cap of 64 in-flight
-    /// dispatches; over-cap fires are dropped and counted).
+    /// Per-callback execution timeout in seconds. Default 30 — bounded so a
+    /// hung callback (e.g. a blackholed audit webhook) is abandoned instead
+    /// of wedging unload/shutdown (B4). Explicit 0 = off (dispatch
+    /// concurrency is still bounded: fixed cap of 64 in-flight dispatches;
+    /// over-cap fires are dropped and counted).
     pub timeout_secs: f32,
 }
 
 impl Default for CallbacksConfig {
     fn default() -> Self {
-        Self { timeout_secs: 0.0 }
+        Self { timeout_secs: 30.0 }
     }
 }
 
@@ -922,7 +924,9 @@ pub struct WorkerHooksConfig {
     pub on_ready_http: Option<HttpHookConfig>,
     pub on_exit_http: Option<HttpHookConfig>,
     pub on_error_http: Option<HttpHookConfig>,
-    /// Seconds before a lifecycle HTTP hook request times out (§3).
+    /// Seconds before a lifecycle hook times out (§3). Bounds HTTP hook
+    /// requests AND shell hook commands (B2: a hung `sh -c` hook is killed
+    /// and reaped instead of parking forever).
     pub hook_http_timeout: f32,
 }
 
@@ -1715,6 +1719,40 @@ impl Config {
             }
         }
         self.validate_tls()?;
+        // Serve-time-only checks belong in the pre-deployment gate too —
+        // config-check / validate_server_config run only this function:
+        // - namespace: register_gie_metrics rejects it at server boot
+        // - trusted_proxies: the CIDR parse fails when the HTTP server
+        //   builds its extractor
+        // - sample_ratio: handed unchecked to Sampler::TraceIdRatioBased
+        //   (out-of-range silently never-samples)
+        // - control_mode: a free-form string compared == "auto" at boot, so
+        //   a typo silently disables the reconcile loop
+        if !crate::metrics::prometheus::is_valid_metric_namespace(&self.metrics.metric_namespace)
+        {
+            anyhow::bail!(
+                "config field `metrics.metric_namespace` '{}' is not a valid Prometheus name segment",
+                self.metrics.metric_namespace
+            );
+        }
+        self.server.trusted_networks()?;
+        for (field, ratio) in [
+            ("telemetry.sample_ratio", self.telemetry.sample_ratio),
+            (
+                "telemetry.health_admin_sample_ratio",
+                self.telemetry.health_admin_sample_ratio,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&ratio) {
+                anyhow::bail!("config field `{field}` must be in [0, 1], got {ratio}");
+            }
+        }
+        match self.orchestration.control_mode.as_str() {
+            "explicit" | "auto" => {}
+            other => anyhow::bail!(
+                "config field `orchestration.control_mode` must be \"explicit\" or \"auto\", got \"{other}\""
+            ),
+        }
         // B6（蓝图 §4.3，本期 gRPC only）：protocol=http 被 serde 接受但未实现——
         // 启动期 fail-fast，而非 warn 后 telemetry 整体静默关闭（docs 已标 reserved）。
         if self.telemetry.enabled && self.telemetry.protocol == TelemetryProtocol::Http {
@@ -2292,6 +2330,48 @@ mod tests {
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.metrics.metric_namespace, "vllm");
         assert!(cfg.metrics.enabled, "enabled keeps its default when unset");
+    }
+
+    /// Pre-deployment validation gaps (audit 2026-08-20): `config-check` and
+    /// `validate_server_config` run only `Config::validate`, so fields
+    /// checked ONLY at serve time pass the gate and fail at boot instead:
+    /// - metrics.metric_namespace ("9bad" fails register_gie_metrics at boot)
+    /// - server.trusted_proxies ("10.0.0.0/33" fails the CIDR parse when the
+    ///   HTTP server builds its extractor)
+    /// - telemetry.sample_ratio outside [0,1] (handed unchecked to
+    ///   Sampler::TraceIdRatioBased — silently never-samples)
+    /// - orchestration.control_mode free-form ("Auto" == "explicit" at
+    ///   server/mod.rs:455, silently disabling the reconcile loop)
+    #[test]
+    fn should_reject_serve_time_only_invalid_configs_at_validate() {
+        let bad_namespace: Config =
+            serde_yaml::from_str("metrics:\n  metric_namespace: \"9bad\"\n").unwrap();
+        assert!(
+            bad_namespace.validate().is_err(),
+            "metric_namespace '9bad' must fail config-check, not boot"
+        );
+
+        let bad_proxy: Config =
+            serde_yaml::from_str("server:\n  trusted_proxies: [\"10.0.0.0/33\"]\n").unwrap();
+        assert!(
+            bad_proxy.validate().is_err(),
+            "an unparseable trusted_proxies CIDR must fail config-check, not boot"
+        );
+
+        for bad in ["telemetry:\n  sample_ratio: 7\n", "telemetry:\n  sample_ratio: -0.5\n"] {
+            let bad_ratio: Config = serde_yaml::from_str(bad).unwrap();
+            assert!(
+                bad_ratio.validate().is_err(),
+                "sample_ratio outside [0,1] must fail validation: {bad}"
+            );
+        }
+
+        let bad_mode: Config =
+            serde_yaml::from_str("orchestration:\n  control_mode: \"Auto\"\n").unwrap();
+        assert!(
+            bad_mode.validate().is_err(),
+            "an unrecognized control_mode must fail validation, not silently select manual mode"
+        );
     }
 
     #[test]

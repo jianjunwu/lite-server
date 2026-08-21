@@ -75,6 +75,7 @@ fn inject_echo_headers(metadata: &mut MetadataMap, request_id: &str, elapsed: Du
 pub(super) fn record_grpc_request_end<T>(
     model: &str,
     version: &str,
+    registered: bool,
     start: Instant,
     result: &Result<T, Status>,
 ) {
@@ -82,7 +83,10 @@ pub(super) fn record_grpc_request_end<T>(
         Ok(_) => "2xx",
         Err(s) => grpc_code_to_status_family(s.code()),
     };
-    crate::metrics::prometheus::record_request_end(model, version, family, start.elapsed().as_secs_f64());
+    // A2 (leak-gap-audit-0821): unresolved pairs record under a constant
+    // label — their series would otherwise be permanent.
+    let (m, v) = crate::metrics::prometheus::reject_labels(registered, model, version);
+    crate::metrics::prometheus::record_request_end(m, v, family, start.elapsed().as_secs_f64());
 }
 
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers

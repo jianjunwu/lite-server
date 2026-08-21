@@ -229,6 +229,7 @@ pub async fn dispatch_custom_route(
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
     let uid = format!("route_{}_{}-{}", model_name, resolved_version, Uuid::new_v4());
+    let stream_id = uid.clone();
     let request = pb::Request {
         uid,
         meta: Some(meta),
@@ -237,12 +238,24 @@ pub async fn dispatch_custom_route(
 
     let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
 
-    let first = tokio::time::timeout(
+    let first = match tokio::time::timeout(
         ROUTE_FIRST_FRAME_TIMEOUT,
         first_route_reply(resp_rx, &mut chunk_rx),
     )
     .await
-    .map_err(|_| AppError::InferenceTimeout("route response timeout".to_string()))?;
+    {
+        Ok(f) => f,
+        Err(_) => {
+            // B1: the worker may still be generating the first frame —
+            // cancel it rather than leave the generator running.
+            let _ = client
+                .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                .await;
+            return Err(AppError::InferenceTimeout(
+                "route response timeout".to_string(),
+            ));
+        }
+    };
 
     match first {
         RouteReply::Unary(Some(response)) => match response.payload {
@@ -278,6 +291,8 @@ pub async fn dispatch_custom_route(
                     // RN-13 (D9-A): the admission guard rides the response
                     // body — the slot is released when the stream ends.
                     admission_slot.take(),
+                    client.clone(),
+                    stream_id,
                 )
             }
             _ => Err(AppError::WorkerCrashed(
@@ -341,6 +356,11 @@ fn build_route_stream_http_response(
     req_ctx: crate::callback::InferenceContext,
     open_time: std::time::Instant,
     admission_guard: Option<crate::admission::AdmissionGuard>,
+    // B1 (leak-gap-audit-0821): worker client + route uid for the cancel-on-
+    // drop guard — the route path is the ONLY streaming adapter that never
+    // cancelled the worker-side generator (SSE/WS/gRPC/bidi all do).
+    cancel_client: std::sync::Arc<crate::transport::zmq::WorkerZmqClient>,
+    stream_id: String,
 ) -> Result<Response, AppError> {
     let is_sse = start.media_type.starts_with("text/event-stream");
     let content_type = if start.media_type.is_empty() {
@@ -353,9 +373,13 @@ fn build_route_stream_http_response(
     // elapsed — aligned with SSE/WS. Firing on the Start frame (the old
     // behavior) reported only cold-start latency and fired before the body
     // had streamed.
+    // B1: cancel the worker-side generator on every non-terminal exit
+    // (client disconnect, deadline/idle reclaim, unexpected frame) — the
+    // guard drops armed unless a terminal frame or channel close disarms it.
+    let guard = crate::streaming::StreamCancelGuard::armed(cancel_client, stream_id);
     let body = futures::stream::unfold(
-        (chunk_rx, false, callback_runner, req_ctx, open_time),
-        move |(mut rx, ended, cb, ctx, t0)| {
+        (chunk_rx, false, callback_runner, req_ctx, open_time, guard),
+        move |(mut rx, ended, cb, ctx, t0, mut guard)| {
             // RN-13 (D9-A): force-capture the admission guard into this
             // closure's environment — the unfold stream owns the closure, so
             // the slot is released exactly when the body stream ends/drops.
@@ -365,31 +389,43 @@ fn build_route_stream_http_response(
                 return None;
             }
             // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
-            let frame = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
-                Ok(Some(f)) => Some(f),
-                Ok(None) => None, // worker closed the stream
+            // A reclaim is NOT a channel close: the worker may still be
+            // generating, so it keeps the guard armed (cancel on drop).
+            let (frame, reclaimed) = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+                Ok(Some(f)) => (Some(f), false),
+                Ok(None) => (None, false), // worker closed the stream
                 Err(elapsed) => {
                     tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
-                    None
+                    (None, true)
                 }
             };
             match frame.map(|f| f.payload) {
                 Some(Some(pb::stream_response::Payload::Chunk(c))) => {
                     let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
-                    Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false, cb, ctx, t0)))
+                    Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false, cb, ctx, t0, guard)))
                 }
                 Some(Some(pb::stream_response::Payload::Error(e))) => {
                     warn!("route stream error: {}", e.message);
                     // Terminal frame → fire the response callback (full elapsed).
+                    guard.disarm();
                     crate::callback::fire_inference_response(&cb, &ctx, t0);
                     if is_sse {
                         let event = sse_frame(e.message.as_bytes());
-                        Some((Ok(bytes::Bytes::from(event)), (rx, true, cb, ctx, t0)))
+                        Some((Ok(bytes::Bytes::from(event)), (rx, true, cb, ctx, t0, guard)))
                     } else {
                         None
                     }
                 }
-                // Done, channel closed, or an unexpected frame — terminal.
+                // Done or channel closed: the worker already ended its side —
+                // disarm, no cancel.
+                Some(Some(pb::stream_response::Payload::Done(_))) | None if !reclaimed => {
+                    guard.disarm();
+                    crate::callback::fire_inference_response(&cb, &ctx, t0);
+                    None
+                }
+                // Deadline/idle reclaim or an unexpected frame — terminal for
+                // us, but the worker may still be generating: the armed
+                // guard cancels on drop.
                 _ => {
                     crate::callback::fire_inference_response(&cb, &ctx, t0);
                     None
@@ -638,5 +674,141 @@ mod route_match_tests {
             }
             other => panic!("expected Hit, got {:?}", other),
         }
+    }
+
+    /// B1 (leak-gap-audit-0821): a streaming route whose client goes away
+    /// mid-stream must CANCEL the worker-side generator. Every other
+    /// streaming adapter (SSE/WS/gRPC stream/decoupled/h2 bidi) sends
+    /// build_stream_cancel on every non-terminal exit; the route path had
+    /// no cancel at all — hyper dropping the body just made the ZMQ actor
+    /// reap the dead route channel while the worker kept generating.
+    #[tokio::test]
+    async fn route_stream_sends_cancel_when_response_body_dropped() {
+        use prost::Message;
+        let sock = std::env::temp_dir().join(format!("route-cancel-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let endpoint = format!("ipc://{}", sock.display());
+
+        // Fake worker: replies Start to the RouteCall, then stays silent (a
+        // long generator); records any incoming stream Cancel.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn({
+            let endpoint = endpoint.clone();
+            move || {
+                let ctx = zmq::Context::new();
+                let s = ctx.socket(zmq::PAIR).expect("worker socket");
+                s.connect(&endpoint).expect("worker connect");
+                let _ = s.set_rcvtimeo(10000);
+                while let Ok(bytes) = s.recv_bytes(0) {
+                    let req = match pb::Request::decode(bytes.as_slice()) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    match req.payload {
+                        Some(pb::request::Payload::Stream(st)) => {
+                            if matches!(
+                                st.action,
+                                Some(pb::stream_request::Action::Cancel(_))
+                            ) {
+                                let _ = tx.send(st.stream_id.clone());
+                            }
+                        }
+                        Some(pb::request::Payload::RouteCall(_)) => {
+                            let resp = pb::Response {
+                                payload: Some(pb::response::Payload::Stream(
+                                    pb::StreamResponse {
+                                        stream_id: req.uid.clone(),
+                                        payload: Some(pb::stream_response::Payload::Start(
+                                            pb::StreamStart {
+                                                media_type: "application/octet-stream".to_string(),
+                                                ..Default::default()
+                                            },
+                                        )),
+                                    },
+                                )),
+                                ..Default::default()
+                            };
+                            if s.send(resp.encode_to_vec(), 0).is_err() {
+                                return;
+                            }
+                        }
+                        _ => {
+                            let _ = s.send(
+                                pb::Response {
+                                    uid: req.uid,
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                                0,
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        let client =
+            std::sync::Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint.clone()));
+        let uid = format!("route_m_1-test-{}", uuid::Uuid::new_v4());
+        let request = pb::Request {
+            uid: uid.clone(),
+            meta: None,
+            payload: Some(pb::request::Payload::RouteCall(pb::SingleRequest {
+                data: bytes::Bytes::new(),
+            })),
+        };
+        let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await.unwrap();
+        let start = match tokio::time::timeout(std::time::Duration::from_secs(5), chunk_rx.recv())
+            .await
+        {
+            Ok(Some(f)) => match f.payload {
+                Some(pb::stream_response::Payload::Start(s)) => s,
+                other => panic!("expected Start, got {other:?}"),
+            },
+            r => panic!("no Start frame: {r:?}"),
+        };
+        drop(resp_rx);
+
+        let resp = build_route_stream_http_response(
+            start,
+            chunk_rx,
+            None,
+            None,
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+            crate::callback::InferenceContext {
+                model_name: "m".to_string(),
+                version: "1".to_string(),
+                route: "/stream".to_string(),
+                protocol: crate::callback::Protocol::Http,
+                request_id: "rid".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                elapsed_us: None,
+            },
+            std::time::Instant::now(),
+            None,
+            client.clone(),
+            uid.clone(),
+        )
+        .expect("stream response builds");
+
+        // Client disconnect = drop the body without reading it out.
+        drop(resp.into_body());
+
+        // The cancel rides a spawned task + the actor — poll, don't block the
+        // runtime (current-thread test runtime).
+        let mut cancelled = None;
+        for _ in 0..40 {
+            if let Ok(id) = rx.try_recv() {
+                cancelled = Some(id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_file(&sock);
+        assert_eq!(
+            cancelled.as_deref(),
+            Some(uid.as_str()),
+            "the worker must receive a Cancel for the route uid when the body drops mid-stream"
+        );
     }
 }

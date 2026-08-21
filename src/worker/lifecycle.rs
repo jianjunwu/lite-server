@@ -12,6 +12,7 @@ use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::inference_queue::{model_version_key, OutlierState};
 use crate::registry::types::*;
+use crate::streaming::StreamCancelGuard;
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
 use futures::StreamExt;
@@ -82,52 +83,6 @@ impl WarmupFailure {
 /// for configs with a tiny startup_timeout.
 fn warmup_fallback_budget(model_config: &ModelConfig) -> Duration {
     Duration::from_secs_f32(model_config.startup_timeout).max(Duration::from_secs(300))
-}
-
-/// F1 (warmup-gaps audit): RAII cancel for a warmup stream. Any exit that
-/// did not observe a terminal frame (Done/Error) or a channel close drops
-/// the guard armed → a StreamCancel goes out so the worker-side generator
-/// stops instead of running to its natural Done (unbounded waste for a long
-/// LLM stream). Covers every abort shape: per-iteration timeout, unexpected
-/// frames, a sibling unit's failure dropping the unit future mid-poll, and
-/// the G4 total budget cutting the whole run. `send_raw` is async, so the
-/// cancel rides a spawned task (Drop is sync); a vanished runtime (process
-/// teardown) skips it — the workers die with the runtime there anyway.
-struct StreamCancelGuard {
-    client: Arc<WorkerZmqClient>,
-    stream_id: String,
-    armed: bool,
-}
-
-impl StreamCancelGuard {
-    fn armed(client: Arc<WorkerZmqClient>, stream_id: String) -> Self {
-        Self {
-            client,
-            stream_id,
-            armed: true,
-        }
-    }
-
-    /// Terminal frame observed or the channel already closed — no cancel.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for StreamCancelGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let client = self.client.clone();
-                let stream_id = std::mem::take(&mut self.stream_id);
-                handle.spawn(async move {
-                    let _ = client
-                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
-                        .await;
-                });
-            }
-        }
-    }
 }
 
 /// G1: build the warmup execution plan. `worker` scope (default) replays the
@@ -642,6 +597,12 @@ impl WorkerManager {
                         );
                     }
                     Err(e) => {
+                        // A plan-parse failure must not wedge the registry
+                        // entry: unlike a warmup failure there is no runtime
+                        // state to preserve for /health, and the only fix is
+                        // "edit config.yaml and retry" — a wedged Pending
+                        // entry makes every retry fail VersionAlreadyLoaded.
+                        let _ = self.registry.remove(model_name, version);
                         return Err(e);
                     }
                 }
@@ -835,6 +796,7 @@ impl WorkerManager {
                         model_name.to_string(),
                         version.to_string(),
                         worker_id as u32,
+                        pid,
                     ),
                     Some(hooks_arc),
                     self.hook_tasks.clone(),
@@ -1825,6 +1787,14 @@ impl WorkerManager {
             model = %model_name, version = %version,
             "force-unloading version after failed graceful unload"
         );
+
+        // Same as the graceful path (P0/D23): invalidate the ensemble plan
+        // cache BEFORE any registry change — a fresh request must never hit
+        // a stale plan for a version that is being removed.
+        if let Some(cache) = &self.ensemble_plans {
+            cache.invalidate_model(model_name);
+        }
+
         let key = model_version_key(model_name, version);
         let (procs, clients) = {
             let mut workers = self.workers.write().await;
@@ -2155,6 +2125,111 @@ class TestAPI(LitAPI):
             // Idempotent: a second call on the deleted version is a no-op.
             wm.force_unload_version("m", "1").await.unwrap();
         });
+    }
+
+    /// Ensemble load-failure wedge (audit 2026-08-20): a version whose
+    /// config.yaml has a top-level `ensemble` key but an invalid DAG fails
+    /// load_model — but the registry entry (registered as Pending BEFORE the
+    /// plan parse) is left behind: no mark_load_failed, no removal, in stark
+    /// contrast to the non-ensemble funnel ("ANY error funnels to one
+    /// mark_load_failed + teardown"). The wedged Pending entry makes every
+    /// retry fail VersionAlreadyLoaded until a manual unload — fixing
+    /// config.yaml and reloading can never heal on its own.
+    #[tokio::test]
+    async fn should_not_wedge_registry_when_ensemble_plan_is_invalid() {
+        let tag = "enswedge";
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-enswedge-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        // Top-level `ensemble` key (detected structurally) but an invalid DAG.
+        std::fs::write(model_dir.join("config.yaml"), "ensemble:\n  steps: []\n").unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        )
+        .with_ensemble_plans(Arc::new(crate::ensemble::EnsemblePlanCache::new()));
+
+        let result = wm.load_model(tag, "1", &ModelConfig::default()).await;
+        assert!(result.is_err(), "an invalid ensemble DAG must fail the load");
+
+        match registry.get(tag, Some("1")) {
+            None => {} // removed — acceptable cleanup
+            Some(mv) => assert_eq!(
+                mv.status,
+                VersionStatus::Failed,
+                "a failed ensemble load must not wedge the entry in {:?}",
+                mv.status
+            ),
+        }
+
+        // The practical consequence: an immediate retry must not be rejected
+        // as a duplicate.
+        let retry = wm.load_model(tag, "1", &ModelConfig::default()).await;
+        if let Err(e) = &retry {
+            assert!(
+                !matches!(e, AppError::VersionAlreadyLoaded(..)),
+                "a retry after a failed ensemble load must not report VersionAlreadyLoaded"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Plan-cache invalidation gap (audit 2026-08-20): graceful unload
+    /// invalidates the ensemble plan cache BEFORE any registry change
+    /// (P0/D23 — a fresh request must never hit a stale plan for a version
+    /// being unloaded). The H5 escalation force_unload_version has no
+    /// invalidate_model call at all: any caller that reaches force-unload
+    /// without a prior graceful attempt (it is `pub`) leaves the Ready plan
+    /// cached for a version that no longer exists.
+    #[tokio::test]
+    async fn force_unload_must_invalidate_ensemble_plan_cache() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::Ensemble,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        let cache = Arc::new(crate::ensemble::EnsemblePlanCache::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            Arc::new(InferenceQueue::new()),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        )
+        .with_ensemble_plans(cache.clone());
+
+        let plan = crate::ensemble::parse_ensemble_plan(
+            "ensemble:\n  output: \"$a.output\"\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n",
+            std::path::Path::new("/nonexistent/config.yaml"),
+        )
+        .expect("minimal ensemble config parses");
+        let key = crate::ensemble::PlanKey {
+            model: "m".to_string(),
+            version: "1".to_string(),
+        };
+        cache.insert_ready(key.clone(), Arc::new(plan));
+        assert!(cache.plans.get(&key).is_some(), "precondition: plan cached");
+
+        wm.force_unload_version("m", "1")
+            .await
+            .expect("force unload succeeds");
+        assert!(
+            cache.plans.get(&key).is_none(),
+            "force_unload_version must invalidate the ensemble plan cache, \
+             same as the graceful unload path (P0/D23)"
+        );
     }
 
     // ===== L3: respawn re-warm fallback budget =====

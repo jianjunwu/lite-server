@@ -185,9 +185,17 @@ async fn generate_stream_entry(
     )
     .await;
     if let Err(e) = &result {
+        // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+        // that resolved to a registry entry — a never-registered pair records
+        // under the constant label (its series would otherwise be permanent).
+        let registered = state
+            .registry
+            .get(model_name, Some(&label_version))
+            .is_some();
+        let (m, v) = prometheus::reject_labels(registered, model_name, &label_version);
         prometheus::record_stream_rejected(
-            model_name,
-            &label_version,
+            m,
+            v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
             "early_reject",
@@ -254,9 +262,17 @@ pub(crate) async fn openai_stream_entry(
     )
     .await;
     if let Err(e) = &result {
+        // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+        // that resolved to a registry entry — a never-registered pair records
+        // under the constant label (its series would otherwise be permanent).
+        let registered = state
+            .registry
+            .get(model_name, Some(&label_version))
+            .is_some();
+        let (m, v) = prometheus::reject_labels(registered, model_name, &label_version);
         prometheus::record_stream_rejected(
-            model_name,
-            &label_version,
+            m,
+            v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
             "early_reject",
@@ -297,9 +313,17 @@ async fn sse_infer_entry(
     )
     .await;
     if let Err(e) = &result {
+        // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+        // that resolved to a registry entry — a never-registered pair records
+        // under the constant label (its series would otherwise be permanent).
+        let registered = state
+            .registry
+            .get(model_name, Some(&label_version))
+            .is_some();
+        let (m, v) = prometheus::reject_labels(registered, model_name, &label_version);
         prometheus::record_stream_rejected(
-            model_name,
-            &label_version,
+            m,
+            v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
             "early_reject",
@@ -1231,9 +1255,12 @@ async fn handle_ws_stream(
         Ok(v) => v,
         Err(_) => {
             // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
+            // A2: 未解析的 (model, version) 用常量 label——其 series 永不随
+            // unload 清除,原始 label 会被模型名枚举无限放大。
+            let (m, v) = prometheus::reject_labels(false, &model_name, &request_version_label);
             prometheus::record_stream_rejected(
-                &model_name,
-                &request_version_label,
+                m,
+                v,
                 "4xx",
                 ws_start.elapsed().as_secs_f64(),
                 "early_reject",
@@ -4296,14 +4323,18 @@ mod tests {
         );
     }
 
-    /// D7:模型不存在 + 无版本(resolve_version 失败)→ 4xx,version label 用
-    /// 请求原值(无版本 → 空串)。
+    /// D7:模型不存在 + 无版本(resolve_version 失败)→ 4xx。A2:未注册模型
+    /// 的拒绝记到常量 ~unknown~ label(其 series 永不随 unload 清除,原始
+    /// label 会被枚举攻击无限放大);常量 label 跨测试共享,断言至少 +1。
     #[tokio::test]
     async fn sse_rejects_missing_model_records_4xx() {
         let model = "sse_early_4xx";
         let state = make_state(Arc::new(CallbackRunner::new()));
-        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "", "4xx"]);
+        let counter = prometheus::REQUESTS_TOTAL
+            .with_label_values(&[prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
+        let raw_counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "", "4xx"]);
         let before = counter.get();
+        let before_raw = raw_counter.get();
         let resp = sse_infer_handler(
             State(state.clone()),
             Path(model.to_string()),
@@ -4314,10 +4345,14 @@ mod tests {
         )
         .await;
         assert_eq!(resp.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            counter.get() >= before + 1.0,
+            "unresolved-model rejection must record 4xx under the constant label"
+        );
         assert_eq!(
-            counter.get(),
-            before + 1.0,
-            "unresolved-version rejection must record 4xx with the request version label"
+            raw_counter.get(),
+            before_raw,
+            "a never-registered model name must not create its own series"
         );
     }
 

@@ -56,29 +56,68 @@ pub fn execute_hook(
         while set.try_join_next().is_some() {}
     }
 
-    // Shell hook: fire-and-forget
+    // Shell hook: fire-and-forget, but bounded (B2, leak-gap-audit-0821):
+    // the same hook_http_timeout knob bounds shell hooks — a hung hook must
+    // not park the JoinSet slot (and its child) forever. stdin is null so a
+    // hook never blocks on the server's terminal; kill_on_drop reaps the
+    // child if the task is aborted (WorkerManager::shutdown's abort_all);
+    // on timeout the child is killed AND reaped. On unix the child runs in
+    // its own process group so a compound command's grandchildren die with
+    // it (kill_on_drop only covers the direct child — shutdown-abort of a
+    // compound hook may still leave grandchildren, documented limit).
     if let Some(cmd) = shell_cmd {
         let resolved = replace_hook_vars(cmd, &vars);
         let hook_name = hook_type.to_string();
+        let hook_timeout = Duration::from_secs_f32(hooks.hook_http_timeout);
         hook_tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawn(async move {
-                match tokio::process::Command::new("sh")
+                #[allow(unused_mut)]
+                let mut command = tokio::process::Command::new("sh");
+                command
                     .arg("-c")
                     .arg(&resolved)
+                    .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status()
-                    .await
+                    .kill_on_drop(true);
+                #[cfg(unix)]
                 {
-                    Ok(status) => {
+                    // tokio's Command has a native unix process_group.
+                    command.process_group(0);
+                }
+                let mut child = match command.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Hook '{}' command failed to execute: {}", hook_name, e);
+                        return;
+                    }
+                };
+                match tokio::time::timeout(hook_timeout, child.wait()).await {
+                    Ok(Ok(status)) => {
                         if !status.success() {
                             warn!("Hook '{}' command exited with {}", hook_name, status);
                         }
                     }
-                    Err(e) => {
-                        warn!("Hook '{}' command failed to execute: {}", hook_name, e);
+                    Ok(Err(e)) => {
+                        warn!("Hook '{}' command wait failed: {}", hook_name, e);
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Hook '{}' command timed out after {:?}; killing",
+                            hook_name, hook_timeout
+                        );
+                        #[cfg(unix)]
+                        {
+                            if let Some(pid) = child.id() {
+                                // Kill the whole group: sh -c "a; b" keeps b
+                                // as a grandchild that child.kill() misses.
+                                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                            }
+                        }
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
                     }
                 }
             });
@@ -156,6 +195,97 @@ mod tests {
         let vars = vec![("$MODEL".to_string(), "x".to_string())];
         let result = replace_hook_vars("no placeholders here", &vars);
         assert_eq!(result, "no placeholders here");
+    }
+
+    /// B2 (leak-gap-audit-0821): a hung shell hook must not park forever.
+    /// The hook timeout (same knob as HTTP hooks) bounds the wait; on
+    /// expiry the child is killed and reaped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_hook_is_bounded_by_timeout() {
+        let hooks = crate::config::WorkerHooksConfig {
+            on_ready: Some("sleep 300".to_string()),
+            hook_http_timeout: 0.2,
+            ..Default::default()
+        };
+        let hook_tasks: HookTasks = Default::default();
+        execute_hook("ready", &hooks, vec![], &hook_tasks);
+
+        // The task must COMPLETE within a small multiple of the timeout —
+        // today it parks on `sleep 300` and never finishes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completed = loop {
+            {
+                let mut set = hook_tasks.lock().unwrap_or_else(|e| e.into_inner());
+                if set.try_join_next().is_some() {
+                    break true;
+                }
+                if set.is_empty() {
+                    break true; // task completed AND already reaped elsewhere
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            completed,
+            "the hook task must conclude near the timeout, not park on the hung command"
+        );
+    }
+
+    /// B2: aborting the hook task set (WorkerManager::shutdown's abort_all)
+    /// must not orphan the hook's child process — kill_on_drop reaps it
+    /// with the dropped future.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborted_shell_hook_does_not_orphan_child() {
+        let tag = format!("lite-server-hook-orphan-{}", std::process::id());
+        let pidfile = std::env::temp_dir().join(&tag);
+        let _ = std::fs::remove_file(&pidfile);
+        let hooks = crate::config::WorkerHooksConfig {
+            // exec keeps the recorded pid for the sleep itself.
+            on_ready: Some(format!(
+                "echo $$ > {}; exec sleep 300",
+                pidfile.display()
+            )),
+            hook_http_timeout: 60.0,
+            ..Default::default()
+        };
+        let hook_tasks: HookTasks = Default::default();
+        execute_hook("ready", &hooks, vec![], &hook_tasks);
+
+        let mut pid_contents = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                pid_contents = Some(s);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let pid: i32 = pid_contents
+            .expect("hook child must have recorded its pid")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Mirror WorkerManager::shutdown: abort every hook task.
+        {
+            let mut set = hook_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            set.abort_all();
+        }
+        // Give the kill a moment to land.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "hook child pid {pid} survived abort_all: the dropped Child is never killed"
+        );
     }
 
     #[test]

@@ -201,6 +201,55 @@ pub async fn recv_chunk(
     }
 }
 
+/// F1 (warmup-gaps audit, promoted from worker/lifecycle for B1): RAII
+/// cancel for a worker-side stream. Any exit that did not observe a terminal
+/// frame (Done/Error) or a channel close drops the guard armed → a
+/// StreamCancel goes out so the worker-side generator stops instead of
+/// running to its natural end (unbounded waste for a long LLM stream or an
+/// infinite route generator). Covers every abort shape: per-iteration
+/// timeout, unexpected frames, a sibling's failure dropping the consumer
+/// future mid-poll, client disconnect dropping the HTTP body, and total
+/// budgets cutting the whole run. `send_raw` is async, so the cancel rides a
+/// spawned task (Drop is sync); a vanished runtime (process teardown) skips
+/// it — the workers die with the runtime there anyway.
+pub(crate) struct StreamCancelGuard {
+    pub(crate) client: std::sync::Arc<crate::transport::zmq::WorkerZmqClient>,
+    pub(crate) stream_id: String,
+    armed: bool,
+}
+
+impl StreamCancelGuard {
+    pub(crate) fn armed(
+        client: std::sync::Arc<crate::transport::zmq::WorkerZmqClient>,
+        stream_id: String,
+    ) -> Self {
+        Self {
+            client,
+            stream_id,
+            armed: true,
+        }
+    }
+
+    /// Terminal frame observed or the channel already closed — no cancel.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let client = self.client.clone();
+                let stream_id = std::mem::take(&mut self.stream_id);
+                handle.spawn(async move {
+                    let _ = client.send_raw(crate::streaming::build_stream_cancel(stream_id)).await;
+                });
+            }
+        }
+    }
+}
+
 /// Run a streaming forward-task body with a uniform panic收口. The SSE /
 /// gRPC-server-stream / h2-bidi forward tasks are DETACHED spawns — nobody
 /// joins their handle, so a panicking body would silently lose its terminal

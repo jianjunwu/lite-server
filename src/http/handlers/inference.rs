@@ -186,10 +186,16 @@ async fn do_infer(
     // a successful queue submit. Version label: the resolved version, or the
     // requested one ("" when absent) if resolution itself failed.
     let handler_start = Instant::now();
-    let record_reject = |version: &str, e: &AppError| {
+    // A2 (leak-gap-audit-0821): reject labels stay raw only when the
+    // (model, version) pair resolved to a registry entry. A never-registered
+    // pair (unknown model / ghost version) is never unloaded, so its series
+    // are permanent — under model-name enumeration the families grow
+    // linearly forever. Unresolved rejects record under a constant label.
+    let record_reject = |registered: bool, version: &str, e: &AppError| {
+        let (m, v) = prometheus::reject_labels(registered, &model_name, version);
         prometheus::record_request_end(
-            &model_name,
-            version,
+            m,
+            v,
             status_family(e.http_status().as_u16() as i32),
             handler_start.elapsed().as_secs_f64(),
         );
@@ -202,7 +208,7 @@ async fn do_infer(
         Ok(v) => v,
         Err(e) => {
             let e = auth_gate_for_unknown_model(&state, &headers, e);
-            record_reject(&reject_version, &e);
+            record_reject(false, &reject_version, &e);
             return Err(e);
         }
     };
@@ -231,15 +237,15 @@ async fn do_infer(
             &headers,
             AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)),
         );
-        record_reject(&resolved_version, &e);
+        record_reject(false, &resolved_version, &e);
         return Err(e);
     };
     if let Err(e) = enforce_auth(mv.policies.auth.as_ref(), &headers) {
-        record_reject(&resolved_version, &e);
+        record_reject(true, &resolved_version, &e);
         return Err(e);
     }
     if let Err(e) = enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await {
-        record_reject(&resolved_version, &e);
+        record_reject(true, &resolved_version, &e);
         return Err(e);
     }
 
@@ -249,7 +255,7 @@ async fn do_infer(
             "{} version {} is not ready",
             model_name, resolved_version
         ));
-        record_reject(&resolved_version, &e);
+        record_reject(true, &resolved_version, &e);
         return Err(e);
     }
 
@@ -258,7 +264,7 @@ async fn do_infer(
         let ensemble_input = match ensemble_input_from_body(&body) {
             Ok(v) => v,
             Err(e) => {
-                record_reject(&resolved_version, &e);
+                record_reject(true, &resolved_version, &e);
                 return Err(e);
             }
         };
@@ -268,7 +274,7 @@ async fn do_infer(
         let dag_selector = match crate::ensemble::dag_selector_from_http(&headers) {
             Ok(v) => v,
             Err(e) => {
-                record_reject(&resolved_version, &e);
+                record_reject(true, &resolved_version, &e);
                 return Err(e);
             }
         };
@@ -283,7 +289,7 @@ async fn do_infer(
         ).await {
             Ok(v) => v,
             Err(e) => {
-                record_reject(&resolved_version, &e);
+                record_reject(true, &resolved_version, &e);
                 return Err(e);
             }
         };
@@ -297,7 +303,7 @@ async fn do_infer(
     let num_workers = mv.workers.len();
     if num_workers == 0 {
         let e = AppError::WorkerCrashed(format!("{} has no workers", model_name));
-        record_reject(&resolved_version, &e);
+        record_reject(true, &resolved_version, &e);
         return Err(e);
     }
 
@@ -376,27 +382,27 @@ async fn do_infer(
             let e = AppError::QueueFull(format!(
                 "Queue full for {} {}", model_name, resolved_version
             ));
-            record_reject(&resolved_version, &e);
+            record_reject(true, &resolved_version, &e);
             return Err(e);
         }
         Err(crate::inference_queue::QueueError::InvalidWorker(msg)) => {
             // B3 direct-mode: x-lite-worker-id 不存在/已剔除 → 400（客户端错误）。
             let e = AppError::Validation(msg);
-            record_reject(&resolved_version, &e);
+            record_reject(true, &resolved_version, &e);
             return Err(e);
         }
         Err(crate::inference_queue::QueueError::NoLiveWorkers(msg)) => {
             // Crash-death gate: every worker process has exited → 503
             // fail-fast（而非挂到 request_timeout）。
             let e = AppError::ModelNotReady(msg);
-            record_reject(&resolved_version, &e);
+            record_reject(true, &resolved_version, &e);
             return Err(e);
         }
         Err(_) => {
             let e = AppError::ModelNotReady(format!(
                 "Queue not available for {} {}", model_name, resolved_version
             ));
-            record_reject(&resolved_version, &e);
+            record_reject(true, &resolved_version, &e);
             return Err(e);
         }
     }
@@ -882,11 +888,15 @@ mod rejection_metrics_tests {
     }
 
     /// Unknown model → 404 (resolution failure) must record requests_total.
+    /// A2 (leak-gap-audit-0821): a never-registered pair records under the
+    /// constant ~unknown~ label — nothing ever unloads it, so raw-label
+    /// recording is a permanent, unbounded series per probe.
     #[tokio::test]
     async fn unary_unknown_model_records_4xx() {
         let _ = prometheus::register_metrics();
         let state = test_state();
-        let before = requests_total("a1_unknown", "", "4xx");
+        let before = requests_total(prometheus::UNKNOWN_MODEL_LABEL, "", "4xx");
+        let before_raw = requests_total("a1_unknown", "", "4xx");
         let result = do_infer(
             state,
             "a1_unknown".to_string(),
@@ -898,7 +908,50 @@ mod rejection_metrics_tests {
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(requests_total("a1_unknown", "", "4xx"), before + 1.0);
+        // Concurrent tests share the constant label — assert at-least-one.
+        assert!(
+            requests_total(prometheus::UNKNOWN_MODEL_LABEL, "", "4xx") >= before + 1.0,
+            "unresolved rejects record under the constant label"
+        );
+        assert_eq!(
+            requests_total("a1_unknown", "", "4xx"),
+            before_raw,
+            "a never-registered model name must not create its own series"
+        );
+    }
+
+    /// A2: cardinality bound — an enumeration of unknown model names grows
+    /// the request families by O(1), not O(probes).
+    #[tokio::test]
+    async fn unary_unknown_model_enumeration_is_cardinality_capped() {
+        let _ = prometheus::register_metrics();
+        let series_count = || {
+            prometheus::REGISTRY
+                .gather()
+                .iter()
+                .find(|f| f.get_name() == "liteserver_request_duration_seconds")
+                .map(|f| f.get_metric().len())
+                .unwrap_or(0)
+        };
+        let before = series_count();
+        for i in 0..2000 {
+            let state = test_state();
+            let _ = do_infer(
+                state,
+                format!("ghost_enum_{i}"),
+                None,
+                "/predict".to_string(),
+                HeaderMap::new(),
+                json_body(),
+                test_cx(),
+            )
+            .await;
+        }
+        let grew = series_count() - before;
+        assert!(
+            grew <= 64,
+            "2000 unknown-model rejects grew liteserver_request_duration_seconds by {grew} series"
+        );
     }
 
     /// Registered but not ready → 503 must record requests_total under the

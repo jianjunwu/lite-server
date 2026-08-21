@@ -543,7 +543,7 @@ lazy_static! {
 }
 
 /// Prometheus metric name 的合法 namespace 段（`[a-zA-Z_:][a-zA-Z0-9_:]*`）。
-fn is_valid_metric_namespace(ns: &str) -> bool {
+pub(crate) fn is_valid_metric_namespace(ns: &str) -> bool {
     let mut chars = ns.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':' => {}
@@ -843,6 +843,29 @@ pub fn record_request_end(model: &str, version: &str, status: &str, duration_sec
     // P-TRACE C4: OTel metrics overlay (no-op unless telemetry.metrics_enabled +
     // feature). Exemplar-ready plumbing; opentelemetry_sdk 0.30 stubs exemplars.
     crate::telemetry::record_request_duration(status, duration_secs);
+}
+
+/// Constant label for reject-path recording when the requested (model,
+/// version) never resolved to a registry entry (A2, leak-gap-audit-0821):
+/// such a pair is never unloaded, so remove_version_metrics never reaps its
+/// series and an unauthenticated client enumerating model names would grow
+/// REQUESTS_TOTAL / REQUEST_DURATION (a 14-bucket histogram per series)
+/// linearly and permanently — the Prometheus-side parity of the AGG-1
+/// TIMELINE cap. Registered pairs (any status, including not-ready/failed)
+/// keep their real labels: per-model reject observability is an intentional
+/// contract. The `~` is outside the valid model name charset (validation.rs:
+/// [a-zA-Z0-9_-]), so no real model can collide.
+pub const UNKNOWN_MODEL_LABEL: &str = "~unknown~";
+
+/// Reject-path label normalization: raw labels for registered pairs,
+/// constant label for pairs that never resolved. Callers (HTTP/gRPC reject
+/// sites) own the registry lookup.
+pub fn reject_labels<'a>(registered: bool, model: &'a str, version: &'a str) -> (&'a str, &'a str) {
+    if registered {
+        (model, version)
+    } else {
+        (UNKNOWN_MODEL_LABEL, "")
+    }
 }
 
 /// Record HTTP request body size with content-type and route labels (D11).
@@ -1504,11 +1527,17 @@ fn deregister_unreferenced_custom_families(model: &str, version: &str) {
     model_ids.remove(&(model.to_string(), version.to_string()));
 
     let mv = (model.to_string(), version.to_string());
-    let emptied: Vec<String> = refs
-        .iter()
-        .filter(|(_, set)| set.len() == 1 && set.contains(&mv))
-        .map(|(key, _)| key.clone())
-        .collect();
+    // Drop the unloading version's own reference EVERYWHERE it appears. A
+    // family shared across versions (the common rolling-deploy shape: v1 and
+    // v2 declare the same metric) must lose this version's ref now — only
+    // removing whole singleton sets leaves shared sets permanently non-empty,
+    // so the family, its index entry, and the phantom refs leak forever.
+    let mut emptied: Vec<String> = Vec::new();
+    for (key, set) in refs.iter_mut() {
+        if set.remove(&mv) && set.is_empty() {
+            emptied.push(key.clone());
+        }
+    }
     for key in emptied {
         refs.remove(&key);
         let Some((mtype, idx)) = index.remove(&key) else {
@@ -2089,6 +2118,68 @@ mod tests {
              translated to B's global slot"
         );
         assert_eq!(value(b_idx, "cm_a"), 0.0, "B's family must not gain A's label set");
+    }
+
+    /// Shared-family refcount gap (audit 2026-08-20): two versions declaring
+    /// the SAME custom metric name (the common rolling-deploy shape — v1 and
+    /// v2 of one model export the same metric) share one family object.
+    /// Unloading BOTH versions must deregister the family.
+    ///
+    /// Current code only drops a family whose ref SET is a singleton of the
+    /// unloading version (deregister_unreferenced_custom_families filters
+    /// `set.len() == 1 && set.contains(&mv)`) and never removes the unloading
+    /// version from a shared set: after v1 unloads the set stays {v1, v2},
+    /// so v2's unload also sees len 2 and the family + both phantom refs
+    /// leak in REGISTRY forever.
+    #[test]
+    #[serial_test::serial(custom_metrics)]
+    fn test_shared_custom_family_deregistered_after_last_version_unloads() {
+        let key = "sharedfam_gauge:gauge";
+        assert!(
+            !CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(key),
+            "precondition: sharedfam_gauge must be unregistered"
+        );
+
+        // v1 and v2 of the same model declare the same metric name.
+        register_custom_metrics("sharedfam_m", "1", &[("sharedfam_gauge", "gauge")]);
+        register_custom_metrics("sharedfam_m", "2", &[("sharedfam_gauge", "gauge")]);
+
+        // Unloading v1 must keep the family alive — v2 still references it.
+        remove_version_metrics("sharedfam_m", "1");
+        assert!(
+            CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(key),
+            "family must survive while v2 still references it"
+        );
+
+        // Unloading v2 (the LAST referencing version) must deregister it.
+        remove_version_metrics("sharedfam_m", "2");
+        assert!(
+            !CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(key),
+            "shared family must be deregistered once no live version references it"
+        );
+        assert!(
+            !CUSTOM_FAMILY_REFS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(key),
+            "phantom (model, version) refs must not survive the final unload"
+        );
+        assert!(
+            !REGISTRY
+                .gather()
+                .iter()
+                .any(|f| f.get_name() == "lite_server_sharedfam_gauge"),
+            "shared family still exported in /metrics after both versions unloaded"
+        );
     }
 
     #[test]

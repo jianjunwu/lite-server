@@ -370,6 +370,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// B4 (leak-gap-audit-0821): the DEFAULT callbacks.timeout_secs must be
+    /// bounded — with the old 0.0 (= off) default, a hung on_model_unload
+    /// callback wedges WorkerManager::shutdown before workers ever get the
+    /// stop message, and (on_server_end hung) even delays the draining flag
+    /// so the LB keeps routing. Explicit 0 stays the documented escape
+    /// hatch; the default must not be the trap.
+    #[test]
+    fn default_callback_timeout_is_bounded() {
+        let default_timeout = crate::config::CallbacksConfig::default().timeout_secs;
+        assert!(
+            default_timeout > 0.0,
+            "the default callbacks.timeout_secs must be bounded (explicit 0 = off)"
+        );
+    }
+
+    /// B4 companion: the abandon mechanism itself — a hung callback is
+    /// dropped at the dispatch timeout and later callbacks still run.
+    struct HangCallback {
+        started: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Callback for HangCallback {
+        async fn on_model_unload(&self, _ctx: &ModelLifecycleContext) {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            // A callback that never returns (wedged audit webhook).
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_callback_is_abandoned_at_dispatch_timeout() {
+        let mut runner = CallbackRunner::new();
+        runner.set_dispatch_timeout(Some(std::time::Duration::from_millis(200)));
+        let cb = Arc::new(HangCallback {
+            started: AtomicUsize::new(0),
+        });
+        runner.register(cb.clone()).await;
+        let ctx = ModelLifecycleContext {
+            model_name: "m".to_string(),
+            version: "1".to_string(),
+            device: None,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runner.on_model_unload(&ctx),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a hung on_model_unload must be abandoned at the dispatch timeout, \
+             not wedge the unload/shutdown path"
+        );
+        assert_eq!(cb.started.load(Ordering::Relaxed), 1);
+    }
+
     struct CountingCallback {
         start_count: AtomicUsize,
         end_count: AtomicUsize,

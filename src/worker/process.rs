@@ -246,6 +246,7 @@ pub(crate) fn crash_exit_handler(
     model_name: String,
     version: String,
     worker_id: u32,
+    worker_pid: Option<u32>,
 ) -> impl FnOnce(WorkerExitKind) + Send + 'static {
     crash_exit_handler_with_grace(
         fail_client,
@@ -254,6 +255,7 @@ pub(crate) fn crash_exit_handler(
         model_name,
         version,
         worker_id,
+        worker_pid,
         None,
     )
 }
@@ -273,6 +275,7 @@ pub(crate) fn crash_exit_handler_with_grace(
     model_name: String,
     version: String,
     worker_id: u32,
+    worker_pid: Option<u32>,
     clean_grace: Option<Duration>,
 ) -> impl FnOnce(WorkerExitKind) + Send + 'static {
     let spawned_at = std::time::Instant::now();
@@ -298,6 +301,35 @@ pub(crate) fn crash_exit_handler_with_grace(
             // requests — no spurious fail on stops.
             WorkerExitKind::Clean => return,
         };
+        // B5 (leak-gap-audit-0821): a LATE exit event from a previous
+        // occupant of this slot must not poison the current one. After a
+        // reap-timeout respawn the replacement owns the slot (shared ZMQ
+        // client, shared OutlierState, registry entry with the new pid);
+        // the old worker's delayed death would otherwise fail_all the
+        // replacement's in-flight requests, mark the healthy slot dead
+        // (no recovery except another respawn — permanent NoLiveWorkers for
+        // single-worker versions), and flip the live registry entry to
+        // Stopped. Act only when the registry still names this handler's
+        // pid for the slot; a mismatch (replacement present, entry gone)
+        // discards the event as stale. `None` pid = unknown, act as before.
+        if let Some(pid) = worker_pid {
+            let current_pid = registry
+                .get(&model_name, Some(&version))
+                .and_then(|mv| {
+                    mv.workers
+                        .iter()
+                        .find(|w| w.worker_id == worker_id)
+                        .and_then(|w| w.pid)
+                });
+            if current_pid != Some(pid) {
+                info!(
+                    model = %model_name, version = %version, worker_id,
+                    "Discarding stale {kind:?} exit event for pid {pid} \
+                     (slot's current occupant: {current_pid:?})"
+                );
+                return;
+            }
+        }
         if let Some(c) = &fail_client {
             c.fail_all(reason);
         }
@@ -626,6 +658,23 @@ impl WorkerManager {
             .ok_or_else(|| AppError::ModelNotFound(format!("{} v{}", model_name, version)))?;
         let model_config = model_version.config;
 
+        // Stale-signal guard: a respawn signal's worker_id is valid only for
+        // the generation that produced it. A reload may have shrunk the
+        // worker count while the signal sat in the channel — an out-of-range
+        // id must fail the respawn BEFORE any status flip or old-proc
+        // removal; the unchecked device_plan index below would otherwise
+        // panic and kill the serial respawn listener server-wide.
+        let device_plan = model_config
+            .resolve_device_plan()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        let Some(&device_index) = device_plan.get(worker_id as usize) else {
+            return Err(AppError::Internal(format!(
+                "stale respawn signal: worker_id {worker_id} out of range for \
+                 {model_name} {version} (workers: {})",
+                device_plan.len()
+            )));
+        };
+
         let model_dir = crate::validation::resolve_model_dir(&self.repo_path, model_name, version)?;
         let model_py = model_dir.join("model.py");
         let config_yaml = model_dir.join("config.yaml");
@@ -738,12 +787,9 @@ impl WorkerManager {
         }
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         // Same resolver as the initial spawn (single source of truth), so a
-        // respawned/recycled worker lands back on its original device. The
-        // config was validated at load, so resolution cannot fail here.
-        let device_plan = model_config
-            .resolve_device_plan()
-            .map_err(|e| AppError::Config(e.to_string()))?;
-        let device = format!("{}:{}", accelerator, device_plan[worker_id as usize]);
+        // respawned/recycled worker lands back on its original device.
+        // Resolved and bounds-checked at the top of this function.
+        let device = format!("{}:{}", accelerator, device_index);
 
         let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
 
@@ -941,6 +987,7 @@ impl WorkerManager {
             outliers.get(&key).cloned()
         };
         let hooks_arc = Arc::new(model_config.hooks.clone());
+        let worker_pid = child.id();
         let done_rx = spawn_worker_monitor(
             child,
             model_name,
@@ -954,6 +1001,7 @@ impl WorkerManager {
                 model_name.to_string(),
                 version.to_string(),
                 worker_id,
+                worker_pid,
                 // H2: a Clean exit moments after a respawn means the
                 // replacement consumed a stale stop replayed on the reused
                 // PAIR socket — treat it as a crash, never ignore it.
@@ -1227,6 +1275,7 @@ mod tests {
             "test_model".to_string(),
             "1".to_string(),
             0,
+            None,
             Some(Duration::from_secs(60)),
         );
         run_clean_exit_monitor(handler).await;
@@ -1247,6 +1296,7 @@ mod tests {
             "test_model".to_string(),
             "1".to_string(),
             0,
+            None,
             Some(Duration::ZERO), // window already elapsed at creation
         );
         run_clean_exit_monitor(handler).await;
@@ -1267,6 +1317,7 @@ mod tests {
             "test_model".to_string(),
             "1".to_string(),
             0,
+            None,
         );
         run_clean_exit_monitor(handler).await;
         assert!(
@@ -1498,6 +1549,7 @@ mod tests {
                     "test_model".to_string(),
                     "1".to_string(),
                     0,
+                    None,
                 );
                 move |kind| {
                     *observed_c.lock().unwrap() = Some(kind);
@@ -1815,6 +1867,123 @@ mod tests {
             .with_label_values(labels)
             .get();
         assert_eq!(after, before + 1.0, "a failed respawn must be counted");
+    }
+
+    /// Stale-signal panic (audit 2026-08-20): a respawn signal carries a
+    /// worker_id valid only for the generation that produced it. After a
+    /// reload shrinks the worker count (config.yaml edited devices 2→1), the
+    /// queued stale signal reaches respawn_worker_inner, whose
+    /// `device_plan[worker_id as usize]` index is unchecked — an
+    /// out-of-range worker_id PANICS the serial respawn listener, silently
+    /// killing health-kill escalations and rolling recycles server-wide
+    /// (the channel then backs up and wedges every model's health checker).
+    /// An out-of-range worker_id must return Err, never panic.
+    #[tokio::test]
+    async fn respawn_with_out_of_range_worker_id_must_err_not_panic() {
+        let (wm, registry) = test_worker_manager();
+        let wm = std::sync::Arc::new(wm);
+        // One-worker generation: device_plan.len() == 1.
+        registry
+            .register(
+                "stale_m",
+                "1",
+                crate::config::ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("stale_m", "1").unwrap();
+
+        // worker_id 5 is valid for no generation of this model — the shape
+        // of a signal queued before a reload shrank the worker count.
+        let result = wm
+            .respawn_worker("stale_m", "1", 5, "health_check", false)
+            .await;
+        assert!(
+            result.is_err(),
+            "an out-of-range worker_id must fail the respawn, not panic the listener"
+        );
+    }
+
+    /// B5 (leak-gap-audit-0821): after a reap-timeout respawn the OLD worker
+    /// eventually dies and its load-time monitor fires a LATE exit event.
+    /// The replacement already occupies the slot — same shared ZMQ client,
+    /// same shared OutlierState, registry entry carrying the NEW pid. The
+    /// stale event must be discarded: fail_all would kill the replacement's
+    /// in-flight requests, mark_dead has no recovery path except another
+    /// respawn (permanent 503 NoLiveWorkers for single-worker versions,
+    /// since successful health probes never clear `dead`), and
+    /// mark_worker_stopped would flip the live replacement's entry.
+    #[tokio::test]
+    async fn late_exit_from_previous_slot_occupant_does_not_poison_replacement() {
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        // The replacement currently occupies slot 0 with pid 2222.
+        registry
+            .set_workers(
+                "m",
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: Some(2222),
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let outlier = Arc::new(crate::inference_queue::OutlierState::new(1));
+
+        // The OLD worker's load-time handler, created for pid 1111, fires late.
+        let handler = crash_exit_handler(
+            None,
+            Some(outlier.clone()),
+            registry.clone(),
+            "m".to_string(),
+            "1".to_string(),
+            0,
+            Some(1111),
+        );
+        handler(WorkerExitKind::Killed);
+
+        assert!(
+            !outlier.is_dead(0),
+            "a stale exit event must not mark the replacement's slot dead"
+        );
+        let workers = registry.get("m", Some("1")).unwrap().workers;
+        assert_eq!(
+            workers[0].status,
+            crate::registry::types::WorkerStatus::Ready,
+            "a stale exit event must not flip the replacement's registry entry"
+        );
+        assert_eq!(workers[0].pid, Some(2222), "the replacement's pid must stay");
+
+        // Sanity: the CURRENT occupant's own exit event still acts.
+        let outlier2 = Arc::new(crate::inference_queue::OutlierState::new(1));
+        let handler2 = crash_exit_handler(
+            None,
+            Some(outlier2.clone()),
+            registry.clone(),
+            "m".to_string(),
+            "1".to_string(),
+            0,
+            Some(2222),
+        );
+        handler2(WorkerExitKind::Crash);
+        assert!(
+            outlier2.is_dead(0),
+            "the current occupant's crash must still mark the slot dead"
+        );
     }
 
     /// Device-placement harness: an echo model whose `setup` appends the

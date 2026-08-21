@@ -92,29 +92,67 @@ pub(super) async fn auto_unpack_lma_files(
         // unpack can never leave a half-written model dir that
         // scan_repo_models would collect.
         let staging = repo_path.join(format!(".tmp-unpack-{}", uuid::Uuid::new_v4()));
-        let output = tokio::time::timeout(
-            unpack_timeout,
-            tokio::process::Command::new(crate::python::resolve_python_interpreter())
-                .args([
-                    "-m",
-                    "lite_server",
-                    "unpack",
-                    path.to_str().unwrap_or(""),
-                    "--to",
-                    staging.to_str().unwrap_or(""),
-                ])
-                .output(),
-        )
-        .await;
+        let child = tokio::process::Command::new(crate::python::resolve_python_interpreter())
+            .args([
+                "-m",
+                "lite_server",
+                "unpack",
+                path.to_str().unwrap_or(""),
+                "--to",
+                staging.to_str().unwrap_or(""),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let output = match child {
+            Ok(mut child) => {
+                // H1 parity with the upload path (files.rs wait_child_bounded):
+                // a hung unpack is KILLED AND REAPED — a bare timeout would
+                // drop the Child without killing it, orphaning a process that
+                // keeps extracting into the staging dir this arm deletes.
+                // Stdout/stderr drain concurrently with the wait so a chatty
+                // child cannot block on a full pipe.
+                let mut stdout_handle = child.stdout.take();
+                let mut stderr_handle = child.stderr.take();
+                let drain = async move {
+                    let mut out = Vec::new();
+                    let mut err = Vec::new();
+                    if let Some(mut h) = stdout_handle.take() {
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut h, &mut out).await;
+                    }
+                    if let Some(mut h) = stderr_handle.take() {
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut h, &mut err).await;
+                    }
+                    (out, err)
+                };
+                let wait_and_drain = async { tokio::join!(child.wait(), drain) };
+                match tokio::time::timeout(unpack_timeout, wait_and_drain).await {
+                    Ok((status, (stdout, stderr))) => Some(status.map(|status| {
+                        std::process::Output {
+                            status,
+                            stdout,
+                            stderr,
+                        }
+                    })),
+                    Err(_) => {
+                        warn!(
+                            "Unpack of .lma artifact {} timed out after {:?}; skipping",
+                            path.display(),
+                            unpack_timeout
+                        );
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        None
+                    }
+                }
+            }
+            Err(e) => Some(Err(e)),
+        };
 
         let output = match output {
-            Ok(o) => o,
-            Err(_) => {
-                warn!(
-                    "Unpack of .lma artifact {} timed out after {:?}; skipping",
-                    path.display(),
-                    unpack_timeout
-                );
+            Some(o) => o,
+            None => {
                 let _ = tokio::fs::remove_dir_all(&staging).await;
                 continue;
             }
@@ -325,6 +363,81 @@ pub(super) fn matches_patterns(filename: &str, patterns: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Orphaned unpack process (audit 2026-08-20): the .lma unpack timeout
+    /// drops the `.output()` future — and with it the Child — WITHOUT
+    /// killing it (no kill_on_drop, no child.kill(); contrast the upload
+    /// path's wait_child_bounded in http/handlers/files.rs, which kills and
+    /// reaps on timeout — H1). The orphaned `python -m lite_server unpack`
+    /// keeps extracting into the staging dir while the timeout arm deletes
+    /// that dir underneath it, then runs on indefinitely. A timed-out
+    /// unpack must kill + reap its child, like the upload path does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unpack_timeout_must_not_orphan_the_child_process() {
+        let repo = std::env::temp_dir().join(format!("lite-server-unpack-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("ghost_v1.lma"), b"not-a-real-archive").unwrap();
+
+        // Shim "python": hangs (a stuck unpack) ONLY for commands touching
+        // this test's unique repo dir; anything else passes through to the
+        // real interpreter, so concurrent tests that also resolve
+        // LITESERVER_PYTHON are unaffected by the env window. The unpack
+        // timeout below is 3s (not ~300ms) because a first exec of the shim
+        // can take several hundred ms under macOS exec-authorization.
+        let shim = repo.join("shim-python.sh");
+        let pidfile = repo.join("shim.pid");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\"{}\"*)\n    echo $$ > {}\n    exec sleep 300\n    ;;\nesac\nexec python3 \"$@\"\n",
+                repo.display(),
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("LITESERVER_PYTHON", &shim);
+        assert_eq!(
+            crate::python::resolve_python_interpreter(),
+            shim.to_string_lossy(),
+            "the env override must reach the resolver"
+        );
+        let mut seen = HashSet::new();
+        auto_unpack_lma_files(&repo, &mut seen, Duration::from_secs(3)).await;
+        std::env::remove_var("LITESERVER_PYTHON");
+        assert_eq!(seen.len(), 1, "the artifact must have been processed");
+
+        // Poll for the pidfile: the shim hangs until the timeout arm kills
+        // it, but its exec+echo may land just after the arm returns.
+        let mut pid_contents = None;
+        for _ in 0..30 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                pid_contents = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let pid: i32 = pid_contents
+            .expect("shim must have started and recorded its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            // Cleanup the demonstrated orphan regardless of the verdict.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+        assert!(
+            !alive,
+            "unpack shim pid {pid} survived the timeout: the dropped Child is never killed \
+             (an orphaned process racing the staging-dir delete)"
+        );
+    }
 
     #[test]
     fn test_matches_patterns() {

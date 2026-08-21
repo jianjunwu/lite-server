@@ -101,7 +101,7 @@ async fn h2_bidi_entry(
     let start = std::time::Instant::now();
     let mut label_version = version.clone().unwrap_or_default();
     let result = h2_bidi_entry_impl(
-        state,
+        state.clone(),
         model_name,
         version,
         headers,
@@ -112,9 +112,17 @@ async fn h2_bidi_entry(
     )
     .await;
     if let Err(e) = &result {
+        // A2 (leak-gap-audit-0821): raw labels only for a (model, version)
+        // that resolved to a registry entry — a never-registered pair records
+        // under the constant label (its series would otherwise be permanent).
+        let registered = state
+            .registry
+            .get(model_name, Some(&label_version))
+            .is_some();
+        let (m, v) = prometheus::reject_labels(registered, model_name, &label_version);
         prometheus::record_stream_rejected(
-            model_name,
-            &label_version,
+            m,
+            v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
             "early_reject",
