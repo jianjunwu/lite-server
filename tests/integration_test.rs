@@ -6629,6 +6629,149 @@ async fn worker_self_terminates_when_server_killed() {
     );
 }
 
+/// Send SIGINT to the server's main process (mirrors send_sigterm).
+#[cfg(unix)]
+fn send_sigint(child: &std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+}
+
+/// A model whose setup() sleeps far longer than any test window, so the
+/// server stays inside the model-loading phase of startup until signaled.
+#[cfg(unix)]
+fn slow_setup_model_repo(tag: &str) -> std::path::PathBuf {
+    let repo = std::env::temp_dir().join(format!("lite-server-{tag}-{}", std::process::id()));
+    let model_dir = repo.join("slow_m").join("1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        "import time\nfrom lite_server import LitAPI\nclass A(LitAPI):\n  def setup(self, d): time.sleep(120)\n  def decode_request(self, r): return r\n  def predict(self, x): return x\n  def encode_response(self, o): return o\n",
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    repo
+}
+
+/// Boot config that loads every repo model (control_mode "all") on three
+/// ephemeral ports.
+#[cfg(unix)]
+fn startup_signal_config(tag: &str, repo: &std::path::Path) -> (String, u16) {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-{tag}-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\norchestration:\n  control_mode: all\nmodel_repository:\n  path: {repo}\n",
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    (cfg.to_string_lossy().to_string(), http_port)
+}
+
+/// SIGINT while models are still loading must shut the server down cleanly.
+/// Before the main select! in run() nothing listened for signals: worker
+/// spawn + setup/warmup can take minutes (or wedge), and on the binary path
+/// Ctrl+C fell to the default action — an unclean kill with no worker
+/// reaping.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_during_model_load_exits_cleanly() {
+    let repo = slow_setup_model_repo("sigint-startup");
+    let (cfg_arg, _http_port) = startup_signal_config("sigint-startup", &repo);
+    let mut server = start_server(&["--config", &cfg_arg]);
+    let server_pid = server.id() as i32;
+
+    // Wait until the worker process exists: its setup() then sleeps 120s, so
+    // the server is deterministically inside load_initial_models.
+    wait_for_worker_pid(server_pid, "slow_m", 30)
+        .await
+        .expect("worker process not found — server never entered model load");
+
+    send_sigint(&server);
+    let exited = wait_for_exit(&mut server, 20).await;
+    if !exited {
+        stop_server(server);
+        panic!("SIGINT during startup must terminate the server within 20s");
+    }
+    let status = server.wait().unwrap();
+    assert!(
+        status.success(),
+        "startup SIGINT must be a graceful exit, got {status}"
+    );
+}
+
+/// Same startup signal, but through the Python-embedded path
+/// (`lite_server.serve`) — where a startup Ctrl+C was fully swallowed:
+/// CPython's SIGINT handler only sets a flag for KeyboardInterrupt, and the
+/// main thread is parked in thread.join() inside serve(), so the exception
+/// can never fire until startup completes on its own. Skipped when the Rust
+/// extension is not built (`maturin develop`), e.g. a bare cargo checkout.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_during_model_load_exits_cleanly_python_embedded() {
+    let probe = Command::new("python3")
+        .args(["-c", "from lite_server import serve; assert serve is not None"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match probe {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("skipping: lite_server extension not built (maturin develop)");
+            return;
+        }
+    }
+
+    let repo = slow_setup_model_repo("sigint-startup-py");
+    let (cfg_arg, _http_port) = startup_signal_config("sigint-startup-py", &repo);
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c")
+        .arg(format!(
+            "from lite_server import serve; serve(config={cfg_arg:?})"
+        ))
+        .current_dir(project_root())
+        .env("PYTHONPATH", project_root().join("python"))
+        .env("LITESERVER_DIE_WITH_PARENT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut server = cmd.spawn().expect("failed to spawn embedded server");
+    let server_pid = server.id() as i32;
+
+    wait_for_worker_pid(server_pid, "slow_m", 30)
+        .await
+        .expect("worker process not found — server never entered model load");
+
+    send_sigint(&server);
+    let exited = wait_for_exit(&mut server, 20).await;
+    if !exited {
+        stop_server(server);
+        panic!(
+            "SIGINT during startup must terminate an embedded server within 20s \
+             (CPython defers KeyboardInterrupt until serve() returns)"
+        );
+    }
+}
+
 /// R4: in PRODUCTION (no LITESERVER_DIE_WITH_PARENT), a worker must still
 /// self-terminate when its server is SIGKILLed. The worker's parent-death watch
 /// must be on by default — not gated by the test-only env flag — or a hard

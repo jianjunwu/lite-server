@@ -284,7 +284,46 @@ impl LiteServer {
         // Load initial models; the returned seen_lma set is handed to the
         // reconcile task so .lma artifacts unpacked at startup are not
         // re-unpacked (i.e. overwritten) on the first reconcile tick.
-        let seen_lma = self.load_initial_models().await?;
+        //
+        // Race the load against shutdown: worker spawn + warmup can take
+        // minutes (or wedge on a broken model), and before the main select!
+        // below nothing listens for signals. On the Python-embedded path a
+        // startup Ctrl+C is otherwise swallowed entirely — CPython's SIGINT
+        // handler only sets a flag for KeyboardInterrupt, and the calling
+        // thread is parked in thread.join() inside serve(), so the exception
+        // can never fire until startup completes on its own. The signal
+        // future is pinned once and reused by the main select!, so there is
+        // no unlistened gap after the load completes.
+        let shutdown_sig = shutdown_signal();
+        tokio::pin!(shutdown_sig);
+        // Fan the programmatic-stop oneshot out to a watch so both the
+        // startup race and the main select! can observe it (a bare oneshot
+        // receiver can be awaited only once). The binary path passes no
+        // receiver, so no forwarder runs and the watch never fires (the
+        // sender is held to the end of run()).
+        let (stop_watch_tx, mut startup_stop_rx) = tokio::sync::watch::channel(());
+        let mut loop_stop_rx = stop_watch_tx.subscribe();
+        if let Some(rx) = shutdown_rx {
+            tokio::spawn(async move {
+                let _ = rx.await;
+                let _ = stop_watch_tx.send(());
+            });
+        }
+        let seen_lma = tokio::select! {
+            _ = &mut shutdown_sig => {
+                info!("shutdown signal received during startup; exiting before serving");
+                crate::telemetry::shutdown().await;
+                self.worker_manager.shutdown().await;
+                return Ok(());
+            }
+            _ = startup_stop_rx.changed() => {
+                info!("stop_server received during startup; exiting before serving");
+                crate::telemetry::shutdown().await;
+                self.worker_manager.shutdown().await;
+                return Ok(());
+            }
+            result = self.load_initial_models() => result?,
+        };
 
         // Fire ServerStart callbacks
         self.callback_runner.on_server_start(&ServerContext {
@@ -540,19 +579,8 @@ impl LiteServer {
         // the ZMQ client map in unload_version and lets the actors exit), then
         // return Err at the end.
         let mut startup_error: Option<AppError> = None;
-        // Programmatic stop: `stop_server()` (Python) signals this oneshot from
-        // another thread. Hoisted as `async move` — an inline block can't move
-        // `shutdown_rx` by value into the select! arm. `None` (binary path)
-        // never resolves.
-        let stop_fut = async move {
-            if let Some(rx) = shutdown_rx {
-                let _ = rx.await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
         let shutdown_reason = tokio::select! {
-            _ = stop_fut => "stop_server".to_string(),
+            _ = loop_stop_rx.changed() => "stop_server".to_string(),
             result = &mut http_handle => {
                 match result {
                     Ok(Ok(())) => "http_server_finished".to_string(),
@@ -593,7 +621,7 @@ impl LiteServer {
                     }
                 }
             }
-            _ = shutdown_signal() => "shutdown_signal".to_string(),
+            _ = &mut shutdown_sig => "shutdown_signal".to_string(),
             _ = parent_died(parent_pid), if die_with_parent => "parent_died".to_string(),
         };
 
