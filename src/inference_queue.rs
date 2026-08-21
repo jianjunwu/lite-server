@@ -365,6 +365,13 @@ impl OutlierState {
             .unwrap_or(false)
     }
 
+    /// Is the rolling-recycle concurrency ticket fully taken? Diagnostics
+    /// for a refused [`Self::claim_recycle`] (the one-shot "waiting for a
+    /// recycle ticket" log in `check_worker_budget`).
+    pub fn recycle_ticket_taken(&self) -> bool {
+        self.recycling_claims.load(Ordering::Relaxed) >= self.max_recycling
+    }
+
     /// Recycle failed (the replacement did not start): drop the claim and fall
     /// back to a plain force-ejection so the impairment stays visible to the
     /// status coordinator and the circuit's half-open probe keeps a recovery
@@ -1471,6 +1478,10 @@ fn update_worker_saturation(model_name: &str, version: &str, inflight: &[Arc<Ato
 struct WorkerBudget {
     count: AtomicUsize,
     threshold: usize, // 0 = disabled
+    /// One-shot guard for the "waiting for a recycle ticket" log: set on the
+    /// first ticket-exhausted claim refusal of a crossed episode, re-armed
+    /// when the claim finally lands (the budget resets).
+    waiting_logged: AtomicBool,
 }
 
 /// Build the per-slot budget table: one independently jittered threshold per
@@ -1484,6 +1495,7 @@ fn build_worker_budgets(
         .map(|_| WorkerBudget {
             count: AtomicUsize::new(0),
             threshold: compute_jittered_max_requests(max_requests, max_requests_jitter),
+            waiting_logged: AtomicBool::new(false),
         })
         .collect()
 }
@@ -1966,9 +1978,27 @@ fn check_worker_budget(
         return;
     }
     if !dispatch.outlier.claim_recycle(worker_idx) {
+        // Refused because a sibling holds the recycle ticket: log once per
+        // crossed episode (the swap makes the first refusal the winner;
+        // re-armed when the claim finally lands below) — the per-completion
+        // retry would otherwise flood the log. Refusals with their own
+        // recovery path (already recycling / ejected / dead) stay silent.
+        if !dispatch.outlier.is_recycling(worker_idx)
+            && !dispatch.outlier.is_ejected(worker_idx)
+            && !dispatch.outlier.is_dead(worker_idx)
+            && dispatch.outlier.recycle_ticket_taken()
+            && !budget.waiting_logged.swap(true, Ordering::Relaxed)
+        {
+            info!(
+                model = %dispatch.model_name, version = %dispatch.version, worker_idx,
+                "Worker crossed max_requests; waiting for a recycle ticket \
+                 (recycle_max_percent cap reached)"
+            );
+        }
         return;
     }
     budget.count.store(0, Ordering::Relaxed);
+    budget.waiting_logged.store(false, Ordering::Relaxed);
     info!(
         model = %dispatch.model_name, version = %dispatch.version, worker_idx,
         threshold = budget.threshold,
@@ -3943,6 +3973,7 @@ mod tests {
                 .map(|&t| WorkerBudget {
                     count: AtomicUsize::new(0),
                     threshold: t,
+                    waiting_logged: AtomicBool::new(false),
                 })
                 .collect(),
             recycle_drain_timeout: Duration::from_millis(100),
@@ -4110,6 +4141,49 @@ mod tests {
             3,
             "a refused claim must not discard the crossed budget"
         );
+    }
+
+    #[tokio::test]
+    async fn should_log_once_when_waiting_for_recycle_ticket() {
+        let (tx, _rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("waitlog", 2, &[2, 2], Some(tx));
+
+        check_worker_budget(&dispatch, &inflight, 0, 2); // slot 0 takes the only ticket
+        assert!(outlier.is_recycling(0));
+
+        // Slot 1 crosses: the ticket-exhausted refusal logs once...
+        let c = crate::test_tracing::event_counts(|| {
+            check_worker_budget(&dispatch, &inflight, 1, 2);
+        });
+        assert_eq!(c.info, 1, "the first ticket-exhausted refusal must log");
+        // ...and the per-completion retries stay silent.
+        let c = crate::test_tracing::event_counts(|| {
+            check_worker_budget(&dispatch, &inflight, 1, 2);
+        });
+        assert_eq!(c.info, 0, "retries must not flood the log");
+
+        // The ticket relays to slot 1; when slot 0 later crosses and waits
+        // on it, the one-shot guard is re-armed and logs again.
+        outlier.reset(0);
+        check_worker_budget(&dispatch, &inflight, 1, 1); // retry: claim lands
+        assert!(outlier.is_recycling(1));
+        let c = crate::test_tracing::event_counts(|| {
+            check_worker_budget(&dispatch, &inflight, 0, 2);
+        });
+        assert_eq!(c.info, 1, "a new waiting episode must log again");
+    }
+
+    #[tokio::test]
+    async fn should_not_log_ticket_wait_when_refused_for_other_reasons() {
+        let (tx, _rx) = mpsc::channel::<RespawnSignal>(8);
+        let (dispatch, outlier, inflight) = budget_dispatch("nowait", 2, &[2, 2], Some(tx));
+        // Slot 1 is ejected for a health reason while the ticket is FREE:
+        // its refused claim is not ticket-waiting and must stay silent.
+        eject(&outlier, 1);
+        let c = crate::test_tracing::event_counts(|| {
+            check_worker_budget(&dispatch, &inflight, 1, 2);
+        });
+        assert_eq!(c.info, 0, "an ejected slot is not waiting on the ticket");
     }
 
     // ===== Recycling claim (recycle/eject separation) tests =====
