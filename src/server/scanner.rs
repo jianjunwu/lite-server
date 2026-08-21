@@ -375,7 +375,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unpack_timeout_must_not_orphan_the_child_process() {
-        let repo = std::env::temp_dir().join(format!("lite-server-unpack-orphan-{}", std::process::id()));
+        // Unique per run: LITESERVER_PYTHON is process-global, so parallel
+        // tests resolving the interpreter land on THIS shim while the env
+        // window is open (the passthrough keeps them correct). A shared
+        // path would let one run's start-of-test delete break another
+        // run's in-flight exec.
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-unpack-orphan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("ghost_v1.lma"), b"not-a-real-archive").unwrap();
@@ -431,7 +443,12 @@ mod tests {
             // Cleanup the demonstrated orphan regardless of the verdict.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        let _ = std::fs::remove_dir_all(&repo);
+        // Do NOT delete the shim dir: a parallel test that resolved
+        // LITESERVER_PYTHON during the env window may not have exec'd yet —
+        // deleting the file turns its (correct, passthrough) spawn into
+        // "No such file or directory" (the test_default_startup_is_serial
+        // flake). The unique path leaves no cross-run state behind; the OS
+        // reaps the temp dir.
         assert!(
             !alive,
             "unpack shim pid {pid} survived the timeout: the dropped Child is never killed \
