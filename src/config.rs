@@ -1681,6 +1681,7 @@ pub struct CliOverrides {
     pub no_streaming_metrics: bool,
     pub graceful_timeout: Option<f32>,
     pub keepalive_timeout: Option<f32>,
+    pub shutdown_stream_grace_ms: Option<u32>,
     /// Per-model tunables overridden via CLI flags.
     pub tunables: ModelTunables,
 }
@@ -1736,6 +1737,9 @@ impl Config {
         }
         if let Some(t) = cli.keepalive_timeout {
             self.server.keepalive_timeout = t;
+        }
+        if let Some(ms) = cli.shutdown_stream_grace_ms {
+            self.server.shutdown_stream_grace_ms = ms;
         }
     }
 
@@ -2687,6 +2691,18 @@ mod tests {
         cfg.apply_overrides(&overrides);
 
         assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_apply_overrides_shutdown_stream_grace_ms() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            shutdown_stream_grace_ms: Some(0),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.server.shutdown_stream_grace_ms, 0);
     }
 
     // --- Model defaults ---

@@ -586,6 +586,7 @@ lite-server serve [参数]
 | `--threads` | Tokio 工作线程数 | `server.threads` |
 | `--metrics-port` | 指标端口 | `server.metrics_port` |
 | `--graceful-timeout` | 优雅关闭超时 | `server.graceful_timeout` |
+| `--shutdown-stream-grace-ms` | 停机取消后流的收尾宽限（毫秒） | `server.shutdown_stream_grace_ms` |
 | `--keepalive-timeout` | HTTP keep-alive 超时 | `server.keepalive_timeout` |
 | `--ejection-error-threshold` | 剔除 worker 的错误次数（0=禁用） | `model_defaults.ejection_error_threshold` |
 | `--ejection-timeout` | 熔断基础退避（秒） | `model_defaults.ejection_timeout` |

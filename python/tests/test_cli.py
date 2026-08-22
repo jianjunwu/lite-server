@@ -748,6 +748,14 @@ class TestServeArgs:
         captured = capsys.readouterr()
         assert "--health-check-interval" in captured.out
 
+    def test_serve_help_includes_shutdown_stream_grace_ms(self, capsys):
+        """--shutdown-stream-grace-ms must be available (grace vs drain-window validation)."""
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["serve", "--help"])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--shutdown-stream-grace-ms" in captured.out
+
     def test_cmd_serve_forwards_correct_kwargs(self, monkeypatch):
         """_cmd_serve must forward exactly the params Rust serve() accepts."""
         called_with = {}
@@ -777,6 +785,7 @@ class TestServeArgs:
             "max_requests_jitter": 50,
             "request_timeout": 30.0,
             "graceful_timeout": 60.0,
+            "shutdown_stream_grace_ms": 0,
             "keepalive_timeout": 10.0,
             "metrics_port": 9090,
             "health_check_interval": 20.0,
@@ -803,6 +812,7 @@ class TestServeArgs:
         assert called_with["ejection_error_threshold"] == 5
         assert called_with["ejection_max_timeout"] == 30.0
         assert called_with["hook_http_timeout"] == 7.0
+        assert called_with["shutdown_stream_grace_ms"] == 0
         assert "transport" not in called_with
 
 

@@ -151,6 +151,12 @@ class TestServerYamlEnhanced:
         text = (root / "server.yaml").read_text()
         assert "graceful_timeout:" in text
 
+    def test_contains_shutdown_stream_grace_ms(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "shutdown_stream_grace_ms:" in text
+
     def test_contains_keepalive_timeout(self, tmp_path):
         gen = ProjectGenerator("p", tmp_path)
         root = gen.generate()

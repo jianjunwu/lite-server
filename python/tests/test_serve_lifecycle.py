@@ -52,6 +52,9 @@ def _serve_kwargs(port: int) -> dict:
         no_metrics=True,
         no_grpc=True,
         graceful_timeout=2.0,
+        # grace 2000ms default does not fit the 2s drain window (grace + 500ms
+        # margin >= window is rejected at config-check); backstop only here.
+        shutdown_stream_grace_ms=0,
         log_level="warn",
     )
 

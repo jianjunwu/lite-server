@@ -664,6 +664,7 @@ lite-server serve [flags]
 | `--threads` | Tokio worker threads | `server.threads` |
 | `--metrics-port` | Metrics port | `server.metrics_port` |
 | `--graceful-timeout` | Graceful shutdown timeout | `server.graceful_timeout` |
+| `--shutdown-stream-grace-ms` | Stream wrap-up budget after shutdown cancel (ms) | `server.shutdown_stream_grace_ms` |
 | `--keepalive-timeout` | HTTP keep-alive timeout | `server.keepalive_timeout` |
 | `--ejection-error-threshold` | Errors to eject a worker (0=disable) | `model_defaults.ejection_error_threshold` |
 | `--ejection-timeout` | Ejected worker base backoff (s) | `model_defaults.ejection_timeout` |

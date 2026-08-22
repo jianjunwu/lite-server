@@ -42,6 +42,7 @@ def main(argv=None):
     serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
     serve_parser.add_argument("--health-check-interval", type=float, help="Active health check interval in seconds (0=disabled)")
     serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")
+    serve_parser.add_argument("--shutdown-stream-grace-ms", type=int, help="Milliseconds a stream may finish wrap-up after the shutdown cancel (must fit inside graceful-timeout with 500ms margin)")
     serve_parser.add_argument("--threads", type=int, help="Number of Tokio worker threads (default: auto = CPU cores)")
     serve_parser.add_argument("--keepalive-timeout", type=float, help="HTTP keep-alive timeout in seconds (0=disabled)")
     # Worker resilience (§3)
@@ -403,6 +404,7 @@ def _cmd_serve(args):
             request_timeout=args.request_timeout,
             health_check_interval=args.health_check_interval,
             graceful_timeout=args.graceful_timeout,
+            shutdown_stream_grace_ms=args.shutdown_stream_grace_ms,
             keepalive_timeout=args.keepalive_timeout,
             ejection_error_threshold=args.ejection_error_threshold,
             ejection_timeout=args.ejection_timeout,

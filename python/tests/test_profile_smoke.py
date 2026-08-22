@@ -108,6 +108,8 @@ def live_server(tmp_path):
             metrics_port=metrics_port,
             no_grpc=True,
             graceful_timeout=2.0,
+            # Backstop only: default grace (2000ms) does not fit the 2s window.
+            shutdown_stream_grace_ms=0,
             log_level="warn",
         ),
         daemon=True,

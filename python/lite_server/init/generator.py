@@ -231,6 +231,9 @@ SERVER_YAML = textwrap.dedent("""\
       # threads: null               # Tokio worker threads (null = auto = CPU cores)
       # cache_registry: false       # Snapshot registry (strategy + active pins) on shutdown; restore on startup
       # graceful_timeout: 30.0      # Max seconds for graceful shutdown
+      # shutdown_stream_grace_ms: 2000  # Stream wrap-up budget after the shutdown
+      #                              # cancel; must fit inside graceful_timeout
+      #                              # with 500ms margin (0 = backstop only)
       # keepalive_timeout: 5.0      # HTTP keep-alive timeout; idle connections reaped
       #                              # after the window. 0 = disable (h1-only; TLS drops
       #                              # the h2 ALPN offer)

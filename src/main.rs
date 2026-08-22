@@ -152,6 +152,11 @@ enum Commands {
         #[arg(long)]
         graceful_timeout: Option<f32>,
 
+        /// Milliseconds a stream may finish its wrap-up after the shutdown cancel;
+        /// must fit inside graceful_timeout with 500ms margin (overrides server config)
+        #[arg(long)]
+        shutdown_stream_grace_ms: Option<u32>,
+
         /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive
         #[arg(long)]
         keepalive_timeout: Option<f32>,
@@ -203,6 +208,7 @@ fn main() {
             hook_http_timeout,
             graceful_timeout,
             keepalive_timeout,
+            shutdown_stream_grace_ms,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -234,6 +240,7 @@ fn main() {
                 no_streaming_metrics,
                 graceful_timeout,
                 keepalive_timeout,
+                shutdown_stream_grace_ms,
                 tunables: lite_server::config::ModelTunables {
                     max_queue_size,
                     max_requests,
