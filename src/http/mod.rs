@@ -691,7 +691,7 @@ async fn serve_unix(
         move |stream| {
             let app = app.clone();
             let server_config = server_config.clone();
-            tokio::spawn(async move {
+            async move {
                 crate::metrics::prometheus::record_http_connection_open("uds");
                 let io = TokioIo::new(stream);
                 let hyper_service = TowerToHyperService::new(app);
@@ -716,7 +716,7 @@ async fn serve_unix(
                     }
                 }
                 crate::metrics::prometheus::record_http_connection_close("uds");
-            });
+            }
         },
     )
     .await
@@ -938,8 +938,14 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
 /// connection handler so tests can inject error sequences without a
 /// failpoint. Transient accept errors sleep 50ms and retry (axum-server
 /// parity); fatal errors end the loop.
+///
+/// `handle_conn` returns the connection's future, which the loop spawns into
+/// a JoinSet — on shutdown the loop drains in-flight connections before
+/// returning (serve_tcp parity). Without the drain, a shutdown would return
+/// immediately and the server-wide teardown would stop workers underneath
+/// still-running connections (and abort the shutdown stream closer early).
 #[cfg(unix)]
-async fn accept_loop<A, Fut, H>(
+async fn accept_loop<A, Fut, H, CFut>(
     mut next_accept: A,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     mut handle_conn: H,
@@ -947,13 +953,20 @@ async fn accept_loop<A, Fut, H>(
 where
     A: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<tokio::net::UnixStream>>,
-    H: FnMut(tokio::net::UnixStream),
+    H: FnMut(tokio::net::UnixStream) -> CFut,
+    CFut: std::future::Future<Output = ()> + Send + 'static,
 {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             result = next_accept() => {
                 match result {
-                    Ok(stream) => handle_conn(stream),
+                    Ok(stream) => {
+                        connections.spawn(handle_conn(stream));
+                        // L1 parity with serve_tcp: reap completed connection
+                        // tasks so their JoinHandles don't accumulate.
+                        while connections.try_join_next().is_some() {}
+                    }
                     Err(e) if is_transient_accept_error(&e) => {
                         tracing::warn!(error = %e, "transient accept error; retrying");
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -962,7 +975,11 @@ where
                 }
             }
             _ = &mut shutdown_rx => {
-                info!("Unix socket server received shutdown signal");
+                info!(
+                    "Unix socket server received shutdown signal; draining {} connection(s)",
+                    connections.len()
+                );
+                while connections.join_next().await.is_some() {}
                 break;
             }
         }
@@ -1060,7 +1077,7 @@ mod tests {
                 Err::<tokio::net::UnixStream, _>(std::io::Error::from_raw_os_error(libc::EMFILE))
             },
             rx,
-            |_| {},
+            |_| async {},
         ));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
@@ -1085,10 +1102,73 @@ mod tests {
                 Err::<tokio::net::UnixStream, _>(std::io::Error::from_raw_os_error(libc::EPERM))
             },
             rx,
-            |_| {},
+            |_| async {},
         )
         .await;
         assert!(result.is_err(), "non-transient accept error must be fatal");
+    }
+
+    /// On shutdown the UDS accept loop must drain in-flight connections
+    /// (serve_tcp parity) instead of abandoning them: it returns only after
+    /// every open connection's task has finished.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_shutdown_drains_in_flight_connections() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (conn_started_tx, conn_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let mut first_accept = true;
+        let mut conn_started_tx = Some(conn_started_tx);
+        let mut release_rx = Some(release_rx);
+        let loop_handle = tokio::spawn(accept_loop(
+            move || {
+                // Accept one real stream, then never again.
+                let pair = if first_accept {
+                    first_accept = false;
+                    Some(tokio::net::UnixStream::pair().unwrap())
+                } else {
+                    None
+                };
+                async move {
+                    match pair {
+                        Some((a, _b)) => Ok::<_, std::io::Error>(a),
+                        None => {
+                            std::future::pending::<std::io::Result<tokio::net::UnixStream>>().await
+                        }
+                    }
+                }
+            },
+            shutdown_rx,
+            move |_stream| {
+                let started = conn_started_tx.take();
+                let release = release_rx.take();
+                async move {
+                    if let Some(tx) = started {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release {
+                        let _ = rx.await;
+                    }
+                }
+            },
+        ));
+
+        // The connection task is running; shutdown must NOT complete while
+        // the connection is still open.
+        conn_started_rx.await.expect("connection task started");
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !loop_handle.is_finished(),
+            "the accept loop must drain in-flight connections, not abandon them"
+        );
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), loop_handle)
+            .await
+            .expect("accept loop finishes once the connection closes")
+            .expect("accept loop task must not panic")
+            .expect("accept loop returns cleanly");
     }
 
     #[tokio::test]

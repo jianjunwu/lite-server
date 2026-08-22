@@ -12084,8 +12084,7 @@ class ShutdownSlowAPI(LitAPI):
 /// control_mode "all" loads both at boot. Returns (config_path, http_port,
 /// metrics_port).
 #[cfg(unix)]
-fn shutdown_stream_server(tag: &str, graceful_timeout: f32, grace_ms: u32) -> (String, u16, u16) {
-    let repo = std::env::temp_dir().join(format!("lite-server-{tag}-{}", std::process::id()));
+fn write_shutdown_stream_models(repo: &std::path::Path) {
     let write_model = |name: &str, py: &str| {
         let dir = repo.join(name).join("1");
         std::fs::create_dir_all(&dir).unwrap();
@@ -12098,6 +12097,12 @@ fn shutdown_stream_server(tag: &str, graceful_timeout: f32, grace_ms: u32) -> (S
     };
     write_model("shutdown_grace", G_GRACE_PY);
     write_model("shutdown_slow", SHUTDOWN_SLOW_PY);
+}
+
+#[cfg(unix)]
+fn shutdown_stream_server(tag: &str, graceful_timeout: f32, grace_ms: u32) -> (String, u16, u16) {
+    let repo = std::env::temp_dir().join(format!("lite-server-{tag}-{}", std::process::id()));
+    write_shutdown_stream_models(&repo);
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
@@ -12118,6 +12123,147 @@ fn shutdown_stream_server(tag: &str, graceful_timeout: f32, grace_ms: u32) -> (S
     )
     .unwrap();
     (cfg.to_string_lossy().to_string(), http_port, metrics_port)
+}
+
+/// UDS variant of [`shutdown_stream_server`]: the HTTP server binds a Unix
+/// socket (`server.host: unix:<path>`); metrics and gRPC are off.
+#[cfg(unix)]
+fn shutdown_stream_server_uds(
+    tag: &str,
+    sock: &str,
+    graceful_timeout: f32,
+    grace_ms: u32,
+) -> String {
+    let repo = std::env::temp_dir().join(format!("lite-server-{tag}-{}", std::process::id()));
+    write_shutdown_stream_models(&repo);
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-{tag}-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "server:\n  host: unix:{sock}\n  log_level: warn\n  graceful_timeout: {graceful_timeout}\n  shutdown_stream_grace_ms: {grace_ms}\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\norchestration:\n  control_mode: all\nmodel_repository:\n  path: {repo}\n",
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    cfg.to_string_lossy().to_string()
+}
+
+/// POST an SSE request over a Unix socket via curl (reqwest has no UDS
+/// client). Returns a task collecting the full body plus a receiver that
+/// fires when the first `data:` chunk arrives.
+#[cfg(unix)]
+fn uds_sse_post(
+    sock: &str,
+    uri: &str,
+    body: &str,
+) -> (
+    tokio::task::JoinHandle<String>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut child = tokio::process::Command::new("curl")
+        .args([
+            "--unix-socket",
+            sock,
+            "-N",
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "content-type: application/json",
+            "-d",
+            body,
+            &format!("http://localhost{uri}"),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("curl must spawn");
+    let stdout = child.stdout.take().unwrap();
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut out = String::new();
+        let mut lines = BufReader::new(stdout).lines();
+        let mut first_tx = Some(first_tx);
+        while let Ok(Some(line)) = lines.next_line().await {
+            out.push_str(&line);
+            out.push('\n');
+            if line.starts_with("data:") {
+                if let Some(tx) = first_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let _ = child.wait().await;
+        out
+    });
+    (handle, first_rx)
+}
+
+/// UDS parity: the negotiated stream close also works over a Unix socket.
+/// The UDS accept loop must drain in-flight connections on shutdown
+/// (previously it abandoned them, which also killed the shutdown stream
+/// closer before it could fire).
+#[cfg(unix)]
+#[tokio::test]
+async fn uds_sigterm_grace_closes_in_flight_stream_with_done() {
+    let sock = unique_uds_path("http-shutdown-grace");
+    let cfg = shutdown_stream_server_uds("uds-shutdown-grace", &sock, 6.0, 2000);
+    let mut server = start_server(&["--config", &cfg]);
+
+    // Wait for the socket to accept connections.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(_) => break,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("UDS never came up at {sock}: {e}"),
+        }
+    }
+
+    let (body_task, first_rx) = uds_sse_post(
+        &sock,
+        "/v2/models/shutdown_grace/decoupled",
+        r#"{"input": 1}"#,
+    );
+    tokio::time::timeout(Duration::from_secs(10), first_rx)
+        .await
+        .expect("first SSE chunk arrives")
+        .unwrap();
+
+    send_sigterm(&server);
+
+    let body = tokio::time::timeout(Duration::from_secs(30), body_task)
+        .await
+        .expect("stream closes within the drain window")
+        .unwrap();
+    assert!(
+        body.contains("\"final\": true") || body.contains("\"final\":true"),
+        "the model's wrap-up chunk must reach the client: {body}"
+    );
+    assert!(
+        body.contains("[DONE]"),
+        "a cooperative model ends the stream with a normal [DONE]: {body}"
+    );
+    assert!(
+        !body.contains("server shutting down"),
+        "a cooperative close must NOT surface the eviction error: {body}"
+    );
+
+    let exited = wait_for_exit(&mut server, 25).await;
+    if !exited {
+        stop_server(server);
+        panic!("server must exit within 25s of SIGTERM");
+    }
+    assert!(
+        server.wait().unwrap().success(),
+        "UDS shutdown after a grace-closed stream must be a clean exit"
+    );
 }
 
 /// A long decoupled stream crossing a server shutdown must close like it
