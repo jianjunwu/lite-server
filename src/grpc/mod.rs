@@ -1747,6 +1747,7 @@ mod request_metrics_tests {
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
                 is_warmup: false,
+                queue_depth_guard: None,
             })
             .unwrap();
 

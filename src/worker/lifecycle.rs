@@ -1300,6 +1300,7 @@ impl WorkerManager {
             inflight_guard: None,
             enqueued_at: std::time::Instant::now(),
             is_warmup: true,
+            queue_depth_guard: None,
         };
         if let Err(e) = self.inference_queue.try_submit(model_name, version, item) {
             // Keep the QueueError detail (full / invalid pin / no live

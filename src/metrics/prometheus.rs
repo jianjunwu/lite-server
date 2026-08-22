@@ -941,8 +941,24 @@ pub fn inc_queue_depth(model: &str, version: &str) {
 }
 
 pub fn dec_queue_depth(model: &str, version: &str) {
-    QUEUE_DEPTH.with_label_values(&[model, version]).dec();
+    let g = QUEUE_DEPTH.with_label_values(&[model, version]);
+    g.dec();
+    floor_gauge_at_zero(&g);
     mirror_gie_queued(model, version, -1.0);
+}
+
+/// Late-dec self-heal (audit 2026-08-22 B5): after remove_version_metrics
+/// purges a series, a late paired dec (e.g. a detached send_batch task's
+/// InflightGuard dropping post-unload) would otherwise resurrect the series
+/// at -1 — and the next load of the same version would start the gauge at
+/// -N. The race is inherent (the purge cannot wait for tasks it cannot
+/// see), so the result is healed instead: a gauge never stays negative.
+/// The read-modify-write window can miss a clamp under extreme concurrency;
+/// the next dec catches it — a gauge is an observation, not a ledger.
+fn floor_gauge_at_zero(g: &prometheus::Gauge) {
+    if g.get() < 0.0 {
+        g.set(0.0);
+    }
 }
 
 /// GIE TotalQueuedRequests 镜像（构造上与 liteserver_queue_depth 同步，无双写
@@ -952,7 +968,9 @@ fn mirror_gie_queued(model: &str, version: &str, delta: f64) {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for g in guard.values() {
-        g.with_label_values(&[model, version]).add(delta);
+        let gauge = g.with_label_values(&[model, version]);
+        gauge.add(delta);
+        floor_gauge_at_zero(&gauge);
     }
 }
 
@@ -974,7 +992,9 @@ pub fn inc_in_flight(model: &str, version: &str) {
 }
 
 pub fn dec_in_flight(model: &str, version: &str) {
-    IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).dec();
+    let g = IN_FLIGHT_REQUESTS.with_label_values(&[model, version]);
+    g.dec();
+    floor_gauge_at_zero(&g);
 }
 
 // ===== Model metrics =====
@@ -2438,6 +2458,32 @@ mod tests {
         assert_eq!(after, before - 1.0, "dec_queue_depth should decrement gauge by 1");
     }
 
+    /// Audit (2026-08-22, resource-leak/observability sweep): a `dec` that
+    /// lands AFTER `remove_version_metrics` has purged the series must not
+    /// resurrect it at -1. Trigger: unload grace times out with requests in
+    /// flight (lifecycle.rs warns "unloading anyway"), `drain.abort()` kills
+    /// the collector, the purge runs, and a detached `send_batch_with_retry`
+    /// task completes afterwards — its `InflightGuard::drop` calls
+    /// `dec_in_flight` on the purged labels, and `with_label_values`
+    /// recreates the series just to drive it negative. The next load of the
+    /// same version then starts the gauge at -N.
+    #[test]
+    fn late_dec_after_purge_must_not_drive_gauge_negative() {
+        // The purge enumerates series via REGISTRY.gather(), so the metric
+        // family must be registered for the purge to act (production always
+        // registers at startup; ignore AlreadyReg from a parallel test).
+        let _ = register_metrics();
+        let (model, version) = ("late_dec_purge", "1");
+        inc_in_flight(model, version);
+        remove_version_metrics(model, version);
+        dec_in_flight(model, version);
+        assert_eq!(
+            IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).get(),
+            0.0,
+            "a dec arriving after the purge must be a no-op, not resurrect the series at -1"
+        );
+    }
+
     #[test]
     fn test_inc_dec_queue_depth_net_zero() {
         let model = "qd_balance";
@@ -2455,17 +2501,17 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_depth_goes_negative_on_extra_dec() {
-        // This test documents the bug: calling dec more times than inc
-        // causes the gauge to go negative. The fix ensures inc/dec are
-        // always called symmetrically in inference_queue.rs.
+    fn test_queue_depth_floored_at_zero_on_extra_dec() {
+        // An unpaired dec (e.g. a late dec after remove_version_metrics
+        // purged the series) must not drive the gauge negative — the floor
+        // heals the inherent purge/late-dec race (see floor_gauge_at_zero).
         let model = "qd_negative";
         let version = "1";
         inc_queue_depth(model, version); // +1
         dec_queue_depth(model, version); // 0
-        dec_queue_depth(model, version); // -1 (extra dec, e.g. from retry)
+        dec_queue_depth(model, version); // extra dec, floored at 0
         let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
-        assert!(value < 0.0, "extra dec should produce negative value, got {}", value);
+        assert_eq!(value, 0.0, "extra dec must be floored at zero, got {}", value);
     }
 
     // ===== Audit: B3 — mutex poisoning in record_worker_metrics =====

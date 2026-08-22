@@ -66,6 +66,34 @@ pub struct QueueItem {
     /// series that exist to expose first-request spikes on real traffic.
     /// Process-internal bookkeeping — never crosses the wire.
     pub is_warmup: bool,
+    /// Collector-side queue-depth count, created when the collector takes
+    /// the item off the channel. Dropped (→ dec) at dispatch start, or with
+    /// the item on any early exit — including the collector's `batch` Vec
+    /// being dropped by an abort, which used to leak the gauge.
+    pub queue_depth_guard: Option<QueueDepthGuard>,
+}
+
+/// RAII pair for the collector's dequeue-side queue-depth count
+/// (`liteserver_queue_depth`): construction increments, drop decrements.
+/// Every exit shape — dispatch (taken at send_batch start), queue-timeout
+/// reject, waiter-gone drop, collector abort with buffered items — releases
+/// the count with no call-site bookkeeping ([`InflightGuard`] parity).
+pub struct QueueDepthGuard {
+    model: String,
+    version: String,
+}
+
+impl QueueDepthGuard {
+    fn new(model: &str, version: &str) -> Self {
+        prometheus::inc_queue_depth(model, version);
+        Self { model: model.to_string(), version: version.to_string() }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        prometheus::dec_queue_depth(&self.model, &self.version);
+    }
 }
 
 /// Decrements the per-version in-flight counter and the
@@ -814,21 +842,17 @@ fn reject_queue_timeout(item: QueueItem) {
 
 /// If queue-timeout REJECT is armed and `item` has waited past the deadline,
 /// reject it and return `None`; otherwise return `Some(item)`.
-/// M4: the reject path pairs the collector's dequeue-side
-/// `inc_queue_depth` — the only other dec lives in `send_batch_with_retry`,
-/// which a rejected item never reaches.
+/// M4: the reject path releases the item's [`QueueDepthGuard`] with it (the
+/// item never reaches the dispatch point, the only other release).
 fn check_queue_timeout(
     item: QueueItem,
     queue_timeout: Duration,
     action: crate::config::QueueTimeoutAction,
-    model: &str,
-    version: &str,
 ) -> Option<QueueItem> {
     if queue_timeout > Duration::ZERO
         && action == crate::config::QueueTimeoutAction::Reject
         && item.enqueued_at.elapsed() > queue_timeout
     {
-        prometheus::dec_queue_depth(model, version);
         reject_queue_timeout(item);
         None
     } else {
@@ -842,12 +866,11 @@ fn check_queue_timeout(
 /// and a batch slot for a result nobody can receive: the same
 /// "no compute for dead clients" contract the B2 CbRemove sweep enforces on
 /// the ZMQ side. `queue_timeout=Reject` measures enqueue AGE, so any client
-/// deadline shorter than it is only caught here. The dec pairs the
-/// collector's dequeue-side `inc_queue_depth`, same as check_queue_timeout.
-fn drop_if_waiter_gone(item: QueueItem, model: &str, version: &str) -> Option<QueueItem> {
+/// deadline shorter than it is only caught here. Dropping the item releases
+/// its [`QueueDepthGuard`], same as check_queue_timeout.
+fn drop_if_waiter_gone(item: QueueItem) -> Option<QueueItem> {
     if item.response_tx.is_closed() {
         debug!(uid = %item.uid, "dropping queued item: waiter already gone");
-        prometheus::dec_queue_depth(model, version);
         None
     } else {
         Some(item)
@@ -2128,9 +2151,10 @@ async fn send_batch_with_retry(
     // batch is homogeneous and this check is exact.
     let all_warmup = batch.iter().all(|i| i.is_warmup);
 
-    // Decrement queue depth once per item — retries must not decrement again
-    for _ in 0..batch.len() {
-        prometheus::dec_queue_depth(model_name, version);
+    // Decrement queue depth once per item at dispatch start — retries must
+    // not decrement again (the guard is taken, so a later drop is a no-op).
+    for item in &mut batch {
+        item.queue_depth_guard.take();
     }
     // P2-1 扩缩指标：提交 → 首次派发（含攒批等待）采样一次；重试不重复采样。
     if !all_warmup {
@@ -2401,18 +2425,17 @@ async fn batch_collector(
 
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
-        while let Some(item) = rx.recv().await {
-            prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
+        while let Some(mut item) = rx.recv().await {
+            item.queue_depth_guard =
+                Some(QueueDepthGuard::new(&dispatch.model_name, &dispatch.version));
             let Some(item) = check_queue_timeout(
                 item,
                 queue_timeout,
                 queue_timeout_action,
-                &dispatch.model_name,
-                &dispatch.version,
             ) else {
                 continue;
             };
-            let Some(item) = drop_if_waiter_gone(item, &dispatch.model_name, &dispatch.version)
+            let Some(item) = drop_if_waiter_gone(item)
             else {
                 continue;
             };
@@ -2432,19 +2455,18 @@ async fn batch_collector(
     loop {
         tokio::select! {
             biased;
-            Some(item) = rx.recv() => {
-                prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
+            Some(mut item) = rx.recv() => {
+                item.queue_depth_guard =
+                    Some(QueueDepthGuard::new(&dispatch.model_name, &dispatch.version));
                 let Some(item) = check_queue_timeout(
                     item,
                     queue_timeout,
                     queue_timeout_action,
-                    &dispatch.model_name,
-                    &dispatch.version,
                 ) else {
                     continue;
                 };
                 let Some(item) =
-                    drop_if_waiter_gone(item, &dispatch.model_name, &dispatch.version)
+                    drop_if_waiter_gone(item)
                 else {
                     continue;
                 };
@@ -2828,6 +2850,7 @@ mod tests {
             inflight_guard: None,
             enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         (item, rx)
     }
@@ -3344,6 +3367,7 @@ mod tests {
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
                 is_warmup: false,
+                queue_depth_guard: None,
             })
             .unwrap();
 
@@ -3359,6 +3383,7 @@ mod tests {
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
                 is_warmup: false,
+                queue_depth_guard: None,
             })
             .unwrap_err();
         assert!(matches!(err, QueueError::NotFound));
@@ -3442,6 +3467,7 @@ mod tests {
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         // Bytes::clone shares the same underlying buffer
         let cloned_data = item.data.clone();
@@ -3504,6 +3530,7 @@ mod tests {
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
 
         // Cloning the item's data is zero-copy
@@ -3549,6 +3576,7 @@ mod tests {
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         tx.try_send(item, 0).unwrap();
 
@@ -3654,6 +3682,7 @@ mod tests {
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         // Cloning meta should be a refcount bump, not a deep copy
         let meta_clone = item.meta.clone();
@@ -5379,6 +5408,7 @@ mod tests {
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
                 is_warmup: false,
+                queue_depth_guard: None,
             })
             .unwrap();
 
@@ -5491,9 +5521,63 @@ mod tests {
                 inflight_guard: None,
                 enqueued_at: Instant::now(),
                 is_warmup: false,
+                queue_depth_guard: None,
             })
             .unwrap();
         resp_rx
+    }
+
+    /// Audit (2026-08-22, resource-leak/observability sweep): aborting the
+    /// collector (register_model's stale-abort on reload, DrainHandle::abort
+    /// on unload-grace timeout) drops items that were already dequeued —
+    /// `inc_queue_depth` ran at recv — but never dispatched, so no
+    /// `dec_queue_depth` pairs them. On the reload path no
+    /// `remove_version_metrics` purge follows, so the gauge leaks +N
+    /// permanently (and the waiters see a bare channel-closed instead of an
+    /// error response).
+    #[tokio::test]
+    async fn collector_abort_must_release_queue_depth_of_buffered_items() {
+        let model = "cab_gauge";
+        let endpoint = drain_test_endpoint(model);
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 4, // batching: items park in the collector's Vec
+            batch_timeout: 60.0, // never fires during the test
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let outlier = Arc::new(OutlierState::new(1));
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        queue.register_model(model, "1", &config, vec![], vec![client], outlier, None);
+
+        let gauge = prometheus::QUEUE_DEPTH.with_label_values(&[model, "1"]);
+        // The receivers must stay alive, or drop_if_waiter_gone reaps the
+        // items (and pairs the gauge) before the abort.
+        let _r1 = submit_one(&queue, model, "cab-1");
+        let _r2 = submit_one(&queue, model, "cab-2");
+        // Wait until the collector has dequeued both (inc happens at recv).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while gauge.get() < 2.0 {
+            assert!(Instant::now() < deadline, "collector never dequeued the items");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Reload path: a same-key register_model aborts the stale collector
+        // with both items still buffered.
+        let outlier2 = Arc::new(OutlierState::new(1));
+        let client2 = Arc::new(WorkerZmqClient::new(drain_test_endpoint("cab_gauge2")));
+        queue.register_model(model, "1", &config, vec![], vec![client2], outlier2, None);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            gauge.get(),
+            0.0,
+            "buffered items dropped by the collector abort leaked queue_depth"
+        );
     }
 
     #[tokio::test]
@@ -5565,6 +5649,7 @@ mod tests {
             inflight_guard: None,
             enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         }
     }
 
@@ -5633,6 +5718,7 @@ mod tests {
                 .checked_sub(ago)
                 .unwrap_or_else(Instant::now),
             is_warmup: false,
+            queue_depth_guard: None,
         }
     }
 
@@ -5649,13 +5735,12 @@ mod tests {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap(),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         let opt = check_queue_timeout(
             item,
             Duration::from_millis(100),
             crate::config::QueueTimeoutAction::Reject,
-            "b1_m",
-            "1",
         );
         assert!(opt.is_none(), "expired item must be rejected");
         let resp = response_rx.await.unwrap();
@@ -5673,8 +5758,6 @@ mod tests {
             enqueued_ago("ok", Duration::ZERO),
             Duration::from_secs(10),
             crate::config::QueueTimeoutAction::Reject,
-            "b1_m",
-            "1",
         );
         assert!(opt.is_some(), "fresh item must not be rejected");
     }
@@ -5685,8 +5768,6 @@ mod tests {
             enqueued_ago("late", Duration::from_secs(5)),
             Duration::from_millis(100),
             crate::config::QueueTimeoutAction::Delay,
-            "b1_m",
-            "1",
         );
         assert!(opt.is_some(), "Delay action must not reject even when expired");
     }
@@ -5697,8 +5778,6 @@ mod tests {
             enqueued_ago("late", Duration::from_secs(5)),
             Duration::ZERO,
             crate::config::QueueTimeoutAction::Reject,
-            "b1_m",
-            "1",
         );
         assert!(opt.is_some(), "queue_timeout=0 must not reject");
     }
@@ -5823,6 +5902,7 @@ mod tests {
             // dequeues it — the reject path fires.
             enqueued_at: Instant::now() - Duration::from_secs(1),
             is_warmup: false,
+            queue_depth_guard: None,
         };
         tx.try_send(item, 0).unwrap();
         let collector = tokio::spawn(batch_collector(rx, tunables, dispatch, vec![
@@ -6141,6 +6221,7 @@ mod tests {
                     inflight_guard: None,
                     enqueued_at: Instant::now(),
                     is_warmup,
+                    queue_depth_guard: None,
                 }];
                 send_batch_with_retry(
                     batch,
@@ -6275,6 +6356,7 @@ mod tests {
             inflight_guard: None,
             enqueued_at: Instant::now(),
             is_warmup: false,
+            queue_depth_guard: None,
         }];
         let err = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
             .await
