@@ -4147,3 +4147,45 @@ async fn chain_consumer_keeps_head_handle_when_consumer_bails() {
         "a consumer-side bail must keep the live head's handle cancel-able"
     );
 }
+
+/// Audit (2026-08-22, resource-leak/observability sweep): cancel_chain does
+/// `chain.lock().unwrap()` — a poisoned chain_handles mutex (any consumer
+/// panicking while holding the lock) makes the teardown itself panic, so
+/// the worker-stream cancels are never sent and every in-flight worker
+/// stream of the chain leaks to its natural end. The codebase standard for
+/// std-mutex poisoning is recovery (worker/hooks.rs:55
+/// `.unwrap_or_else(|e| e.into_inner())`); cancel_chain must degrade to the
+/// fallback cancel instead of panicking.
+#[tokio::test]
+async fn cancel_chain_must_survive_a_poisoned_handle_list() {
+    let endpoint = {
+        let sock = std::env::temp_dir().join(format!(
+            "lite-server-poison-chain-{}.sock",
+            std::process::id()
+        ));
+        format!("ipc://{}", sock.display())
+    };
+    let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+    let chain = Arc::new(std::sync::Mutex::new(vec![StreamHandle {
+        stream_id: "s-poisoned".to_string(),
+        cancel_client: client.clone(),
+        abort: tokio::spawn(async {}).abort_handle(),
+    }]));
+
+    // Poison the mutex: a thread panics while holding the guard.
+    let chain2 = chain.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = chain2.lock().unwrap();
+        panic!("simulated consumer panic while holding chain_handles");
+    })
+    .join();
+
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        cancel_chain(Some(&chain), None, "fallback-stream", &client),
+    ))
+    .await;
+    assert!(
+        result.is_ok(),
+        "cancel_chain panicked on a poisoned handle list — the worker-stream cancels were never sent"
+    );
+}

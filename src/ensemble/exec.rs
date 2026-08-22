@@ -1108,7 +1108,7 @@ pub(crate) async fn consume_stream_consumer(
                     }
                 };
                 {
-                    let mut handles = chain_handles.lock().unwrap();
+                    let mut handles = chain_handles.lock().unwrap_or_else(|e| e.into_inner());
                     let handle = StreamHandle {
                         stream_id: sub.stream_id.clone(),
                         cancel_client: Arc::clone(&sub.cancel_client),
@@ -1202,7 +1202,7 @@ fn remove_chain_handle(
 ) {
     chain_handles
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .retain(|h| h.stream_id != stream_id);
 }
 
@@ -1261,7 +1261,7 @@ async fn spawn_chain(
     .await?;
     {
         // D18: record the head handle (appended; the tail lands at index 0).
-        let mut h = chain_handles.lock().unwrap();
+        let mut h = chain_handles.lock().unwrap_or_else(|e| e.into_inner());
         h.push(StreamHandle {
             stream_id: head_stream.stream_id.clone(),
             cancel_client: Arc::clone(&head_stream.cancel_client),
@@ -1276,7 +1276,7 @@ async fn spawn_chain(
     // unchanged; chain cancellation broadcasts over `chain` via
     // [`cancel_ensemble_stream`].
     let cancel_client = {
-        let handles = chain_handles.lock().unwrap();
+        let handles = chain_handles.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&handles[0].cancel_client)
     };
 
@@ -1396,7 +1396,7 @@ pub async fn cancel_chain(
             // Collect the cancel targets under the lock, then send outside it
             // (MutexGuard must not cross an await — the future stays Send).
             let targets: Vec<(String, Arc<crate::transport::zmq::WorkerZmqClient>)> = {
-                let handles = chain.lock().unwrap();
+                let handles = chain.lock().unwrap_or_else(|e| e.into_inner());
                 if handles.is_empty() {
                     vec![(fallback_stream_id.to_string(), fallback_client.clone())]
                 } else {
