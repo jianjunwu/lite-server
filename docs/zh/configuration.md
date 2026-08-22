@@ -22,6 +22,10 @@ server:
                                # <repo>/.lite-server-registry.json，启动时恢复。
                                # 容忍损坏文件；删除该文件即重置。
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
+  shutdown_stream_grace_ms: 2000  # 停机时在途流的协商关闭宽限窗口（毫秒）：drain 窗口
+                               # 临近结束时，服务端请求所有在途流收尾（与滚动回收的宽限
+                               # cancel 同一协议），客户端看到正常流结束；超期未收尾的流
+                               # 以终止错误帧驱逐。0 = 旧式硬切断
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒）；空闲连接超过该窗口被回收
                                #（h1 空闲回收 + slowloris 头防护）。0 = 完全禁用 keep-alive
                                #（强制 h1-only；TLS 下撤销 h2 ALPN——h2 无 close 语义）

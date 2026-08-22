@@ -25,8 +25,13 @@ window.
    gRPC sends `GOAWAY` and rejects new streams (tonic `serve_with_shutdown`
    / `serve_with_incoming_shutdown`).
 3. **Drain in-flight.** In-flight HTTP requests and gRPC RPCs are allowed to
-   finish. A long-lived SSE / gRPC stream runs until it ends naturally or
-   the grace window expires.
+   finish. A long-lived SSE / gRPC stream runs until it ends naturally or,
+   near the end of the drain window, is asked to wrap up via the negotiated
+   close (`server.shutdown_stream_grace_ms`, default 2000ms — same protocol
+   as the rolling-recycle grace cancel): a cooperative model ends the stream
+   with a normal `Done`; whatever survives the grace window is evicted with
+   a terminal error frame, never a silently dropped connection. Set
+   `shutdown_stream_grace_ms: 0` for the legacy hard-cut at the backstop.
 4. **Grace backstop.** After `server.graceful_timeout` (default `30`s),
    still-running server tasks are force-aborted. (An individual request is
    also bound by its own per-request deadline, `server.timeout`, and the

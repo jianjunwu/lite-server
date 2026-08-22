@@ -22,6 +22,11 @@ server:
                                # <repo>/.lite-server-registry.json on shutdown; restore on
                                # startup. Corrupt-file tolerant; delete the file to reset.
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
+  shutdown_stream_grace_ms: 2000  # Negotiated-close window (ms) for in-flight streams at
+                               # shutdown: near the end of the drain window every open stream
+                               # is asked to wrap up (same protocol as the recycle grace
+                               # cancel) so clients see a normal stream end; survivors are
+                               # evicted with a terminal error. 0 = legacy hard-cut
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds); idle connections are
                                # reaped after this window (h1 idle reaper + slowloris-header
                                # guard). 0 = disable keep-alive entirely (h1-only; on TLS

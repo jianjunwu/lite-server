@@ -257,6 +257,17 @@ them explicitly:
   `recycle_stream_grace_ms: 0` to skip the negotiation and evict
   immediately. Bidi sessions are always cancelled immediately (interactive
   sessions have no self-close path).
+- **Server shutdown** applies the same negotiated close once, globally:
+  in-flight streams drain naturally for most of the `graceful_timeout`
+  window, then every remaining stream gets a grace cancel
+  (`reason=shutdown`, `grace_ms` from `server.shutdown_stream_grace_ms`,
+  default 2000) just before the drain backstop. Cooperative models end with
+  a normal `Done` (counted by `liteserver_shutdown_streams_closed_total`);
+  survivors are evicted with a terminal error frame (`server shutting down:
+  evicting in-flight streams`, counted by
+  `liteserver_shutdown_streams_evicted_total`). The drain window itself is
+  observable via `liteserver_draining` (gauge) and
+  `liteserver_shutdown_drain_seconds` (histogram).
 - **Worker death mid-stream** (recycle, health-check kill, unload, hot
   reload): never a silent EOF. The client always gets a terminal error —
   SSE `data: {"error":"worker exited mid-stream"}`, WS

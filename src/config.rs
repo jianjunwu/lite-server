@@ -188,6 +188,13 @@ pub struct ServerConfig {
     pub cache_registry: bool,
     /// Max seconds to wait for in-flight requests during graceful shutdown.
     pub graceful_timeout: f32,
+    /// Grace window (milliseconds) for the negotiated close of in-flight
+    /// streams during graceful shutdown: near the end of the drain window the
+    /// server asks every open stream to wrap up (same protocol as the
+    /// rolling-recycle grace cancel), so cooperative clients see a normal
+    /// stream end instead of a dropped connection at the backstop. 0
+    /// disables the negotiated close (legacy hard-cut).
+    pub shutdown_stream_grace_ms: u32,
     /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive.
     pub keepalive_timeout: f32,
     /// K3/K4 (resource-leak-plan): interval in seconds between server-initiated
@@ -329,6 +336,7 @@ impl Default for ServerConfig {
             threads: None,
             cache_registry: false,
             graceful_timeout: 30.0,
+            shutdown_stream_grace_ms: 2000,
             keepalive_timeout: 5.0,
             stream_keepalive_interval_secs: 30.0,
             stream_channel_size: 64,
@@ -2159,6 +2167,7 @@ mod tests {
         assert_eq!(cfg.timeout, 30.0);
         assert_eq!(cfg.graceful_timeout, 30.0);
         assert_eq!(cfg.keepalive_timeout, 5.0);
+        assert_eq!(cfg.shutdown_stream_grace_ms, 2000);
     }
 
     #[test]

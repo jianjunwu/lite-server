@@ -1199,6 +1199,77 @@ impl InferenceQueue {
         check_worker_budget(&entry.dispatch, &entry.worker_inflight, worker_idx, 1);
     }
 
+    /// Total in-flight streams across every registered version and slot
+    /// (shutdown observability: streams bypass the queue, so the pending
+    /// request count never sees them).
+    pub fn total_stream_inflight(&self) -> usize {
+        self.queues
+            .iter()
+            .map(|entry| {
+                let dispatch = &entry.dispatch;
+                (0..dispatch.zmq_clients.len())
+                    .map(|slot| dispatch.outlier.stream_inflight(slot))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Q2-at-shutdown: grace-cancel every in-flight stream across all
+    /// versions (`reason` + `grace_ms`, same protocol as the rolling-recycle
+    /// negotiated close). Returns per-version `(model, version, asked)`
+    /// counts of streams asked to wrap up.
+    pub fn graceful_cancel_all_streams(
+        &self,
+        reason: &str,
+        grace_ms: u32,
+    ) -> Vec<(String, String, usize)> {
+        let mut asked = Vec::new();
+        for entry in self.queues.iter() {
+            let dispatch = &entry.dispatch;
+            let mut version_asked = 0;
+            for (slot, client) in dispatch.zmq_clients.iter().enumerate() {
+                let n = dispatch.outlier.stream_inflight(slot);
+                if n > 0 {
+                    client.graceful_cancel_all(reason, grace_ms);
+                    version_asked += n;
+                }
+            }
+            if version_asked > 0 {
+                asked.push((
+                    dispatch.model_name.clone(),
+                    dispatch.version.clone(),
+                    version_asked,
+                ));
+            }
+        }
+        asked
+    }
+
+    /// Evict every in-flight stream across all versions with a client-visible
+    /// terminal error. Returns per-version `(model, version, evicted)` counts.
+    pub fn fail_all_streams(&self, reason: &str) -> Vec<(String, String, usize)> {
+        let mut evicted = Vec::new();
+        for entry in self.queues.iter() {
+            let dispatch = &entry.dispatch;
+            let mut version_evicted = 0;
+            for (slot, client) in dispatch.zmq_clients.iter().enumerate() {
+                let n = dispatch.outlier.stream_inflight(slot);
+                if n > 0 {
+                    client.fail_all(reason);
+                    version_evicted += n;
+                }
+            }
+            if version_evicted > 0 {
+                evicted.push((
+                    dispatch.model_name.clone(),
+                    dispatch.version.clone(),
+                    version_evicted,
+                ));
+            }
+        }
+        evicted
+    }
+
     /// G4: take one stream-concurrency slot for the version
     /// (`max_concurrent_streams`). The returned permit releases on drop —
     /// callers fold it into the stream's RAII guard so every exit shape

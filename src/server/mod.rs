@@ -666,6 +666,7 @@ impl LiteServer {
         // the gRPC overall Health service goes NOT_SERVING (mark_draining pushes
         // immediately rather than waiting for the next coordinator tick).
         draining.store(true, Ordering::Relaxed);
+        prometheus::set_draining(true);
         self.worker_manager.mark_draining().await;
 
         // Abort background tasks
@@ -689,15 +690,21 @@ impl LiteServer {
         let _ = http_shutdown_tx.send(());
         let _ = grpc_shutdown_tx.send(());
 
-        // Spawn periodic shutdown status logger
+        // Spawn periodic shutdown status logger. Streams bypass the request
+        // queue (their pending count drops once headers are sent), so the
+        // logger counts them separately via the queue's per-slot counters —
+        // otherwise a shutdown draining only long streams would report
+        // "all requests drained" while they are still open.
         let state_for_monitor = shutdown_state.clone();
+        let queue_for_monitor = self.inference_queue.clone();
         let monitor_graceful = self.config.server.graceful_timeout;
         let monitor_handle = tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(2));
             loop {
                 tick.tick().await;
                 let pending = state_for_monitor.pending();
-                if pending == 0 {
+                let streams = queue_for_monitor.total_stream_inflight();
+                if pending == 0 && streams == 0 {
                     let elapsed = state_for_monitor
                         .elapsed()
                         .map(|d| d.as_secs())
@@ -713,8 +720,8 @@ impl LiteServer {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 info!(
-                    "Graceful shutdown: {} in-flight after {}s (timeout {}s)",
-                    pending, elapsed, monitor_graceful
+                    "Graceful shutdown: {} in-flight ({} streams) after {}s (timeout {}s)",
+                    pending, streams, elapsed, monitor_graceful
                 );
             }
         });
@@ -754,7 +761,31 @@ impl LiteServer {
         // the error path also releases the handle borrows before the abort()
         // calls below.
         if startup_error.is_none() {
+            // Q2-at-shutdown: streams bypass the queue, so the connection
+            // drain above would otherwise hold them open until the backstop
+            // and then hard-cut them. Give them the same negotiated close a
+            // rolling recycle gets (client sees a normal stream end), with
+            // any survivors evicted on a terminal error frame just before the
+            // backstop fires. Runs concurrently with the drain; aborted below
+            // once the drain finishes.
+            let stream_grace =
+                Duration::from_millis(u64::from(self.config.server.shutdown_stream_grace_ms));
+            let stream_close_handle = if stream_grace.is_zero() {
+                None
+            } else {
+                Some(tokio::spawn(close_streams_for_shutdown(
+                    self.inference_queue.clone(),
+                    graceful_timeout,
+                    stream_grace,
+                )))
+            };
             tokio::join!(http_fut, grpc_fut);
+            if let Some(h) = stream_close_handle {
+                h.abort();
+            }
+            prometheus::record_shutdown_drain(
+                shutdown_state.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            );
         } else {
             drop(http_fut);
             drop(grpc_fut);
@@ -865,6 +896,63 @@ async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
         .map_err(|e| AppError::Internal(format!("metrics server error: {}", e)))?;
 
     Ok(())
+}
+
+/// Q2-at-shutdown stream closer: near the end of the drain window, ask every
+/// in-flight stream (across all versions) to wrap up within `grace` — the
+/// same negotiated close a rolling recycle performs, so cooperative clients
+/// end with a normal stream Done instead of a dropped connection at the
+/// backstop. Streams still open after the grace window are evicted with a
+/// client-visible terminal error.
+///
+/// Timing: the cancel fires `grace + margin` before the drain backstop so
+/// wrap-up output and the eviction frame land while the connections are
+/// still being drained (the HTTP/gRPC drain only force-aborts AT `window`).
+async fn close_streams_for_shutdown(
+    queue: Arc<InferenceQueue>,
+    window: Duration,
+    grace: Duration,
+) {
+    const BACKSTOP_MARGIN: Duration = Duration::from_millis(500);
+    let fire_after = window
+        .saturating_sub(grace)
+        .saturating_sub(BACKSTOP_MARGIN);
+    tokio::time::sleep(fire_after).await;
+    let asked = queue.graceful_cancel_all_streams("shutdown", grace.as_millis() as u32);
+    if asked.is_empty() {
+        return;
+    }
+    info!(
+        "Graceful shutdown: {} in-flight stream(s) asked to wrap up (grace {}ms)",
+        asked.iter().map(|(_, _, n)| n).sum::<usize>(),
+        grace.as_millis()
+    );
+    let wait = async {
+        while queue.total_stream_inflight() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let _ = tokio::time::timeout(grace, wait).await;
+    let evicted = queue.fail_all_streams("server shutting down: evicting in-flight streams");
+    for (model, version, n) in &evicted {
+        warn!(
+            model = %model, version = %version, evicted = n,
+            "Shutdown stream grace elapsed; evicting in-flight streams"
+        );
+        prometheus::record_shutdown_streams_evicted(model, version, *n as u64);
+    }
+    // asked − evicted per version = streams that closed cleanly in the window.
+    for (model, version, n) in &asked {
+        let evicted_n = evicted
+            .iter()
+            .find(|(m, v, _)| m == model && v == version)
+            .map(|(_, _, n)| *n)
+            .unwrap_or(0);
+        let closed = n.saturating_sub(evicted_n);
+        if closed > 0 {
+            prometheus::record_shutdown_streams_closed(model, version, closed as u64);
+        }
+    }
 }
 
 #[cfg(unix)]

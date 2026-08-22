@@ -12046,3 +12046,228 @@ async fn should_close_decoupled_stream_cleanly_within_recycle_grace() {
     }
     assert!(recycled, "the worker must still roll-recycle after the graceful close");
 }
+
+// ---------------------------------------------------------------------------
+// Q2-at-shutdown: negotiated close for in-flight streams on server shutdown
+// ---------------------------------------------------------------------------
+
+/// A decoupled model that never checks `sender.closing` — the grace cancel
+/// expires unanswered and the server must evict the stream with a terminal
+/// error frame.
+const SHUTDOWN_SLOW_PY: &str = r#"import asyncio
+from lite_server import LitAPI
+
+
+class ShutdownSlowAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return x
+
+    async def predict_decoupled(self, data, sender):
+        async def _push():
+            for i in range(600):
+                await sender.send({"index": i})
+                await asyncio.sleep(0.5)
+        asyncio.create_task(_push())
+
+    def encode_response(self, output):
+        return output
+"#;
+
+/// Repo + server.yaml for the shutdown stream tests: one cooperative model
+/// (the recycle grace model's code) and one that ignores the grace cancel.
+/// control_mode "all" loads both at boot. Returns (config_path, http_port,
+/// metrics_port).
+#[cfg(unix)]
+fn shutdown_stream_server(tag: &str, graceful_timeout: f32, grace_ms: u32) -> (String, u16, u16) {
+    let repo = std::env::temp_dir().join(format!("lite-server-{tag}-{}", std::process::id()));
+    let write_model = |name: &str, py: &str| {
+        let dir = repo.join(name).join("1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), py).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+    };
+    write_model("shutdown_grace", G_GRACE_PY);
+    write_model("shutdown_slow", SHUTDOWN_SLOW_PY);
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-{tag}-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\n  graceful_timeout: {graceful_timeout}\n  shutdown_stream_grace_ms: {grace_ms}\nmetrics:\n  enabled: true\ngrpc:\n  enabled: false\norchestration:\n  control_mode: all\nmodel_repository:\n  path: {repo}\n",
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    (cfg.to_string_lossy().to_string(), http_port, metrics_port)
+}
+
+/// A long decoupled stream crossing a server shutdown must close like it
+/// does on a rolling recycle: near the end of the drain window the server
+/// grace-cancels in-flight streams, the cooperative model pushes its wrap-up
+/// chunk and closes — the client sees a normal [DONE] instead of a dropped
+/// connection at the backstop.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_grace_closes_in_flight_stream_with_done() {
+    let (cfg, http_port, _metrics_port) = shutdown_stream_server("shutdown-grace", 6.0, 2000);
+    let mut server = start_server(&["--config", &cfg]);
+    wait_for_server(http_port, 60).await;
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post(format!(
+            "http://127.0.0.1:{http_port}/v2/models/shutdown_grace/decoupled"
+        ))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Confirm the stream is actually producing before signaling.
+    let first = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+        .await
+        .expect("first chunk arrives")
+        .unwrap();
+    assert!(first.is_some(), "stream must be open before SIGTERM");
+
+    send_sigterm(&server);
+
+    let body = tokio::time::timeout(Duration::from_secs(30), resp.text())
+        .await
+        .expect("stream closes within the drain window")
+        .unwrap();
+    assert!(
+        body.contains("\"final\": true") || body.contains("\"final\":true"),
+        "the model's wrap-up chunk must reach the client: {body}"
+    );
+    assert!(
+        body.contains("[DONE]"),
+        "a cooperative model ends the stream with a normal [DONE]: {body}"
+    );
+    assert!(
+        !body.contains("server shutting down"),
+        "a cooperative close must NOT surface the eviction error: {body}"
+    );
+
+    let exited = wait_for_exit(&mut server, 25).await;
+    if !exited {
+        stop_server(server);
+        panic!("server must exit within 25s of SIGTERM");
+    }
+    assert!(
+        server.wait().unwrap().success(),
+        "shutdown after a grace-closed stream must be a clean exit"
+    );
+}
+
+/// An uncooperative stream (ignores the grace cancel) is evicted at the end
+/// of the grace window with a client-visible terminal error instead of a
+/// silently dropped connection, and the shutdown metrics (draining gauge,
+/// evicted counter) are scrapeable during the drain window.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_evicts_uncooperative_stream_and_records_metrics() {
+    let (cfg, http_port, metrics_port) = shutdown_stream_server("shutdown-evict", 8.0, 2000);
+    let mut server = start_server(&["--config", &cfg]);
+    wait_for_server(http_port, 60).await;
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post(format!(
+            "http://127.0.0.1:{http_port}/v2/models/shutdown_slow/decoupled"
+        ))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let first = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+        .await
+        .expect("first chunk arrives")
+        .unwrap();
+    assert!(first.is_some(), "stream must be open before SIGTERM");
+
+    // Scrape metrics through the whole drain window until the server dies:
+    // the evicted counter only appears in the last ~second of the window.
+    let scrape = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut saw_draining = false;
+        let mut saw_evicted = false;
+        for _ in 0..200 {
+            match client
+                .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    if body.contains("liteserver_draining 1") {
+                        saw_draining = true;
+                    }
+                    let evicted = body
+                        .lines()
+                        .find(|l| l.starts_with(
+                            "liteserver_shutdown_streams_evicted_total{model=\"shutdown_slow\"",
+                        ))
+                        .and_then(|l| l.rsplit_once(' '))
+                        .and_then(|(_, n)| n.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if evicted >= 1.0 {
+                        saw_evicted = true;
+                    }
+                }
+                Err(_) => break, // metrics server is gone — shutdown finished
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        (saw_draining, saw_evicted)
+    });
+
+    sleep(Duration::from_millis(500)).await;
+    send_sigterm(&server);
+
+    let body = tokio::time::timeout(Duration::from_secs(30), resp.text())
+        .await
+        .expect("evicted stream terminates within the drain window")
+        .unwrap();
+    assert!(
+        body.contains("server shutting down"),
+        "an evicted stream must surface the terminal error, not a bare drop: {body}"
+    );
+
+    let (saw_draining, saw_evicted) = scrape.await.unwrap();
+    assert!(saw_draining, "liteserver_draining must be 1 during the drain window");
+    assert!(
+        saw_evicted,
+        "the eviction must count toward liteserver_shutdown_streams_evicted_total"
+    );
+
+    let exited = wait_for_exit(&mut server, 30).await;
+    if !exited {
+        stop_server(server);
+        panic!("server must exit within 30s of SIGTERM");
+    }
+    assert!(
+        server.wait().unwrap().success(),
+        "shutdown after an eviction must still be a clean exit"
+    );
+}

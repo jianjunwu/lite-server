@@ -281,6 +281,41 @@ lazy_static! {
         "Number of in-flight requests during shutdown"
     ).unwrap();
 
+    /// 1 while the server is draining (SIGTERM/SIGINT received, health
+    /// endpoints failing) — lets alerts catch a pod stuck in the drain window.
+    pub static ref DRAINING: prometheus::IntGauge = prometheus::IntGauge::new(
+        "liteserver_draining",
+        "1 while the server is in the graceful-shutdown drain window"
+    ).unwrap();
+
+    /// Request-drain duration (shutdown start → HTTP/gRPC drain finished).
+    pub static ref SHUTDOWN_DRAIN_SECONDS: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "liteserver_shutdown_drain_seconds",
+            "Graceful-shutdown request-drain duration"
+        ).buckets(vec![0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0])
+    ).unwrap();
+
+    /// Streams closed cleanly by the shutdown negotiated close (wrap-up
+    /// within the grace window — the client saw a normal stream end).
+    pub static ref SHUTDOWN_STREAMS_CLOSED_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_shutdown_streams_closed_total",
+            "In-flight streams closed cleanly by the shutdown negotiated close"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
+    /// Shutdown counterpart of RECYCLE_STREAMS_EVICTED_TOTAL: streams still
+    /// open after the shutdown grace window, terminated with an error frame.
+    pub static ref SHUTDOWN_STREAMS_EVICTED_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_shutdown_streams_evicted_total",
+            "In-flight streams force-evicted after the shutdown stream grace window"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
     // P10 (D40): concurrent streaming ensemble DAGs (global, no model label —
     // same口径 as the semaphore; per-model visibility comes from the existing
     // record_stream_open/terminal model labels, aligning with the m4 label
@@ -503,6 +538,10 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWN_FAILURES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
+    REGISTRY.register(Box::new(DRAINING.clone()))?;
+    REGISTRY.register(Box::new(SHUTDOWN_DRAIN_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(SHUTDOWN_STREAMS_CLOSED_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(SHUTDOWN_STREAMS_EVICTED_TOTAL.clone()))?;
     // P10 (D40) + m4: ensemble streaming capacity gauge and batch-0/1
     // histograms — unregistered collectors never reach /metrics.
     REGISTRY.register(Box::new(ENSEMBLE_STREAMING_ACTIVE.clone()))?;
@@ -1783,6 +1822,37 @@ pub fn record_recycle_streams_evicted(model: &str, version: &str, count: u64) {
         .inc_by(count as f64);
 }
 
+/// Mark the drain window open (shutdown received). The process exits after
+/// teardown, so the gauge is never reset — it exists for scrapes and alerts
+/// DURING the drain window.
+pub fn set_draining(draining: bool) {
+    DRAINING.set(if draining { 1 } else { 0 });
+}
+
+/// Q2-at-shutdown observability: drain duration (shutdown start → HTTP/gRPC
+/// drain finished). Compare against `graceful_timeout`: a value pinned at
+/// the timeout means the backstop fired.
+pub fn record_shutdown_drain(seconds: f64) {
+    SHUTDOWN_DRAIN_SECONDS.observe(seconds);
+}
+
+/// Streams that wrapped up within the shutdown grace window (client saw a
+/// normal stream end).
+pub fn record_shutdown_streams_closed(model: &str, version: &str, count: u64) {
+    SHUTDOWN_STREAMS_CLOSED_TOTAL
+        .with_label_values(&[model, version])
+        .inc_by(count as f64);
+}
+
+/// Streams still open after the shutdown grace window, terminated with an
+/// error frame. A rising value means `shutdown_stream_grace_ms` (or the
+/// drain window) is too short for the models' wrap-up.
+pub fn record_shutdown_streams_evicted(model: &str, version: &str, count: u64) {
+    SHUTDOWN_STREAMS_EVICTED_TOTAL
+        .with_label_values(&[model, version])
+        .inc_by(count as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,6 +1901,43 @@ mod tests {
         record_stream_close(model, version, protocol);
         // net zero — gauge should be back to its value before open
         // (other tests may have incremented, so just check relative)
+    }
+
+    #[test]
+    fn test_record_shutdown_streams_evicted_increments() {
+        let before = SHUTDOWN_STREAMS_EVICTED_TOTAL
+            .with_label_values(&["evict_model", "1"])
+            .get();
+        record_shutdown_streams_evicted("evict_model", "1", 2);
+        let after = SHUTDOWN_STREAMS_EVICTED_TOTAL
+            .with_label_values(&["evict_model", "1"])
+            .get();
+        assert_eq!(after, before + 2.0);
+    }
+
+    #[test]
+    fn test_record_shutdown_streams_closed_increments() {
+        let before = SHUTDOWN_STREAMS_CLOSED_TOTAL
+            .with_label_values(&["closed_model", "1"])
+            .get();
+        record_shutdown_streams_closed("closed_model", "1", 3);
+        let after = SHUTDOWN_STREAMS_CLOSED_TOTAL
+            .with_label_values(&["closed_model", "1"])
+            .get();
+        assert_eq!(after, before + 3.0);
+    }
+
+    #[test]
+    fn test_set_draining_gauge() {
+        set_draining(true);
+        assert_eq!(DRAINING.get(), 1);
+    }
+
+    #[test]
+    fn test_record_shutdown_drain_observes() {
+        let before = SHUTDOWN_DRAIN_SECONDS.get_sample_count();
+        record_shutdown_drain(1.5);
+        assert_eq!(SHUTDOWN_DRAIN_SECONDS.get_sample_count(), before + 1);
     }
 
     #[test]
