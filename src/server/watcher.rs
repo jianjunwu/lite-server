@@ -310,8 +310,16 @@ pub(super) async fn start_file_watcher(
 
     info!("File watcher started on {}", repo_path.display());
 
-    // Debounce: collect events over 1.5s windows
+    // Debounce: collect events over 1.5s windows. The window slides on every
+    // event (a quiet tail is required before flush), but a max-wait bounds
+    // the starvation: under continuous churn (events arriving faster than
+    // the debounce, e.g. a training job checkpointing into the repo) the
+    // sliding deadline would never fire and pending_paths would grow
+    // unbounded while hot-reload/reconcile stall — flush when the window has
+    // been open for 3 debounce intervals regardless.
+    let max_wait = debounce * 3;
     let mut debounce_deadline: Option<Instant> = None;
+    let mut window_start: Option<Instant> = None;
     let mut pending_paths: Vec<(PathBuf, WatchEventKind)> = Vec::new();
     let mut tick = interval(Duration::from_millis(200));
 
@@ -358,6 +366,7 @@ pub(super) async fn start_file_watcher(
                             pending_paths.push((path, kind));
                         }
                         debounce_deadline = Some(Instant::now() + debounce);
+                        window_start.get_or_insert_with(Instant::now);
                     }
                     Err(e) => {
                         warn!("Watch error: {}", e);
@@ -366,7 +375,10 @@ pub(super) async fn start_file_watcher(
             }
             _ = tick.tick() => {
                 if let Some(deadline) = debounce_deadline {
-                    if Instant::now() >= deadline && !pending_paths.is_empty() {
+                    let max_wait_fired = window_start
+                        .map(|ws| ws.elapsed() >= max_wait)
+                        .unwrap_or(false);
+                    if (Instant::now() >= deadline || max_wait_fired) && !pending_paths.is_empty() {
                         // Deduplicate
                         pending_paths.sort();
                         pending_paths.dedup();
@@ -374,6 +386,7 @@ pub(super) async fn start_file_watcher(
                             std::mem::take(&mut pending_paths);
                         let _ = tx.send(paths).await;
                         debounce_deadline = None;
+                        window_start = None;
                     }
                 }
             }
@@ -465,6 +478,67 @@ mod tests {
 
         handle.abort();
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    /// Audit (2026-08-22, resource-leak/observability sweep): the sliding
+    /// debounce (every event resets the deadline) had no max-wait — under
+    /// continuous churn (events arriving faster than the debounce, e.g. a
+    /// training job checkpointing into the repo) the flush never fired:
+    /// pending_paths grew unbounded and hot-reload/reconcile stalled for the
+    /// entire churn. The window keeps sliding, but a flush must be bounded
+    /// by the max-wait (3 debounce intervals) even while events keep
+    /// arriving.
+    #[tokio::test]
+    async fn watcher_must_flush_within_a_bounded_window_under_continuous_churn() {
+        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-churn-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
+        let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
+        let sub_dir = tmp_dir.join("model").join("1");
+        tokio::fs::create_dir_all(&sub_dir).await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            tmp_dir.clone(),
+            inference_queue,
+            "warn".to_string(),
+            callback_runner,
+        ));
+
+        let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
+        let has_hot_reload = Arc::new(AtomicBool::new(true));
+        let debounce = Duration::from_millis(1000);
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, debounce, registry,
+        ));
+
+        // Give the watcher time to start.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Churn: a unique file every 100ms for 6s — events keep arriving
+        // faster than the debounce window.
+        let churn_dir = sub_dir.clone();
+        let churn = tokio::spawn(async move {
+            for i in 0..60 {
+                let _ = tokio::fs::write(churn_dir.join(format!("ckpt-{i}.bin")), b"x").await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        // The max-wait (3× debounce) must flush a batch even mid-churn:
+        // first event + ≤3s. Old code only flushed after the LAST event +
+        // debounce (~7s in), so nothing arrived within 4.5s.
+        let first = tokio::time::timeout(Duration::from_millis(4500), rx.recv()).await;
+        churn.abort();
+        handle.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        assert!(
+            first.is_ok(),
+            "no batch was flushed within 4.5s of continuous churn — the sliding \
+             debounce starved (deadline reset by every event, no max-wait)"
+        );
     }
 
     // ===== P1/P2: watcher lifecycle events → reconcile trigger (control_mode = "auto") =====
