@@ -579,6 +579,8 @@ lite-server serve [参数]
 | `--max-queue-size` | 所有模型的最大队列 | `model_defaults.max_queue_size` |
 | `--max-requests` | 滚动回收：每个 worker 处理 N 个请求后重启 | `model_defaults.max_requests` |
 | `--max-requests-jitter` | max_requests 的逐 worker 抖动 | `model_defaults.max_requests_jitter` |
+| `--recycle-stream-drain-timeout-secs` | 滚动回收等待在途流自然结束的秒数，超时后进入协商关闭 | `model_defaults.recycle_stream_drain_timeout_secs` |
+| `--recycle-stream-grace-ms` | 回收 drain 超时后协商关闭的宽限窗口（毫秒，0 = 立即驱逐） | `model_defaults.recycle_stream_grace_ms` |
 | `--request-timeout` | 单请求超时 | `model_defaults.request_timeout` |
 | `--health-check-interval` | 健康检查间隔 | `model_defaults.health_check_interval` |
 | `--threads` | Tokio 工作线程数 | `server.threads` |

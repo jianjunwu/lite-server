@@ -657,6 +657,8 @@ lite-server serve [flags]
 | `--max-queue-size` | Max queue size for all models | `model_defaults.max_queue_size` |
 | `--max-requests` | Rolling recycle: restart each worker after it serves N requests | `model_defaults.max_requests` |
 | `--max-requests-jitter` | Per-worker jitter for max_requests | `model_defaults.max_requests_jitter` |
+| `--recycle-stream-drain-timeout-secs` | Seconds a rolling recycle waits for in-flight streams before the negotiated close | `model_defaults.recycle_stream_drain_timeout_secs` |
+| `--recycle-stream-grace-ms` | Grace window (ms) for the negotiated stream close after the recycle drain times out (0 = evict immediately) | `model_defaults.recycle_stream_grace_ms` |
 | `--request-timeout` | Per-request timeout | `model_defaults.request_timeout` |
 | `--health-check-interval` | Health check interval | `model_defaults.health_check_interval` |
 | `--threads` | Tokio worker threads | `server.threads` |

@@ -88,6 +88,16 @@ enum Commands {
         #[arg(long)]
         max_requests_jitter: Option<usize>,
 
+        /// Seconds a rolling recycle waits for in-flight streams before the
+        /// negotiated close (overrides model config)
+        #[arg(long)]
+        recycle_stream_drain_timeout_secs: Option<f32>,
+
+        /// Grace window in milliseconds for the negotiated stream close after
+        /// the recycle drain times out (0 = evict immediately, overrides model config)
+        #[arg(long)]
+        recycle_stream_grace_ms: Option<u32>,
+
         /// Per-request hard timeout in seconds (0 = disabled, overrides model config)
         #[arg(long)]
         request_timeout: Option<f32>,
@@ -177,6 +187,8 @@ fn main() {
             max_queue_size,
             max_requests,
             max_requests_jitter,
+            recycle_stream_drain_timeout_secs,
+            recycle_stream_grace_ms,
             request_timeout,
             health_check_interval,
             ejection_error_threshold,
@@ -226,12 +238,12 @@ fn main() {
                     max_queue_size,
                     max_requests,
                     max_requests_jitter,
+                    recycle_stream_drain_timeout_secs,
+                    recycle_stream_grace_ms,
                     // No CLI flag: tunable via config file / model_defaults only.
                     recycle_max_percent: None,
                     count_streams_toward_max_requests: None,
-                    recycle_stream_drain_timeout_secs: None,
                     max_concurrent_streams: None,
-                    recycle_stream_grace_ms: None,
                     request_timeout,
                     health_check_interval,
                     ejection_error_threshold,
@@ -339,5 +351,33 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
                 .build()
                 .expect("failed to build multi-threaded tokio runtime")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_recycle_stream_flags() {
+        let cli = Cli::try_parse_from([
+            "lite-server",
+            "serve",
+            "--recycle-stream-drain-timeout-secs",
+            "120.5",
+            "--recycle-stream-grace-ms",
+            "3000",
+        ])
+        .expect("recycle stream knobs must be CLI-overridable");
+        let Commands::Serve {
+            recycle_stream_drain_timeout_secs,
+            recycle_stream_grace_ms,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(recycle_stream_drain_timeout_secs, Some(120.5));
+        assert_eq!(recycle_stream_grace_ms, Some(3000));
     }
 }
