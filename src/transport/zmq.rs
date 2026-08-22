@@ -281,7 +281,10 @@ impl WorkerZmqClient {
                     for (uid, tx) in pending.drain() {
                         let _ = tx.send(error_response(&uid, "Worker shutting down"));
                     }
-                    stream_routes.clear();
+                    // S2: in-flight streams get the same terminal Error frame
+                    // as fail_all — a bare clear() would read as a clean EOF
+                    // and count the shutdown-truncated stream as successful.
+                    release_stream_routes(&mut stream_routes, "Worker shutting down");
                     drop(socket);
                     drop(ctx);
                     return;
@@ -764,24 +767,7 @@ fn drain_commands(
                 for (uid, tx) in pending.drain() {
                     let _ = tx.send(error_response(&uid, &reason));
                 }
-                for (sid, tx) in stream_routes.drain() {
-                    let term = pb::StreamResponse {
-                        stream_id: sid,
-                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
-                            message: reason.clone(),
-                        })),
-                    };
-                    // S2: a full stream channel must not silently swallow the
-                    // crash frame — a dropped terminal reads as a clean EOF
-                    // and the crash gets counted as a successful stream. Same
-                    // delivery contract as the overflow path above: spawn a
-                    // bounded send (RN-4: OVERFLOW_DELIVERY_TIMEOUT); a live
-                    // consumer always observes the frame, a dead one ends the
-                    // send with Closed.
-                    tokio::spawn(async move {
-                        let _ = tokio::time::timeout(OVERFLOW_DELIVERY_TIMEOUT, tx.send(term)).await;
-                    });
-                }
+                release_stream_routes(stream_routes, &reason);
                 if n_pending > 0 || n_streams > 0 {
                     warn!(
                         "ZMQ fail_all ({}): released {} pending + {} stream(s)",
@@ -808,6 +794,29 @@ fn drain_commands(
             Err(mpsc::error::TryRecvError::Empty) => return DrainOutcome::Continue,
             Err(mpsc::error::TryRecvError::Disconnected) => return DrainOutcome::Shutdown,
         }
+    }
+}
+
+/// S2 terminal-frame contract: every in-flight stream route gets a bounded
+/// terminal Error frame — a dropped sender reads as a clean EOF and the
+/// truncation gets counted as a successful stream. Shared by the FailAll
+/// and Shutdown release paths (same delivery contract as the overflow path:
+/// spawn a bounded send, RN-4 OVERFLOW_DELIVERY_TIMEOUT; a live consumer
+/// always observes the frame, a dead one ends the send with Closed).
+fn release_stream_routes(
+    stream_routes: &mut HashMap<String, mpsc::Sender<pb::StreamResponse>>,
+    reason: &str,
+) {
+    for (sid, tx) in stream_routes.drain() {
+        let term = pb::StreamResponse {
+            stream_id: sid,
+            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                message: reason.to_string(),
+            })),
+        };
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(OVERFLOW_DELIVERY_TIMEOUT, tx.send(term)).await;
+        });
     }
 }
 
@@ -1281,6 +1290,85 @@ mod tests {
         );
 
         drop(client);
+        let _ = worker.join();
+    }
+
+    // Audit (2026-08-22, resource-leak/observability sweep): the Shutdown
+    // branch (command channel closed, or ZmqCommand::Shutdown) drains unary
+    // pending with an error response but `stream_routes.clear()` just drops
+    // the senders — in-flight stream consumers see a clean EOF, violating
+    // the S2 terminal-frame contract the FailAll path documents ("a dropped
+    // terminal reads as a clean EOF and the crash gets counted as a
+    // successful stream"). force_unload_version hits exactly this path: the
+    // clients are shut down with no prior fail_all, so an in-flight stream
+    // truncated by the unload is counted as a successfully completed one.
+    #[tokio::test]
+    async fn shutdown_must_deliver_terminal_error_to_inflight_streams() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-shutdown-stream-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&sock);
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 37000 + std::process::id() % 1000);
+
+        // Silent peer: receives everything, never replies — the stream route
+        // stays open until the actor shuts down.
+        let ep_for_worker = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&ep_for_worker).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            loop {
+                match s.recv_bytes(0) {
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let client = std::sync::Arc::new(WorkerZmqClient::new(endpoint));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let open_req = pb::Request {
+            uid: "s-open".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
+                stream_id: "shutdown-stream".to_string(),
+                action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
+                    data: bytes::Bytes::from_static(b"{}"),
+                    meta: None,
+                    decoupled: None,
+                })),
+            })),
+        };
+        let mut chunk_rx = client
+            .send_stream(open_req, "shutdown-stream".to_string())
+            .await
+            .expect("send_stream");
+
+        // Let the actor register the route.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        client.shutdown().await;
+
+        // S2 contract: a live consumer must observe a terminal Error frame —
+        // never a clean EOF for a shutdown-truncated stream.
+        let frame = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv())
+            .await
+            .expect("stream route not released by shutdown")
+            .expect("stream closed without a terminal frame (clean EOF)");
+        assert!(
+            matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))),
+            "expected terminal Error frame, got {:?}",
+            frame.payload
+        );
+
         let _ = worker.join();
     }
 
