@@ -1751,6 +1751,25 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         check_duration_secs("server.timeout", self.server.timeout)?;
         check_duration_secs("server.graceful_timeout", self.server.graceful_timeout)?;
+        // The shutdown stream closer fires its wrap-up cancel
+        // `grace + 500ms` before the drain backstop (server/mod.rs
+        // close_streams_for_shutdown); a grace that does not fit inside the
+        // drain window saturates fire_after to 0 (streams cancelled the
+        // moment shutdown starts) and the closer is aborted before its
+        // eviction pass runs — no terminal error frame, no evicted/closed
+        // metrics. Fail fast at config-check instead.
+        if self.server.shutdown_stream_grace_ms > 0
+            && (self.server.shutdown_stream_grace_ms as f32 + 500.0)
+                >= self.server.graceful_timeout * 1000.0
+        {
+            anyhow::bail!(
+                "config field `server.shutdown_stream_grace_ms` ({} ms) must leave room inside \
+                 `server.graceful_timeout` ({} s): grace + 500ms margin >= window means the \
+                 negotiated stream close can never run",
+                self.server.shutdown_stream_grace_ms,
+                self.server.graceful_timeout
+            );
+        }
         check_duration_secs("server.keepalive_timeout", self.server.keepalive_timeout)?;
         check_duration_secs(
             "server.stream_keepalive_interval_secs",
@@ -2455,6 +2474,38 @@ mod tests {
         assert!(
             all_mode.validate().is_ok(),
             "\"all\" (load every model in the repo at boot) is a documented control_mode"
+        );
+    }
+
+    /// Audit (2026-08-22, resource-leak/observability sweep):
+    /// `shutdown_stream_grace_ms` >= `graceful_timeout` silently breaks the
+    /// shutdown negotiated-close contract (server/mod.rs
+    /// close_streams_for_shutdown): `fire_after = window − grace − margin`
+    /// saturates to 0, so the wrap-up cancel fires the moment shutdown
+    /// starts; and when the HTTP/gRPC drain join completes the closer is
+    /// aborted before `fail_all_streams` runs — in-flight streams get no
+    /// terminal error frame and the evicted/closed metrics never record.
+    /// The combination must fail config-check (A6 precedent: serve-time-only
+    /// invariants belong in the pre-deployment gate).
+    #[test]
+    fn should_reject_shutdown_stream_grace_exceeding_graceful_window() {
+        let bad: Config = serde_yaml::from_str(
+            "server:\n  graceful_timeout: 5.0\n  shutdown_stream_grace_ms: 10000\n",
+        )
+        .unwrap();
+        assert!(
+            bad.validate().is_err(),
+            "shutdown_stream_grace_ms (10s) >= graceful_timeout (5s) must fail validation — \
+             the negotiated close can never run inside the drain window"
+        );
+
+        let ok: Config = serde_yaml::from_str(
+            "server:\n  graceful_timeout: 30.0\n  shutdown_stream_grace_ms: 2000\n",
+        )
+        .unwrap();
+        assert!(
+            ok.validate().is_ok(),
+            "the default-shaped combination (2s grace inside a 30s window) must stay valid"
         );
     }
 

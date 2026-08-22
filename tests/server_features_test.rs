@@ -151,16 +151,23 @@ async fn test_graceful_shutdown_respects_timeout() {
     let _ = std::fs::remove_file(socket_path);
 
     let repo = ensure_model_repo();
+    // graceful_timeout=1s + the default shutdown_stream_grace_ms=2000 is a
+    // rejected combination (the negotiated close cannot fit a 1s drain
+    // window) — declare the test's intent explicitly: no negotiated close,
+    // just the backstop.
+    let config_path = "/tmp/lite-server-graceful-test.yaml";
+    std::fs::write(
+        config_path,
+        format!(
+            "server:\n  host: unix:{socket_path}\n  graceful_timeout: 1.0\n  shutdown_stream_grace_ms: 0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            repo.display()
+        ),
+    )
+    .expect("write config");
     let mut child = Command::new(&bin)
         .arg("serve")
-        .arg("--host")
-        .arg(format!("unix:{}", socket_path))
-        .arg("--graceful-timeout")
-        .arg("1")
-        .arg("--model-repo")
-        .arg(&repo)
-        .arg("--no-metrics")
-        .arg("--no-grpc")
+        .arg("--config")
+        .arg(config_path)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())

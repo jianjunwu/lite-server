@@ -2232,7 +2232,7 @@ async fn test_graceful_shutdown_aborts_inflight_after_timeout() {
         std::fs::write(
             &server_yaml,
             format!(
-                "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18213\n  graceful_timeout: 2.0\n  timeout: 5.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+                "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18213\n  graceful_timeout: 2.0\n  shutdown_stream_grace_ms: 0\n  timeout: 5.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
                 http_port = http_port,
                 grpc_port = grpc_port,
                 repo = repo.to_string_lossy()
