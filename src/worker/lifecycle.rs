@@ -1808,6 +1808,17 @@ impl WorkerManager {
             cache.invalidate_model(model_name);
         }
 
+        // §6.5 single teardown path: same primitives as the graceful unload
+        // (teardown_version_runtime), minus the wait — force means kill now.
+        // Stop the coordinator so it can't tick against a half-torn-down
+        // version, and drain the inference queue so its collector + health
+        // checker die and new submissions are rejected instead of hanging on
+        // the shut-down clients below.
+        self.stop_status_coordinator(model_name, version).await;
+        if let Some(drain) = self.inference_queue.begin_drain(model_name, version) {
+            drain.abort();
+        }
+
         let key = model_version_key(model_name, version);
         let (procs, clients) = {
             let mut workers = self.workers.write().await;
@@ -2191,6 +2202,103 @@ class TestAPI(LitAPI):
             );
         }
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Audit (2026-08-22, resource-leak/observability sweep):
+    /// force_unload_version removes the registry entry and shuts the ZMQ
+    /// clients down but never drains the inference queue — the graceful path
+    /// funnels through teardown_version_runtime, which runs
+    /// `inference_queue.begin_drain` + `drain.abort()` (single teardown path,
+    /// §6.5). The version's queue entry, batch collector and health checker
+    /// survive the force unload, and try_submit keeps accepting requests
+    /// that can only die on a shut-down client (they hang to
+    /// request_timeout), while the health checker probes the dead clients
+    /// forever.
+    #[tokio::test]
+    async fn force_unload_must_drain_the_inference_queue() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "fqm",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("fqm", "1").unwrap();
+
+        let queue = Arc::new(InferenceQueue::new());
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-fqm-{}.sock",
+                std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        queue.register_model(
+            "fqm",
+            "1",
+            &crate::config::ModelConfig::default(),
+            vec![],
+            vec![client],
+            Arc::new(crate::inference_queue::OutlierState::new(1)),
+            None,
+        );
+
+        let wm = WorkerManager::new(
+            registry,
+            std::env::temp_dir(),
+            queue.clone(),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+        wm.force_unload_version("fqm", "1").await.unwrap();
+
+        assert!(
+            queue.begin_drain("fqm", "1").is_none(),
+            "the inference-queue entry must be gone after force-unload \
+             (collector + health checker aborted, submissions rejected)"
+        );
+    }
+
+    /// Companion: the graceful unload stops the version's status coordinator
+    /// FIRST (unload_version:1656) so it can't tick against a half-torn-down
+    /// version; the force path skips that stop, leaking the periodic
+    /// coordinator task for the process's lifetime (one ghost ticker per
+    /// force-unloaded version).
+    #[tokio::test]
+    async fn force_unload_must_stop_the_status_coordinator() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "fsc",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("fsc", "1").unwrap();
+
+        let wm = WorkerManager::new(
+            registry,
+            std::env::temp_dir(),
+            Arc::new(InferenceQueue::new()),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+        wm.start_status_coordinator("fsc", "1", std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(wm.status_coordinators.read().await.len(), 1);
+
+        wm.force_unload_version("fsc", "1").await.unwrap();
+
+        assert!(
+            wm.status_coordinators.read().await.is_empty(),
+            "the status coordinator task must be stopped on force-unload"
+        );
     }
 
     /// Plan-cache invalidation gap (audit 2026-08-20): graceful unload
