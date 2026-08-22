@@ -1682,6 +1682,13 @@ async fn execute_stream_step(
     // (can land on a healthy instance), each attempt a fresh stream_id.
     // Chunk/Start/Done commits the stream (no replay — P5/§6.3). retries == 0
     // keeps the historical no-peek path byte-for-byte.
+    // G4: stream concurrency cap for this DAG node's model version — taken
+    // BEFORE any worker stream opens so a capacity rejection has no side
+    // effect to roll back (grpc/rpc/stream.rs:234 "rejected pre-open"
+    // parity). One permit per logical stream, held across retry attempts.
+    let permit = state
+        .inference_queue
+        .try_acquire_stream_permit(&step.model, &resolved_version)?;
     let (chunk_rx, stream_id, cancel_client, wrapper_abort, inflight_guard) = if step.retries == 0 {
         let client = &clients[worker_id];
         let stream_id = format!("stream-{}", Uuid::new_v4());
@@ -1691,10 +1698,6 @@ async fn execute_stream_step(
         let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
         // G3: count the stream toward the slot's max_requests budget (per DAG node).
         state.inference_queue.record_stream_served(&step.model, &resolved_version, worker_id);
-        // G4: stream concurrency cap for this DAG node's model version.
-        let permit = state
-            .inference_queue
-            .try_acquire_stream_permit(&step.model, &resolved_version)?;
         // G1/G3: count the in-flight stream on its slot (per DAG node).
         let guard = state
             .worker_manager
@@ -1705,7 +1708,7 @@ async fn execute_stream_step(
     } else {
         open_stream_with_retry(
             state, step, &resolved_version, payload_bytes.clone(), &meta, opts,
-            step_deadline, &clients, worker_id, step.retries,
+            step_deadline, &clients, worker_id, step.retries, permit,
         )
         .await?
     };
@@ -1775,6 +1778,9 @@ async fn open_stream_with_retry(
     clients: &[Arc<crate::transport::zmq::WorkerZmqClient>],
     mut worker_id: usize,
     retries: u32,
+    // G4: acquired by the caller BEFORE any open (capacity rejection must be
+    // side-effect free); attached to the committed attempt's guard.
+    permit: Option<crate::inference_queue::StreamPermit>,
 ) -> Result<
     (
         mpsc::Receiver<pb::StreamResponse>,
@@ -1785,6 +1791,7 @@ async fn open_stream_with_retry(
     ),
     AppError,
 > {
+    let mut permit = permit;
     // First-frame peek bound: the step budget remaining; with no deadline the
     // idle budget (same escape hatch as the adapters' recv_chunk: 0 = none).
     let peek_bound = crate::deadline::remaining(step_deadline).or_else(|| {
@@ -1816,20 +1823,16 @@ async fn open_stream_with_retry(
         };
         // G3: count this attempt toward the slot's max_requests budget.
         state.inference_queue.record_stream_served(&step.model, resolved_version, worker_id);
-        // G4: stream concurrency cap for this attempt (a capacity rejection
-        // is not a worker fault — no retry).
-        let attempt_permit = state
-            .inference_queue
-            .try_acquire_stream_permit(&step.model, resolved_version)?;
         // G1/G3: count this attempt's stream on its slot. Retry continues
         // cancel the stream and drop the guard with it; the committed
         // attempt's guard moves into the first-frame forwarder (or rides the
-        // returned tuple when no forwarder runs).
+        // returned tuple when no forwarder runs). The G4 permit is attached
+        // only at the commit points below.
         let attempt_guard = state
             .worker_manager
             .get_outlier_state(&step.model, resolved_version)
             .await
-            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(attempt_permit));
+            .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id));
 
         // Peek the first frame (bounded). Committed frames: Chunk/Start/Done.
         let first = match peek_bound {
@@ -1848,7 +1851,7 @@ async fn open_stream_with_retry(
                         worker_id = repick_streaming_worker(state, step, resolved_version, meta, clients).await?;
                         continue;
                     }
-                    return Ok((rx, stream_id, Arc::clone(client), None, attempt_guard));
+                    return Ok((rx, stream_id, Arc::clone(client), None, attempt_guard.map(|g| g.with_permit(permit.take()))));
                 }
             },
             None => rx.recv().await,
@@ -1880,7 +1883,7 @@ async fn open_stream_with_retry(
         let task = tokio::spawn(async move {
             // The in-flight count releases when this forwarder ends — the
             // stream is over by then (rx closed or the consumer gone).
-            let _attempt_guard = attempt_guard;
+            let _attempt_guard = attempt_guard.map(|g| g.with_permit(permit.take()));
             if let Some(f) = first {
                 if tx.send(f).await.is_err() {
                     return;
@@ -1923,4 +1926,215 @@ async fn repick_streaming_worker(
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
     Ok(worker_id)
+}
+
+#[cfg(test)]
+mod audit_0822_tests {
+    //! Audit (2026-08-22, resource-leak/observability sweep) evidence tests.
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::proto::liteserver as pb;
+    use prost::Message;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::time::Duration;
+
+    fn audit_state() -> Arc<AppState> {
+        let cb = Arc::new(CallbackRunner::new());
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let queue = Arc::new(crate::inference_queue::InferenceQueue::new());
+        let wm = Arc::new(crate::worker::WorkerManager::new(
+            registry.clone(),
+            PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            crate::config::Config::default(),
+            PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// Register `model` v1 ready with one worker + ZMQ client (test hook) AND
+    /// an inference-queue entry whose `max_concurrent_streams` is 1, so the
+    /// G4 permit is enforced.
+    async fn register_capped_streaming_model(
+        state: &Arc<AppState>,
+        model: &str,
+        endpoint: String,
+    ) {
+        state
+            .registry
+            .register(
+                model,
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client.clone()])
+            .await;
+        let config = crate::config::ModelConfig {
+            max_concurrent_streams: 1,
+            ..Default::default()
+        };
+        state.inference_queue.register_model(
+            model,
+            "1",
+            &config,
+            vec![],
+            vec![client],
+            Arc::new(crate::inference_queue::OutlierState::new(1)),
+            None,
+        );
+    }
+
+    /// Silent PAIR worker: records every received frame's stream action into
+    /// `seen` (Open / Cancel), never replies — the opened stream stays
+    /// in-flight until something cancels it.
+    fn spawn_recording_worker(
+        endpoint: String,
+        seen: std::sync::mpsc::Sender<String>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let action = match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => "open",
+                    Some(pb::stream_request::Action::Cancel(_)) => "cancel",
+                    _ => "other",
+                };
+                let _ = seen.send(format!("{}:{action}", st.stream_id));
+            }
+        })
+    }
+
+    fn single_stream_step_plan(model: &str) -> EnsemblePlan {
+        EnsemblePlan {
+            steps: vec![EnsembleStep {
+                name: "s".to_string(),
+                model: model.to_string(),
+                version: Some("1".to_string()),
+                inputs: HashMap::new(),
+                stream: true,
+                params: HashMap::new(),
+                timeout_secs: None,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
+                outputs_decl: None,
+                when: None,
+            }],
+            layers: vec![vec![0]],
+            output_step: 0,
+            output_field: None,
+            chains: Vec::new(),
+            inputs_decl: None,
+            input_modes: Vec::new(),
+            conditional_refs: Vec::new(),
+            step_dep_keys: vec![Vec::new()],
+            step_raw_eligible: Vec::new(),
+            outputs: None,
+            dag_sets: None,
+            config_path: PathBuf::from("/audit-0822"),
+            source_mtime: None,
+        }
+    }
+
+    /// execute_stream_step must take the G4 concurrency permit BEFORE opening
+    /// the worker stream — the gRPC unary-stream path's contract
+    /// ("rejected pre-open", grpc/rpc/stream.rs:234). The old order
+    /// (send_stream → record → permit) abandoned an already-opened worker
+    /// stream on capacity rejection with no cancel: the server-side route
+    /// was reaped by the ZMQ actor's orphan sweep, but the worker-side
+    /// generator never learned and ran to its natural end (an unbounded
+    /// generator occupies the worker forever). The fix makes the rejection
+    /// side-effect free: the worker must observe NO open frame at all.
+    #[tokio::test]
+    async fn capacity_reject_must_not_open_a_worker_stream() {
+        let state = audit_state();
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-audit0822-cap-{}.sock",
+                std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _worker = spawn_recording_worker(endpoint.clone(), seen_tx);
+        register_capped_streaming_model(&state, "capm", endpoint).await;
+
+        // Occupy the only stream-concurrency slot (cap = 1).
+        let _held = state
+            .inference_queue
+            .try_acquire_stream_permit("capm", "1")
+            .expect("permit acquisition must succeed")
+            .expect("registered version must return a permit");
+
+        let plan = single_stream_step_plan("capm");
+        let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+        let opts = EnsembleExecOpts {
+            client_ip: String::new(),
+            deadline_unix_ns: None,
+            decoupled: false,
+            dag_selector: None,
+        };
+        let snapshot = Arc::new(VersionSnapshot::default());
+        let res = execute_stream_step(
+            &state, &plan, 0, &ctx, "req-cap", &opts, None, None, &snapshot,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::StreamingCapacityExceeded(_))),
+            "the occupied cap must reject the second stream with StreamingCapacityExceeded"
+        );
+
+        // The rejection must be side-effect free: no open frame may reach
+        // the worker for the rejected request.
+        let mut frames = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match seen_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(frame) => frames.push(frame),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(
+            frames.is_empty(),
+            "capacity rejection leaked a worker stream open: {frames:?}"
+        );
+    }
 }
