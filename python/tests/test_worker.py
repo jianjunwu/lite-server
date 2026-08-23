@@ -607,7 +607,9 @@ class TestOuterHandlerErrorTraceback:
                 pass
 
             def step(self, active_sequences):
-                return [1 / 0 for _ in active_sequences]  # ZeroDivisionError
+                # Raise directly: a listcomp gets its own frame on Python < 3.12,
+                # which would make the deepest-frame assertion version-dependent.
+                raise ZeroDivisionError("division by zero")
 
             def has_finished(self, uid, token, generated_sequence):
                 return True
