@@ -1,12 +1,18 @@
-import { Card, Table } from 'antd';
+import { useState } from 'react';
+import { Button, Card, Table } from 'antd';
+import { BellOutlined, BellFilled } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useAlerts } from '../api/hooks';
+import {
+  ensureNotificationPermission, loadNotifyPref, notificationsSupported, saveNotifyPref,
+} from '../api/notifications';
 import type { AlertItem } from '../api/types';
 import { STATUS_COLORS, dataTextStyle } from '../theme';
 import { formatTime } from '../components/format';
 import { PageHeader } from '../components/PageHeader';
+import { App } from 'antd';
 
 function SeverityText({ severity }: { severity: AlertItem['severity'] }) {
   const color = severity === 'critical' ? STATUS_COLORS.error : STATUS_COLORS.warning;
@@ -20,13 +26,48 @@ function SeverityText({ severity }: { severity: AlertItem['severity'] }) {
 
 export function AlertsPage() {
   const { t } = useTranslation();
+  const { message } = App.useApp();
   const { instanceId } = useInstance();
   const alertsQuery = useAlerts(instanceId);
   const alerts = alertsQuery.data?.alerts ?? [];
+  const [notifyOn, setNotifyOn] = useState(loadNotifyPref());
+
+  const toggleNotify = async () => {
+    if (notifyOn) {
+      saveNotifyPref(false);
+      setNotifyOn(false);
+      return;
+    }
+    if (!notificationsSupported()) {
+      message.warning(t('alerts.notifyUnsupported'));
+      return;
+    }
+    const granted = await ensureNotificationPermission();
+    if (!granted) {
+      message.warning(t('alerts.notifyDenied'));
+      return;
+    }
+    saveNotifyPref(true);
+    setNotifyOn(true);
+    message.success(t('alerts.notifyEnabled'));
+  };
 
   return (
     <>
-      <PageHeader title={t('alerts.title')} subtitle={instanceId} />
+      <PageHeader
+        title={t('alerts.title')}
+        subtitle={instanceId}
+        extra={
+          <Button
+            size="small"
+            icon={notifyOn ? <BellFilled /> : <BellOutlined />}
+            type={notifyOn ? 'primary' : 'default'}
+            onClick={toggleNotify}
+          >
+            {notifyOn ? t('alerts.notifyOn') : t('alerts.notifyOff')}
+          </Button>
+        }
+      />
       <Card size="small">
         <Table<AlertItem>
           rowKey={(a) => `${a.model}/${a.version}/${a.rule}/${a.severity}`}

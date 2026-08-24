@@ -17,6 +17,8 @@ import { setLanguage } from '../i18n';
 import i18n from '../i18n';
 import { StatusDot, statusKind } from '../components/StatusBadge';
 import { TaskBell } from '../components/TaskBell';
+import { GlobalSearch } from '../components/GlobalSearch';
+import { useAlertNotifier } from '../api/useAlertNotifier';
 import { useThemeMode, useNeutrals } from '../context/ThemeModeContext';
 import { MoonOutlined, SunOutlined } from '@ant-design/icons';
 import { UserMenu } from '../components/UserMenu';
@@ -34,6 +36,7 @@ export function AppLayout() {
   const instancesQuery = useInstances();
   const instances = instancesQuery.data?.instances ?? [];
   const currentHealth = useHealthSummary(instanceId);
+  useAlertNotifier(instanceId);
 
   // Default to the first configured instance once the list arrives.
   useEffect(() => {
@@ -104,6 +107,7 @@ export function AppLayout() {
             />
           </Space>
           <Space size="middle">
+            <GlobalSearch />
             <Button type="text" icon={dark ? <SunOutlined /> : <MoonOutlined />} onClick={toggle} aria-label="theme" />
             <TaskBell />
             <Select

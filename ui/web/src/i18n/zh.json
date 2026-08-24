@@ -84,7 +84,15 @@
     "value": "当前值",
     "threshold": "阈值",
     "time": "时间",
-    "noAlerts": "暂无活跃告警"
+    "noAlerts": "暂无活跃告警",
+    "notifyOn": "通知已开启",
+    "notifyOff": "开启通知",
+    "notifyEnabled": "浏览器通知已开启（仅在标签页隐藏时推送）",
+    "notifyDenied": "浏览器拒绝了通知权限",
+    "notifyUnsupported": "当前浏览器不支持通知"
+  },
+  "search": {
+    "placeholder": "跨实例搜索模型"
   },
   "ops": {
     "actions": "操作",

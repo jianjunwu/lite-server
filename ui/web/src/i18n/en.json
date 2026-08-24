@@ -84,7 +84,15 @@
     "value": "Value",
     "threshold": "Threshold",
     "time": "Time",
-    "noAlerts": "No active alerts"
+    "noAlerts": "No active alerts",
+    "notifyOn": "Notifications on",
+    "notifyOff": "Notify me",
+    "notifyEnabled": "Browser notifications enabled (fires only while the tab is hidden)",
+    "notifyDenied": "Notification permission denied by the browser",
+    "notifyUnsupported": "This browser does not support notifications"
+  },
+  "search": {
+    "placeholder": "Search models across instances"
   },
   "ops": {
     "actions": "Actions",
