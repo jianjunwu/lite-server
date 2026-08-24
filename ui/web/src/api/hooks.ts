@@ -82,7 +82,7 @@ export function useModelHealth(instanceId: string | null, model: string, version
   });
 }
 
-export function useTimelineAll(instanceId: string | null, refetchInterval = 5_000) {
+export function useTimelineAll(instanceId: string | null, refetchInterval: number | false = 5_000) {
   return useQuery({
     queryKey: [instanceId, 'timeline'],
     queryFn: () => apiFetch<TimelineAllResponse>(instanceId!, '/metrics/timeline'),
@@ -103,7 +103,7 @@ export function useTimeline(instanceId: string | null, model: string, version?: 
   });
 }
 
-export function useAlerts(instanceId: string | null, refetchInterval = 10_000) {
+export function useAlerts(instanceId: string | null, refetchInterval: number | false = 10_000) {
   return useQuery({
     queryKey: [instanceId, 'alerts'],
     queryFn: () => apiFetch<AlertsResponse>(instanceId!, '/metrics/alerts'),
