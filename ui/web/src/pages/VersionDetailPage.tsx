@@ -8,6 +8,7 @@ import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { buildTimelineOption } from '../components/timelineChart';
+import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { formatAge } from '../components/format';
 import { dataTextStyle, TYPE } from '../theme';
 
@@ -16,6 +17,8 @@ export function VersionDetailPage() {
   const { name = '', version = '' } = useParams();
   const { instanceId } = useInstance();
 
+  const chartColors = useChartColors();
+  const neutrals = useNeutrals();
   const versionsQuery = useVersions(instanceId, name);
   const readyQuery = useModelReady(instanceId, name, version);
   const healthQuery = useModelHealth(instanceId, name, version);
@@ -31,10 +34,10 @@ export function VersionDetailPage() {
           title={
             <span>
               <Link to={`/models/${encodeURIComponent(name)}`}>{name}</Link>
-              <span style={{ color: '#9CA3AF' }}> / </span>
+              <span style={{ color: neutrals.textMuted }}> / </span>
               <span style={dataTextStyle}>{version}</span>
               {info?.active && (
-                <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#111827', marginLeft: 10 }}>
+                <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.06em', color: neutrals.textPrimary, marginLeft: 10 }}>
                   ● {t('common.active')}
                 </span>
               )}
@@ -76,7 +79,7 @@ export function VersionDetailPage() {
         isEmpty={snapshots.every((s) => s.entries.length === 0)}
         onRetry={() => timelineQuery.refetch()}
       >
-        <EChart option={buildTimelineOption(snapshots, 'qps')} group={`ver-${name}-${version}`} />
+        <EChart option={buildTimelineOption(snapshots, 'qps', { palette: chartColors })} group={`ver-${name}-${version}`} />
       </ChartCard>
       <ChartCard
         title={t('metrics.p99')}
@@ -84,7 +87,7 @@ export function VersionDetailPage() {
         error={timelineQuery.error}
         isEmpty={snapshots.every((s) => s.entries.length === 0)}
       >
-        <EChart option={buildTimelineOption(snapshots, 'p99_ms', { yAxisName: 'ms' })} group={`ver-${name}-${version}`} />
+        <EChart option={buildTimelineOption(snapshots, 'p99_ms', { yAxisName: 'ms', palette: chartColors })} group={`ver-${name}-${version}`} />
       </ChartCard>
     </div>
   );

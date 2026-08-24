@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Alert, Layout, Menu, Select, Space, Typography } from 'antd';
+import { Alert, Button, Layout, Menu, Select, Space, Typography } from 'antd';
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -17,8 +17,10 @@ import { setLanguage } from '../i18n';
 import i18n from '../i18n';
 import { StatusDot, statusKind } from '../components/StatusBadge';
 import { TaskBell } from '../components/TaskBell';
+import { useThemeMode, useNeutrals } from '../context/ThemeModeContext';
+import { MoonOutlined, SunOutlined } from '@ant-design/icons';
 import { UserMenu } from '../components/UserMenu';
-import { eyebrowStyle } from '../theme';
+
 
 const { Sider, Header, Content } = Layout;
 
@@ -27,6 +29,8 @@ export function AppLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const { instanceId, setInstanceId } = useInstance();
+  const { dark, toggle } = useThemeMode();
+  const neutrals = useNeutrals();
   const instancesQuery = useInstances();
   const instances = instancesQuery.data?.instances ?? [];
   const currentHealth = useHealthSummary(instanceId);
@@ -63,7 +67,7 @@ export function AppLayout() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider width={208} collapsible breakpoint="lg" style={{ borderRight: '1px solid #E5E7EB' }}>
+      <Sider width={208} collapsible breakpoint="lg" style={{ borderRight: `1px solid ${neutrals.border}` }}>
         <div style={{ height: 48, display: 'flex', alignItems: 'center', paddingLeft: 20, gap: 8 }}>
           <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 18 }} />
           <Typography.Text strong style={{ fontSize: 15 }}>lite-ui</Typography.Text>
@@ -77,14 +81,14 @@ export function AppLayout() {
             alignItems: 'center',
             justifyContent: 'space-between',
             padding: '0 16px',
-            borderBottom: '1px solid #E5E7EB',
+            borderBottom: `1px solid ${neutrals.border}`,
             position: 'sticky',
             top: 0,
             zIndex: 10,
           }}
         >
           <Space size="middle">
-            <span style={eyebrowStyle}>{t('common.instance')}</span>
+            <span style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em', color: neutrals.textSecondary }}>{t('common.instance')}</span>
             {instanceId && (
               <StatusDot
                 kind={currentHealth.isError ? 'offline' : statusKind(currentHealth.data?.status ?? 'loading')}
@@ -100,6 +104,7 @@ export function AppLayout() {
             />
           </Space>
           <Space size="middle">
+            <Button type="text" icon={dark ? <SunOutlined /> : <MoonOutlined />} onClick={toggle} aria-label="theme" />
             <TaskBell />
             <Select
               size="small"

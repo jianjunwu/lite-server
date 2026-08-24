@@ -6,6 +6,7 @@ import { StatusBadge } from './StatusBadge';
 import { TrafficRiver } from './TrafficRiver';
 import { VersionActions } from './VersionActions';
 import { formatAge } from './format';
+import { useNeutrals } from '../context/ThemeModeContext';
 import { dataTextStyle, TYPE } from '../theme';
 
 interface VersionsTableProps {
@@ -22,6 +23,7 @@ interface VersionsTableProps {
 export function VersionsTable({ model, versions, loading, ops }: VersionsTableProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const neutrals = useNeutrals();
 
   const columns: TableProps<VersionInfo>['columns'] = [
     {
@@ -41,7 +43,7 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
       width: 90,
       render: (a: boolean) =>
         a ? (
-          <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#111827' }}>
+          <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.06em', color: neutrals.textPrimary }}>
             ● {t('common.active')}
           </span>
         ) : null,

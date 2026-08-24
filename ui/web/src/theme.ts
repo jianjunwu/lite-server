@@ -3,26 +3,28 @@ import { theme, type ThemeConfig } from 'antd';
 // Design tokens per .claude/frontend-ui-plan.md §7.0:
 // restrained engineering dashboard — single brand accent, border-separated
 // cards (no shadows), compact density.
-export const themeConfig: ThemeConfig = {
-  algorithm: [theme.defaultAlgorithm, theme.compactAlgorithm],
-  token: {
-    colorPrimary: '#4F46E5',
-    colorBorderSecondary: '#E5E7EB',
-    borderRadius: 6,
-    fontFamily:
-      "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
-  },
-  components: {
-    Layout: {
-      headerHeight: 48,
-      headerBg: '#ffffff',
-      siderBg: '#ffffff',
+export function getThemeConfig(dark: boolean): ThemeConfig {
+  return {
+    algorithm: dark ? [theme.darkAlgorithm, theme.compactAlgorithm] : [theme.defaultAlgorithm, theme.compactAlgorithm],
+    token: {
+      colorPrimary: '#4F46E5',
+      colorBorderSecondary: dark ? '#374151' : '#E5E7EB',
+      borderRadius: 6,
+      fontFamily:
+        "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
     },
-    Card: {
-      boxShadowTertiary: 'none',
+    components: {
+      Layout: {
+        headerHeight: 48,
+        headerBg: dark ? '#111827' : '#ffffff',
+        siderBg: dark ? '#111827' : '#ffffff',
+      },
+      Card: {
+        boxShadowTertiary: 'none',
+      },
     },
-  },
-};
+  };
+}
 
 // Status semantics: same hues everywhere (badges, worker matrix, donut,
 // threshold lines). Always paired with icons/text (colorblind-safe).
@@ -66,11 +68,4 @@ export const TYPE = {
 export const dataTextStyle: React.CSSProperties = {
   fontFamily: DATA_FONT,
   fontVariantNumeric: 'tabular-nums',
-};
-
-export const eyebrowStyle: React.CSSProperties = {
-  fontSize: TYPE.eyebrow,
-  textTransform: 'uppercase',
-  letterSpacing: '0.06em',
-  color: '#6B7280',
 };

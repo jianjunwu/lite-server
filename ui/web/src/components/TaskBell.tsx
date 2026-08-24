@@ -4,10 +4,12 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTasks, type UiTask } from '../context/TaskContext';
 import { STATUS_COLORS, TYPE } from '../theme';
+import { useNeutrals } from '../context/ThemeModeContext';
 
 function TaskRow({ task, onDismiss }: { task: UiTask; onDismiss: (id: string) => void }) {
+  const neutrals = useNeutrals();
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: `1px solid ${neutrals.border}` }}>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: TYPE.body, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {task.title}

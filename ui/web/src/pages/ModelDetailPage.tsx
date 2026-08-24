@@ -15,6 +15,7 @@ import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
 import { RoutingEditor } from '../components/RoutingEditor';
 import { buildTimelineOption } from '../components/timelineChart';
+import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
 
 export function ModelDetailPage() {
@@ -28,6 +29,8 @@ export function ModelDetailPage() {
   const [loadOpen, setLoadOpen] = useState(false);
   const [loadVersion, setLoadVersion] = useState('');
 
+  const chartColors = useChartColors();
+  const neutrals = useNeutrals();
   const versionsQuery = useVersions(instanceId, name);
   const healthQuery = useModelHealth(instanceId, name);
   const timelineQuery = useTimeline(instanceId, name);
@@ -61,7 +64,7 @@ export function ModelDetailPage() {
           <span>
             {name}
             {versionsQuery.data?.active_version && (
-              <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: '#4B5563', marginLeft: 12 }}>
+              <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: neutrals.textSecondary, marginLeft: 12 }}>
                 ● {versionsQuery.data.active_version}
               </span>
             )}
@@ -125,7 +128,7 @@ export function ModelDetailPage() {
                   isEmpty={snapshots.every((s) => s.entries.length === 0)}
                   onRetry={() => timelineQuery.refetch()}
                 >
-                  <EChart option={buildTimelineOption(snapshots, 'qps')} group={`model-${name}`} />
+                  <EChart option={buildTimelineOption(snapshots, 'qps', { palette: chartColors })} group={`model-${name}`} />
                 </ChartCard>
                 <ChartCard
                   title={t('metrics.p99')}
@@ -133,7 +136,7 @@ export function ModelDetailPage() {
                   error={timelineQuery.error}
                   isEmpty={snapshots.every((s) => s.entries.length === 0)}
                 >
-                  <EChart option={buildTimelineOption(snapshots, 'p99_ms', { yAxisName: 'ms' })} group={`model-${name}`} />
+                  <EChart option={buildTimelineOption(snapshots, 'p99_ms', { yAxisName: 'ms', palette: chartColors })} group={`model-${name}`} />
                 </ChartCard>
               </div>
             ),

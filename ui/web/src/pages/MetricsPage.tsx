@@ -5,6 +5,7 @@ import { useInstance } from '../context/InstanceContext';
 import { useAlerts, useModels, useTimelineAll, useVersions } from '../api/hooks';
 import { ChartCard } from '../components/ChartCard';
 import { PageHeader } from '../components/PageHeader';
+import { useChartColors } from '../context/ThemeModeContext';
 import { EChart } from '../components/EChart';
 import { buildTimelineOption, type MetricKey, type ThresholdLine } from '../components/timelineChart';
 
@@ -25,6 +26,7 @@ export function MetricsPage() {
   const [refreshMs, setRefreshMs] = useState<number>(loadRefresh());
   const [paused, setPaused] = useState(false);
 
+  const chartColors = useChartColors();
   const modelsQuery = useModels(instanceId);
   const modelNames = useMemo(
     () => [...new Set((modelsQuery.data?.models ?? []).map((m) => m.name))],
@@ -136,6 +138,7 @@ export function MetricsPage() {
                 option={buildTimelineOption(snapshots, c.key, {
                   yAxisName: c.yAxisName,
                   thresholds: c.rule ? thresholdsFor(c.rule) : undefined,
+                  palette: chartColors,
                 })}
                 group={CHART_GROUP}
               />

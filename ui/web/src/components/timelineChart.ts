@@ -10,12 +10,26 @@ export interface ThresholdLine {
   severity: 'warning' | 'critical';
 }
 
+export interface ChartPalette {
+  axis: string;
+  split: string;
+  text: string;
+}
+
+const DEFAULT_PALETTE: ChartPalette = { axis: '#D1D5DB', split: '#E5E7EB', text: '#6B7280' };
+
 /** Snapshots -> multi-series line chart option (one series per model/version). */
 export function buildTimelineOption(
   snapshots: TimelineSnapshot[],
   key: MetricKey,
-  opts: { title?: string; yAxisName?: string; thresholds?: ThresholdLine[]; group?: string } = {},
+  opts: {
+    title?: string;
+    yAxisName?: string;
+    thresholds?: ThresholdLine[];
+    palette?: ChartPalette;
+  } = {},
 ): EChartsOption {
+  const palette = opts.palette ?? DEFAULT_PALETTE;
   const series: SeriesOption[] = snapshots.map((snap, idx) => {
     const color = SERIES_COLORS[idx % SERIES_COLORS.length];
     const markLine =
@@ -48,16 +62,17 @@ export function buildTimelineOption(
   });
 
   return {
-    title: opts.title ? { text: opts.title, textStyle: { fontSize: 13 } } : undefined,
+    title: opts.title ? { text: opts.title, textStyle: { fontSize: 13, color: palette.text } } : undefined,
     grid: { left: 48, right: 16, top: 32, bottom: 28 },
     tooltip: { trigger: 'axis', order: 'valueDesc' },
-    legend: { type: 'scroll', bottom: 0, textStyle: { fontSize: 11 } },
-    xAxis: { type: 'time', axisLine: { lineStyle: { color: '#D1D5DB' } } },
+    legend: { type: 'scroll', bottom: 0, textStyle: { fontSize: 11, color: palette.text } },
+    xAxis: { type: 'time', axisLine: { lineStyle: { color: palette.axis } } },
     yAxis: {
       type: 'value',
       name: opts.yAxisName,
-      splitLine: { lineStyle: { color: '#E5E7EB', type: 'dashed' } },
+      splitLine: { lineStyle: { color: palette.split, type: 'dashed' } },
       axisLabel: {
+        color: palette.text,
         formatter: (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)),
       },
     },

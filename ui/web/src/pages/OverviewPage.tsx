@@ -11,12 +11,14 @@ import { StatCard } from '../components/StatCard';
 import { EChart } from '../components/EChart';
 import { PageHeader } from '../components/PageHeader';
 import { STATUS_COLORS, TYPE, dataTextStyle } from '../theme';
+import { useNeutrals } from '../context/ThemeModeContext';
 import { formatMs, formatNumber } from '../components/format';
 
 const MAX_MODEL_ROWS = 6;
 
 export function OverviewPage() {
   const { t } = useTranslation();
+  const neutrals = useNeutrals();
   const instancesQuery = useInstances();
   const instances = useMemo(() => instancesQuery.data?.instances ?? [], [instancesQuery.data]);
 
@@ -149,7 +151,7 @@ export function OverviewPage() {
               // All quiet: no chart, just a calm statement.
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 120 }}>
                 <StatusDot kind="ready" size={10} />
-                <span style={{ fontSize: TYPE.body, color: '#374151' }}>
+                <span style={{ fontSize: TYPE.body, color: neutrals.textPrimary }}>
                   {t('overview.allReady', { versions: totalVersions, instances: instances.length })}
                 </span>
               </div>
@@ -223,7 +225,7 @@ export function OverviewPage() {
                               <StatusDot key={v.version} kind={statusKind(v.status)} size={7} />
                             ))}
                           </span>
-                          <span style={{ ...dataTextStyle, marginLeft: 'auto', fontSize: TYPE.secondary, color: '#6B7280' }}>
+                          <span style={{ ...dataTextStyle, marginLeft: 'auto', fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
                             {latestP99 > 0 ? formatMs(latestP99) : '-'}
                           </span>
                         </div>

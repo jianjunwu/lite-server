@@ -15,6 +15,7 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import { formatMs } from '../components/format';
 import { MONO_FONT, STATUS_COLORS, TYPE, dataTextStyle } from '../theme';
+import { useNeutrals } from '../context/ThemeModeContext';
 
 // ---- response slot state ----------------------------------------------------
 
@@ -53,6 +54,7 @@ function ResponseMeta({ slot }: { slot: SlotState }) {
 
 function SlotView({ slot }: { slot: SlotState }) {
   const { t } = useTranslation();
+  const neutrals = useNeutrals();
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -74,7 +76,7 @@ function SlotView({ slot }: { slot: SlotState }) {
       {slot.events.length > 0 && (
         <div ref={scrollRef} style={{ maxHeight: 400, overflow: 'auto' }}>
           {slot.events.map((e, i) => (
-            <pre key={i} style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary, margin: 0, padding: '2px 0', borderBottom: '1px dashed #F3F4F6' }}>
+            <pre key={i} style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary, margin: 0, padding: '2px 0', borderBottom: `1px dashed ${neutrals.border}` }}>
               {e}
             </pre>
           ))}
@@ -86,6 +88,7 @@ function SlotView({ slot }: { slot: SlotState }) {
 
 function DiffView({ textA, textB }: { textA: string; textB: string }) {
   const { t } = useTranslation();
+  const neutrals = useNeutrals();
   const parts = diffLines(textA, textB);
   const identical = parts.every((p) => !p.added && !p.removed);
   if (identical) {
@@ -98,7 +101,7 @@ function DiffView({ textA, textB }: { textA: string; textB: string }) {
           key={i}
           style={{
             display: 'block',
-            background: p.added ? '#ECFDF5' : p.removed ? '#FEF2F2' : 'transparent',
+            background: p.added ? neutrals.diffAddBg : p.removed ? neutrals.diffRemoveBg : 'transparent',
             color: p.added ? STATUS_COLORS.ready : p.removed ? STATUS_COLORS.error : undefined,
           }}
         >

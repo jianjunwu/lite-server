@@ -1,6 +1,7 @@
 import { Tooltip } from 'antd';
 import { SERIES_COLORS, dataTextStyle, TYPE } from '../theme';
 import type { VersionInfo } from '../api/types';
+import { useNeutrals } from '../context/ThemeModeContext';
 
 interface TrafficRiverProps {
   versions: VersionInfo[];
@@ -19,6 +20,7 @@ export function versionColor(index: number): string {
  * canary traffic split made visible.
  */
 export function TrafficRiver({ versions, height = 12, onSelect }: TrafficRiverProps) {
+  const neutrals = useNeutrals();
   const total = versions.reduce((sum, v) => sum + v.weight, 0);
   if (versions.length === 0 || total <= 0) return <span style={dataTextStyle}>-</span>;
 
@@ -48,7 +50,7 @@ export function TrafficRiver({ versions, height = 12, onSelect }: TrafficRiverPr
         {versions.map((v, idx) => (
           <span
             key={v.version}
-            style={{ ...dataTextStyle, fontSize: TYPE.eyebrow, color: '#4B5563', whiteSpace: 'nowrap' }}
+            style={{ ...dataTextStyle, fontSize: TYPE.eyebrow, color: neutrals.textSecondary, whiteSpace: 'nowrap' }}
           >
             <span style={{ color: versionColor(idx) }}>{v.active ? '●' : '○'}</span>
             {v.version} {v.weight}%
