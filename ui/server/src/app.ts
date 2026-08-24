@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs';
 import type { InstanceRegistry } from './config.js';
 import { registerProxyRoutes } from './proxy.js';
 import { registerInstanceRoutes } from './routes-instances.js';
+import { registerAuth } from './auth/plugin.js';
+import type { UserStore } from './auth/users.js';
 
 export interface AppOptions {
   /** Directory of the built SPA; served at / when it exists. */
@@ -11,6 +13,8 @@ export interface AppOptions {
   logger?: boolean;
   /** Max proxied request body in bytes (uploads). Default 1 GiB. */
   bodyLimit?: number;
+  /** Local-account auth. Omit for a fully open BFF (dev only). */
+  auth?: { enabled: boolean; userStore: UserStore };
 }
 
 export function buildApp(registry: InstanceRegistry, opts: AppOptions = {}): FastifyInstance {
@@ -19,14 +23,21 @@ export function buildApp(registry: InstanceRegistry, opts: AppOptions = {}): Fas
     bodyLimit: opts.bodyLimit ?? 1 << 30,
   });
 
-  // BFF's own APIs (default JSON parsing).
-  registerInstanceRoutes(app, registry);
-
-  // Instance proxy lives in its own encapsulation scope with a verbatim
-  // buffering parser (see proxy.ts).
-  app.register(async (scope) => {
-    registerProxyRoutes(scope, registry);
-  });
+  // Auth first: the guard hook must cover every route below.
+  if (opts.auth) {
+    app.register(async (scope) => {
+      await registerAuth(scope, opts.auth!);
+      registerInstanceRoutes(scope, registry);
+      scope.register(async (proxyScope) => {
+        registerProxyRoutes(proxyScope, registry);
+      });
+    });
+  } else {
+    registerInstanceRoutes(app, registry);
+    app.register(async (scope) => {
+      registerProxyRoutes(scope, registry);
+    });
+  }
 
   if (opts.webDist && existsSync(opts.webDist)) {
     app.register(fastifyStatic, { root: opts.webDist, wildcard: true });
