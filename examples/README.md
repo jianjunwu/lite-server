@@ -89,6 +89,12 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 25 | [kserve_v2](25_kserve_v2/) | KServe V2 dataplane | Raw tensor bytes (`x-tensor-*` headers), Triton Binary Tensor Data Extension (`ctx.binary_data`, `binary_data_output`), tritonclient e2e |
 | 26 | [openai_compact](26_openai_compact/) | OpenAI-compatible subset | `/v1/chat/completions` unary + SSE, `/v1/embeddings`, `/v1/models`; worker-side translation via `lite_server.helpers.openai` |
 
+### LLM Backends
+
+| # | Example | Description | Key Concept |
+|---|---------|-------------|-------------|
+| 27 | [vllm](27_vllm/) | vLLM `AsyncLLMEngine` serving | Lazy engine init, cumulative→delta slicing, Hermes tool calling, `engine.abort()` on disconnect (requires GPU + `pip install vllm`; not in `run_all.py`) |
+
 ## Running Any Example
 
 ```bash

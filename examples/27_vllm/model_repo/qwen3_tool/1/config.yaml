@@ -1,0 +1,33 @@
+max_batch_size: 1
+batch_timeout: 0.0
+stream: true
+# vLLM's internal scheduler does the batching — lite-server CB is incompatible.
+continuous_batching: false
+accelerator: cuda
+devices: 1
+workers_per_device: 1
+
+# Warmup: creates the engine (first predict) before the version reports Ready,
+# so real traffic never sees the cold start.
+policies:
+  warmup:
+    enabled: true
+    samples:
+      - input_ref: warmup/input.json
+        iterations: 1
+    timeout_secs: 300.0
+
+# vLLM engine parameters (custom fields, read in setup())
+visible_devices: "0"
+tensor_parallel_size: 1
+model_path: yifan02/qwen3-0.6b-tool-distill
+max_model_len: 8192
+gpu_memory_utilization: 0.60   # on the CPU backend this is CPU-RAM utilization; keep low for small containers
+dtype: "auto"
+trust_remote_code: false
+# Skip torch.compile: on CPU the Inductor pass dominates startup (tens of
+# minutes) with little benefit at this scale. Set false on GPU for throughput.
+enforce_eager: true
+
+# Tool calling: "hermes" parses Qwen3-style <tool_call> blocks; null disables.
+tool_parser: hermes
