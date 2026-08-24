@@ -111,6 +111,32 @@ describe('TrafficRiver editable', () => {
     expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
   });
 
+  it('should_discard_the_draft_when_the_version_set_changes_before_apply', () => {
+    // Versions refetch every 10s; a draft built by position must never be
+    // applied to a changed version set (weights would land on wrong versions).
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (ui: React.ReactElement) => (
+      <MemoryRouter initialEntries={['/?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <AntdApp>
+            <InstanceProvider>{ui}</InstanceProvider>
+          </AntdApp>
+        </QueryClientProvider>
+      </MemoryRouter>
+    );
+    const utils = render(
+      tree(<TrafficRiver versions={[version('v1', 70, true), version('v2', 30)]} model="m" editable />),
+    );
+    fireEvent.keyDown(screen.getAllByRole('slider')[0], { key: 'ArrowRight' });
+    expect(screen.getByText(/v1 71%/)).toBeInTheDocument();
+    utils.rerender(
+      tree(<TrafficRiver versions={[version('v1', 70, true), version('v3', 30)]} model="m" editable />),
+    );
+    expect(screen.getByText(/v1 70%/)).toBeInTheDocument();
+    expect(screen.getByText(/v3 30%/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+  });
+
   it('should_apply_draft_weights_via_set_routing_after_confirm', async () => {
     renderRiver(<TrafficRiver versions={[version('v1', 70, true), version('v2', 30)]} model="m" editable />);
     fireEvent.keyDown(screen.getAllByRole('slider')[0], { key: 'ArrowRight' });

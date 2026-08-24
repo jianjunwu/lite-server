@@ -288,7 +288,9 @@ function UsersTab() {
     try {
       if (editing) {
         const patch: Record<string, unknown> = { role: values.role };
-        if (values.password && values.password.length >= 8) patch.password = values.password;
+        // Empty means "keep the current password"; the form enforces min 8
+        // for non-empty values, so anything here is safe to send.
+        if (values.password) patch.password = values.password;
         await bffFetch(`/api/users/${encodeURIComponent(editing.username)}`, {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
@@ -393,7 +395,7 @@ function UsersTab() {
             name="password"
             label={t('settings.users.password')}
             extra={editing ? t('settings.users.passwordKeepHint') : t('settings.users.passwordHint')}
-            rules={editing ? [] : [{ required: true, min: 8 }]}
+            rules={[{ required: editing === null, min: 8 }]}
           >
             <Input.Password autoComplete="new-password" style={{ fontFamily: MONO_FONT }} />
           </Form.Item>

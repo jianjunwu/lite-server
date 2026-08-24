@@ -42,17 +42,26 @@ export function TrafficRiver({ versions, height = 12, onSelect, model, editable 
   const { apply, busy } = useApplyRouting(model ?? '');
   const barRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ index: number; startX: number; base: number[]; moved: boolean } | null>(null);
-  const [draft, setDraft] = useState<number[] | null>(null);
+  const [draft, setDraft] = useState<Record<string, number> | null>(null);
 
   const serverWeights = versions.map((v) => v.weight);
-  const weights = draft ?? serverWeights;
+  // Drafts are keyed by version name and go stale the moment the version set
+  // changes (versions refetch every 10s) — otherwise weights built against
+  // old positions would be applied to the wrong versions.
+  const draftStale =
+    draft !== null &&
+    (Object.keys(draft).length !== versions.length || versions.some((v) => !(v.version in draft)));
+  const weights = draft && !draftStale ? versions.map((v) => draft[v.version]) : serverWeights;
   const total = serverWeights.reduce((sum, w) => sum + w, 0);
   const canEdit = Boolean(editable && model && versions.length > 1 && total > 0);
 
   if (versions.length === 0 || total <= 0) return <span style={dataTextStyle}>-</span>;
 
+  const setDraftFromWeights = (next: number[]) =>
+    setDraft(Object.fromEntries(versions.map((v, i) => [v.version, next[i]])));
+
   const dragBy = (index: number, deltaPct: number) =>
-    setDraft((prev) => boundaryDrag(prev ?? serverWeights, index, deltaPct));
+    setDraftFromWeights(boundaryDrag(weights, index, deltaPct));
 
   const onHandlePointerDown = (e: React.PointerEvent<HTMLDivElement>, index: number) => {
     e.preventDefault();
@@ -69,7 +78,7 @@ export function TrafficRiver({ versions, height = 12, onSelect, model, editable 
     const barWidth = barRef.current.getBoundingClientRect().width;
     if (barWidth <= 0) return;
     drag.moved = true;
-    setDraft(boundaryDrag(drag.base, drag.index, (dx / barWidth) * total));
+    setDraftFromWeights(boundaryDrag(drag.base, drag.index, (dx / barWidth) * total));
   };
 
   const onHandlePointerUp = () => {
@@ -88,9 +97,9 @@ export function TrafficRiver({ versions, height = 12, onSelect, model, editable 
   };
 
   const applyDraft = () => {
-    if (!draft) return;
+    if (!draft || draftStale) return;
     apply(
-      Object.fromEntries(versions.map((v, i) => [v.version, draft[i]])),
+      Object.fromEntries(versions.map((v) => [v.version, draft[v.version]])),
       Object.fromEntries(versions.map((v, i) => [v.version, serverWeights[i]])),
       () => setDraft(null),
     );
@@ -175,7 +184,7 @@ export function TrafficRiver({ versions, height = 12, onSelect, model, editable 
             {v.version} {weights[idx]}%
           </span>
         ))}
-        {canEdit && draft && (
+        {canEdit && draft && !draftStale && (
           <Space size="small">
             <Tag color="#B45309" style={{ border: 'none', color: '#fff', marginInlineEnd: 0 }}>
               {t('routing.modified')}

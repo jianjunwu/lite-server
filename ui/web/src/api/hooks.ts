@@ -53,7 +53,8 @@ export function useVersions(instanceId: string | null, model: string) {
   return useQuery({
     queryKey: [instanceId, 'versions', model],
     queryFn: () => apiFetch<VersionsResponse>(instanceId!, `/v2/models/${encodeURIComponent(model)}/versions`),
-    enabled: instanceId !== null,
+    // An empty model would poll /v2/models//versions (404) forever.
+    enabled: instanceId !== null && model !== '',
     refetchInterval: 10_000,
   });
 }

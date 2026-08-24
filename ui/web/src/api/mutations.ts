@@ -70,6 +70,16 @@ export async function withAdminKeyRetry<T>(instanceId: string, fn: () => Promise
     return await fn();
   } catch (err) {
     if (!(err instanceof ApiError) || err.status !== 401 || !keyRequester) throw err;
+    // A BFF-side 401 ({error:'unauthenticated'}) means the login session
+    // expired — the auth flow handles it; an instance-key prompt here would
+    // sit on top of the login redirect and the retry would fail anyway.
+    if (
+      err.body !== null &&
+      typeof err.body === 'object' &&
+      (err.body as { error?: unknown }).error === 'unauthenticated'
+    ) {
+      throw err;
+    }
     const key = await keyRequester(instanceId);
     if (!key) throw err;
     setAdminKey(instanceId, key);

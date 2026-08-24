@@ -14,6 +14,12 @@ export function useAlertNotifier(instanceId: string | null) {
   const alertsQuery = useAlerts(instanceId, 15_000);
   const seen = useRef<Set<string> | null>(null);
 
+  // Switching instances: the other instance's firing alerts are not "newly
+  // firing" for this user — reset so the first batch is a silent baseline.
+  useEffect(() => {
+    seen.current = null;
+  }, [instanceId]);
+
   useEffect(() => {
     const alerts = alertsQuery.data?.alerts;
     if (!alerts) return;
