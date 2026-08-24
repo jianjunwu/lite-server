@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Form, Input, Modal, Typography } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { setKeyRequester } from '../api/mutations';
@@ -16,16 +16,29 @@ const RequestKeyContext = createContext<(instanceId: string) => Promise<string |
  * Global admin-key prompt: mutations that hit a 401 ask here for the
  * instance key; the user types it once per browser session (sessionStorage,
  * per instance) and the failed mutation retries automatically.
+ *
+ * Concurrent requests for the same instance share one prompt/promise;
+ * requests for different instances queue so no caller is ever left hanging.
  */
 export function AdminKeyProvider({ children }: { children: ReactNode }) {
   const { t } = useTranslation();
   const [pending, setPending] = useState<PendingRequest | null>(null);
+  const queueRef = useRef<PendingRequest[]>([]);
+  const inflightRef = useRef(new Map<string, Promise<string | null>>());
   const [form] = Form.useForm<{ key: string }>();
 
   const requestKey = useCallback((instanceId: string) => {
-    return new Promise<string | null>((resolve) => {
-      setPending({ instanceId, resolve });
+    const inflight = inflightRef.current.get(instanceId);
+    if (inflight) return inflight;
+    const promise = new Promise<string | null>((resolve) => {
+      const request = { instanceId, resolve };
+      queueRef.current.push(request);
+      // Show it unless another prompt is already open. The updater stays
+      // pure — the queue push above happens exactly once per request.
+      setPending((current) => current ?? request);
     });
+    inflightRef.current.set(instanceId, promise);
+    return promise;
   }, []);
 
   useEffect(() => {
@@ -34,8 +47,11 @@ export function AdminKeyProvider({ children }: { children: ReactNode }) {
   }, [requestKey]);
 
   const close = (key: string | null) => {
-    pending?.resolve(key);
-    setPending(null);
+    if (!pending) return;
+    inflightRef.current.delete(pending.instanceId);
+    pending.resolve(key);
+    queueRef.current = queueRef.current.filter((r) => r !== pending);
+    setPending(queueRef.current[0] ?? null);
     form.resetFields();
   };
 
