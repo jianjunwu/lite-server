@@ -305,6 +305,26 @@ jobs:
           & "$env:USERPROFILE\miniconda\Scripts\conda.exe" install -y -c conda-forge libprotobuf
           "PROTOC=$env:USERPROFILE\miniconda\Library\bin\protoc.exe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
+      # The web UI ships inside every wheel (lite_server/webui/static/).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Build web UI
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C web build
+      - name: Stage SPA into wheel package data
+        shell: bash
+        run: |
+          rm -rf python/lite_server/webui/static
+          cp -r ui/web/dist python/lite_server/webui/static
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
