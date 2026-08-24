@@ -150,6 +150,15 @@ export function PlaygroundPage() {
     setTemplates(effectiveModel ? listTemplates(effectiveModel) : []);
   }, [effectiveModel]);
 
+  // Abort in-flight requests when the page unmounts; otherwise orphan
+  // streams keep generating on the instance after navigation.
+  useEffect(() => {
+    return () => {
+      aborts.current.forEach((fn) => fn());
+      aborts.current = [];
+    };
+  }, []);
+
   const running = slotA.status === 'running' || slotB.status === 'running';
 
   const setSlot = (which: 'a' | 'b', patch: Partial<SlotState> | ((cur: SlotState) => SlotState)) => {
@@ -169,12 +178,17 @@ export function PlaygroundPage() {
     if (!instanceId || !effectiveModel) return Promise.resolve(false);
     setSlot(which, { ...IDLE_SLOT, status: 'running' });
     if (protocol === 'unary') {
-      return inferUnary(instanceId, effectiveModel, version, requestBody)
+      const controller = new AbortController();
+      aborts.current.push(() => controller.abort());
+      return inferUnary(instanceId, effectiveModel, version, requestBody, controller.signal)
         .then((res) => {
           setSlot(which, { status: 'done', text: res.text, durationMs: res.durationMs, requestId: res.requestId });
           return true;
         })
         .catch((err) => {
+          // stop() already marked the slot; don't overwrite it with an
+          // AbortError message.
+          if (controller.signal.aborted) return false;
           setSlot(which, {
             status: 'error',
             error: err instanceof Error ? err.message : String(err),

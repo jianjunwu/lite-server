@@ -15,12 +15,13 @@ export class SseParser {
   push(chunk: string): string[] {
     this.buffer += chunk;
     const events: string[] = [];
-    let idx: number;
-    while ((idx = this.buffer.indexOf('\n\n')) >= 0) {
-      const frame = this.buffer.slice(0, idx);
-      this.buffer = this.buffer.slice(idx + 2);
+    // Frames are separated by a blank line; both LF and CRLF are legal.
+    let match: RegExpExecArray | null;
+    while ((match = /\r?\n\r?\n/.exec(this.buffer)) !== null) {
+      const frame = this.buffer.slice(0, match.index);
+      this.buffer = this.buffer.slice(match.index + match[0].length);
       const data = frame
-        .split('\n')
+        .split(/\r?\n/)
         .filter((line) => line.startsWith('data:'))
         .map((line) => line.slice(5).replace(/^ /, ''))
         .join('\n');
@@ -129,6 +130,9 @@ export function streamEvents(
       if (done) break;
       for (const payload of parser.push(decoder.decode(value, { stream: true }))) {
         if (payload === SSE_DONE) {
+          // Release the connection instead of waiting for the upstream to
+          // close it on its own.
+          await reader.cancel().catch(() => {});
           cb.onDone(performance.now() - started);
           return;
         }
@@ -138,7 +142,12 @@ export function streamEvents(
     // Connection closed without [DONE] — treat as done (server finished early).
     cb.onDone(performance.now() - started);
   })().catch((err) => {
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted) {
+      // Aborted (Stop button / page unmount): settle like a completed run so
+      // callers awaiting send() are not left hanging.
+      cb.onDone(performance.now() - started);
+      return;
+    }
     cb.onError(err instanceof Error ? err : new Error(String(err)));
   });
 

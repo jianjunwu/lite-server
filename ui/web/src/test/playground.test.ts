@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { SseParser, deleteTemplate, listTemplates, saveTemplate } from '../api/playground';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { SseParser, deleteTemplate, listTemplates, saveTemplate, streamEvents } from '../api/playground';
 
 describe('SseParser', () => {
   it('should_parse_complete_frames', () => {
@@ -32,6 +32,60 @@ describe('SseParser', () => {
   it('should_emit_done_marker_as_regular_payload', () => {
     const p = new SseParser();
     expect(p.push('data: [DONE]\n\n')).toEqual(['[DONE]']);
+  });
+
+  it('should_parse_crlf_framed_events', () => {
+    // The SSE spec allows \r\n line endings; an upstream behind certain
+    // proxies may frame with \r\n\r\n.
+    const p = new SseParser();
+    expect(p.push('data: a\r\n\r\ndata: b\r\n\r\n')).toEqual(['a', 'b']);
+  });
+});
+
+describe('streamEvents', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Mirrors real fetch: aborting the request signal errors the body stream.
+  const abortableStream = (_input: RequestInfo | URL, init?: RequestInit) =>
+    Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(c) {
+            init?.signal?.addEventListener('abort', () =>
+              c.error(new DOMException('Aborted', 'AbortError')),
+            );
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+  it('should_call_onDone_when_aborted_mid_stream', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(abortableStream));
+    const cb = { onEvent: vi.fn(), onDone: vi.fn(), onError: vi.fn() };
+    const abort = streamEvents('prod', 'm', null, '{}', cb);
+    await new Promise((r) => setTimeout(r, 10));
+    abort();
+    // The caller's send() promise settles via onDone — aborting must not
+    // leave it hanging.
+    await vi.waitFor(() => expect(cb.onDone).toHaveBeenCalledTimes(1));
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('should_cancel_the_reader_when_done_marker_arrives', async () => {
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+      },
+      cancel,
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+    const cb = { onEvent: vi.fn(), onDone: vi.fn(), onError: vi.fn() };
+    streamEvents('prod', 'm', null, '{}', cb);
+    await vi.waitFor(() => expect(cb.onDone).toHaveBeenCalled());
+    // Without cancel the connection lingers until the upstream closes it.
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalled());
   });
 });
 
