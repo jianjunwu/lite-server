@@ -159,11 +159,16 @@ maturin build --release  # release wheel
 
 ## Web Console (lite-ui)
 
-A web console for lite-server lives in [`ui/`](ui/): multi-instance dashboard,
-model lifecycle management (load/unload/activate/canary routing), and an
-inference playground. It runs as a standalone Node service that proxies each
-lite-server instance — no changes to the server needed. See
-[ui/README.md](ui/README.md).
+A web console ships inside the wheel: multi-instance dashboard, model
+lifecycle management (load/unload/activate/canary routing), and an inference
+playground. It runs as a small Python service (FastAPI) that reverse-proxies
+each configured lite-server instance — no changes to the server needed.
+
+```bash
+lite-server web        # serves the UI + API on :8600
+```
+
+The SPA source lives in [`ui/web/`](ui/). See [ui/README.md](ui/README.md).
 
 ## Examples
 

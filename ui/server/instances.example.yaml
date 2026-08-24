@@ -1,9 +1,0 @@
-# lite-ui instance registry.
-# Loaded at startup; UI-driven CRUD (M2) writes back atomically.
-# Instances may also be injected via env: LITE_UI_INSTANCES='[{"id":"...","name":"...","base_url":"..."}]'
-instances:
-  - id: local
-    name: Local dev
-    base_url: http://localhost:8000
-    # admin_key: inline-key           # injected by BFF; never sent to the browser
-    # admin_key_env: SOME_ENV_VAR     # or read from the environment at startup
