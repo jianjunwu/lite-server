@@ -166,6 +166,25 @@
     "passwordChanged": "Password changed",
     "mustChangeHint": "You must set a new password before continuing."
   },
+  "playground": {
+    "single": "Single",
+    "activeVersion": "active",
+    "templates": "Templates",
+    "templateName": "Template name",
+    "saveTemplate": "Save",
+    "templateSaved": "Template saved",
+    "send": "Send",
+    "stop": "Stop",
+    "stopped": "Stopped by user",
+    "response": "Response",
+    "noResponse": "Send a request to see the response",
+    "invalidJson": "Request body is not valid JSON",
+    "diff": "Diff (A → B)",
+    "identical": "Responses are identical",
+    "history": "History",
+    "emptyHistory": "No requests yet (kept in memory, cleared on refresh)",
+    "load": "Load"
+  },
   "settings": {
     "tabs": {
       "instances": "Instances",

@@ -53,6 +53,11 @@ export function VersionDetailPage() {
           <Descriptions.Item label={t('common.loadedAt')}>
             {info?.loaded_at ? formatAge(info.loaded_at) : '-'}
           </Descriptions.Item>
+          <Descriptions.Item label="">
+            <Link to={`/playground?model=${encodeURIComponent(name)}&version=${encodeURIComponent(version)}`}>
+              {t('nav.playground')} →
+            </Link>
+          </Descriptions.Item>
         </Descriptions>
       </Card>
 

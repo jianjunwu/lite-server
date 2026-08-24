@@ -166,6 +166,25 @@
     "passwordChanged": "密码已修改",
     "mustChangeHint": "继续之前请先设置新密码。"
   },
+  "playground": {
+    "single": "单版本",
+    "activeVersion": "激活版本",
+    "templates": "请求模板",
+    "templateName": "模板名称",
+    "saveTemplate": "存为模板",
+    "templateSaved": "模板已保存",
+    "send": "发送",
+    "stop": "中断",
+    "stopped": "已被用户中断",
+    "response": "响应",
+    "noResponse": "发送请求后在此查看响应",
+    "invalidJson": "请求体不是合法的 JSON",
+    "diff": "差异（A → B）",
+    "identical": "两个版本的响应完全一致",
+    "history": "历史记录",
+    "emptyHistory": "暂无请求（仅内存保存，刷新即清空）",
+    "load": "载入"
+  },
   "settings": {
     "tabs": {
       "instances": "实例",

@@ -111,6 +111,32 @@ describe('RBAC', () => {
     await app.close();
   });
 
+  it('should_allow_viewer_inference_post_but_not_admin_post', async () => {
+    const { app } = await setupWithUsers();
+    const { cookie } = await login(app, 'viewer1', 'viewer-pass-1');
+    const infer = await app.inject({
+      method: 'POST',
+      url: '/api/i/plain/v2/models/m/infer',
+      headers: { cookie: cookie!, 'x-requested-with': 'lite-ui' },
+      payload: { input: 1 },
+    });
+    expect(infer.statusCode).toBe(200);
+    const events = await app.inject({
+      method: 'POST',
+      url: '/api/i/plain/v2/models/m/events',
+      headers: { cookie: cookie!, 'x-requested-with': 'lite-ui' },
+      payload: { input: 1 },
+    });
+    expect(events.statusCode).toBe(200);
+    const reload = await app.inject({
+      method: 'POST',
+      url: '/api/i/plain/v2/models/m/reload',
+      headers: { cookie: cookie!, 'x-requested-with': 'lite-ui' },
+    });
+    expect(reload.statusCode).toBe(403);
+    await app.close();
+  });
+
   it('should_allow_operator_proxy_mutation_but_forbid_instance_write', async () => {
     const { app } = await setupWithUsers();
     const { cookie } = await login(app, 'op1', 'op-pass-123');

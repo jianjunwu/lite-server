@@ -80,6 +80,9 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
       }
       if (url.startsWith('/api/auth/')) return; // any authenticated user
       if (url.startsWith('/api/i/')) {
+        // Inference calls (unary/SSE) are open to viewers; everything else
+        // on the proxy is admin-class and needs operator+.
+        if (/\/(infer|events)(\?|$)/.test(url)) return;
         if (roleRank(req.user.role) >= roleRank('operator')) return;
         return reply.code(403).send({ error: 'forbidden', required: 'operator' });
       }
