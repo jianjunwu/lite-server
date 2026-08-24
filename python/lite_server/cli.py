@@ -350,6 +350,21 @@ def main(argv=None):
         help="Generate only model_repo/<name>/1/ (no project shell)",
     )
 
+    # web
+    web_parser = subparsers.add_parser("web", help="Start the web UI (SPA + multi-instance proxy)")
+    web_parser.add_argument("--port", type=int, default=None,
+                            help="Listen port (default: 8600, env LITE_UI_PORT)")
+    web_parser.add_argument("--host", default=None,
+                            help="Bind address (default: 0.0.0.0, env LITE_UI_HOST)")
+    web_parser.add_argument("--instances-file", default=None,
+                            help="Path to instances.yaml (default: ./instances.yaml, env LITE_UI_INSTANCES_FILE)")
+    web_parser.add_argument("--auth-file", default=None,
+                            help="Path to auth.yaml (default: ./auth.yaml, env LITE_UI_AUTH_FILE)")
+    web_parser.add_argument("--auth", choices=["on", "off"], default=None,
+                            help="Local-account auth (default: on, env LITE_UI_AUTH)")
+    web_parser.add_argument("--web-dist", default=None,
+                            help="Path to the built SPA (default: wheel-bundled assets, env LITE_UI_WEB_DIST)")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -368,9 +383,26 @@ def main(argv=None):
         return _cmd_unpack(args)
     elif args.command == "init":
         return _cmd_init(args)
+    elif args.command == "web":
+        return _cmd_web(args)
     else:
         parser.print_help()
         return 0
+
+
+def _cmd_web(args):
+    """Start the web UI BFF (FastAPI + uvicorn)."""
+    from lite_server.webui.server import run_web
+
+    run_web(
+        host=args.host,
+        port=args.port,
+        instances_file=args.instances_file,
+        auth_file=args.auth_file,
+        auth=args.auth,
+        web_dist=args.web_dist,
+    )
+    return 0
 
 
 def _cmd_serve(args):

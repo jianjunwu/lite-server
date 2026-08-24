@@ -15,6 +15,11 @@ dependencies = [
     "pyzmq>=25.0",
     "protobuf>=5.0",
     "orjson>=3.9,<4",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.28.1",
+    "PyJWT>=2.9",
+    "bcrypt>=4.2",
 ]
 classifiers = [
     "Programming Language :: Rust",
@@ -61,7 +66,7 @@ python-source = "python"
 module-name = "_lite_server"
 bindings = "pyo3"
 features = ["python"]
-include = ["python/**/*.py", "python/**/*.yaml", "python/**/*.j2"]
+include = ["python/**/*.py", "python/**/*.yaml", "python/**/*.j2", "python/lite_server/webui/static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
