@@ -127,7 +127,10 @@
     "applyTitle": "Apply routing weights",
     "applyBody": "Traffic shifts to the new weights immediately:",
     "applied": "Routing updated",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "dragHandle": "{{a}} / {{b}} weight divider",
+    "modified": "Modified (not applied)",
+    "reset": "Reset"
   },
   "upload": {
     "title": "Upload model",

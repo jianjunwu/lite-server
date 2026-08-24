@@ -1,11 +1,10 @@
 import { useState } from 'react';
-import { App, Button, InputNumber, Space, Table, Tag } from 'antd';
-import { useQueryClient } from '@tanstack/react-query';
+import { Button, InputNumber, Space, Table, Tag } from 'antd';
 import { useTranslation } from 'react-i18next';
-import { useInstance } from '../context/InstanceContext';
-import { modelOps, validateWeights, withAdminKeyRetry } from '../api/mutations';
+import { validateWeights } from '../api/mutations';
+import { useApplyRouting } from './useApplyRouting';
 import type { VersionInfo } from '../api/types';
-import { dataTextStyle, TYPE } from '../theme';
+import { dataTextStyle } from '../theme';
 
 interface RoutingEditorProps {
   model: string;
@@ -17,47 +16,15 @@ interface RoutingEditorProps {
  * (must equal 100), before/after diff in the confirm modal. */
 export function RoutingEditor({ model, versions, onClose }: RoutingEditorProps) {
   const { t } = useTranslation();
-  const { message, modal } = App.useApp();
-  const { instanceId } = useInstance();
-  const queryClient = useQueryClient();
+  const { apply, busy } = useApplyRouting(model);
   const [weights, setWeights] = useState<Record<string, number>>(
     Object.fromEntries(versions.map((v) => [v.version, v.weight])),
   );
-  const [busy, setBusy] = useState(false);
 
   const validation = validateWeights(weights);
   const before = Object.fromEntries(versions.map((v) => [v.version, v.weight]));
 
-  const apply = () => {
-    if (!instanceId) return;
-    const diff = versions
-      .map((v) => `${v.version}: ${before[v.version]}% → ${weights[v.version]}%`)
-      .join('\n');
-    modal.confirm({
-      title: t('routing.applyTitle'),
-      content: (
-        <pre style={{ fontSize: TYPE.secondary, margin: 0, whiteSpace: 'pre-wrap' }}>
-          {t('routing.applyBody')}
-          {'\n'}
-          {diff}
-        </pre>
-      ),
-      okText: t('routing.apply'),
-      onOk: async () => {
-        setBusy(true);
-        try {
-          await withAdminKeyRetry(instanceId, () => modelOps.setRouting(instanceId, model, weights));
-          message.success(t('routing.applied'));
-          await queryClient.invalidateQueries({ queryKey: [instanceId] });
-          onClose();
-        } catch (err) {
-          message.error(err instanceof Error ? err.message : String(err));
-        } finally {
-          setBusy(false);
-        }
-      },
-    });
-  };
+  const confirm = () => apply(weights, before, onClose);
 
   return (
     <div style={{ marginTop: 16 }}>
@@ -95,7 +62,7 @@ export function RoutingEditor({ model, versions, onClose }: RoutingEditorProps) 
         <Tag color={validation.ok ? '#16A34A' : '#DC2626'} style={{ border: 'none', color: '#fff' }}>
           {t('routing.sum')}: {validation.sum}/100
         </Tag>
-        <Button type="primary" size="small" disabled={!validation.ok || busy} onClick={apply}>
+        <Button type="primary" size="small" disabled={!validation.ok || busy} onClick={confirm}>
           {t('routing.apply')}
         </Button>
         <Button size="small" onClick={onClose} disabled={busy}>

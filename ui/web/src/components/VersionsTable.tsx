@@ -88,6 +88,8 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
         versions.length > 0 ? (
           <TrafficRiver
             versions={versions}
+            model={model}
+            editable={ops}
             onSelect={(v) => navigate(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`)}
           />
         ) : null
