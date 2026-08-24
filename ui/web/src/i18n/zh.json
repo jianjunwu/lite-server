@@ -85,5 +85,102 @@
     "threshold": "阈值",
     "time": "时间",
     "noAlerts": "暂无活跃告警"
+  },
+  "ops": {
+    "actions": "操作",
+    "reload": "热加载",
+    "reloadConfirm": "热加载版本 {{version}}？",
+    "reloaded": "已热加载",
+    "activate": "激活",
+    "activateTitle": "激活版本",
+    "activateBody": "将「{{model}}」的激活版本硬切换为「{{version}}」，流量即刻切换。",
+    "activated": "版本已激活",
+    "unload": "卸载",
+    "unloadConfirm": "卸载版本 {{version}}？",
+    "unloadActiveTitle": "卸载激活版本",
+    "unloadActiveBody": "「{{version}}」是「{{model}}」的激活版本，卸载后该模型将不可服务。",
+    "unloaded": "已卸载",
+    "delete": "删除",
+    "deleteTitle": "删除版本 {{version}}",
+    "deleteBody": "将永久删除「{{model}}」的「{{version}}」。请输入版本名确认。",
+    "forceDeleteActive": "强制删除激活版本（危险）",
+    "deleted": "已删除",
+    "load": "加载",
+    "loadVersion": "加载版本",
+    "loadBody": "将「{{model}}」的仓库版本加载到内存。",
+    "loadRequested": "已请求加载 {{version}}"
+  },
+  "routing": {
+    "edit": "编辑路由",
+    "current": "当前",
+    "new": "新权重",
+    "sum": "总和",
+    "apply": "应用",
+    "applyTitle": "应用路由权重",
+    "applyBody": "流量将即刻按新权重分配：",
+    "applied": "路由已更新",
+    "cancel": "取消"
+  },
+  "upload": {
+    "title": "上传模型",
+    "model": "模型",
+    "modelPlaceholder": "新建或已有模型名",
+    "version": "版本",
+    "files": "文件",
+    "dragger": "点击或拖拽文件到此处",
+    "draggerHint": "单个 .lma 产物，或原始 model.py + 资源文件",
+    "lmaConflict": ".lma 上传只能是单个文件",
+    "filesSelected": "个文件已选",
+    "loadAfter": "上传后立即加载",
+    "submit": "上传",
+    "uploading": "上传中…",
+    "cancel": "取消上传",
+    "noFiles": "请至少选择一个文件",
+    "success": "已上传 {{model}}/{{version}}",
+    "loadedOk": "已加载并服务中",
+    "taskTitle": "上传 {{model}}/{{version}}"
+  },
+  "tasks": {
+    "title": "任务",
+    "empty": "暂无任务",
+    "clearFinished": "清除已完成"
+  },
+  "adminKey": {
+    "title": "需要 Admin Key",
+    "hint": "该操作需要实例的管理密钥：",
+    "submit": "保存并重试",
+    "cancel": "取消",
+    "required": "请输入密钥"
+  },
+  "settings": {
+    "tabs": {
+      "instances": "实例",
+      "keys": "Admin Key"
+    },
+    "instances": {
+      "add": "添加实例",
+      "addTitle": "添加实例",
+      "editTitle": "编辑实例 {{id}}",
+      "name": "名称",
+      "adminKey": "Admin Key",
+      "adminKeyHint": "存储在 BFF 服务端，不会下发到浏览器",
+      "adminKeyKeepHint": "留空则保留已存密钥",
+      "probe": "保存前检查可达性",
+      "edit": "编辑",
+      "delete": "删除",
+      "deleteConfirm": "删除实例 {{id}}？",
+      "save": "保存",
+      "created": "实例已添加",
+      "updated": "实例已更新",
+      "deleted": "实例已删除"
+    },
+    "keys": {
+      "hint": "浏览器侧密钥存于 sessionStorage（标签页关闭即清除），随请求以 x-admin-key 发送。两者同时存在时，浏览器密钥优先于服务端实例密钥。",
+      "browserKey": "浏览器密钥",
+      "save": "保存",
+      "saved": "已保存 {{id}} 的密钥",
+      "clear": "清除",
+      "cleared": "已清除 {{id}} 的密钥"
+    }
   }
 }

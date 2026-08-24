@@ -1,22 +1,30 @@
-import { Card, Tabs, Typography } from 'antd';
-import { useQuery } from '@tanstack/react-query';
+import { Card, Tabs, Typography, Button, Input, Modal, App } from 'antd';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { apiFetch } from '../api/client';
+import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import { useModelHealth, useTimeline, useVersions } from '../api/hooks';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
+import { RoutingEditor } from '../components/RoutingEditor';
 import { buildTimelineOption } from '../components/timelineChart';
 import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
 
 export function ModelDetailPage() {
   const { t } = useTranslation();
+  const { message } = App.useApp();
   const { name = '' } = useParams();
   const { instanceId } = useInstance();
+  const queryClient = useQueryClient();
+  const [editingRouting, setEditingRouting] = useState(false);
+  const [loadOpen, setLoadOpen] = useState(false);
+  const [loadVersion, setLoadVersion] = useState('');
 
   const versionsQuery = useVersions(instanceId, name);
   const healthQuery = useModelHealth(instanceId, name);
@@ -30,6 +38,19 @@ export function ModelDetailPage() {
 
   const versions = versionsQuery.data?.versions ?? [];
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
+
+  const submitLoad = async () => {
+    if (!instanceId || !loadVersion.trim()) return;
+    try {
+      await withAdminKeyRetry(instanceId, () => modelOps.loadVersion(instanceId, name, loadVersion.trim()));
+      message.success(t('ops.loadRequested', { version: loadVersion.trim() }));
+      await queryClient.invalidateQueries({ queryKey: [instanceId] });
+      setLoadOpen(false);
+      setLoadVersion('');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -49,6 +70,11 @@ export function ModelDetailPage() {
             ? `${t('models.healthyWorkers')}: ${healthQuery.data.healthy_workers}/${healthQuery.data.total_workers} · ${instanceId}`
             : instanceId
         }
+        extra={
+          <Button size="small" onClick={() => setLoadOpen(true)}>
+            {t('ops.loadVersion')}
+          </Button>
+        }
       />
 
       <Tabs
@@ -57,8 +83,20 @@ export function ModelDetailPage() {
             key: 'versions',
             label: t('models.tabs.versions'),
             children: (
-              <Card size="small">
-                <VersionsTable model={name} versions={versions} loading={versionsQuery.isLoading} />
+              <Card
+                size="small"
+                extra={
+                  !editingRouting && versions.length > 0 ? (
+                    <Button size="small" onClick={() => setEditingRouting(true)}>
+                      {t('routing.edit')}
+                    </Button>
+                  ) : undefined
+                }
+              >
+                <VersionsTable model={name} versions={versions} loading={versionsQuery.isLoading} ops />
+                {editingRouting && (
+                  <RoutingEditor model={name} versions={versions} onClose={() => setEditingRouting(false)} />
+                )}
               </Card>
             ),
           },
@@ -113,6 +151,24 @@ export function ModelDetailPage() {
           },
         ]}
       />
+
+      <Modal
+        open={loadOpen}
+        title={t('ops.loadVersion')}
+        okText={t('ops.load')}
+        onOk={submitLoad}
+        onCancel={() => setLoadOpen(false)}
+        okButtonProps={{ disabled: !loadVersion.trim() }}
+      >
+        <p style={{ fontSize: 13 }}>{t('ops.loadBody', { model: name })}</p>
+        <Input
+          value={loadVersion}
+          onChange={(e) => setLoadVersion(e.target.value)}
+          placeholder="v2"
+          style={{ fontFamily: MONO_FONT }}
+          onPressEnter={submitLoad}
+        />
+      </Modal>
     </div>
   );
 }

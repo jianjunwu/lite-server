@@ -85,5 +85,102 @@
     "threshold": "Threshold",
     "time": "Time",
     "noAlerts": "No active alerts"
+  },
+  "ops": {
+    "actions": "Actions",
+    "reload": "Reload",
+    "reloadConfirm": "Hot-reload version {{version}}?",
+    "reloaded": "Reloaded",
+    "activate": "Activate",
+    "activateTitle": "Activate version",
+    "activateBody": "Hard-switch the active version of \"{{model}}\" to \"{{version}}\". Traffic moves immediately.",
+    "activated": "Version activated",
+    "unload": "Unload",
+    "unloadConfirm": "Unload version {{version}}?",
+    "unloadActiveTitle": "Unload active version",
+    "unloadActiveBody": "\"{{version}}\" is the active version of \"{{model}}\". Unloading it makes the model unservable.",
+    "unloaded": "Unloaded",
+    "delete": "Delete",
+    "deleteTitle": "Delete version {{version}}",
+    "deleteBody": "This permanently removes \"{{version}}\" of \"{{model}}\". Type the version name to confirm.",
+    "forceDeleteActive": "Force-delete the active version (dangerous)",
+    "deleted": "Deleted",
+    "load": "Load",
+    "loadVersion": "Load version",
+    "loadBody": "Load a repository version of \"{{model}}\" into memory.",
+    "loadRequested": "Load requested for {{version}}"
+  },
+  "routing": {
+    "edit": "Edit routing",
+    "current": "Current",
+    "new": "New weight",
+    "sum": "Sum",
+    "apply": "Apply",
+    "applyTitle": "Apply routing weights",
+    "applyBody": "Traffic shifts to the new weights immediately:",
+    "applied": "Routing updated",
+    "cancel": "Cancel"
+  },
+  "upload": {
+    "title": "Upload model",
+    "model": "Model",
+    "modelPlaceholder": "New or existing model name",
+    "version": "Version",
+    "files": "Files",
+    "dragger": "Click or drag files here",
+    "draggerHint": "One .lma artifact, or raw model.py + assets",
+    "lmaConflict": "A .lma upload must be a single file",
+    "filesSelected": "files selected",
+    "loadAfter": "Load immediately after upload",
+    "submit": "Upload",
+    "uploading": "Uploading…",
+    "cancel": "Cancel upload",
+    "noFiles": "Select at least one file",
+    "success": "Uploaded {{model}}/{{version}}",
+    "loadedOk": "Loaded and serving",
+    "taskTitle": "Upload {{model}}/{{version}}"
+  },
+  "tasks": {
+    "title": "Tasks",
+    "empty": "No tasks yet",
+    "clearFinished": "Clear finished"
+  },
+  "adminKey": {
+    "title": "Admin key required",
+    "hint": "This operation needs the admin key for instance",
+    "submit": "Save & retry",
+    "cancel": "Cancel",
+    "required": "Key is required"
+  },
+  "settings": {
+    "tabs": {
+      "instances": "Instances",
+      "keys": "Admin keys"
+    },
+    "instances": {
+      "add": "Add instance",
+      "addTitle": "Add instance",
+      "editTitle": "Edit instance {{id}}",
+      "name": "Name",
+      "adminKey": "Admin key",
+      "adminKeyHint": "Stored on the BFF, never sent to browsers",
+      "adminKeyKeepHint": "Leave empty to keep the stored key",
+      "probe": "Check reachability before saving",
+      "edit": "Edit",
+      "delete": "Delete",
+      "deleteConfirm": "Delete instance {{id}}?",
+      "save": "Save",
+      "created": "Instance added",
+      "updated": "Instance updated",
+      "deleted": "Instance deleted"
+    },
+    "keys": {
+      "hint": "Browser-side keys live in sessionStorage (cleared when this tab closes) and are sent as x-admin-key with every request. When both exist, the browser key wins over the server-side instance key.",
+      "browserKey": "Browser key",
+      "save": "Save",
+      "saved": "Key saved for {{id}}",
+      "clear": "Clear",
+      "cleared": "Key cleared for {{id}}"
+    }
   }
 }

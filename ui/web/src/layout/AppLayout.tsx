@@ -16,6 +16,7 @@ import { useInstance } from '../context/InstanceContext';
 import { setLanguage } from '../i18n';
 import i18n from '../i18n';
 import { StatusDot, statusKind } from '../components/StatusBadge';
+import { TaskBell } from '../components/TaskBell';
 import { eyebrowStyle } from '../theme';
 
 const { Sider, Header, Content } = Layout;
@@ -98,6 +99,7 @@ export function AppLayout() {
             />
           </Space>
           <Space size="middle">
+            <TaskBell />
             <Select
               size="small"
               value={i18n.language}

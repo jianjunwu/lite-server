@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Card, Empty, Table } from 'antd';
+import { Button, Card, Empty, Table } from 'antd';
+import { UploadOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
@@ -8,12 +9,15 @@ import type { ModelListItem } from '../api/types';
 import { StatusBadge } from '../components/StatusBadge';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
+import { UploadDrawer } from '../components/UploadDrawer';
 import { dataTextStyle } from '../theme';
 
 function ModelExpandRow({ model }: { model: string }) {
   const { instanceId } = useInstance();
   const versionsQuery = useVersions(instanceId, model);
-  return <VersionsTable model={model} versions={versionsQuery.data?.versions ?? []} loading={versionsQuery.isLoading} />;
+  return (
+    <VersionsTable model={model} versions={versionsQuery.data?.versions ?? []} loading={versionsQuery.isLoading} ops />
+  );
 }
 
 export function ModelsPage() {
@@ -21,12 +25,22 @@ export function ModelsPage() {
   const { instanceId } = useInstance();
   const modelsQuery = useModels(instanceId);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   const rows = useMemo(() => modelsQuery.data?.models ?? [], [modelsQuery.data]);
+  const modelNames = useMemo(() => [...new Set(rows.map((m) => m.name))], [rows]);
 
   return (
     <>
-      <PageHeader title={t('models.title')} subtitle={instanceId} />
+      <PageHeader
+        title={t('models.title')}
+        subtitle={instanceId}
+        extra={
+          <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
+            {t('upload.title')}
+          </Button>
+        }
+      />
       <Card size="small">
         <Table<ModelListItem>
           rowKey={(r) => `${r.name}/${r.version}`}
@@ -66,6 +80,7 @@ export function ModelsPage() {
           ]}
         />
       </Card>
+      <UploadDrawer open={uploadOpen} onClose={() => setUploadOpen(false)} existingModels={modelNames} />
     </>
   );
 }
