@@ -168,4 +168,6 @@ class InstanceStore:
         }
         tmp = f"{self._config_path}.tmp-{os.getpid()}"
         Path(tmp).write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        # The file can hold plaintext admin keys: keep it owner-only.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self._config_path)

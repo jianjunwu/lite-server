@@ -22,8 +22,12 @@ def make_setup(tmp_path, upstream, env=None, auth_enabled=True):
     return {"app": app, "store": store, "auth_path": str(auth_path)}
 
 
+CSRF = {"x-requested-with": "lite-ui"}
+
+
 def login(client: httpx.Client, username: str, password: str) -> httpx.Response:
-    return client.post("/api/auth/login", json={"username": username, "password": password})
+    return client.post("/api/auth/login", headers=CSRF,
+                       json={"username": username, "password": password})
 
 
 @pytest.fixture
@@ -73,9 +77,6 @@ def rbac_ctx(ctx):
     return ctx
 
 
-CSRF = {"x-requested-with": "lite-ui"}
-
-
 def test_should_allow_viewer_get_but_forbid_proxy_mutation(rbac_ctx):
     client = rbac_ctx["client"]
     login(client, "viewer1", "viewer-pass-1")
@@ -95,6 +96,23 @@ def test_should_allow_viewer_inference_post_but_not_admin_post(rbac_ctx):
     assert events.status_code == 200
     reload = client.post("/api/i/plain/v2/models/m/reload", headers=CSRF)
     assert reload.status_code == 403
+
+
+def test_should_allow_viewer_inference_post_with_query_string(rbac_ctx):
+    client = rbac_ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    res = client.post("/api/i/plain/v2/models/m/infer?stream=true", headers=CSRF, json={"input": 1})
+    assert res.status_code == 200
+
+
+def test_should_not_let_viewer_smuggle_infer_exemption_via_query_string(rbac_ctx):
+    client = rbac_ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    unload = client.post("/api/i/plain/v2/models/m/unload?next=/infer", headers=CSRF)
+    assert unload.status_code == 403
+    routing = client.put("/api/i/plain/v2/models/m/routing?a=/events", headers=CSRF,
+                         json={"weights": {}})
+    assert routing.status_code == 403
 
 
 def test_should_allow_operator_proxy_mutation_but_forbid_instance_write(rbac_ctx):
@@ -155,6 +173,47 @@ def test_should_reject_duplicate_username_with_409(ctx):
     res = client.post("/api/users", headers=CSRF,
                       json={"username": "admin", "password": "whatever-123", "role": "viewer"})
     assert res.status_code == 409
+
+
+def test_should_require_csrf_header_on_login(ctx):
+    res = ctx["client"].post("/api/auth/login",
+                             json={"username": "admin", "password": "boot-pass-1"})
+    assert res.status_code == 403
+    assert res.json()["error"] == "csrf_header_missing"
+
+
+def test_should_enforce_role_change_within_token_lifetime(rbac_ctx):
+    client = rbac_ctx["client"]
+    login(client, "op1", "op-pass-123")
+    # Admin demotes op1 after the token was issued; the old token must not
+    # keep operator rights for the rest of its lifetime.
+    rbac_ctx["store"].update("op1", {"role": "viewer"}, actor="admin")
+    res = client.post("/api/i/plain/v2/models/m/reload", headers=CSRF)
+    assert res.status_code == 403
+
+
+def test_should_reject_requests_from_deleted_user(rbac_ctx):
+    client = rbac_ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    rbac_ctx["store"].remove("viewer1", actor="admin")
+    res = client.get("/api/instances")
+    assert res.status_code == 401
+
+
+def test_should_reject_overlong_password_with_400_not_500(ctx):
+    ctx["store"].set_password("admin", "admin-pass-1")
+    client = ctx["client"]
+    login(client, "admin", "admin-pass-1")
+    res = client.post("/api/users", headers=CSRF,
+                      json={"username": "longpw", "password": "p" * 100, "role": "viewer"})
+    assert res.status_code == 400
+
+
+def test_should_return_401_not_500_when_login_password_exceeds_bcrypt_limit(ctx):
+    # bcrypt rejects passwords over 72 bytes with ValueError; the login
+    # endpoint must turn that into a plain invalid-credentials 401.
+    res = login(ctx["client"], "admin", "x" * 100)
+    assert res.status_code == 401
 
 
 def test_should_pass_everything_through_with_synthetic_admin(tmp_path, upstream, client_factory):

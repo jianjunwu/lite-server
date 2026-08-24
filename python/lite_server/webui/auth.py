@@ -120,7 +120,10 @@ class UserStore:
 
     def verify(self, username: str, password: str) -> UserRecord | None:
         user = self._users.get(username)
-        if user is None:
+        if user is None or not isinstance(password, str):
+            return None
+        # bcrypt rejects passwords over 72 bytes with ValueError.
+        if len(password.encode()) > 72:
             return None
         return user if bcrypt.checkpw(password.encode(), user.password_hash.encode()) else None
 
@@ -134,6 +137,9 @@ class UserStore:
     def _validate_password(password) -> str:
         if not isinstance(password, str) or len(password) < 8:
             raise AuthError("invalid", "password must be at least 8 characters")
+        if len(password.encode()) > 72:
+            # bcrypt hard limit; it raises ValueError beyond this.
+            raise AuthError("invalid", "password must be at most 72 bytes")
         return password
 
     @staticmethod
@@ -256,8 +262,9 @@ def _set_session_cookie(response: JSONResponse, request: Request, token: str) ->
 
 
 # Inference calls (unary/SSE) are open to viewers; everything else on the proxy
-# is admin-class and needs operator+.
-_INFER_RE = re.compile(r"/(infer|events)(\?|$)")
+# is admin-class and needs operator+. Matched against the URL path only —
+# query strings must never influence the exemption.
+_INFER_RE = re.compile(r"/(infer|events)$")
 
 
 def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResponse | None:
@@ -271,6 +278,11 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
     if not path.startswith("/api/"):
         return None  # static assets are public
     if path == "/api/auth/login" and request.method == "POST":
+        # Login sets a session cookie, so it needs the same CSRF protection as
+        # every other mutation (SameSite=Lax does not stop a cross-site POST
+        # from planting a cookie in the response).
+        if request.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            return JSONResponse({"error": "csrf_header_missing"}, status_code=403)
         return None
 
     payload = verify_token(store, request.cookies.get(COOKIE_NAME, ""))
@@ -278,8 +290,13 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
         return JSONResponse({"error": "unauthenticated"}, status_code=401)
     request.state.user = payload
 
+    # Roles and account deletion take effect immediately: the store, not the
+    # token payload, is authoritative.
     current = store.get(payload.get("username", ""))
-    must_change = current.must_change_password if current else False
+    if current is None:
+        return JSONResponse({"error": "unauthenticated"}, status_code=401)
+    role = current.role
+    must_change = current.must_change_password
     is_password_flow = path in ("/api/auth/me", "/api/auth/change-password", "/api/auth/logout")
     if must_change and not is_password_flow:
         return JSONResponse({"error": "password_change_required"}, status_code=403)
@@ -291,19 +308,18 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
         if path.startswith("/api/auth/"):
             return None  # any authenticated user
         if path.startswith("/api/i/"):
-            url = path + (f"?{request.url.query}" if request.url.query else "")
-            if _INFER_RE.search(url):
+            if _INFER_RE.search(path):
                 return None
-            if role_rank(payload["role"]) >= role_rank("operator"):
+            if role_rank(role) >= role_rank("operator"):
                 return None
             return JSONResponse({"error": "forbidden", "required": "operator"}, status_code=403)
         # Everything else (/api/instances, /api/users, ...) is admin territory.
-        if role_rank(payload["role"]) >= role_rank("admin"):
+        if role_rank(role) >= role_rank("admin"):
             return None
         return JSONResponse({"error": "forbidden", "required": "admin"}, status_code=403)
 
     # GETs: any authenticated user — except the user directory itself.
-    if path.startswith("/api/users") and role_rank(payload["role"]) < role_rank("admin"):
+    if path.startswith("/api/users") and role_rank(role) < role_rank("admin"):
         return JSONResponse({"error": "forbidden", "required": "admin"}, status_code=403)
     return None
 

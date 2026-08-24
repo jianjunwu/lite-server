@@ -34,14 +34,22 @@ class _SpaFiles(StaticFiles):
 async def _lifespan(app: FastAPI):
     yield
     await app.state.http.aclose()
+    await app.state.http_stream.aclose()
 
 
-def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = True) -> FastAPI:
+def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = True,
+              unary_timeout: float = 60.0) -> FastAPI:
     app = FastAPI(lifespan=_lifespan)
     app.state.registry = registry
     # trust_env=False: instance forwarding must not honor system/env proxy
     # settings (the Node BFF's undici client does not either).
-    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0), trust_env=False)
+    # Two clients: bounded for unary calls, unbounded read for SSE streams.
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(unary_timeout, connect=10.0), trust_env=False
+    )
+    app.state.http_stream = httpx.AsyncClient(
+        timeout=httpx.Timeout(None, connect=10.0), trust_env=False
+    )
 
     if user_store is not None:
         app.state.user_store = user_store

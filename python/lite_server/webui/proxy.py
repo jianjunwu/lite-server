@@ -18,11 +18,20 @@ HOP_BY_HOP = frozenset({
     "content-length",
 })
 
+# Request direction: browser credentials for the BFF itself must never leak to
+# upstream instances (a compromised instance could harvest session JWTs).
+# content-length is kept: the streamed body is byte-identical, and having the
+# length lets upstreams that don't read chunked bodies work unchanged.
+_STRIP_REQUEST = (HOP_BY_HOP - {"content-length"}) | {"cookie", "authorization"}
+
+# Response direction: upstream cookies must not be planted on the BFF origin.
+_STRIP_RESPONSE = HOP_BY_HOP | {"set-cookie"}
+
 _METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
 
 def _upstream_headers(request: Request, inst) -> dict[str, str]:
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST}
     # Admin key priority: explicit browser header > instance-level key.
     if "x-admin-key" in request.headers:
         headers["x-admin-key"] = request.headers["x-admin-key"]
@@ -40,9 +49,16 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
 
     query = request.url.query
     url = f"{inst.base_url}/{tail}" + (f"?{query}" if query else "")
-    body = None if request.method in ("GET", "HEAD") else await request.body()
 
-    client: httpx.AsyncClient = request.app.state.http
+    # SSE responses are long-lived: they go through the client with no read
+    # timeout; everything else is bounded so a stalled instance can't exhaust
+    # the connection pool.
+    accept = request.headers.get("accept", "")
+    client: httpx.AsyncClient = (
+        request.app.state.http_stream if "text/event-stream" in accept else request.app.state.http
+    )
+    # Stream the request body: large uploads must not be buffered in BFF memory.
+    body = None if request.method in ("GET", "HEAD") else request.stream()
     req = client.build_request(
         request.method, url, headers=_upstream_headers(request, inst), content=body
     )
@@ -53,12 +69,13 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
 
     async def body_iter():
         try:
-            async for chunk in upstream.aiter_bytes():
+            # Raw bytes: body and content-encoding stay consistent end to end.
+            async for chunk in upstream.aiter_raw():
                 yield chunk
         finally:
             await upstream.aclose()
 
-    headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP}
+    headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
     # Send the body as a stream: SSE / chunked responses pass through unbuffered.
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=headers)
 

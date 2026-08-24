@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import socket
 import threading
@@ -72,6 +73,29 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             return
+        if self.path == "/setcookie":
+            payload = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", "lite_ui_token=forged; Path=/")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/gzip":
+            # Compresses regardless of accept-encoding, to simulate an upstream
+            # (or its own reverse proxy) that always gzips.
+            payload = gzip.compress(b"gzip-me")
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-encoding", "gzip")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/hang":
+            # Simulates an instance that accepts but stalls mid-response.
+            time.sleep(2)
         if self.path == "/fail500":
             payload = json.dumps({"error": "boom"}).encode()
             self.send_response(500)

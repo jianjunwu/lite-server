@@ -105,3 +105,53 @@ def test_should_return_502_when_instance_unreachable(client):
     body = res.json()
     assert body["error"] == "instance_unreachable"
     assert body["instance"] == "dead"
+
+
+def test_should_not_forward_browser_credentials_to_upstream(client, upstream):
+    client.get("/api/i/plain/v2/models",
+               headers={"cookie": "lite_ui_token=SECRETJWT", "authorization": "Bearer abc"})
+    assert "cookie" not in upstream.last_request["headers"]
+    assert "authorization" not in upstream.last_request["headers"]
+
+
+def test_should_not_forward_upstream_set_cookie_to_browser(client):
+    res = client.get("/api/i/plain/setcookie")
+    assert res.status_code == 200
+    assert "set-cookie" not in res.headers
+
+
+def test_should_round_trip_gzipped_upstream_body_intact(client):
+    # The body and its content-encoding must stay consistent end to end:
+    # either raw bytes + encoding header, or decoded bytes + no header.
+    res = client.get("/api/i/plain/gzip")
+    assert res.status_code == 200
+    assert res.text == "gzip-me"
+
+
+def test_should_stream_request_body_without_buffering(client, upstream, monkeypatch):
+    async def _boom(self):
+        raise AssertionError("proxy must not buffer the request body in memory")
+
+    monkeypatch.setattr("starlette.requests.Request.body", _boom)
+    payload = b"x" * 4096
+    res = client.post("/api/i/plain/v2/repository/models/m", content=payload)
+    assert res.status_code == 200
+    assert upstream.last_request["body"].encode() == payload
+
+
+def test_should_time_out_unary_request_when_upstream_hangs(registry, live):
+    app = build_app(registry, unary_timeout=0.5)
+    start = time.monotonic()
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.get("/api/i/plain/hang")
+    assert res.status_code == 502
+    assert time.monotonic() - start < 2
+
+
+def test_should_not_time_out_sse_stream(registry, live):
+    # SSE responses are exempt from the unary read timeout.
+    app = build_app(registry, unary_timeout=0.3)
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.get("/api/i/plain/sse-slow", headers={"accept": "text/event-stream"})
+    assert res.status_code == 200
+    assert res.text == "data: one\n\ndata: two\n\n"

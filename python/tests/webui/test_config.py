@@ -1,10 +1,12 @@
 """Port of ui/server/test/config.test.ts."""
 
 import json
+import os
+import stat
 
 import pytest
 
-from lite_server.webui.config import load_instances
+from lite_server.webui.config import InstanceStore, load_instances
 
 
 def write_yaml(tmp_path, content: str) -> str:
@@ -93,3 +95,12 @@ instances:
 """)
     instances = load_instances(path, {})
     assert instances[0].base_url == "http://h:8000"
+
+
+def test_should_persist_instances_yaml_with_owner_only_permissions(tmp_path):
+    # The file can hold plaintext admin keys; it must not be world-readable.
+    path = write_yaml(tmp_path, "instances: []\n")
+    store = InstanceStore(path, {})
+    store.create({"id": "a", "name": "A", "base_url": "http://h:1", "admin_key": "secret"})
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == 0o600
