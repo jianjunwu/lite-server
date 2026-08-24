@@ -1,17 +1,17 @@
-import { Card, Descriptions, Tabs, Tag, Typography } from 'antd';
+import { Card, Tabs, Typography } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 import { useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { apiFetch } from '../api/client';
 import { useModelHealth, useTimeline, useVersions } from '../api/hooks';
-import { StatusBadge } from '../components/StatusBadge';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
+import { VersionsTable } from '../components/VersionsTable';
+import { PageHeader } from '../components/PageHeader';
 import { buildTimelineOption } from '../components/timelineChart';
-import { formatAge, formatMs } from '../components/format';
-import { MONO_FONT } from '../theme';
+import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
 
 export function ModelDetailPage() {
   const { t } = useTranslation();
@@ -33,26 +33,23 @@ export function ModelDetailPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Card size="small">
-        <Descriptions
-          title={
-            <span>
-              {name}{' '}
-              {versionsQuery.data?.active_version && (
-                <Tag color="#4F46E5">{t('models.activeVersion')}: {versionsQuery.data.active_version}</Tag>
-              )}
-            </span>
-          }
-          size="small"
-          column={{ xs: 1, md: 3 }}
-        >
-          <Descriptions.Item label={t('models.versions')}>{versions.length}</Descriptions.Item>
-          <Descriptions.Item label={t('models.healthyWorkers')}>
-            {healthQuery.data ? `${healthQuery.data.healthy_workers}/${healthQuery.data.total_workers}` : '-'}
-          </Descriptions.Item>
-          <Descriptions.Item label={t('common.instance')}>{instanceId}</Descriptions.Item>
-        </Descriptions>
-      </Card>
+      <PageHeader
+        title={
+          <span>
+            {name}
+            {versionsQuery.data?.active_version && (
+              <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: '#4B5563', marginLeft: 12 }}>
+                ● {versionsQuery.data.active_version}
+              </span>
+            )}
+          </span>
+        }
+        subtitle={
+          healthQuery.data
+            ? `${t('models.healthyWorkers')}: ${healthQuery.data.healthy_workers}/${healthQuery.data.total_workers} · ${instanceId}`
+            : instanceId
+        }
+      />
 
       <Tabs
         items={[
@@ -61,24 +58,7 @@ export function ModelDetailPage() {
             label: t('models.tabs.versions'),
             children: (
               <Card size="small">
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                  <tbody>
-                    {versions.map((v) => (
-                      <tr key={v.version} style={{ borderBottom: '1px solid #E5E7EB' }}>
-                        <td style={{ padding: '8px 12px' }}>
-                          <a href={`/models/${encodeURIComponent(name)}/versions/${encodeURIComponent(v.version)}`}>
-                            {v.version}
-                          </a>
-                        </td>
-                        <td><StatusBadge status={v.status} /></td>
-                        <td>{v.active ? <Tag color="#4F46E5">{t('common.active')}</Tag> : null}</td>
-                        <td>{t('common.weight')}: {v.weight}</td>
-                        <td>{t('common.workers')}: {v.workers.ready}/{v.workers.total}</td>
-                        <td>{v.loaded_at ? formatAge(v.loaded_at) : '-'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <VersionsTable model={name} versions={versions} loading={versionsQuery.isLoading} />
               </Card>
             ),
           },

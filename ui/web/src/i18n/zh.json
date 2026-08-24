@@ -36,7 +36,8 @@
     "noInstances": "尚未配置实例",
     "noInstancesHint": "请在 instances.yaml 或设置页中添加实例。",
     "serverVersion": "服务端版本",
-    "loadedModels": "已加载模型"
+    "loadedModels": "已加载模型",
+    "allReady": "全部 {{versions}} 个版本就绪（{{instances}} 个实例）"
   },
   "models": {
     "title": "模型",
@@ -44,6 +45,7 @@
     "versions": "版本数",
     "activeVersion": "激活版本",
     "modelType": "类型",
+    "traffic": "流量",
     "noModels": "该实例上没有已加载的模型",
     "detail": "模型详情",
     "versionDetail": "版本详情",

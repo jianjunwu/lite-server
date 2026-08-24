@@ -1,5 +1,6 @@
 import { Card, Statistic } from 'antd';
 import type { ReactNode } from 'react';
+import { dataTextStyle } from '../theme';
 
 interface StatCardProps {
   title: ReactNode;
@@ -12,7 +13,12 @@ interface StatCardProps {
 export function StatCard({ title, value, suffix, children }: StatCardProps) {
   return (
     <Card size="small">
-      <Statistic title={title} value={value} suffix={suffix} valueStyle={{ fontVariantNumeric: 'tabular-nums' }} />
+      <Statistic
+        title={title}
+        value={value}
+        suffix={suffix}
+        valueStyle={{ ...dataTextStyle, fontWeight: 600 }}
+      />
       {children}
     </Card>
   );

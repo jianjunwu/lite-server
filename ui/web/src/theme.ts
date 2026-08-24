@@ -48,3 +48,29 @@ export const SERIES_COLORS = [
 ];
 
 export const MONO_FONT = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
+
+// Typography: Inter for prose (what humans read), mono for data (what the
+// machine reports — metrics, version ids, timestamps, request ids).
+export const DATA_FONT = MONO_FONT;
+
+// Type scale — the only sizes allowed in the UI.
+export const TYPE = {
+  eyebrow: 11, // uppercase labels, card eyebrows
+  secondary: 12, // secondary text, table meta
+  body: 13, // default prose
+  cardTitle: 15, // card / section titles
+  pageTitle: 20, // page-level title
+  hero: 28, // hero numbers
+} as const;
+
+export const dataTextStyle: React.CSSProperties = {
+  fontFamily: DATA_FONT,
+  fontVariantNumeric: 'tabular-nums',
+};
+
+export const eyebrowStyle: React.CSSProperties = {
+  fontSize: TYPE.eyebrow,
+  textTransform: 'uppercase',
+  letterSpacing: '0.06em',
+  color: '#6B7280',
+};

@@ -36,7 +36,8 @@
     "noInstances": "No instances configured",
     "noInstancesHint": "Add an instance in instances.yaml or via Settings.",
     "serverVersion": "Server version",
-    "loadedModels": "Loaded models"
+    "loadedModels": "Loaded models",
+    "allReady": "All {{versions}} versions ready across {{instances}} instances"
   },
   "models": {
     "title": "Models",
@@ -44,6 +45,7 @@
     "versions": "Versions",
     "activeVersion": "Active version",
     "modelType": "Type",
+    "traffic": "Traffic",
     "noModels": "No models loaded on this instance",
     "detail": "Model detail",
     "versionDetail": "Version detail",

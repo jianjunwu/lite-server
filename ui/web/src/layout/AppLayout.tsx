@@ -11,10 +11,12 @@ import {
 } from '@ant-design/icons';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { useInstances } from '../api/hooks';
+import { useInstances, useHealthSummary } from '../api/hooks';
 import { useInstance } from '../context/InstanceContext';
 import { setLanguage } from '../i18n';
 import i18n from '../i18n';
+import { StatusDot, statusKind } from '../components/StatusBadge';
+import { eyebrowStyle } from '../theme';
 
 const { Sider, Header, Content } = Layout;
 
@@ -25,6 +27,7 @@ export function AppLayout() {
   const { instanceId, setInstanceId } = useInstance();
   const instancesQuery = useInstances();
   const instances = instancesQuery.data?.instances ?? [];
+  const currentHealth = useHealthSummary(instanceId);
 
   // Default to the first configured instance once the list arrives.
   useEffect(() => {
@@ -79,7 +82,12 @@ export function AppLayout() {
           }}
         >
           <Space size="middle">
-            <span style={{ color: '#6B7280', fontSize: 12 }}>{t('common.instance')}</span>
+            <span style={eyebrowStyle}>{t('common.instance')}</span>
+            {instanceId && (
+              <StatusDot
+                kind={currentHealth.isError ? 'offline' : statusKind(currentHealth.data?.status ?? 'loading')}
+              />
+            )}
             <Select
               style={{ minWidth: 220 }}
               value={instanceId ?? undefined}
@@ -102,8 +110,8 @@ export function AppLayout() {
             />
           </Space>
         </Header>
-        {instancesQuery.isError && (
-          <Alert type="warning" showIcon banner message={t('common.unreachable')} />
+        {instanceId && currentHealth.isError && (
+          <Alert type="warning" showIcon banner message={`${t('common.unreachable')}: ${instanceId}`} />
         )}
         <Content style={{ padding: 24 }}>
           <Outlet context={{ navigate }} />

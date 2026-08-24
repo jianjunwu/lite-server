@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useAlerts, useModels, useTimelineAll, useVersions } from '../api/hooks';
 import { ChartCard } from '../components/ChartCard';
+import { PageHeader } from '../components/PageHeader';
 import { EChart } from '../components/EChart';
 import { buildTimelineOption, type MetricKey, type ThresholdLine } from '../components/timelineChart';
 
@@ -73,8 +74,9 @@ export function MetricsPage() {
   const isEmpty = snapshots.every((s) => s.entries.length === 0);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Card size="small">
+    <>
+      <PageHeader title={t('metrics.title')} subtitle={instanceId} />
+      <Card size="small" style={{ marginBottom: 16 }}>
         <Space wrap size="middle">
           <Select
             style={{ minWidth: 200 }}
@@ -141,6 +143,6 @@ export function MetricsPage() {
           </Col>
         ))}
       </Row>
-    </div>
+    </>
   );
 }

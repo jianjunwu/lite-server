@@ -1,15 +1,19 @@
 import { useMemo } from 'react';
 import { Card, Col, Empty, Row, Skeleton, Typography } from 'antd';
 import { useQueries } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api/client';
 import { useInstances } from '../api/hooks';
 import type { AlertsResponse, HealthSummary, ServerInfo, TimelineAllResponse } from '../api/types';
-import { StatusBadge, statusKind } from '../components/StatusBadge';
+import { StatusBadge, StatusDot, statusKind } from '../components/StatusBadge';
 import { StatCard } from '../components/StatCard';
 import { EChart } from '../components/EChart';
-import { STATUS_COLORS } from '../theme';
-import { formatNumber } from '../components/format';
+import { PageHeader } from '../components/PageHeader';
+import { STATUS_COLORS, TYPE, dataTextStyle } from '../theme';
+import { formatMs, formatNumber } from '../components/format';
+
+const MAX_MODEL_ROWS = 6;
 
 export function OverviewPage() {
   const { t } = useTranslation();
@@ -50,9 +54,9 @@ export function OverviewPage() {
 
   const loading = instancesQuery.isLoading;
 
-  // Fleet-wide aggregates.
-  const { statusCounts, fleetQps, sparkline, activeAlerts } = useMemo(() => {
+  const { statusCounts, totalVersions, fleetQps, sparkline, activeAlerts } = useMemo(() => {
     const counts: Record<string, number> = { ready: 0, loading: 0, warning: 0, error: 0, offline: 0 };
+    let versions = 0;
     let qps = 0;
     let alerts = 0;
     const buckets = new Map<number, number>();
@@ -61,6 +65,7 @@ export function OverviewPage() {
       q.data?.models.forEach((m) =>
         m.versions.forEach((v) => {
           counts[statusKind(v.status)] += 1;
+          versions += 1;
         }),
       );
     });
@@ -78,7 +83,7 @@ export function OverviewPage() {
       alerts += q.data?.alerts.length ?? 0;
     });
     const line = [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([ts, v]) => [ts * 1000, v]);
-    return { statusCounts: counts, fleetQps: qps, sparkline: line, activeAlerts: alerts };
+    return { statusCounts: counts, totalVersions: versions, fleetQps: qps, sparkline: line, activeAlerts: alerts };
   }, [healthQueries, timelineQueries, alertsQueries]);
 
   if (!loading && instances.length === 0) {
@@ -94,6 +99,8 @@ export function OverviewPage() {
     );
   }
 
+  const degraded = totalVersions - statusCounts.ready;
+
   const donutOption = {
     tooltip: { trigger: 'item' as const },
     legend: { bottom: 0, textStyle: { fontSize: 11 } },
@@ -104,7 +111,15 @@ export function OverviewPage() {
         label: { show: false },
         data: (['ready', 'loading', 'warning', 'error', 'offline'] as const)
           .filter((k) => statusCounts[k] > 0)
-          .map((k) => ({ name: k, value: statusCounts[k], itemStyle: { color: STATUS_COLORS[k] } })),
+          .map((k) => ({
+            name: k,
+            value: statusCounts[k],
+            itemStyle: {
+              color: STATUS_COLORS[k],
+              // Quiet rule: healthy slices recede, anomalies pop.
+              opacity: k === 'ready' ? 0.35 : 1,
+            },
+          })),
       },
     ],
   };
@@ -126,10 +141,21 @@ export function OverviewPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <PageHeader title={t('overview.title')} />
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8}>
           <Card title={t('overview.fleetStatus')} size="small" loading={loading}>
-            <EChart option={donutOption} height={180} />
+            {degraded === 0 && totalVersions > 0 ? (
+              // All quiet: no chart, just a calm statement.
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 120 }}>
+                <StatusDot kind="ready" size={10} />
+                <span style={{ fontSize: TYPE.body, color: '#374151' }}>
+                  {t('overview.allReady', { versions: totalVersions, instances: instances.length })}
+                </span>
+              </div>
+            ) : (
+              <EChart option={donutOption} height={180} />
+            )}
           </Card>
         </Col>
         <Col xs={24} md={8}>
@@ -147,12 +173,23 @@ export function OverviewPage() {
         {instances.map((inst, idx) => {
           const health = healthQueries[idx];
           const info = infoQueries[idx];
+          const timeline = timelineQueries[idx];
           const unreachable = health.isError;
+          const models = health.data?.models ?? [];
+          const snapshots = timeline.data?.snapshots ?? [];
+
           return (
             <Col xs={24} md={12} xl={8} key={inst.id}>
               <Card
                 size="small"
-                title={inst.name}
+                title={
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    {inst.name}
+                    <Typography.Text type="secondary" style={{ fontSize: TYPE.eyebrow, fontWeight: 400 }}>
+                      {info.data?.version ?? ''}
+                    </Typography.Text>
+                  </span>
+                }
                 extra={
                   unreachable ? (
                     <StatusBadge status="offline" text={t('common.unreachable')} />
@@ -164,16 +201,44 @@ export function OverviewPage() {
                 {health.isLoading ? (
                   <Skeleton active paragraph={{ rows: 2 }} />
                 ) : unreachable ? (
-                  <Typography.Text type="secondary">{inst.base_url}</Typography.Text>
+                  <Typography.Text type="secondary" style={dataTextStyle}>{inst.base_url}</Typography.Text>
                 ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>{inst.base_url}</Typography.Text>
-                    <span>
-                      {t('overview.serverVersion')}: <b>{info.data?.version ?? '-'}</b>
-                    </span>
-                    <span>
-                      {t('overview.loadedModels')}: <b>{health.data?.models.length ?? 0}</b>
-                    </span>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {models.slice(0, MAX_MODEL_ROWS).map((m) => {
+                      const modelSnaps = snapshots.filter((s) => s.model === m.name);
+                      const latestP99 = Math.max(
+                        0,
+                        ...modelSnaps.map((s) => s.entries[s.entries.length - 1]?.p99_ms ?? 0),
+                      );
+                      return (
+                        <div key={m.name} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <Link
+                            to={`/models/${encodeURIComponent(m.name)}?i=${encodeURIComponent(inst.id)}`}
+                            style={{ flex: '0 0 40%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                          >
+                            {m.name}
+                          </Link>
+                          <span style={{ display: 'inline-flex', gap: 4 }}>
+                            {m.versions.map((v) => (
+                              <StatusDot key={v.version} kind={statusKind(v.status)} size={7} />
+                            ))}
+                          </span>
+                          <span style={{ ...dataTextStyle, marginLeft: 'auto', fontSize: TYPE.secondary, color: '#6B7280' }}>
+                            {latestP99 > 0 ? formatMs(latestP99) : '-'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {models.length > MAX_MODEL_ROWS && (
+                      <Link to={`/models?i=${encodeURIComponent(inst.id)}`} style={{ fontSize: TYPE.secondary }}>
+                        +{models.length - MAX_MODEL_ROWS} more
+                      </Link>
+                    )}
+                    {models.length === 0 && (
+                      <Typography.Text type="secondary" style={{ fontSize: TYPE.secondary }}>
+                        {t('models.noModels')}
+                      </Typography.Text>
+                    )}
                   </div>
                 )}
               </Card>

@@ -1,4 +1,4 @@
-import { Card, Descriptions, Tag } from 'antd';
+import { Card, Descriptions } from 'antd';
 import { Link, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
@@ -9,6 +9,7 @@ import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { buildTimelineOption } from '../components/timelineChart';
 import { formatAge } from '../components/format';
+import { dataTextStyle, TYPE } from '../theme';
 
 export function VersionDetailPage() {
   const { t } = useTranslation();
@@ -31,8 +32,12 @@ export function VersionDetailPage() {
             <span>
               <Link to={`/models/${encodeURIComponent(name)}`}>{name}</Link>
               <span style={{ color: '#9CA3AF' }}> / </span>
-              {version}{' '}
-              {info?.active && <Tag color="#4F46E5">{t('common.active')}</Tag>}
+              <span style={dataTextStyle}>{version}</span>
+              {info?.active && (
+                <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#111827', marginLeft: 10 }}>
+                  ● {t('common.active')}
+                </span>
+              )}
             </span>
           }
           size="small"
