@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { parse } from 'yaml';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { parse, stringify } from 'yaml';
 
 export interface InstanceConfig {
   id: string;
@@ -98,4 +98,104 @@ export function loadInstances(opts: { configPath: string; env: NodeJS.ProcessEnv
     list: () => [...instances.values()],
     get: (id) => instances.get(id),
   };
+}
+
+export type StoreErrorCode = 'invalid' | 'duplicate' | 'not_found' | 'readonly';
+
+export class StoreError extends Error {
+  constructor(
+    public code: StoreErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'StoreError';
+  }
+}
+
+export interface InstanceInput {
+  id?: unknown;
+  name?: unknown;
+  base_url?: unknown;
+  admin_key?: unknown;
+}
+
+/**
+ * Mutable instance registry with atomic yaml write-back. Env-injected
+ * instances stay readonly and are never persisted.
+ */
+export class InstanceStore implements InstanceRegistry {
+  private instances = new Map<string, InstanceConfig>();
+
+  constructor(private opts: { configPath: string; env: NodeJS.ProcessEnv }) {
+    const loaded = loadInstances(opts);
+    for (const inst of loaded.list()) {
+      this.instances.set(inst.id, inst);
+    }
+  }
+
+  list(): InstanceConfig[] {
+    return [...this.instances.values()];
+  }
+
+  get(id: string): InstanceConfig | undefined {
+    return this.instances.get(id);
+  }
+
+  create(input: InstanceInput): InstanceConfig {
+    const inst = this.validate(input);
+    if (this.instances.has(inst.id)) {
+      throw new StoreError('duplicate', `instance id "${inst.id}" already exists`);
+    }
+    this.instances.set(inst.id, inst);
+    this.persist();
+    return inst;
+  }
+
+  update(id: string, patch: Omit<InstanceInput, 'id'>): InstanceConfig {
+    const existing = this.instances.get(id);
+    if (!existing) throw new StoreError('not_found', `unknown instance "${id}"`);
+    if (existing.readonly) throw new StoreError('readonly', `instance "${id}" is env-managed (readonly)`);
+    const merged = this.validate({
+      id,
+      name: patch.name ?? existing.name,
+      base_url: patch.base_url ?? existing.baseUrl,
+      admin_key: patch.admin_key !== undefined ? patch.admin_key : existing.adminKey,
+    });
+    this.instances.set(id, merged);
+    this.persist();
+    return merged;
+  }
+
+  remove(id: string): void {
+    const existing = this.instances.get(id);
+    if (!existing) throw new StoreError('not_found', `unknown instance "${id}"`);
+    if (existing.readonly) throw new StoreError('readonly', `instance "${id}" is env-managed (readonly)`);
+    this.instances.delete(id);
+    this.persist();
+  }
+
+  private validate(input: InstanceInput): InstanceConfig {
+    try {
+      return normalize(input, this.opts.env, 'api', false);
+    } catch (err) {
+      throw new StoreError('invalid', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** Atomic write: temp file + rename. Only file-managed instances persist. */
+  private persist() {
+    const doc = {
+      instances: this.list()
+        .filter((i) => !i.readonly)
+        .map((i) => ({
+          id: i.id,
+          name: i.name,
+          base_url: i.baseUrl,
+          ...(i.adminKey ? { admin_key: i.adminKey } : {}),
+        })),
+    };
+    const tmp = `${this.opts.configPath}.tmp-${process.pid}`;
+    writeFileSync(tmp, stringify(doc));
+    renameSync(tmp, this.opts.configPath);
+  }
 }

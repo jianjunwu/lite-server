@@ -69,15 +69,24 @@ async function proxyHandler(req: FastifyRequest, reply: FastifyReply, registry: 
 }
 
 export function registerProxyRoutes(app: FastifyInstance, registry: InstanceRegistry) {
-  app.get('/api/instances', async () => ({
-    instances: registry.list().map((i) => ({
-      id: i.id,
-      name: i.name,
-      base_url: i.baseUrl,
-      has_admin_key: Boolean(i.adminKey),
-      readonly: i.readonly,
-    })),
-  }));
+  // Buffer request bodies verbatim so the proxy can forward bytes as-is
+  // (no JSON parse/re-serialize round-trip). Scoped to the proxy plugin so
+  // the BFF's own JSON APIs keep the default parser. 'application/json'
+  // must be overridden explicitly — the specific parser wins over '*' in
+  // fastify's matching. Control-plane bodies are small; streaming uploads
+  // get a raised bodyLimit (see app.ts).
+  const bufferParser = (
+    _req: unknown,
+    payload: NodeJS.ReadableStream,
+    done: (err: Error | null, body?: Buffer) => void,
+  ) => {
+    const chunks: Buffer[] = [];
+    payload.on('data', (c: Buffer) => chunks.push(c));
+    payload.on('end', () => done(null, Buffer.concat(chunks)));
+    payload.on('error', done);
+  };
+  app.addContentTypeParser('application/json', bufferParser);
+  app.addContentTypeParser('*', bufferParser);
 
   app.all('/api/i/:id/*', (req, reply) => proxyHandler(req, reply, registry));
   // Trailing-slash-less form: /api/i/:id proxies to the instance root.

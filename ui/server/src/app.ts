@@ -3,35 +3,30 @@ import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
 import type { InstanceRegistry } from './config.js';
 import { registerProxyRoutes } from './proxy.js';
+import { registerInstanceRoutes } from './routes-instances.js';
 
 export interface AppOptions {
   /** Directory of the built SPA; served at / when it exists. */
   webDist?: string;
   logger?: boolean;
+  /** Max proxied request body in bytes (uploads). Default 1 GiB. */
+  bodyLimit?: number;
 }
 
 export function buildApp(registry: InstanceRegistry, opts: AppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: opts.logger ?? false });
+  const app = Fastify({
+    logger: opts.logger ?? false,
+    bodyLimit: opts.bodyLimit ?? 1 << 30,
+  });
 
-  // Buffer request bodies verbatim so the proxy can forward bytes as-is
-  // (no JSON parse/re-serialize round-trip). Control-plane bodies are small;
-  // streaming uploads (M2) will bypass this with a dedicated raw route.
-  // 'application/json' must be overridden explicitly — the specific parser
-  // wins over '*' in fastify's matching.
-  const bufferParser = (
-    _req: unknown,
-    payload: NodeJS.ReadableStream,
-    done: (err: Error | null, body?: Buffer) => void,
-  ) => {
-    const chunks: Buffer[] = [];
-    payload.on('data', (c: Buffer) => chunks.push(c));
-    payload.on('end', () => done(null, Buffer.concat(chunks)));
-    payload.on('error', done);
-  };
-  app.addContentTypeParser('application/json', bufferParser);
-  app.addContentTypeParser('*', bufferParser);
+  // BFF's own APIs (default JSON parsing).
+  registerInstanceRoutes(app, registry);
 
-  registerProxyRoutes(app, registry);
+  // Instance proxy lives in its own encapsulation scope with a verbatim
+  // buffering parser (see proxy.ts).
+  app.register(async (scope) => {
+    registerProxyRoutes(scope, registry);
+  });
 
   if (opts.webDist && existsSync(opts.webDist)) {
     app.register(fastifyStatic, { root: opts.webDist, wildcard: true });

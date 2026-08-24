@@ -1,6 +1,6 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadInstances } from './config.js';
+import { InstanceStore } from './config.js';
 import { buildApp } from './app.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -10,7 +10,7 @@ const host = process.env.LITE_UI_HOST ?? '0.0.0.0';
 const configPath = process.env.LITE_UI_INSTANCES_FILE ?? join(here, '..', 'instances.yaml');
 const webDist = process.env.LITE_UI_WEB_DIST ?? join(here, '..', '..', 'web', 'dist');
 
-const registry = loadInstances({ configPath, env: process.env });
+const registry = new InstanceStore({ configPath, env: process.env });
 const app = buildApp(registry, { webDist, logger: true });
 
 app
