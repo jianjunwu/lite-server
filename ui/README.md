@@ -17,9 +17,20 @@ pip install miraserver
 lite-server web        # UI + API on :8600
 ```
 
-Open http://localhost:8600. First login: user `admin` with the password
-printed once at startup (or set `LITE_UI_ADMIN_PASSWORD`); you must change it
-on first login.
+Open http://localhost:8600. On first run with an empty user store, open
+registration is available: the first registered user becomes `admin`, after
+which registration requires an invite code (Settings → Invites). For
+unattended installs, set `LITE_UI_ADMIN_PASSWORD` instead — it bootstraps an
+`admin` account (password change forced on first login) and registration
+stays invite-only.
+
+Auth state lives in `auth.db` (SQLite, users/sessions/invites/audit). A
+pre-existing `auth.yaml` is imported once and renamed to `auth.yaml.migrated`.
+Sessions are opaque httpOnly cookies (12h); logout, password changes, and
+admin kicks revoke them server-side. Login is rate-limited (account locks
+after 5 failures in 15 min, source IPs throttle after 30) and every security
+event lands in the audit trail (Settings → Audit). TOTP two-factor auth can
+be enabled per user in Settings → Security.
 
 ## Develop
 
@@ -42,8 +53,12 @@ Point the BFF at your instances via `./instances.yaml` (see
 | `LITE_UI_INSTANCES_FILE` | `./instances.yaml` | Instance registry file |
 | `LITE_UI_INSTANCES` | — | JSON array of extra instances (marked readonly) |
 | `LITE_UI_AUTH` | `true` | Set `false` to disable login entirely (local use) |
-| `LITE_UI_AUTH_FILE` | `./auth.yaml` | User store file (`<file>.secret` holds the JWT key) |
-| `LITE_UI_ADMIN_PASSWORD` | random (printed once) | Bootstrap admin password |
+| `LITE_UI_AUTH_DB` | `./auth.db` | SQLite auth store (users, sessions, invites, audit) |
+| `LITE_UI_AUTH_FILE` | `./auth.yaml` | Legacy user file, imported once into the DB |
+| `LITE_UI_ADMIN_PASSWORD` | — | Bootstrap admin password (optional; skips open registration) |
+| `LITE_UI_PROXY_HEADERS` | `false` | Trust `X-Forwarded-Proto`/`-For` — only behind a trusted reverse proxy |
+| `LITE_UI_AUDIT_LOG` | — | Optional rotating file sink for the audit trail |
+| `LITE_UI_AUDIT_LOG_MAX_BYTES` / `LITE_UI_AUDIT_LOG_BACKUPS` | `10485760` / `5` | Audit log rotation |
 | `LITE_UI_WEB_DIST` | wheel-bundled assets | SPA directory served by the BFF |
 
 All of the above have `lite-server web` CLI flag equivalents (see

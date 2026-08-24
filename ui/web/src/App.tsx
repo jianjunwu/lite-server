@@ -5,6 +5,7 @@ import { AppLayout } from './layout/AppLayout';
 import { InstanceProvider } from './context/InstanceContext';
 import { RequireAuth } from './components/RequireAuth';
 import { LoginPage } from './pages/LoginPage';
+import { RegisterPage } from './pages/RegisterPage';
 
 // Route-level code splitting: each page (and its share of echarts/antd)
 // loads on demand instead of inflating the entry bundle.
@@ -36,6 +37,7 @@ export function App() {
     <InstanceProvider>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
         <Route
           element={
             <RequireAuth>

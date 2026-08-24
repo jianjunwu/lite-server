@@ -1,14 +1,16 @@
 import { useState } from 'react';
-import { App, Button, Card, Checkbox, Drawer, Form, Input, Popconfirm, Select, Table, Tabs, Tag, Typography } from 'antd';
+import { App, Button, Card, Checkbox, Drawer, Form, Input, Modal, Popconfirm, Select, Table, Tabs, Tag, Typography } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
+import { QRCodeSVG } from 'qrcode.react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { bffFetch, setAdminKey } from '../api/client';
+import { auditApi, authApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
 import { useInstances } from '../api/hooks';
 import { useAuth } from '../context/AuthContext';
 import type { InstanceInfo } from '../api/types';
 import { PageHeader } from '../components/PageHeader';
-import { MONO_FONT, dataTextStyle, TYPE } from '../theme';
+import { MONO_FONT, STATUS_COLORS, dataTextStyle, TYPE } from '../theme';
 
 interface InstanceFormValues {
   id: string;
@@ -254,6 +256,7 @@ interface UserRow {
   role: 'viewer' | 'operator' | 'admin';
   createdAt: string;
   mustChangePassword: boolean;
+  totpEnabled?: boolean;
 }
 
 function UsersTab() {
@@ -270,6 +273,24 @@ function UsersTab() {
     queryFn: () => bffFetch<{ users: UserRow[] }>('/api/users'),
   });
   const users = usersQuery.data?.users ?? [];
+
+  const [sessionsFor, setSessionsFor] = useState<string | null>(null);
+  const userSessionsQuery = useQuery({
+    queryKey: ['bff', 'user-sessions', sessionsFor],
+    queryFn: () => sessionsApi.listFor(sessionsFor as string),
+    enabled: sessionsFor !== null,
+  });
+
+  const kick = async (id: string) => {
+    if (!sessionsFor) return;
+    try {
+      await sessionsApi.revokeFor(sessionsFor, id);
+      message.success(t('settings.sessions.revoked'));
+      await userSessionsQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const openCreate = () => {
     setEditing(null);
@@ -325,6 +346,16 @@ function UsersTab() {
     }
   };
 
+  const resetTotp = async (u: UserRow) => {
+    try {
+      await authApi.adminResetTotp(u.username);
+      message.success(t('settings.users.totpReset'));
+      await usersQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   return (
     <>
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
@@ -358,12 +389,22 @@ function UsersTab() {
           },
           {
             title: '',
-            width: 150,
+            width: 290,
             render: (_: unknown, u: UserRow) => (
               <span>
+                <Button type="text" size="small" onClick={() => setSessionsFor(u.username)}>
+                  {t('settings.sessions.view')}
+                </Button>
                 <Button type="text" size="small" onClick={() => openEdit(u)}>
                   {t('settings.users.edit')}
                 </Button>
+                {u.totpEnabled && (
+                  <Popconfirm title={t('settings.users.totpResetConfirm', { name: u.username })} onConfirm={() => void resetTotp(u)}>
+                    <Button type="text" size="small">
+                      {t('settings.users.totpResetAction')}
+                    </Button>
+                  </Popconfirm>
+                )}
                 {u.username !== me?.username && (
                   <Popconfirm title={t('settings.users.deleteConfirm', { name: u.username })} onConfirm={() => remove(u)}>
                     <Button type="text" size="small" danger>
@@ -395,7 +436,7 @@ function UsersTab() {
             name="password"
             label={t('settings.users.password')}
             extra={editing ? t('settings.users.passwordKeepHint') : t('settings.users.passwordHint')}
-            rules={[{ required: editing === null, min: 8 }]}
+            rules={[{ required: editing === null, min: 12 }]}
           >
             <Input.Password autoComplete="new-password" style={{ fontFamily: MONO_FONT }} />
           </Form.Item>
@@ -413,6 +454,407 @@ function UsersTab() {
           </Button>
         </Form>
       </Drawer>
+
+      <Drawer
+        title={t('settings.sessions.userTitle', { name: sessionsFor })}
+        open={sessionsFor !== null}
+        onClose={() => setSessionsFor(null)}
+        width={640}
+      >
+        <SessionsTable
+          sessions={userSessionsQuery.data?.sessions ?? []}
+          loading={userSessionsQuery.isLoading}
+          onRevoke={(id) => void kick(id)}
+        />
+      </Drawer>
+    </>
+  );
+}
+
+function SessionsTable({ sessions, loading, onRevoke }: {
+  sessions: SessionInfo[];
+  loading?: boolean;
+  onRevoke: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Table<SessionInfo>
+      size="small"
+      rowKey="id"
+      loading={loading}
+      dataSource={sessions}
+      pagination={false}
+      columns={[
+        { title: t('settings.sessions.created'), dataIndex: 'createdAt', render: (v: string) => <span style={dataTextStyle}>{v}</span> },
+        { title: t('settings.sessions.lastSeen'), dataIndex: 'lastSeenAt', render: (v: string) => <span style={dataTextStyle}>{v}</span> },
+        { title: t('settings.sessions.ip'), dataIndex: 'ip', render: (v: string | null) => <span style={dataTextStyle}>{v ?? '-'}</span> },
+        { title: t('settings.sessions.userAgent'), dataIndex: 'userAgent', ellipsis: true },
+        {
+          title: '',
+          width: 140,
+          render: (_: unknown, s: SessionInfo) => (
+            <span>
+              {s.current && <Tag>{t('settings.sessions.current')}</Tag>}
+              <Button type="text" size="small" danger onClick={() => onRevoke(s.id)}>
+                {t('settings.sessions.revoke')}
+              </Button>
+            </span>
+          ),
+        },
+      ]}
+    />
+  );
+}
+
+function TotpSection() {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const { user, refresh } = useAuth();
+  const [enrollment, setEnrollment] = useState<{ secret: string; otpauthUrl: string } | null>(null);
+  const [backupCodes, setBackupCodes] = useState<string[] | null>(null);
+  const [code, setCode] = useState('');
+  const [disableOpen, setDisableOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const startEnroll = async () => {
+    setBusy(true);
+    try {
+      setEnrollment(await authApi.totpEnroll());
+      setCode('');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      const { backupCodes: codes } = await authApi.totpConfirm(code.trim());
+      setBackupCodes(codes);
+      setEnrollment(null);
+      setCode('');
+      await refresh();
+    } catch {
+      message.error(t('settings.totp.invalidCode'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disable = async () => {
+    setBusy(true);
+    try {
+      await authApi.totpDisable(code.trim());
+      message.success(t('settings.totp.disabled'));
+      setDisableOpen(false);
+      setCode('');
+      await refresh();
+    } catch {
+      message.error(t('settings.totp.invalidCode'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyBackupCodes = async () => {
+    await navigator.clipboard.writeText((backupCodes ?? []).join('\n'));
+    message.success(t('settings.totp.copied'));
+  };
+
+  return (
+    <Card size="small" title={t('settings.totp.title')} style={{ marginBottom: 16 }}>
+      {backupCodes ? (
+        <>
+          <Typography.Paragraph type="warning" style={{ fontSize: TYPE.secondary }}>
+            {t('settings.totp.backupHint')}
+          </Typography.Paragraph>
+          <pre style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary, lineHeight: 1.8 }}>
+            {backupCodes.join('\n')}
+          </pre>
+          <Button onClick={() => void copyBackupCodes()} style={{ marginRight: 8 }}>
+            {t('settings.totp.copyCodes')}
+          </Button>
+          <Button type="primary" onClick={() => setBackupCodes(null)}>
+            {t('settings.totp.done')}
+          </Button>
+        </>
+      ) : enrollment ? (
+        <>
+          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <QRCodeSVG value={enrollment.otpauthUrl} size={160} />
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <Typography.Paragraph style={{ fontSize: TYPE.secondary }}>
+                {t('settings.totp.scanHint')}
+              </Typography.Paragraph>
+              <Typography.Paragraph copyable style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary }}>
+                {enrollment.secret}
+              </Typography.Paragraph>
+              <Input
+                placeholder={t('settings.totp.codePlaceholder')}
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                style={{ marginBottom: 8 }}
+                autoComplete="one-time-code"
+              />
+              <Button type="primary" loading={busy} onClick={() => void confirm()} style={{ marginRight: 8 }}>
+                {t('settings.totp.confirm')}
+              </Button>
+              <Button onClick={() => setEnrollment(null)}>{t('settings.totp.cancel')}</Button>
+            </div>
+          </div>
+        </>
+      ) : user?.totpEnabled ? (
+        <>
+          <Tag color={STATUS_COLORS.ready}>{t('settings.totp.enabled')}</Tag>
+          <Button danger size="small" onClick={() => setDisableOpen(true)} style={{ marginLeft: 8 }}>
+            {t('settings.totp.disable')}
+          </Button>
+        </>
+      ) : (
+        <Button onClick={() => void startEnroll()} loading={busy}>
+          {t('settings.totp.enable')}
+        </Button>
+      )}
+
+      <Modal
+        open={disableOpen}
+        title={t('settings.totp.disable')}
+        okText={t('settings.totp.disable')}
+        okButtonProps={{ danger: true, loading: busy }}
+        onOk={() => void disable()}
+        onCancel={() => setDisableOpen(false)}
+        destroyOnHidden
+      >
+        <Typography.Paragraph style={{ fontSize: TYPE.secondary }}>
+          {t('settings.totp.disableHint')}
+        </Typography.Paragraph>
+        <Input
+          placeholder={t('settings.totp.codePlaceholder')}
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          autoComplete="one-time-code"
+        />
+      </Modal>
+    </Card>
+  );
+}
+
+function SecurityTab() {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const sessionsQuery = useQuery({ queryKey: ['bff', 'my-sessions'], queryFn: sessionsApi.listMine });
+
+  const revoke = async (id: string) => {
+    try {
+      await sessionsApi.revokeMine(id);
+      message.success(t('settings.sessions.revoked'));
+      await sessionsQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <>
+      <TotpSection />
+      <Card size="small" title={t('settings.sessions.myTitle')}>
+        <SessionsTable
+          sessions={sessionsQuery.data?.sessions ?? []}
+          loading={sessionsQuery.isLoading}
+          onRevoke={(id) => void revoke(id)}
+        />
+      </Card>
+    </>
+  );
+}
+
+const AUDIT_ACTIONS = [
+  'login_success', 'login_failure', 'login_throttled', 'account_locked', 'logout',
+  'session_revoked', 'password_changed', 'user_created', 'user_updated', 'user_deleted',
+  'unlock', 'http_mutation',
+];
+
+function AuditTab() {
+  const { t } = useTranslation();
+  const [action, setAction] = useState<string>('');
+  const auditQuery = useQuery({
+    queryKey: ['bff', 'audit', action],
+    queryFn: () => auditApi.list({ limit: 200, action: action || undefined }),
+  });
+
+  return (
+    <>
+      <Select
+        allowClear
+        placeholder={t('settings.audit.filterAction')}
+        style={{ width: 240, marginBottom: 12 }}
+        value={action || undefined}
+        onChange={(v) => setAction(v ?? '')}
+        options={AUDIT_ACTIONS.map((a) => ({ value: a, label: a }))}
+      />
+      <Table<AuditEntry>
+        size="small"
+        rowKey="id"
+        loading={auditQuery.isLoading}
+        dataSource={auditQuery.data?.entries ?? []}
+        columns={[
+          { title: t('settings.audit.ts'), dataIndex: 'ts', width: 230, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
+          { title: t('settings.audit.actor'), dataIndex: 'actor', width: 110, render: (v: string | null) => v ?? '-' },
+          { title: t('settings.audit.action'), dataIndex: 'action', width: 160, render: (v: string) => <Tag>{v}</Tag> },
+          { title: t('settings.audit.target'), dataIndex: 'target', width: 110, render: (v: string | null) => v ?? '-' },
+          { title: t('settings.audit.ip'), dataIndex: 'ip', width: 120, render: (v: string | null) => <span style={dataTextStyle}>{v ?? '-'}</span> },
+          {
+            title: t('settings.audit.detail'),
+            dataIndex: 'detail',
+            ellipsis: true,
+            render: (v: Record<string, unknown> | null) => (v ? JSON.stringify(v) : '-'),
+          },
+        ]}
+      />
+    </>
+  );
+}
+
+function InvitesTab() {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [form] = Form.useForm<{ role: string; maxUses: number; expiresInHours: number }>();
+  const [busy, setBusy] = useState(false);
+
+  const invitesQuery = useQuery({ queryKey: ['bff', 'invites'], queryFn: invitesApi.list });
+
+  const create = async (values: { role: string; maxUses: number; expiresInHours: number }) => {
+    setBusy(true);
+    try {
+      await invitesApi.create({
+        role: values.role as InviteInfo['role'],
+        maxUses: values.maxUses,
+        expiresInHours: values.expiresInHours > 0 ? values.expiresInHours : null,
+      });
+      message.success(t('settings.invites.created'));
+      await invitesQuery.refetch();
+      setDrawerOpen(false);
+      form.resetFields();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async (code: string) => {
+    await navigator.clipboard.writeText(code);
+    message.success(t('settings.invites.copied'));
+  };
+
+  const revoke = async (code: string) => {
+    try {
+      await invitesApi.revoke(code);
+      message.success(t('settings.invites.revoked'));
+      await invitesQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setDrawerOpen(true)}>
+          {t('settings.invites.add')}
+        </Button>
+      </div>
+      <Table<InviteInfo>
+        size="small"
+        rowKey="code"
+        loading={invitesQuery.isLoading}
+        dataSource={invitesQuery.data?.invites ?? []}
+        pagination={false}
+        columns={[
+          {
+            title: t('settings.invites.code'),
+            dataIndex: 'code',
+            render: (v: string) => <span style={dataTextStyle}>{v}</span>,
+          },
+          { title: t('settings.invites.role'), dataIndex: 'role', width: 100, render: (r: string) => <Tag>{r}</Tag> },
+          {
+            title: t('settings.invites.uses'),
+            width: 90,
+            render: (_: unknown, i: InviteInfo) => `${i.useCount}/${i.maxUses}`,
+          },
+          {
+            title: t('settings.invites.expiresAt'),
+            dataIndex: 'expiresAt',
+            render: (v: string | null) => <span style={dataTextStyle}>{v ?? t('settings.invites.never')}</span>,
+          },
+          {
+            title: t('settings.invites.status'),
+            width: 110,
+            render: (_: unknown, i: InviteInfo) =>
+              i.revokedAt ? <Tag>{t('settings.invites.revokedTag')}</Tag> : null,
+          },
+          {
+            title: '',
+            width: 180,
+            render: (_: unknown, i: InviteInfo) => (
+              <span>
+                <Button type="text" size="small" onClick={() => void copy(i.code)}>
+                  {t('settings.invites.copy')}
+                </Button>
+                {!i.revokedAt && (
+                  <Popconfirm title={t('settings.invites.revokeConfirm')} onConfirm={() => void revoke(i.code)}>
+                    <Button type="text" size="small" danger>
+                      {t('settings.invites.revoke')}
+                    </Button>
+                  </Popconfirm>
+                )}
+              </span>
+            ),
+          },
+        ]}
+      />
+
+      <Drawer
+        title={t('settings.invites.addTitle')}
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        width={360}
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          onFinish={create}
+          initialValues={{ role: 'viewer', maxUses: 1, expiresInHours: 72 }}
+          requiredMark={false}
+        >
+          <Form.Item name="role" label={t('settings.invites.role')} rules={[{ required: true }]}>
+            <Select
+              options={[
+                { value: 'viewer', label: 'viewer' },
+                { value: 'operator', label: 'operator' },
+                { value: 'admin', label: 'admin' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="maxUses" label={t('settings.invites.maxUses')} rules={[{ required: true }]}>
+            <Input type="number" min={1} />
+          </Form.Item>
+          <Form.Item
+            name="expiresInHours"
+            label={t('settings.invites.expiresInHours')}
+            extra={t('settings.invites.expiresHint')}
+            rules={[{ required: true }]}
+          >
+            <Input type="number" min={0} />
+          </Form.Item>
+          <Button type="primary" htmlType="submit" block loading={busy}>
+            {t('settings.invites.create')}
+          </Button>
+        </Form>
+      </Drawer>
     </>
   );
 }
@@ -423,9 +865,12 @@ export function SettingsPage() {
   const tabs = [
     { key: 'instances', label: t('settings.tabs.instances'), children: <InstancesTab /> },
     { key: 'keys', label: t('settings.tabs.keys'), children: <AdminKeysTab /> },
+    { key: 'security', label: t('settings.tabs.security'), children: <SecurityTab /> },
   ];
   if (can('admin')) {
     tabs.push({ key: 'users', label: t('settings.tabs.users'), children: <UsersTab /> });
+    tabs.push({ key: 'invites', label: t('settings.tabs.invites'), children: <InvitesTab /> });
+    tabs.push({ key: 'audit', label: t('settings.tabs.audit'), children: <AuditTab /> });
   }
   return (
     <>

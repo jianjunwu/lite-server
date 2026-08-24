@@ -359,7 +359,7 @@ def main(argv=None):
     web_parser.add_argument("--instances-file", default=None,
                             help="Path to instances.yaml (default: ./instances.yaml, env LITE_UI_INSTANCES_FILE)")
     web_parser.add_argument("--auth-file", default=None,
-                            help="Path to auth.yaml (default: ./auth.yaml, env LITE_UI_AUTH_FILE)")
+                            help="Path to legacy auth.yaml import source (default: ./auth.yaml, env LITE_UI_AUTH_FILE)")
     web_parser.add_argument("--auth", choices=["on", "off"], default=None,
                             help="Local-account auth (default: on, env LITE_UI_AUTH)")
     web_parser.add_argument("--web-dist", default=None,

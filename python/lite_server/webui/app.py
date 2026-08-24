@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,7 +14,18 @@ from . import auth as auth_module
 from . import proxy as proxy_module
 from . import registry as registry_module
 
-_logger = logging.getLogger("lite_server.webui.audit")
+SECURITY_HEADERS = {
+    # antd is CSS-in-JS and injects <style> at runtime, hence style-src
+    # 'unsafe-inline'; the bundle itself has no inline scripts.
+    "content-security-policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "same-origin",
+}
 
 
 class _SpaFiles(StaticFiles):
@@ -59,15 +69,21 @@ def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = 
         async def guard(request, call_next):
             deny = auth_module.check_request(user_store, auth_enabled, request)
             response = deny if deny is not None else await call_next(request)
-            # Audit: every mutation with its actor and outcome.
-            if request.method != "GET" and request.url.path.startswith("/api/"):
+            # Audit: every mutation with its actor and outcome. /api/auth/*
+            # emits specific events (login_success, user_created, ...) already.
+            if (request.method != "GET"
+                    and request.url.path.startswith("/api/")
+                    and not request.url.path.startswith("/api/auth/")):
                 user = getattr(request.state, "user", None)
-                _logger.info(
-                    "ui mutation user=%s method=%s url=%s status=%s",
-                    user.get("username") if user else None,
-                    request.method,
-                    request.url.path,
-                    response.status_code,
+                user_store.record_audit(
+                    "http_mutation",
+                    actor=user.get("username") if user else None,
+                    ip=request.client.host if request.client else None,
+                    detail={
+                        "method": request.method,
+                        "path": request.url.path,
+                        "status": response.status_code,
+                    },
                 )
             return response
 
@@ -78,5 +94,14 @@ def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = 
 
     if web_dist and Path(web_dist).exists():
         app.mount("/", _SpaFiles(directory=str(web_dist), html=True), name="spa")
+
+    # Registered last so it is the outermost middleware: deny responses from
+    # the auth guard must carry the headers too.
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        for key, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(key, value)
+        return response
 
     return app

@@ -69,7 +69,7 @@ export function UserMenu() {
           <Form.Item name="currentPassword" label={t('auth.currentPassword')} rules={[{ required: true }]}>
             <Input.Password autoComplete="current-password" />
           </Form.Item>
-          <Form.Item name="newPassword" label={t('auth.newPassword')} rules={[{ required: true, min: 8 }]}>
+          <Form.Item name="newPassword" label={t('auth.newPassword')} rules={[{ required: true, min: 12 }]}>
             <Input.Password autoComplete="new-password" />
           </Form.Item>
           <Form.Item

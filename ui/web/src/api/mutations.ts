@@ -1,4 +1,4 @@
-import { ApiError, apiFetch, getAdminKey, setAdminKey } from './client';
+import { ApiError, apiFetch, getAdminKey, notifyBffUnauthorized, setAdminKey } from './client';
 
 const enc = encodeURIComponent;
 
@@ -70,13 +70,13 @@ export async function withAdminKeyRetry<T>(instanceId: string, fn: () => Promise
     return await fn();
   } catch (err) {
     if (!(err instanceof ApiError) || err.status !== 401 || !keyRequester) throw err;
-    // A BFF-side 401 ({error:'unauthenticated'}) means the login session
+    // A BFF-side 401 ({error:'bff_unauthenticated'}) means the login session
     // expired — the auth flow handles it; an instance-key prompt here would
     // sit on top of the login redirect and the retry would fail anyway.
     if (
       err.body !== null &&
       typeof err.body === 'object' &&
-      (err.body as { error?: unknown }).error === 'unauthenticated'
+      (err.body as { error?: unknown }).error === 'bff_unauthenticated'
     ) {
       throw err;
     }
@@ -130,6 +130,8 @@ export function uploadModelFiles(
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(body as UploadResult);
       } else {
+        // XHR bypasses client.ts — report an expired BFF session here.
+        notifyBffUnauthorized(xhr.status, body);
         const message =
           body && typeof body === 'object' && 'error' in body
             ? String((body as { error: unknown }).error)

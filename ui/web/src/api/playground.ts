@@ -1,4 +1,4 @@
-import { ApiError, getAdminKey } from './client';
+import { ApiError, getAdminKey, notifyBffUnauthorized } from './client';
 
 const enc = encodeURIComponent;
 
@@ -85,6 +85,8 @@ export async function inferUnary(
     let message = `HTTP ${res.status}`;
     try {
       const parsed = JSON.parse(raw) as { error?: unknown };
+      // Raw fetch bypasses client.ts — report an expired BFF session here.
+      notifyBffUnauthorized(res.status, parsed);
       if (parsed.error) message = String(parsed.error);
     } catch {
       // Keep default.
@@ -120,6 +122,12 @@ export function streamEvents(
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
+      // Raw fetch bypasses client.ts — report an expired BFF session here.
+      try {
+        notifyBffUnauthorized(res.status, JSON.parse(text));
+      } catch {
+        // Non-JSON error body: never a BFF session marker.
+      }
       throw new ApiError(res.status, res.headers.get('x-request-id'), text, `HTTP ${res.status}`);
     }
     const reader = res.body!.getReader();

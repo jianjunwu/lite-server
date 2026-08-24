@@ -175,7 +175,20 @@
     "confirmPassword": "Confirm password",
     "passwordMismatch": "Passwords do not match",
     "passwordChanged": "Password changed",
-    "mustChangeHint": "You must set a new password before continuing."
+    "mustChangeHint": "You must set a new password before continuing.",
+    "registerLink": "Create account",
+    "register": "Register",
+    "backToLogin": "Back to sign in",
+    "inviteCode": "Invite code",
+    "inviteRequired": "Registration requires an invite code",
+    "invalidInvite": "Invalid, expired, or exhausted invite code",
+    "passwordPolicy": "At least 12 characters with 3 of: lowercase, uppercase, digits, symbols",
+    "totpCode": "Authenticator code",
+    "totpCodeHint": "Enter the 6-digit code from your authenticator app, or a backup code",
+    "verify": "Verify",
+    "invalidTotpCode": "Invalid or expired code — try again",
+    "accountLocked": "Account locked — try again in {{seconds}}s",
+    "tooManyAttempts": "Too many attempts — please wait and try again later"
   },
   "playground": {
     "single": "Single",
@@ -200,7 +213,10 @@
     "tabs": {
       "instances": "Instances",
       "keys": "Admin keys",
-      "users": "Users"
+      "users": "Users",
+      "security": "Security",
+      "audit": "Audit",
+      "invites": "Invites"
     },
     "users": {
       "add": "Add user",
@@ -208,7 +224,7 @@
       "editTitle": "Edit user {{name}}",
       "username": "Username",
       "password": "Password",
-      "passwordHint": "At least 8 characters; the user must change it on first login",
+      "passwordHint": "At least 12 characters with 3 of: lowercase, uppercase, digits, symbols",
       "passwordKeepHint": "Leave empty to keep the current password",
       "role": "Role",
       "status": "Status",
@@ -218,7 +234,10 @@
       "deleteConfirm": "Delete user {{name}}?",
       "created": "User created",
       "updated": "User updated",
-      "deleted": "User deleted"
+      "deleted": "User deleted",
+      "totpReset": "2FA reset",
+      "totpResetConfirm": "Reset 2FA for {{name}}? They can re-enroll at next login.",
+      "totpResetAction": "Reset 2FA"
     },
     "instances": {
       "add": "Add instance",
@@ -244,6 +263,65 @@
       "saved": "Key saved for {{id}}",
       "clear": "Clear",
       "cleared": "Key cleared for {{id}}"
+    },
+    "sessions": {
+      "myTitle": "My sessions",
+      "userTitle": "Sessions of {{name}}",
+      "view": "Sessions",
+      "created": "Created",
+      "lastSeen": "Last seen",
+      "ip": "IP",
+      "userAgent": "User agent",
+      "current": "current",
+      "revoke": "Revoke",
+      "revoked": "Session revoked"
+    },
+    "audit": {
+      "filterAction": "Filter by action",
+      "ts": "Time",
+      "actor": "Actor",
+      "action": "Action",
+      "target": "Target",
+      "ip": "IP",
+      "detail": "Detail"
+    },
+    "invites": {
+      "add": "New invite",
+      "addTitle": "New invite",
+      "code": "Code",
+      "role": "Role",
+      "uses": "Uses",
+      "maxUses": "Max uses",
+      "expiresAt": "Expires at",
+      "expiresInHours": "Expires in (hours)",
+      "expiresHint": "0 means the invite never expires",
+      "never": "never",
+      "status": "Status",
+      "revokedTag": "revoked",
+      "copy": "Copy",
+      "copied": "Code copied",
+      "revoke": "Revoke",
+      "revokeConfirm": "Revoke this invite?",
+      "revoked": "Invite revoked",
+      "created": "Invite created",
+      "create": "Create invite"
+    },
+    "totp": {
+      "title": "Two-factor authentication (TOTP)",
+      "enable": "Enable 2FA",
+      "enabled": "2FA enabled",
+      "disable": "Disable 2FA",
+      "disabled": "2FA disabled",
+      "disableHint": "Enter a current authenticator or backup code to confirm.",
+      "scanHint": "Scan with your authenticator app, or copy the secret manually.",
+      "codePlaceholder": "6-digit code",
+      "confirm": "Confirm",
+      "cancel": "Cancel",
+      "invalidCode": "Invalid code — check your authenticator and retry",
+      "backupHint": "Store these backup codes somewhere safe. Each works once and they are shown only now.",
+      "copyCodes": "Copy codes",
+      "copied": "Backup codes copied",
+      "done": "Done"
     }
   }
 }

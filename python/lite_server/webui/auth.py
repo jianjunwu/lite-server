@@ -1,28 +1,40 @@
-"""Local-account auth: users in auth.yaml, JWT cookie, three-role RBAC."""
+"""Local-account auth: users and sessions in SQLite, three-role RBAC."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import os
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Mapping
 
+import anyio
 import bcrypt
-import jwt
-import yaml
+import pyotp
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-ROLES = ["viewer", "operator", "admin"]
+from .authdb import ROLES, AuthDB, utcnow
+
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{2,32}$")
 COOKIE_NAME = "lite_ui_token"
 CSRF_HEADER = "x-requested-with"
 CSRF_VALUE = "lite-ui"
-TOKEN_TTL = timedelta(hours=12)
+SESSION_TTL = timedelta(hours=12)
+BCRYPT_COST = 12
+# Login throttling: an account locks after LOCK_THRESHOLD failures inside
+# LOCK_WINDOW; one source IP is throttled after IP_LOCK_THRESHOLD failures in
+# the same window (higher, to tolerate NAT'd legitimate users).
+LOCK_THRESHOLD = 5
+LOCK_WINDOW = timedelta(minutes=15)
+IP_LOCK_THRESHOLD = 30
+# Second-factor login challenge: single-use, short-lived, bounded attempts.
+TOTP_CHALLENGE_TTL = timedelta(minutes=5)
+TOTP_CHALLENGE_MAX_ATTEMPTS = 5
+BACKUP_CODE_COUNT = 8
 
 _logger = logging.getLogger("lite_server.webui.audit")
 
@@ -41,11 +53,30 @@ _STATUS_FOR = {"invalid": 400, "duplicate": 409, "not_found": 404, "forbidden": 
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utcnow()
 
 
 def _hash(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(10)).decode()
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(BCRYPT_COST)).decode()
+
+
+def _hash_cost(password_hash: str) -> int:
+    try:
+        return int(password_hash.split("$")[2])
+    except (IndexError, ValueError):
+        return 0
+
+
+_DUMMY_HASH: str | None = None
+
+
+def _dummy_hash() -> str:
+    """Precomputed hash verified for unknown usernames, so a missing account
+    costs the same bcrypt work as a wrong password (timing side channel)."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = _hash("dummy-password-for-timing")
+    return _DUMMY_HASH
 
 
 @dataclass
@@ -55,6 +86,7 @@ class UserRecord:
     role: str
     created_at: str
     must_change_password: bool
+    totp_secret: str | None = None
 
 
 def public_user(u: UserRecord) -> dict:
@@ -63,69 +95,67 @@ def public_user(u: UserRecord) -> dict:
         "role": u.role,
         "createdAt": u.created_at,
         "mustChangePassword": u.must_change_password,
+        "totpEnabled": u.totp_secret is not None,
     }
 
 
 class UserStore:
-    """Local account store: users in auth.yaml (bcrypt hashes), JWT secret in a
-    sibling 0600 file. Bootstrap: first run with no users creates `admin` from
-    LITE_UI_ADMIN_PASSWORD or a random password printed once."""
+    """Local account and session store backed by SQLite (AuthDB). Bootstrap:
+    with LITE_UI_ADMIN_PASSWORD set and no users, an `admin` account is
+    created (must change password on first login). Without it the store stays
+    empty and the first run is served by open registration (first registrant
+    becomes admin)."""
 
-    def __init__(self, auth_path: str, secret_path: str, env: Mapping[str, str]):
-        self._auth_path = str(auth_path)
-        self._users: dict[str, UserRecord] = {}
+    def __init__(self, db_path: str, env: Mapping[str, str],
+                 legacy_auth_path: str | None = None):
+        self._db = AuthDB(db_path, legacy_auth_path=legacy_auth_path)
 
-        path = Path(self._auth_path)
-        if path.exists():
-            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            for raw in doc.get("users") or []:
-                if not isinstance(raw.get("username"), str) or not isinstance(raw.get("password_hash"), str):
-                    continue
-                self._users[raw["username"]] = UserRecord(
-                    username=raw["username"],
-                    password_hash=raw["password_hash"],
-                    role=raw["role"] if raw.get("role") in ROLES else "viewer",
-                    created_at=raw["created_at"] if isinstance(raw.get("created_at"), str) else _now(),
-                    must_change_password=raw.get("must_change_password") is True,
+        if self._db.query_one("SELECT username FROM users LIMIT 1") is None:
+            from_env = env.get("LITE_UI_ADMIN_PASSWORD")
+            if from_env:
+                self._db.execute(
+                    "INSERT INTO users"
+                    " (username, password_hash, role, created_at, must_change_password)"
+                    " VALUES (?, ?, ?, ?, 1)",
+                    ("admin", _hash(from_env), "admin", _now()),
                 )
 
-        if not self._users:
-            from_env = env.get("LITE_UI_ADMIN_PASSWORD")
-            password = from_env or secrets.token_urlsafe(9)
-            self._users["admin"] = UserRecord(
-                username="admin",
-                password_hash=_hash(password),
-                role="admin",
-                created_at=_now(),
-                must_change_password=True,
-            )
-            self._persist()
-            if not from_env:
-                # Printed once; the file only stores the hash.
-                print(f"[lite-ui] bootstrap admin password: {password} (you must change it on first login)")
-
-        secret_file = Path(secret_path)
-        if secret_file.exists():
-            self.secret = secret_file.read_text(encoding="utf-8").strip()
-        else:
-            self.secret = secrets.token_hex(48)
-            secret_file.write_text(self.secret, encoding="utf-8")
-            os.chmod(secret_path, 0o600)
+    @staticmethod
+    def _to_record(row) -> UserRecord:
+        return UserRecord(
+            username=row["username"],
+            password_hash=row["password_hash"],
+            role=row["role"],
+            created_at=row["created_at"],
+            must_change_password=bool(row["must_change_password"]),
+            totp_secret=row["totp_secret"],
+        )
 
     def list(self) -> list[dict]:
-        return [public_user(u) for u in self._users.values()]
+        rows = self._db.query("SELECT * FROM users ORDER BY username")
+        return [public_user(self._to_record(r)) for r in rows]
 
     def get(self, username: str) -> UserRecord | None:
-        return self._users.get(username)
+        row = self._db.query_one("SELECT * FROM users WHERE username = ?", (username,))
+        return self._to_record(row) if row is not None else None
 
     def verify(self, username: str, password: str) -> UserRecord | None:
-        user = self._users.get(username)
-        if user is None or not isinstance(password, str):
+        if not isinstance(password, str) or len(password.encode()) > 72:
             return None
         # bcrypt rejects passwords over 72 bytes with ValueError.
-        if len(password.encode()) > 72:
+        user = self.get(username) if isinstance(username, str) else None
+        if user is None:
+            bcrypt.checkpw(password.encode(), _dummy_hash().encode())
             return None
-        return user if bcrypt.checkpw(password.encode(), user.password_hash.encode()) else None
+        if not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
+            return None
+        if _hash_cost(user.password_hash) < BCRYPT_COST:
+            # Transparently upgrade older hashes to the current cost factor.
+            self._db.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (_hash(password), username),
+            )
+        return user
 
     @staticmethod
     def _validate_username(username) -> str:
@@ -135,11 +165,22 @@ class UserStore:
 
     @staticmethod
     def _validate_password(password) -> str:
-        if not isinstance(password, str) or len(password) < 8:
-            raise AuthError("invalid", "password must be at least 8 characters")
+        if not isinstance(password, str) or len(password) < 12:
+            raise AuthError("invalid", "password must be at least 12 characters")
         if len(password.encode()) > 72:
             # bcrypt hard limit; it raises ValueError beyond this.
             raise AuthError("invalid", "password must be at most 72 bytes")
+        classes = sum((
+            any(c.islower() for c in password),
+            any(c.isupper() for c in password),
+            any(c.isdigit() for c in password),
+            any(not c.isalnum() for c in password),
+        ))
+        if classes < 3:
+            raise AuthError(
+                "invalid",
+                "password must use at least 3 of: lowercase, uppercase, digits, symbols",
+            )
         return password
 
     @staticmethod
@@ -152,90 +193,362 @@ class UserStore:
         username = self._validate_username(raw.get("username"))
         password = self._validate_password(raw.get("password"))
         role = self._validate_role(raw.get("role"))
-        if username in self._users:
+        if self.get(username) is not None:
             raise AuthError("duplicate", f'user "{username}" already exists')
-        record = UserRecord(
-            username=username,
-            password_hash=_hash(password),
-            role=role,
-            created_at=_now(),
-            must_change_password=True,
+        self._db.execute(
+            "INSERT INTO users (username, password_hash, role, created_at, must_change_password)"
+            " VALUES (?, ?, ?, ?, 1)",
+            (username, _hash(password), role, _now()),
         )
-        self._users[username] = record
-        self._persist()
-        return public_user(record)
+        return public_user(self.get(username))
 
     def update(self, username: str, patch: dict, actor: str) -> dict:
-        existing = self._users.get(username)
+        existing = self.get(username)
         if existing is None:
             raise AuthError("not_found", f'unknown user "{username}"')
         if patch.get("role") is not None:
             role = self._validate_role(patch["role"])
             if existing.role == "admin" and role != "admin" and self._admin_count() <= 1:
                 raise AuthError("forbidden", "cannot demote the last admin")
-            existing.role = role
+            self._db.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
         if patch.get("password") is not None:
-            existing.password_hash = _hash(self._validate_password(patch["password"]))
-            existing.must_change_password = True
-        self._persist()
-        return public_user(existing)
+            self._db.execute(
+                "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE username = ?",
+                (_hash(self._validate_password(patch["password"])), username),
+            )
+        return public_user(self.get(username))
 
     def set_password(self, username: str, password: str) -> None:
         """Self-service password change; clears the must-change flag."""
-        existing = self._users.get(username)
-        if existing is None:
+        if self.get(username) is None:
             raise AuthError("not_found", f'unknown user "{username}"')
-        existing.password_hash = _hash(self._validate_password(password))
-        existing.must_change_password = False
-        self._persist()
+        self._db.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE username = ?",
+            (_hash(self._validate_password(password)), username),
+        )
 
     def remove(self, username: str, actor: str) -> None:
-        existing = self._users.get(username)
+        existing = self.get(username)
         if existing is None:
             raise AuthError("not_found", f'unknown user "{username}"')
         if username == actor:
             raise AuthError("forbidden", "cannot delete yourself")
         if existing.role == "admin" and self._admin_count() <= 1:
             raise AuthError("forbidden", "cannot delete the last admin")
-        del self._users[username]
-        self._persist()
+        self._db.execute("DELETE FROM users WHERE username = ?", (username,))
 
     def _admin_count(self) -> int:
-        return sum(1 for u in self._users.values() if u.role == "admin")
+        return self._db.query_one("SELECT COUNT(*) FROM users WHERE role = 'admin'")[0]
 
-    def _persist(self) -> None:
-        doc = {
-            "users": [
-                {
-                    "username": u.username,
-                    "password_hash": u.password_hash,
-                    "role": u.role,
-                    "created_at": u.created_at,
-                    "must_change_password": u.must_change_password,
-                }
-                for u in self._users.values()
-            ]
+    def user_count(self) -> int:
+        return self._db.query_one("SELECT COUNT(*) FROM users")[0]
+
+    # ---- registration and invites ----
+
+    def register(self, raw: dict) -> dict:
+        """Public registration: open (first user becomes admin) when the store
+        is empty, otherwise a valid invite code is required. The invite check,
+        its consumption, and the user insert are one transaction."""
+        username = self._validate_username(raw.get("username"))
+        password = self._validate_password(raw.get("password"))
+        with self._db.transaction() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            if count == 0:
+                role = "admin"
+            else:
+                code = raw.get("inviteCode")
+                if not isinstance(code, str) or not code:
+                    raise AuthError("forbidden", "invite_required")
+                invite = conn.execute(
+                    "SELECT * FROM invites WHERE code = ?", (code,)
+                ).fetchone()
+                if (invite is None or invite["revoked_at"] is not None
+                        or invite["use_count"] >= invite["max_uses"]
+                        or (invite["expires_at"] is not None and invite["expires_at"] <= _now())):
+                    raise AuthError("invalid", "invalid_invite")
+                role = invite["role"]
+                conn.execute("UPDATE invites SET use_count = use_count + 1 WHERE code = ?", (code,))
+            if conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone():
+                raise AuthError("duplicate", f'user "{username}" already exists')
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, created_at, must_change_password)"
+                " VALUES (?, ?, ?, ?, 0)",
+                (username, _hash(password), role, _now()),
+            )
+        return public_user(self.get(username))
+
+    def create_invite(self, *, role: str = "viewer", max_uses: int = 1,
+                      expires_in_hours: int | None = 72, created_by: str) -> dict:
+        self._validate_role(role)
+        code = secrets.token_urlsafe(12)
+        expires_at = (
+            (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()
+            if expires_in_hours is not None else None
+        )
+        self._db.execute(
+            "INSERT INTO invites (code, role, max_uses, use_count, expires_at, created_by, created_at)"
+            " VALUES (?, ?, ?, 0, ?, ?, ?)",
+            (code, role, max(1, int(max_uses)), expires_at, created_by, _now()),
+        )
+        return self._public_invite(self._db.query_one("SELECT * FROM invites WHERE code = ?", (code,)))
+
+    def list_invites(self) -> list[dict]:
+        rows = self._db.query("SELECT * FROM invites ORDER BY created_at DESC")
+        return [self._public_invite(r) for r in rows]
+
+    def revoke_invite(self, code: str) -> bool:
+        cur = self._db.execute(
+            "UPDATE invites SET revoked_at = ? WHERE code = ? AND revoked_at IS NULL",
+            (_now(), code),
+        )
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _public_invite(row) -> dict:
+        return {
+            "code": row["code"],
+            "role": row["role"],
+            "maxUses": row["max_uses"],
+            "useCount": row["use_count"],
+            "expiresAt": row["expires_at"],
+            "createdBy": row["created_by"],
+            "createdAt": row["created_at"],
+            "revokedAt": row["revoked_at"],
         }
-        tmp = f"{self._auth_path}.tmp-{os.getpid()}"
-        Path(tmp).write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self._auth_path)
+
+    # ---- sessions ----
+
+    def create_session(self, username: str, ip: str | None, user_agent: str | None) -> str:
+        """Issues an opaque cookie token; only its sha256 is stored."""
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        self._db.execute(
+            "INSERT INTO sessions (id, username, created_at, expires_at, last_seen_at, ip, user_agent)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_session_id(token), username, _now(), (now + SESSION_TTL).isoformat(),
+             _now(), ip, user_agent),
+        )
+        # Lazy cleanup of expired and long-revoked rows.
+        self._db.execute(
+            "DELETE FROM sessions WHERE expires_at < ? OR revoked_at < ?",
+            (_now(), (now - timedelta(days=7)).isoformat()),
+        )
+        return token
+
+    def lookup_session(self, token: str):
+        """Returns the joined session+user row for a valid cookie token."""
+        if not token:
+            return None
+        row = self._db.query_one(
+            "SELECT s.id AS session_id, s.last_seen_at, u.* FROM sessions s"
+            " JOIN users u ON u.username = s.username"
+            " WHERE s.id = ? AND s.revoked_at IS NULL AND s.expires_at > ?",
+            (_session_id(token), _now()),
+        )
+        if row is None:
+            return None
+        # Touch last_seen at most once a minute (SSE streams would otherwise
+        # turn every event into a write).
+        last_seen = datetime.fromisoformat(row["last_seen_at"])
+        if datetime.now(timezone.utc) - last_seen > timedelta(seconds=60):
+            self._db.execute(
+                "UPDATE sessions SET last_seen_at = ? WHERE id = ?", (_now(), row["session_id"])
+            )
+        return row
+
+    def list_sessions(self, username: str, current_id: str | None = None) -> list[dict]:
+        rows = self._db.query(
+            "SELECT id, created_at, last_seen_at, ip, user_agent FROM sessions"
+            " WHERE username = ? AND revoked_at IS NULL AND expires_at > ?"
+            " ORDER BY created_at DESC",
+            (username, _now()),
+        )
+        return [
+            {
+                "id": r["id"],
+                "createdAt": r["created_at"],
+                "lastSeenAt": r["last_seen_at"],
+                "ip": r["ip"],
+                "userAgent": r["user_agent"],
+                "current": r["id"] == current_id,
+            }
+            for r in rows
+        ]
+
+    def revoke_session(self, session_id: str, *, username: str | None = None) -> bool:
+        """Revokes one session. With username given, only that user's own
+        session can be targeted (self-service scoping)."""
+        if username is None:
+            cur = self._db.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (_now(), session_id),
+            )
+        else:
+            cur = self._db.execute(
+                "UPDATE sessions SET revoked_at = ?"
+                " WHERE id = ? AND username = ? AND revoked_at IS NULL",
+                (_now(), session_id, username),
+            )
+        return cur.rowcount > 0
+
+    def revoke_other_sessions(self, username: str, keep_id: str) -> None:
+        self._db.execute(
+            "UPDATE sessions SET revoked_at = ?"
+            " WHERE username = ? AND id != ? AND revoked_at IS NULL",
+            (_now(), username, keep_id),
+        )
+
+    # ---- login throttling ----
+
+    def record_failed_attempt(self, ip: str | None, username: str) -> None:
+        self._db.execute(
+            "INSERT INTO login_attempts (ts, ip, username, success) VALUES (?, ?, ?, 0)",
+            (_now(), ip, username),
+        )
+        # Keep the table bounded; anything outside the window is irrelevant.
+        cutoff = (datetime.now(timezone.utc) - LOCK_WINDOW).isoformat()
+        self._db.execute("DELETE FROM login_attempts WHERE ts < ?", (cutoff,))
+
+    def failed_attempts(self, *, username: str | None = None, ip: str | None = None,
+                        since: str) -> list[str]:
+        """Failure timestamps in ascending order, filtered by user or IP."""
+        if username is not None:
+            rows = self._db.query(
+                "SELECT ts FROM login_attempts WHERE username = ? AND success = 0 AND ts > ?"
+                " ORDER BY ts ASC",
+                (username, since),
+            )
+        else:
+            rows = self._db.query(
+                "SELECT ts FROM login_attempts WHERE ip = ? AND success = 0 AND ts > ?"
+                " ORDER BY ts ASC",
+                (ip, since),
+            )
+        return [r["ts"] for r in rows]
+
+    def clear_failed_attempts(self, username: str) -> None:
+        self._db.execute("DELETE FROM login_attempts WHERE username = ?", (username,))
+
+    # ---- audit ----
+
+    def record_audit(self, action: str, *, actor: str | None = None,
+                     target: str | None = None, ip: str | None = None,
+                     detail: dict | None = None) -> None:
+        self._db.execute(
+            "INSERT INTO audit (ts, actor, action, target, ip, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (utcnow(), actor, action, target, ip,
+             json.dumps(detail, sort_keys=True) if detail else None),
+        )
+        _logger.info("action=%s actor=%s target=%s ip=%s detail=%s",
+                     action, actor, target, ip, detail)
+
+    def list_audit(self, *, limit: int = 100, offset: int = 0,
+                   action: str | None = None, actor: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM audit"
+        clauses: list[str] = []
+        params: list = []
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if actor:
+            clauses.append("actor = ?")
+            params.append(actor)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend((min(limit, 500), offset))
+        rows = self._db.query(sql, tuple(params))
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "actor": r["actor"],
+                "action": r["action"],
+                "target": r["target"],
+                "ip": r["ip"],
+                "detail": json.loads(r["detail"]) if r["detail"] else None,
+            }
+            for r in rows
+        ]
+
+    # ---- TOTP ----
+
+    def totp_pending_secret(self, username: str) -> str | None:
+        row = self._db.query_one(
+            "SELECT totp_pending_secret FROM users WHERE username = ?", (username,)
+        )
+        return row["totp_pending_secret"] if row else None
+
+    def set_totp_pending(self, username: str, secret: str) -> None:
+        self._db.execute(
+            "UPDATE users SET totp_pending_secret = ? WHERE username = ?", (secret, username)
+        )
+
+    def enable_totp(self, username: str, backup_hashes: list[str]) -> None:
+        """Promotes the pending secret to active and stores backup code hashes."""
+        self._db.execute(
+            "UPDATE users SET totp_secret = totp_pending_secret,"
+            " totp_pending_secret = NULL, backup_codes = ? WHERE username = ?",
+            (json.dumps(backup_hashes), username),
+        )
+
+    def disable_totp(self, username: str) -> None:
+        self._db.execute(
+            "UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL,"
+            " backup_codes = NULL WHERE username = ?",
+            (username,),
+        )
+
+    def consume_backup_code(self, username: str, code: str) -> bool:
+        """Single-use backup codes, stored as sha256 hashes only."""
+        row = self._db.query_one("SELECT backup_codes FROM users WHERE username = ?", (username,))
+        if row is None or not row["backup_codes"]:
+            return False
+        hashes: list[str] = json.loads(row["backup_codes"])
+        digest = hashlib.sha256(code.encode()).hexdigest()
+        if digest not in hashes:
+            return False
+        hashes.remove(digest)
+        self._db.execute(
+            "UPDATE users SET backup_codes = ? WHERE username = ?",
+            (json.dumps(hashes), username),
+        )
+        return True
+
+    # ---- second-factor login challenges ----
+
+    def create_challenge(self, username: str) -> str:
+        challenge_id = secrets.token_urlsafe(24)
+        now = datetime.now(timezone.utc)
+        self._db.execute(
+            "INSERT INTO login_challenges (id, username, created_at, expires_at, attempts)"
+            " VALUES (?, ?, ?, ?, 0)",
+            (challenge_id, username, _now(), (now + TOTP_CHALLENGE_TTL).isoformat()),
+        )
+        self._db.execute("DELETE FROM login_challenges WHERE expires_at < ?", (_now(),))
+        return challenge_id
+
+    def get_challenge(self, challenge_id: str):
+        return self._db.query_one(
+            "SELECT * FROM login_challenges WHERE id = ? AND expires_at > ?",
+            (challenge_id, _now()),
+        )
+
+    def bump_challenge_attempts(self, challenge_id: str) -> int:
+        self._db.execute(
+            "UPDATE login_challenges SET attempts = attempts + 1 WHERE id = ?", (challenge_id,)
+        )
+        row = self._db.query_one(
+            "SELECT attempts FROM login_challenges WHERE id = ?", (challenge_id,)
+        )
+        return row["attempts"] if row else TOTP_CHALLENGE_MAX_ATTEMPTS
+
+    def delete_challenge(self, challenge_id: str) -> None:
+        self._db.execute("DELETE FROM login_challenges WHERE id = ?", (challenge_id,))
 
 
-def issue_token(store: UserStore, user: UserRecord) -> str:
-    now = datetime.now(timezone.utc)
-    return jwt.encode(
-        {"username": user.username, "role": user.role, "iat": now, "exp": now + TOKEN_TTL},
-        store.secret,
-        algorithm="HS256",
-    )
-
-
-def verify_token(store: UserStore, token: str) -> dict | None:
-    try:
-        return jwt.decode(token, store.secret, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        return None
+def _session_id(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 async def _json_body(request: Request) -> dict:
@@ -244,6 +557,10 @@ async def _json_body(request: Request) -> dict:
     except Exception:
         return {}
     return body if isinstance(body, dict) else {}
+
+
+def _client_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
 
 
 def _error(exc: AuthError) -> JSONResponse:
@@ -259,6 +576,18 @@ def _set_session_cookie(response: JSONResponse, request: Request, token: str) ->
         samesite="lax",
         secure=request.url.scheme == "https",
     )
+
+
+def _finish_login(request: Request, store: UserStore, user: UserRecord) -> JSONResponse:
+    """Issues the session cookie once every factor has verified."""
+    token = store.create_session(
+        user.username,
+        ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    response = JSONResponse({"user": public_user(user)})
+    _set_session_cookie(response, request, token)
+    return response
 
 
 # Inference calls (unary/SSE) are open to viewers; everything else on the proxy
@@ -277,26 +606,29 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
         return None
     if not path.startswith("/api/"):
         return None  # static assets are public
-    if path == "/api/auth/login" and request.method == "POST":
-        # Login sets a session cookie, so it needs the same CSRF protection as
+    if path in ("/api/auth/login", "/api/auth/register", "/api/auth/totp") and request.method == "POST":
+        # These set a session cookie, so they need the same CSRF protection as
         # every other mutation (SameSite=Lax does not stop a cross-site POST
         # from planting a cookie in the response).
         if request.headers.get(CSRF_HEADER) != CSRF_VALUE:
             return JSONResponse({"error": "csrf_header_missing"}, status_code=403)
         return None
+    if path == "/api/auth/registration" and request.method == "GET":
+        return None
 
-    payload = verify_token(store, request.cookies.get(COOKIE_NAME, ""))
-    if payload is None:
-        return JSONResponse({"error": "unauthenticated"}, status_code=401)
-    request.state.user = payload
+    session = store.lookup_session(request.cookies.get(COOKIE_NAME, ""))
+    if session is None:
+        # Namespaced marker: the frontend logs out only on this exact body, so
+        # a 401 relayed from a proxied instance can never be mistaken for an
+        # expired BFF session.
+        return JSONResponse({"error": "bff_unauthenticated"}, status_code=401)
+    request.state.user = {"username": session["username"], "role": session["role"]}
+    request.state.session_id = session["session_id"]
 
-    # Roles and account deletion take effect immediately: the store, not the
-    # token payload, is authoritative.
-    current = store.get(payload.get("username", ""))
-    if current is None:
-        return JSONResponse({"error": "unauthenticated"}, status_code=401)
-    role = current.role
-    must_change = current.must_change_password
+    # Roles and account deletion take effect immediately: the store row, not
+    # any token payload, is authoritative.
+    role = session["role"]
+    must_change = bool(session["must_change_password"])
     is_password_flow = path in ("/api/auth/me", "/api/auth/change-password", "/api/auth/logout")
     if must_change and not is_password_flow:
         return JSONResponse({"error": "password_change_required"}, status_code=403)
@@ -318,8 +650,9 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
             return None
         return JSONResponse({"error": "forbidden", "required": "admin"}, status_code=403)
 
-    # GETs: any authenticated user — except the user directory itself.
-    if path.startswith("/api/users") and role_rank(role) < role_rank("admin"):
+    # GETs: any authenticated user — except the user directory, audit trail,
+    # and invite list.
+    if path.startswith(("/api/users", "/api/audit", "/api/invites")) and role_rank(role) < role_rank("admin"):
         return JSONResponse({"error": "forbidden", "required": "admin"}, status_code=403)
     return None
 
@@ -330,42 +663,176 @@ def create_router(store: UserStore) -> APIRouter:
     @router.post("/api/auth/login")
     async def login(request: Request):
         body = await _json_body(request)
-        username = body.get("username")
-        user = store.verify(username, body.get("password") or "") if isinstance(username, str) else None
+        username = body.get("username") if isinstance(body.get("username"), str) else ""
+        password = body.get("password") or ""
+        ip = request.client.host if request.client else None
+        now = datetime.now(timezone.utc)
+        window_start = (now - LOCK_WINDOW).isoformat()
+
+        # IP throttle: sustained failures from one source, any account.
+        if ip and len(store.failed_attempts(ip=ip, since=window_start)) >= IP_LOCK_THRESHOLD:
+            store.record_audit("login_throttled", target=username or None, ip=ip)
+            return JSONResponse(
+                {"error": "too_many_attempts"},
+                status_code=429,
+                headers={"Retry-After": str(int(LOCK_WINDOW.total_seconds()))},
+            )
+
+        # Account lockout: exact per-account anti-bruteforce. Locked accounts
+        # skip bcrypt entirely (the lock status is not a secret).
+        if username:
+            failures = store.failed_attempts(username=username, since=window_start)
+            if len(failures) >= LOCK_THRESHOLD:
+                oldest_of_last_five = datetime.fromisoformat(failures[-LOCK_THRESHOLD])
+                retry_after = max(1, int((oldest_of_last_five + LOCK_WINDOW - now).total_seconds()))
+                return JSONResponse(
+                    {"error": "account_locked", "retryAfterSec": retry_after},
+                    status_code=423,
+                )
+
+        # bcrypt at cost 12 blocks the event loop for ~250ms; run it off-loop.
+        user = await anyio.to_thread.run_sync(store.verify, username, password) if username else None
         if user is None:
+            store.record_failed_attempt(ip, username)
+            store.record_audit("login_failure", target=username or None, ip=ip)
+            if username and len(store.failed_attempts(username=username, since=window_start)) == LOCK_THRESHOLD:
+                store.record_audit("account_locked", target=username, ip=ip)
             return JSONResponse({"error": "invalid_credentials"}, status_code=401)
-        response = JSONResponse({"user": public_user(user)})
-        _set_session_cookie(response, request, issue_token(store, user))
+
+        store.clear_failed_attempts(user.username)
+        if user.totp_secret is not None:
+            # Password verified; the second factor gates the actual session.
+            challenge = store.create_challenge(user.username)
+            return JSONResponse({"totpRequired": True, "challenge": challenge})
+        store.record_audit("login_success", actor=user.username, ip=ip)
+        return _finish_login(request, store, user)
+
+    @router.post("/api/auth/totp")
+    async def totp_verify(request: Request):
+        body = await _json_body(request)
+        challenge_id = body.get("challenge") if isinstance(body.get("challenge"), str) else ""
+        code = body.get("code") or ""
+        ip = _client_ip(request)
+        challenge = store.get_challenge(challenge_id)
+        if challenge is None:
+            return JSONResponse({"error": "invalid_challenge"}, status_code=401)
+        username = challenge["username"]
+        user = store.get(username)
+        verified = user is not None and user.totp_secret is not None and (
+            pyotp.TOTP(user.totp_secret).verify(code, valid_window=1)
+            or store.consume_backup_code(username, code)
+        )
+        if not verified:
+            store.record_audit("totp_failure", target=username, ip=ip)
+            if store.bump_challenge_attempts(challenge_id) >= TOTP_CHALLENGE_MAX_ATTEMPTS:
+                store.delete_challenge(challenge_id)
+            return JSONResponse({"error": "invalid_code"}, status_code=401)
+        store.delete_challenge(challenge_id)
+        store.record_audit("login_success", actor=username, ip=ip, detail={"secondFactor": True})
+        return _finish_login(request, store, user)
+
+    @router.post("/api/auth/totp/enroll")
+    async def totp_enroll(request: Request):
+        username = request.state.user["username"]
+        secret = pyotp.random_base32()
+        store.set_totp_pending(username, secret)
+        uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="lite-ui")
+        return {"secret": secret, "otpauthUrl": uri}
+
+    @router.post("/api/auth/totp/confirm")
+    async def totp_confirm(request: Request):
+        username = request.state.user["username"]
+        code = (await _json_body(request)).get("code") or ""
+        pending = store.totp_pending_secret(username)
+        if pending is None or not pyotp.TOTP(pending).verify(code, valid_window=1):
+            return JSONResponse({"error": "invalid_code"}, status_code=401)
+        backup_codes = [secrets.token_hex(4) for _ in range(BACKUP_CODE_COUNT)]
+        store.enable_totp(username, [hashlib.sha256(c.encode()).hexdigest() for c in backup_codes])
+        store.record_audit("totp_enabled", actor=username, ip=_client_ip(request))
+        # Shown once; only the hashes are stored.
+        return {"backupCodes": backup_codes}
+
+    @router.post("/api/auth/totp/disable")
+    async def totp_disable(request: Request):
+        username = request.state.user["username"]
+        code = (await _json_body(request)).get("code") or ""
+        user = store.get(username)
+        if user is None or user.totp_secret is None:
+            return JSONResponse({"error": "totp_not_enabled"}, status_code=400)
+        if not (pyotp.TOTP(user.totp_secret).verify(code, valid_window=1)
+                or store.consume_backup_code(username, code)):
+            return JSONResponse({"error": "invalid_code"}, status_code=401)
+        store.disable_totp(username)
+        store.record_audit("totp_disabled", actor=username, ip=_client_ip(request))
+        return {"ok": True}
+
+    @router.get("/api/auth/registration")
+    async def registration_status():
+        open_ = store.user_count() == 0
+        return {"open": open_, "inviteRequired": not open_}
+
+    @router.post("/api/auth/register")
+    async def register(request: Request):
+        try:
+            user = store.register(await _json_body(request))
+        except AuthError as e:
+            return _error(e)
+        ip = _client_ip(request)
+        store.record_audit("register", actor=user["username"], ip=ip,
+                           detail={"role": user["role"]})
+        token = store.create_session(
+            user["username"], ip=ip, user_agent=request.headers.get("user-agent")
+        )
+        response = JSONResponse({"user": user}, status_code=201)
+        _set_session_cookie(response, request, token)
         return response
 
     @router.post("/api/auth/logout")
-    async def logout():
+    async def logout(request: Request):
+        store.revoke_session(request.state.session_id)
+        store.record_audit("session_revoked", actor=request.state.user["username"],
+                           ip=_client_ip(request), detail={"session": request.state.session_id[:12]})
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
 
     @router.get("/api/auth/me")
     async def me(request: Request):
-        payload = request.state.user
-        current = store.get(payload["username"])
-        if current:
-            return {"user": public_user(current)}
-        return {"user": {**payload, "mustChangePassword": False}}
+        current = store.get(request.state.user["username"])
+        return {"user": public_user(current)}
 
     @router.post("/api/auth/change-password")
     async def change_password(request: Request):
         body = await _json_body(request)
         payload = request.state.user
-        if store.verify(payload["username"], body.get("currentPassword") or "") is None:
+        current_password = body.get("currentPassword") or ""
+        new_password = body.get("newPassword") or ""
+        verified = await anyio.to_thread.run_sync(store.verify, payload["username"], current_password)
+        if verified is None:
             return JSONResponse({"error": "invalid_credentials"}, status_code=401)
+        if new_password == current_password:
+            return JSONResponse({"error": "password_reused"}, status_code=400)
         try:
-            store.set_password(payload["username"], body.get("newPassword") or "")
+            store.set_password(payload["username"], new_password)
         except AuthError as e:
             return _error(e)
+        # A password change kicks every other session; the current one stays.
+        store.revoke_other_sessions(payload["username"], request.state.session_id)
+        store.record_audit("password_changed", actor=payload["username"], ip=_client_ip(request))
         user = store.get(payload["username"])
-        response = JSONResponse({"user": public_user(user)})
-        _set_session_cookie(response, request, issue_token(store, user))
-        return response
+        return JSONResponse({"user": public_user(user)})
+
+    @router.get("/api/auth/sessions")
+    async def my_sessions(request: Request):
+        return {"sessions": store.list_sessions(
+            request.state.user["username"], current_id=request.state.session_id)}
+
+    @router.delete("/api/auth/sessions/{session_id}")
+    async def revoke_my_session(session_id: str, request: Request):
+        if store.revoke_session(session_id, username=request.state.user["username"]):
+            store.record_audit("session_revoked", actor=request.state.user["username"],
+                               ip=_client_ip(request), detail={"session": session_id[:12]})
+        return {"ok": True}
 
     # ---- user management (admin; enforced by the guard) ----
 
@@ -379,6 +846,9 @@ def create_router(store: UserStore) -> APIRouter:
             user = store.create(await _json_body(request))
         except AuthError as e:
             return _error(e)
+        store.record_audit("user_created", actor=request.state.user["username"],
+                           target=user["username"], ip=_client_ip(request),
+                           detail={"role": user["role"]})
         return JSONResponse({"user": user}, status_code=201)
 
     @router.put("/api/users/{name}")
@@ -387,6 +857,8 @@ def create_router(store: UserStore) -> APIRouter:
             user = store.update(name, await _json_body(request), request.state.user["username"])
         except AuthError as e:
             return _error(e)
+        store.record_audit("user_updated", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request))
         return {"user": user}
 
     @router.delete("/api/users/{name}")
@@ -395,6 +867,67 @@ def create_router(store: UserStore) -> APIRouter:
             store.remove(name, request.state.user["username"])
         except AuthError as e:
             return _error(e)
+        store.record_audit("user_deleted", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request))
         return {"ok": True}
+
+    @router.post("/api/users/{name}/unlock")
+    async def unlock_user(name: str, request: Request):
+        store.clear_failed_attempts(name)
+        store.record_audit("unlock", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request))
+        return {"ok": True}
+
+    @router.delete("/api/users/{name}/totp")
+    async def reset_user_totp(name: str, request: Request):
+        store.disable_totp(name)
+        store.record_audit("totp_reset", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request))
+        return {"ok": True}
+
+    @router.get("/api/users/{name}/sessions")
+    async def user_sessions(name: str):
+        return {"sessions": store.list_sessions(name)}
+
+    @router.delete("/api/users/{name}/sessions/{session_id}")
+    async def kick_user_session(name: str, session_id: str, request: Request):
+        if store.revoke_session(session_id, username=name):
+            store.record_audit("session_revoked", actor=request.state.user["username"],
+                               target=name, ip=_client_ip(request),
+                               detail={"session": session_id[:12]})
+        return {"ok": True}
+
+    @router.get("/api/invites")
+    async def list_invites():
+        return {"invites": store.list_invites()}
+
+    @router.post("/api/invites")
+    async def create_invite(request: Request):
+        body = await _json_body(request)
+        try:
+            invite = store.create_invite(
+                role=body.get("role") or "viewer",
+                max_uses=body.get("maxUses") or 1,
+                expires_in_hours=body.get("expiresInHours", 72),
+                created_by=request.state.user["username"],
+            )
+        except AuthError as e:
+            return _error(e)
+        store.record_audit("invite_created", actor=request.state.user["username"],
+                           ip=_client_ip(request),
+                           detail={"role": invite["role"], "maxUses": invite["maxUses"]})
+        return JSONResponse({"invite": invite}, status_code=201)
+
+    @router.delete("/api/invites/{code}")
+    async def revoke_invite(code: str, request: Request):
+        store.revoke_invite(code)
+        store.record_audit("invite_revoked", actor=request.state.user["username"],
+                           ip=_client_ip(request))
+        return {"ok": True}
+
+    @router.get("/api/audit")
+    async def list_audit(limit: int = 100, offset: int = 0,
+                         action: str | None = None, actor: str | None = None):
+        return {"entries": store.list_audit(limit=limit, offset=offset, action=action, actor=actor)}
 
     return router

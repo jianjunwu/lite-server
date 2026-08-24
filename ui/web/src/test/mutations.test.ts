@@ -72,13 +72,13 @@ describe('withAdminKeyRetry', () => {
   });
 
   it('should_not_prompt_when_401_marks_bff_session_expiry', async () => {
-    // BFF-side 401s ({error:'unauthenticated'}) mean the login session died;
+    // BFF-side 401s ({error:'bff_unauthenticated'}) mean the login session died;
     // the auth flow handles those. Prompting for an instance key on top of
     // the login redirect is wrong, and the retry would fail anyway.
     const requester = vi.fn();
     setKeyRequester(requester);
     const err = await withAdminKeyRetry('prod', async () => {
-      throw new ApiError(401, null, { error: 'unauthenticated' }, 'unauthenticated');
+      throw new ApiError(401, null, { error: 'bff_unauthenticated' }, 'bff_unauthenticated');
     }).catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect(requester).not.toHaveBeenCalled();
