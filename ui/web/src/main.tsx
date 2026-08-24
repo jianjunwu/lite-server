@@ -6,6 +6,7 @@ import { App as AntdApp, ConfigProvider } from 'antd';
 import { App } from './App';
 import { themeConfig } from './theme';
 import { AdminKeyProvider } from './context/AdminKeyContext';
+import { AuthProvider } from './context/AuthContext';
 import { TaskProvider } from './context/TaskContext';
 import './i18n';
 
@@ -27,7 +28,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <TaskProvider>
             <AdminKeyProvider>
               <BrowserRouter>
-                <App />
+                <AuthProvider>
+                  <App />
+                </AuthProvider>
               </BrowserRouter>
             </AdminKeyProvider>
           </TaskProvider>

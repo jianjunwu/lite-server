@@ -152,10 +152,43 @@
     "cancel": "Cancel",
     "required": "Key is required"
   },
+  "auth": {
+    "username": "Username",
+    "password": "Password",
+    "login": "Log in",
+    "logout": "Log out",
+    "invalidCredentials": "Invalid username or password",
+    "changePassword": "Change password",
+    "currentPassword": "Current password",
+    "newPassword": "New password",
+    "confirmPassword": "Confirm password",
+    "passwordMismatch": "Passwords do not match",
+    "passwordChanged": "Password changed",
+    "mustChangeHint": "You must set a new password before continuing."
+  },
   "settings": {
     "tabs": {
       "instances": "Instances",
-      "keys": "Admin keys"
+      "keys": "Admin keys",
+      "users": "Users"
+    },
+    "users": {
+      "add": "Add user",
+      "addTitle": "Add user",
+      "editTitle": "Edit user {{name}}",
+      "username": "Username",
+      "password": "Password",
+      "passwordHint": "At least 8 characters; the user must change it on first login",
+      "passwordKeepHint": "Leave empty to keep the current password",
+      "role": "Role",
+      "status": "Status",
+      "mustChange": "must change password",
+      "edit": "Edit",
+      "delete": "Delete",
+      "deleteConfirm": "Delete user {{name}}?",
+      "created": "User created",
+      "updated": "User updated",
+      "deleted": "User deleted"
     },
     "instances": {
       "add": "Add instance",

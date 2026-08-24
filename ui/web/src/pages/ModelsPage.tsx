@@ -4,6 +4,7 @@ import { UploadOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
+import { useAuth } from '../context/AuthContext';
 import { useModels, useVersions } from '../api/hooks';
 import type { ModelListItem } from '../api/types';
 import { StatusBadge } from '../components/StatusBadge';
@@ -14,15 +15,22 @@ import { dataTextStyle } from '../theme';
 
 function ModelExpandRow({ model }: { model: string }) {
   const { instanceId } = useInstance();
+  const { can } = useAuth();
   const versionsQuery = useVersions(instanceId, model);
   return (
-    <VersionsTable model={model} versions={versionsQuery.data?.versions ?? []} loading={versionsQuery.isLoading} ops />
+    <VersionsTable
+      model={model}
+      versions={versionsQuery.data?.versions ?? []}
+      loading={versionsQuery.isLoading}
+      ops={can('operator')}
+    />
   );
 }
 
 export function ModelsPage() {
   const { t } = useTranslation();
   const { instanceId } = useInstance();
+  const { can } = useAuth();
   const modelsQuery = useModels(instanceId);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -36,9 +44,11 @@ export function ModelsPage() {
         title={t('models.title')}
         subtitle={instanceId}
         extra={
-          <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
-            {t('upload.title')}
-          </Button>
+          can('operator') ? (
+            <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
+              {t('upload.title')}
+            </Button>
+          ) : undefined
         }
       />
       <Card size="small">

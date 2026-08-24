@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
+import { useAuth } from '../context/AuthContext';
 import { apiFetch } from '../api/client';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import { useModelHealth, useTimeline, useVersions } from '../api/hooks';
@@ -21,6 +22,7 @@ export function ModelDetailPage() {
   const { message } = App.useApp();
   const { name = '' } = useParams();
   const { instanceId } = useInstance();
+  const { can } = useAuth();
   const queryClient = useQueryClient();
   const [editingRouting, setEditingRouting] = useState(false);
   const [loadOpen, setLoadOpen] = useState(false);
@@ -71,9 +73,11 @@ export function ModelDetailPage() {
             : instanceId
         }
         extra={
-          <Button size="small" onClick={() => setLoadOpen(true)}>
-            {t('ops.loadVersion')}
-          </Button>
+          can('operator') ? (
+            <Button size="small" onClick={() => setLoadOpen(true)}>
+              {t('ops.loadVersion')}
+            </Button>
+          ) : undefined
         }
       />
 
@@ -86,14 +90,14 @@ export function ModelDetailPage() {
               <Card
                 size="small"
                 extra={
-                  !editingRouting && versions.length > 0 ? (
+                  can('operator') && !editingRouting && versions.length > 0 ? (
                     <Button size="small" onClick={() => setEditingRouting(true)}>
                       {t('routing.edit')}
                     </Button>
                   ) : undefined
                 }
               >
-                <VersionsTable model={name} versions={versions} loading={versionsQuery.isLoading} ops />
+                <VersionsTable model={name} versions={versions} loading={versionsQuery.isLoading} ops={can('operator')} />
                 {editingRouting && (
                   <RoutingEditor model={name} versions={versions} onClose={() => setEditingRouting(false)} />
                 )}

@@ -17,6 +17,7 @@ import { setLanguage } from '../i18n';
 import i18n from '../i18n';
 import { StatusDot, statusKind } from '../components/StatusBadge';
 import { TaskBell } from '../components/TaskBell';
+import { UserMenu } from '../components/UserMenu';
 import { eyebrowStyle } from '../theme';
 
 const { Sider, Header, Content } = Layout;
@@ -110,6 +111,7 @@ export function AppLayout() {
                 { value: 'zh', label: '中文' },
               ]}
             />
+            <UserMenu />
           </Space>
         </Header>
         {instanceId && currentHealth.isError && (

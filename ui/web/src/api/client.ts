@@ -22,6 +22,25 @@ export class ApiError extends Error {
   }
 }
 
+/** Called when the BFF itself rejects the session (401 {error:'unauthenticated'}).
+ * Registered once by AuthProvider. Instance 401s never trigger this. */
+let onBffUnauthorized: (() => void) | null = null;
+
+export function setOnBffUnauthorized(handler: (() => void) | null) {
+  onBffUnauthorized = handler;
+}
+
+function checkBffUnauthorized(status: number, body: unknown) {
+  if (
+    status === 401 &&
+    body !== null &&
+    typeof body === 'object' &&
+    (body as { error?: unknown }).error === 'unauthenticated'
+  ) {
+    onBffUnauthorized?.();
+  }
+}
+
 async function parseErrorBody(res: Response): Promise<unknown> {
   const text = await res.text().catch(() => '');
   try {
@@ -46,6 +65,7 @@ export async function apiFetch<T>(instanceId: string, path: string, init?: Reque
   }
   if (!res.ok) {
     const body = await parseErrorBody(res);
+    checkBffUnauthorized(res.status, body);
     const message =
       body && typeof body === 'object' && 'error' in body
         ? String((body as { error: unknown }).error)
@@ -62,7 +82,9 @@ export async function bffFetch<T>(path: string, init?: RequestInit): Promise<T> 
     headers: { 'x-requested-with': 'lite-ui', ...init?.headers },
   });
   if (!res.ok) {
-    throw new ApiError(res.status, res.headers.get('x-request-id'), await parseErrorBody(res), `HTTP ${res.status}`);
+    const body = await parseErrorBody(res);
+    checkBffUnauthorized(res.status, body);
+    throw new ApiError(res.status, res.headers.get('x-request-id'), body, `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
