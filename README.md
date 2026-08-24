@@ -157,6 +157,14 @@ maturin develop          # dev build
 maturin build --release  # release wheel
 ```
 
+## Web Console (lite-ui)
+
+A web console for lite-server lives in [`ui/`](ui/): multi-instance dashboard,
+model lifecycle management (load/unload/activate/canary routing), and an
+inference playground. It runs as a standalone Node service that proxies each
+lite-server instance — no changes to the server needed. See
+[ui/README.md](ui/README.md).
+
 ## Examples
 
 See [examples/](examples/) for runnable model repositories:

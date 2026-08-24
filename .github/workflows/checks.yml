@@ -99,6 +99,39 @@ jobs:
       - name: Run telemetry e2e integration tests
         run: cargo test --features telemetry --test integration_test -- telemetry --test-threads=1
 
+  # lite-ui (ui/ workspace): BFF + SPA tests and build. Independent of the
+  # Rust/Python toolchain — the UI talks to lite-server over HTTP only.
+  ui:
+    name: lite-ui test & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        working-directory: ui
+        run: pnpm -r test
+      - name: Build
+        working-directory: ui
+        run: pnpm -r build
+      - name: Pack release tarball
+        working-directory: ui
+        run: ./scripts/pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lite-ui-tgz
+          path: ui/dist-release/*.tgz
+          retention-days: 14
+
   # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
   # liteserver_pb2.py + liteserver_pb2_grpc.py（regen_proto.sh 固定
   # grpcio-tools 1.62.x，无 runtime_version guard；脚本内置 guard 检查）。

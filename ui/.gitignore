@@ -1,5 +1,9 @@
 node_modules/
 dist/
+dist-release/
 *.local.yaml
+instances.yaml
+auth.yaml
+auth.yaml.secret
 .DS_Store
 *.tsbuildinfo
