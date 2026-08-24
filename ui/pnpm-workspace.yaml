@@ -1,0 +1,7 @@
+packages:
+  - web
+  - server
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild

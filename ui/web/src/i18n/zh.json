@@ -1,0 +1,87 @@
+{
+  "nav": {
+    "groupMonitor": "监控",
+    "groupTools": "工具",
+    "overview": "概览",
+    "models": "模型",
+    "metrics": "指标",
+    "alerts": "告警",
+    "playground": "Playground",
+    "settings": "设置"
+  },
+  "common": {
+    "instance": "实例",
+    "refresh": "刷新",
+    "loading": "加载中",
+    "empty": "暂无数据",
+    "retry": "重试",
+    "language": "语言",
+    "status": "状态",
+    "workers": "Worker",
+    "version": "版本",
+    "active": "激活",
+    "weight": "权重",
+    "loadedAt": "加载时间",
+    "unreachable": "实例不可达",
+    "requestId": "请求 ID",
+    "comingSoon": "即将推出"
+  },
+  "overview": {
+    "title": "概览",
+    "fleetStatus": "集群状态",
+    "fleetQps": "集群 QPS",
+    "fleetErrors": "活跃告警",
+    "instances": "实例",
+    "models": "模型",
+    "noInstances": "尚未配置实例",
+    "noInstancesHint": "请在 instances.yaml 或设置页中添加实例。",
+    "serverVersion": "服务端版本",
+    "loadedModels": "已加载模型"
+  },
+  "models": {
+    "title": "模型",
+    "name": "名称",
+    "versions": "版本数",
+    "activeVersion": "激活版本",
+    "modelType": "类型",
+    "noModels": "该实例上没有已加载的模型",
+    "detail": "模型详情",
+    "versionDetail": "版本详情",
+    "ready": "就绪",
+    "notReady": "未就绪",
+    "healthyWorkers": "健康 Worker",
+    "tabs": {
+      "versions": "版本",
+      "workers": "Worker",
+      "metrics": "指标",
+      "compare": "对比"
+    }
+  },
+  "metrics": {
+    "title": "指标",
+    "model": "模型",
+    "versionsOverlay": "版本叠加",
+    "qps": "QPS",
+    "p99": "P99 延迟",
+    "queueDepth": "队列深度",
+    "workers": "活跃 Worker",
+    "refreshInterval": "刷新频率",
+    "pause": "暂停",
+    "every2s": "2 秒",
+    "every5s": "5 秒",
+    "every10s": "10 秒",
+    "every30s": "30 秒",
+    "warningThreshold": "警告阈值",
+    "criticalThreshold": "严重阈值"
+  },
+  "alerts": {
+    "title": "告警",
+    "rule": "规则",
+    "message": "消息",
+    "severity": "级别",
+    "value": "当前值",
+    "threshold": "阈值",
+    "time": "时间",
+    "noAlerts": "暂无活跃告警"
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "nav": {
+    "groupMonitor": "Monitor",
+    "groupTools": "Tools",
+    "overview": "Overview",
+    "models": "Models",
+    "metrics": "Metrics",
+    "alerts": "Alerts",
+    "playground": "Playground",
+    "settings": "Settings"
+  },
+  "common": {
+    "instance": "Instance",
+    "refresh": "Refresh",
+    "loading": "Loading",
+    "empty": "No data",
+    "retry": "Retry",
+    "language": "Language",
+    "status": "Status",
+    "workers": "Workers",
+    "version": "Version",
+    "active": "Active",
+    "weight": "Weight",
+    "loadedAt": "Loaded at",
+    "unreachable": "Instance unreachable",
+    "requestId": "Request ID",
+    "comingSoon": "Coming soon"
+  },
+  "overview": {
+    "title": "Overview",
+    "fleetStatus": "Fleet status",
+    "fleetQps": "Fleet QPS",
+    "fleetErrors": "Active alerts",
+    "instances": "Instances",
+    "models": "Models",
+    "noInstances": "No instances configured",
+    "noInstancesHint": "Add an instance in instances.yaml or via Settings.",
+    "serverVersion": "Server version",
+    "loadedModels": "Loaded models"
+  },
+  "models": {
+    "title": "Models",
+    "name": "Name",
+    "versions": "Versions",
+    "activeVersion": "Active version",
+    "modelType": "Type",
+    "noModels": "No models loaded on this instance",
+    "detail": "Model detail",
+    "versionDetail": "Version detail",
+    "ready": "Ready",
+    "notReady": "Not ready",
+    "healthyWorkers": "Healthy workers",
+    "tabs": {
+      "versions": "Versions",
+      "workers": "Workers",
+      "metrics": "Metrics",
+      "compare": "Compare"
+    }
+  },
+  "metrics": {
+    "title": "Metrics",
+    "model": "Model",
+    "versionsOverlay": "Versions overlay",
+    "qps": "QPS",
+    "p99": "P99 latency",
+    "queueDepth": "Queue depth",
+    "workers": "Active workers",
+    "refreshInterval": "Refresh interval",
+    "pause": "Pause",
+    "every2s": "2s",
+    "every5s": "5s",
+    "every10s": "10s",
+    "every30s": "30s",
+    "warningThreshold": "warning threshold",
+    "criticalThreshold": "critical threshold"
+  },
+  "alerts": {
+    "title": "Alerts",
+    "rule": "Rule",
+    "message": "Message",
+    "severity": "Severity",
+    "value": "Value",
+    "threshold": "Threshold",
+    "time": "Time",
+    "noAlerts": "No active alerts"
+  }
+}

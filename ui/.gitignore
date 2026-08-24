@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.local.yaml
+.DS_Store
