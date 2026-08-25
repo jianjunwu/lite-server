@@ -993,6 +993,10 @@ impl Admin for GrpcAdminService {
             &staged,
             url_version.as_deref(),
             load,
+            // The UploadModelRequest proto has no force field, so the gRPC
+            // surface keeps its historical implicit-overwrite behavior
+            // until the proto grows one (wire change, tracked separately).
+            true,
         )
         .await
         .map_err(to_status)?;

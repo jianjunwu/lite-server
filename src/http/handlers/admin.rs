@@ -588,6 +588,16 @@ pub(crate) async fn delete_version_impl(
     crate::validation::validate_identifier(model_name)?;
     crate::validation::validate_version(version)?;
 
+    // Serialize against concurrent uploads of the same version:
+    // finalize_upload holds this lock across its exists-check + commit +
+    // artifact housekeeping. The guard must cover the WHOLE impl — unload,
+    // directory removal, artifact/swap-backup cleanup — not just the
+    // remove_dir_all: an upload committing mid-delete would otherwise
+    // leave a live worker running on a swapped-out directory.
+    let version_lock =
+        crate::http::handlers::files::version_op_lock(model_name, version).await;
+    let _version_guard = version_lock.lock().await;
+
     info!(model = %model_name, version = %version, "delete version requested");
     // G4: capture the active pin BEFORE unload — unload clears it via
     // registry.remove (auto-fallback may already have moved the pointer).

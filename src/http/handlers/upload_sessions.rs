@@ -531,6 +531,7 @@ async fn assemble_and_finalize(
         &staged,
         Some(&meta.version),
         auto_load,
+        query.force.unwrap_or(false),
     )
     .await?;
 
@@ -667,6 +668,11 @@ mod tests {
                 "/v2/repository/models/:model_name/versions/:version/upload-sessions/:session_id/files/:file_index/chunks/:chunk_index",
                 axum::routing::put(put_session_chunk),
             )
+            // Delete-version endpoint, for delete↔complete serialization tests.
+            .route(
+                "/v2/models/:model_name/versions/:version",
+                axum::routing::delete(crate::http::handlers::admin::delete_version_handler),
+            )
             .with_state(state)
     }
 
@@ -757,13 +763,23 @@ mod tests {
     }
 
     async fn complete(app: &Router, model: &str, version: &str, sid: &str) -> axum::response::Response {
+        complete_force(app, model, version, sid, false).await
+    }
+
+    async fn complete_force(
+        app: &Router,
+        model: &str,
+        version: &str,
+        sid: &str,
+        force: bool,
+    ) -> axum::response::Response {
         app.clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!(
-                        "/v2/repository/models/{}/versions/{}/upload-sessions/{}/complete?load=false",
-                        model, version, sid
+                        "/v2/repository/models/{}/versions/{}/upload-sessions/{}/complete?load=false&force={}",
+                        model, version, sid, force
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -1045,10 +1061,11 @@ mod tests {
         assert!(tmp.join("mymodel").join("1").join("config.yaml").exists());
 
         // A second session for the same version replaces the dir wholesale
-        // (swap semantics inherited from finalize_upload).
+        // (swap semantics inherited from finalize_upload) — only with
+        // explicit force; without it the complete would 409.
         let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "model.py", "size": 64 }])).await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'n'; 64]).await;
-        let response = complete(&app, "mymodel", "1", &sid2).await;
+        let response = complete_force(&app, "mymodel", "1", &sid2, true).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             !tmp.join("mymodel").join("1").join("config.yaml").exists(),
@@ -1059,6 +1076,123 @@ mod tests {
     }
 
     // ===== delete =====
+
+    #[tokio::test]
+    async fn test_complete_existing_version_without_force_is_409_and_retryable_with_force() {
+        let tmp = unique_tmp("ovr409");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+
+        // Land version 1 via a first session.
+        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
+        let response = complete(&app, "mymodel", "1", &sid1).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A second session for the same version: complete without force must
+        // refuse to clobber the committed content...
+        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
+        let response = complete(&app, "mymodel", "1", &sid2).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // ...the on-disk bytes are untouched...
+        let committed = tokio::fs::read(tmp.join("mymodel").join("1").join("w.bin"))
+            .await
+            .unwrap();
+        assert_eq!(committed, vec![b'a'; 64]);
+
+        // ...and the rejected session stays resumable: retry with force.
+        let session = get_session(&app, "mymodel", "1", &sid2).await;
+        assert_eq!(session["state"], "uploading");
+        let response = complete_force(&app, "mymodel", "1", &sid2, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let committed = tokio::fs::read(tmp.join("mymodel").join("1").join("w.bin"))
+            .await
+            .unwrap();
+        assert_eq!(committed, vec![b'b'; 64], "force retry must swap the new content in");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_concurrent_same_version_exactly_one_succeeds() {
+        let tmp = unique_tmp("race409");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+
+        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
+        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
+
+        let (r1, r2) = tokio::join!(
+            complete(&app, "mymodel", "1", &sid1),
+            complete(&app, "mymodel", "1", &sid2)
+        );
+        let mut statuses = [r1.status(), r2.status()];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::CONFLICT],
+            "the version op lock must serialize the commits: one winner, one 409"
+        );
+
+        // Whichever won, the landed bytes are one session's exact content —
+        // never a mix.
+        let committed = tokio::fs::read(tmp.join("mymodel").join("1").join("w.bin"))
+            .await
+            .unwrap();
+        assert!(
+            committed == vec![b'a'; 64] || committed == vec![b'b'; 64],
+            "committed content must be exactly one session's payload"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_and_complete_serialize_to_a_defined_outcome() {
+        let tmp = unique_tmp("delrace");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+
+        // Land version 1, then stage a second session fully.
+        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
+        let response = complete(&app, "mymodel", "1", &sid1).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
+
+        // Race the delete against the second complete (force: the version
+        // may still exist when the complete wins the lock).
+        let app2 = app.clone();
+        let delete = async move {
+            app2.oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v2/models/mymodel/versions/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (rd, rc) = tokio::join!(delete, complete_force(&app, "mymodel", "1", &sid2, true));
+        assert_eq!(rd.status(), StatusCode::OK, "delete must not error under the lock");
+        assert_eq!(rc.status(), StatusCode::OK, "complete must not error under the lock");
+
+        // Two defined outcomes: delete won (dir gone) or complete won (dir
+        // holds exactly the new content). Anything else is a mixed state.
+        let dir = tmp.join("mymodel").join("1");
+        if dir.exists() {
+            let committed = tokio::fs::read(dir.join("w.bin")).await.unwrap();
+            assert_eq!(committed, vec![b'b'; 64], "complete won: exact new content, no mix");
+        }
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
 
     #[tokio::test]
     async fn test_delete_session_removes_staging() {

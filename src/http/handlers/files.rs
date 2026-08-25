@@ -17,6 +17,35 @@ use tracing::{info, warn};
 #[derive(Deserialize)]
 pub struct UploadQuery {
     pub load: Option<bool>,
+    /// Overwrite guard: committing onto an existing version directory is
+    /// refused with 409 unless force is set (see finalize_upload).
+    pub force: Option<bool>,
+}
+
+/// Per-(model, version) mutex serializing directory-level mutations:
+/// finalize_upload's exists-check + commit + artifact housekeeping on one
+/// side, delete_version_impl's unload + removal on the other. Entries are
+/// insert-ONLY: the key space is bounded by repo contents, and removing an
+/// entry would reintroduce the classic dashmap removal/waiter race (a
+/// waiter on the old Arc and a newcomer on a fresh Arc could enter the
+/// critical section together).
+type VersionOpLocks = dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
+
+pub(crate) fn version_op_locks() -> &'static VersionOpLocks {
+    static LOCKS: std::sync::OnceLock<VersionOpLocks> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(dashmap::DashMap::new)
+}
+
+/// Clone the Arc'd mutex for one (model, version) op; the caller holds the
+/// guard across its critical section.
+pub(crate) async fn version_op_lock(
+    model: &str,
+    version: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    version_op_locks()
+        .entry((model.to_string(), version.to_string()))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 pub async fn upload_model_handler(
@@ -141,6 +170,7 @@ pub async fn upload_model_handler(
         &staged,
         Some(&version),
         auto_load,
+        query.force.unwrap_or(false),
     )
     .await?;
 
@@ -253,6 +283,7 @@ pub(crate) async fn finalize_upload(
     staged: &[StagedUploadFile],
     url_version: Option<&str>,
     load: bool,
+    force: bool,
 ) -> Result<UploadOutcome, AppError> {
     let unpack_timeout =
         std::time::Duration::from_secs_f32(state.config.tunables.unpack_timeout_secs);
@@ -372,6 +403,28 @@ pub(crate) async fn finalize_upload(
         }
     }
 
+    // Overwrite guard + commit under the per-version op lock: the
+    // exists-check and the swap below are atomic against concurrent
+    // completes/uploads, and against delete_version_impl (which holds the
+    // same lock across unload + removal + artifact cleanup). Without force,
+    // committing onto an existing version directory is refused — the
+    // committed content is someone's truth, never silently clobbered.
+    let version_lock = version_op_lock(model_name, &effective_version).await;
+    let version_guard = version_lock.lock().await;
+
+    if !force
+        && state
+            .repo_path
+            .join(model_name)
+            .join(&effective_version)
+            .exists()
+    {
+        return Err(AppError::Conflict(format!(
+            "version {} of model {} already exists; pass ?force=true to overwrite",
+            effective_version, model_name
+        )));
+    }
+
     // H3: move staged content into place — version dirs via swap semantics
     // (replaced wholesale, never partial), model-root files by overwrite.
     commit_staging(&state.repo_path, model_name, staging).await?;
@@ -418,6 +471,14 @@ pub(crate) async fn finalize_upload(
         )
         .await;
     }
+
+    // Artifact retention and the drift patch above stay INSIDE the lock:
+    // delete_version_impl removes exactly those artifacts under the same
+    // lock, so a delete can never slip between commit and housekeeping and
+    // leave an orphan .lma that would resurrect the version on restart.
+    // Auto-load, by contrast, runs outside the lock — a delete interleaving
+    // here surfaces as a load_error, a defined outcome.
+    drop(version_guard);
 
     let load_error = auto_load_uploaded(state, model_name, &effective_version, load).await;
 
@@ -514,7 +575,16 @@ pub async fn upload_model_package_handler(
     }
 
     let auto_load = query.load.unwrap_or(true);
-    let outcome = finalize_upload(&state, &model_name, &staging, &staged, None, auto_load).await?;
+    let outcome = finalize_upload(
+        &state,
+        &model_name,
+        &staging,
+        &staged,
+        None,
+        auto_load,
+        query.force.unwrap_or(false),
+    )
+    .await?;
 
     info!(
         model = %model_name,
@@ -1280,12 +1350,21 @@ mod upload_download_tests {
                 axum::routing::post(upload_model_handler),
             )
             .route(
+                "/v2/repository/models/:model_name/upload",
+                axum::routing::post(upload_model_package_handler),
+            )
+            .route(
                 "/v2/repository/models/:model_name/versions/:version/download",
                 axum::routing::get(download_model_handler),
             )
             .route(
                 "/v2/repository/models/:model_name/versions/:version/files",
                 axum::routing::get(list_files_handler),
+            )
+            // Delete-version endpoint, for delete↔upload serialization tests.
+            .route(
+                "/v2/models/:model_name/versions/:version",
+                axum::routing::delete(crate::http::handlers::admin::delete_version_handler),
             )
             .with_state(state)
     }
@@ -2069,7 +2148,8 @@ mod upload_download_tests {
             .unwrap();
 
         // Second upload: only model.py. Swap semantics must replace the
-        // whole version directory, so old.txt must disappear.
+        // whole version directory, so old.txt must disappear. Requires
+        // explicit force — without it the upload would 409.
         let body = multipart_body(
             boundary,
             "model.py",
@@ -2079,7 +2159,7 @@ mod upload_download_tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false&force=true")
                     .header(
                         "content-type",
                         format!("multipart/form-data; boundary={}", boundary),
@@ -2099,6 +2179,174 @@ mod upload_download_tests {
             !tmp.join("mymodel").join("1").join("old.txt").exists(),
             "re-upload must replace the version directory wholesale"
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_existing_version_without_force_is_409() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-upload-409-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let app = test_router(test_app_state(tmp.clone()));
+        let boundary = "----ovr409boundary";
+        let upload = |data: &'static [u8], force: bool| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v2/repository/models/mymodel/versions/1/upload?load=false&force={}",
+                            force
+                        ))
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={}", boundary),
+                        )
+                        .body(Body::from(multipart_body(boundary, "model.py", data)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let response = upload(b"def predict(x): return 'A'\n", false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Existing version + no force → 409, and the committed bytes stay.
+        let response = upload(b"def predict(x): return 'B'\n", false).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let content = tokio::fs::read_to_string(tmp.join("mymodel").join("1").join("model.py"))
+            .await
+            .unwrap();
+        assert_eq!(content, "def predict(x): return 'A'\n");
+
+        // Explicit force → swap.
+        let response = upload(b"def predict(x): return 'B'\n", true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = tokio::fs::read_to_string(tmp.join("mymodel").join("1").join("model.py"))
+            .await
+            .unwrap();
+        assert_eq!(content, "def predict(x): return 'B'\n");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_model_package_existing_version_without_force_is_409() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-pkg-409-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let app = test_router(test_app_state(tmp.clone()));
+        let boundary = "----pkg409boundary";
+        let upload = |force: bool| {
+            let app = app.clone();
+            let data = data.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v2/repository/models/mymodel/upload?load=false&force={}",
+                            force
+                        ))
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={}", boundary),
+                        )
+                        .body(Body::from(multipart_body(boundary, "mymodel_v1.lma", &data)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let response = upload(false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The manifest version (1) is already on disk: model-level upload
+        // follows the same overwrite guard as the versioned endpoint.
+        let response = upload(false).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = upload(true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_and_multipart_upload_serialize_to_a_defined_outcome() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-delrace-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let app = test_router(test_app_state(tmp.clone()));
+        let boundary = "----delraceboundary";
+        let upload = |data: &'static [u8], force: bool| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v2/repository/models/mymodel/versions/1/upload?load=false&force={}",
+                            force
+                        ))
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={}", boundary),
+                        )
+                        .body(Body::from(multipart_body(boundary, "model.py", data)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let response = upload(b"def predict(x): return 'A'\n", false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Race the delete against a re-upload (force: the version may still
+        // exist when the upload wins the lock).
+        let app2 = app.clone();
+        let delete = async move {
+            app2.oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v2/models/mymodel/versions/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (rd, ru) = tokio::join!(delete, upload(b"def predict(x): return 'B'\n", true));
+        assert_eq!(rd.status(), StatusCode::OK, "delete must not error under the lock");
+        assert_eq!(ru.status(), StatusCode::OK, "upload must not error under the lock");
+
+        // Two defined outcomes: delete won (dir gone) or upload won (dir
+        // holds exactly the new content). Anything else is a mixed state.
+        let dir = tmp.join("mymodel").join("1");
+        if dir.exists() {
+            let content = tokio::fs::read_to_string(dir.join("model.py")).await.unwrap();
+            assert_eq!(content, "def predict(x): return 'B'\n", "upload won: exact new content");
+        }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -2853,13 +3101,14 @@ mod upload_download_tests {
 
         // A raw upload replaces the version content — the stale original
         // artifact must go (drift patch), so downloads repack from disk.
+        // Explicit force: the .lma upload above already committed version 1.
         let boundary2 = "----f10bdriftrawboundary";
         let body2 = multipart_body(boundary2, "model.py", b"def predict(x): return 'NEW'\n");
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false&force=true")
                     .header(
                         "content-type",
                         format!("multipart/form-data; boundary={}", boundary2),
