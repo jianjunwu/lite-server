@@ -73,7 +73,7 @@ export function AppLayout() {
       <Sider width={208} collapsible breakpoint="lg" style={{ borderRight: `1px solid ${neutrals.border}` }}>
         <div style={{ height: 48, display: 'flex', alignItems: 'center', paddingLeft: 20, gap: 8 }}>
           <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 18 }} />
-          <Typography.Text strong style={{ fontSize: 15 }}>lite-ui</Typography.Text>
+          <Typography.Text strong style={{ fontSize: 15 }}>{t('common.appName')}</Typography.Text>
         </div>
         <Menu mode="inline" selectedKeys={[selectedKey]} items={menuItems} style={{ border: 'none' }} />
       </Sider>

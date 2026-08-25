@@ -10,6 +10,7 @@
     "settings": "Settings"
   },
   "common": {
+    "appName": "lite-server",
     "instance": "Instance",
     "refresh": "Refresh",
     "loading": "Loading",

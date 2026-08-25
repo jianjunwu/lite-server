@@ -36,7 +36,7 @@ function ForceChangePassword() {
       <Card style={{ width: 400 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
           <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 22 }} />
-          <Typography.Text strong style={{ fontSize: TYPE.pageTitle }}>lite-ui</Typography.Text>
+          <Typography.Text strong style={{ fontSize: TYPE.pageTitle }}>{t('common.appName')}</Typography.Text>
         </div>
         <Typography.Paragraph type="secondary" style={{ fontSize: TYPE.body }}>
           {t('auth.mustChangeHint')}
