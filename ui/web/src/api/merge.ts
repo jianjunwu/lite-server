@@ -16,6 +16,10 @@ export interface MergedModel {
   modelType: string;
   /** Repository versions available for loading (null-version artifacts excluded). */
   repoVersions: string[];
+  /** Loaded in the registry but absent from the repository scan — the disk
+   * copy vanished underneath a running model. Only computed when the scan
+   * succeeded (undefined repo = old server = no verdict). */
+  drifted: boolean;
 }
 
 export function mergeModelList(
@@ -26,7 +30,7 @@ export function mergeModelList(
   const ensure = (name: string): MergedModel => {
     let m = byName.get(name);
     if (!m) {
-      m = { name, status: 'unloaded', versionCount: 0, workers: 0, modelType: 'unknown', repoVersions: [] };
+      m = { name, status: 'unloaded', versionCount: 0, workers: 0, modelType: 'unknown', repoVersions: [], drifted: false };
       byName.set(name, m);
     }
     return m;
@@ -38,9 +42,11 @@ export function mergeModelList(
     if (!set) versionSets.set(name, (set = new Set()));
     set.add(version);
   };
+  const repoNames = new Set<string>();
 
   for (const entry of repo ?? []) {
     const m = ensure(entry.name);
+    repoNames.add(entry.name);
     if (m.modelType === 'unknown') m.modelType = entry.type;
     if (entry.version !== null) {
       m.repoVersions.push(entry.version);
@@ -65,6 +71,7 @@ export function mergeModelList(
         : kinds.includes('loading')
           ? 'loading'
           : 'ready';
+      if (repo !== undefined && !repoNames.has(m.name)) m.drifted = true;
     }
   }
 

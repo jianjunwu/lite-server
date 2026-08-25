@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App as AntdApp } from 'antd';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -61,6 +61,7 @@ const model = (over: Partial<MergedModel>): MergedModel => ({
   workers: 1,
   modelType: 'litapi',
   repoVersions: ['1'],
+  drifted: false,
   ...over,
 });
 
@@ -78,6 +79,7 @@ function renderPage() {
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   mockList.data = [];
   mockCanInstance = true;
   for (const k of Object.keys(mockVersions)) delete mockVersions[k];
@@ -121,6 +123,54 @@ describe('ModelsPage repository view', () => {
     renderPage();
     expect(screen.queryByRole('button', { name: 'Load' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Upload model' })).toBeNull();
+  });
+
+  it('should_show_drift_badge_for_loaded_models_missing_from_disk', () => {
+    mockList.data = [
+      model({ name: 'echo', status: 'ready', drifted: true }),
+      model({ name: 'ghost', status: 'unloaded', workers: 0 }),
+    ];
+    renderPage();
+    expect(screen.getByLabelText('drift warning')).toBeTruthy();
+  });
+
+  it('should_show_a_quiet_line_when_everything_is_unloaded', () => {
+    mockList.data = [
+      model({ name: 'a', status: 'unloaded', workers: 0 }),
+      model({ name: 'b', status: 'unloaded', workers: 0 }),
+    ];
+    renderPage();
+    expect(screen.getByText(/2 models in repository, none loaded/)).toBeTruthy();
+  });
+
+  it('should_show_upload_guidance_in_the_empty_state', () => {
+    mockList.data = [];
+    renderPage();
+    expect(screen.getByText(/Upload a model or run an example/)).toBeTruthy();
+  });
+
+  it('should_delete_a_model_after_typing_its_name', async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Actions' }));
+    fireEvent.click(await screen.findByText('Delete model'));
+    const input = await screen.findByPlaceholderText('ghost');
+    fireEvent.change(input, { target: { value: 'ghost' } });
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/api/i/prod/v2/models/ghost?force=true');
+    expect((init as RequestInit).method).toBe('DELETE');
   });
 
   it('should_show_repo_versions_with_load_action_in_the_expand_row', async () => {

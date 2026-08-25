@@ -28,6 +28,8 @@ export const modelOps = {
       `/v2/models/${enc(model)}/versions/${enc(version)}${force ? '?force=true' : ''}`,
       'DELETE',
     ),
+  deleteModel: (inst: string, model: string, force = false) =>
+    mutate(inst, `/v2/models/${enc(model)}${force ? '?force=true' : ''}`, 'DELETE'),
   setRouting: (inst: string, model: string, weights: Record<string, number>) =>
     mutate<{ success: boolean; weights: Record<string, number> }>(
       inst,

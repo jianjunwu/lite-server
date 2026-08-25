@@ -79,7 +79,10 @@
       "addUser": "Grant user",
       "userPlaceholder": "username",
       "saved": "Access updated"
-    }
+    },
+    "drifted": "Loaded, but missing from the repository on disk",
+    "emptyGuide": "Upload a model or run an example to get started",
+    "noneLoaded": "{{count}} models in repository, none loaded"
   },
   "metrics": {
     "title": "Metrics",
@@ -129,9 +132,9 @@
     "activateBody": "Hard-switch the active version of \"{{model}}\" to \"{{version}}\". Traffic moves immediately.",
     "activated": "Version activated",
     "unload": "Unload",
-    "unloadConfirm": "Unload version {{version}}?",
+    "unloadConfirm": "Unload version {{version}}? The model stays in the repository and can be reloaded anytime.",
     "unloadActiveTitle": "Unload active version",
-    "unloadActiveBody": "\"{{version}}\" is the active version of \"{{model}}\". Unloading it makes the model unservable.",
+    "unloadActiveBody": "\"{{version}}\" is the active version of \"{{model}}\". Unloading it makes the model unservable; it stays in the repository and can be reloaded anytime.",
     "unloaded": "Unloaded",
     "delete": "Delete",
     "deleteTitle": "Delete version {{version}}",
@@ -142,7 +145,12 @@
     "loadVersion": "Load version",
     "loadBody": "Load a repository version of \"{{model}}\" into memory.",
     "loadRequested": "Load requested for {{version}}",
-    "loadConfirm": "Load version {{version}}?"
+    "loadConfirm": "Load version {{version}}?",
+    "deleteModel": "Delete model",
+    "deleteModelTitle": "Delete model {{model}}",
+    "deleteModelBody": "This permanently removes \"{{model}}\" and all its versions from the repository. Type the model name to confirm.",
+    "forceDeleteLoaded": "Force: delete even while versions are loaded",
+    "modelDeleted": "Model deleted"
   },
   "routing": {
     "edit": "Edit routing",

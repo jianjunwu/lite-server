@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Button, Card, Empty, Popconfirm, Segmented, Table } from 'antd';
-import { UploadOutlined } from '@ant-design/icons';
+import { Button, Card, Checkbox, Dropdown, Empty, Input, Modal, Popconfirm, Segmented, Table, Tooltip, Typography } from 'antd';
+import { MoreOutlined, UploadOutlined, WarningOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
@@ -15,7 +15,7 @@ import { StatusBadge } from '../components/StatusBadge';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
 import { UploadDrawer } from '../components/UploadDrawer';
-import { dataTextStyle } from '../theme';
+import { dataTextStyle, MONO_FONT, STATUS_COLORS, TYPE } from '../theme';
 
 const STATUS_FILTERS: MergedModelStatus[] = ['ready', 'loading', 'degraded', 'unloaded'];
 
@@ -76,6 +76,73 @@ function LoadAction({ model }: { model: MergedModel }) {
   );
 }
 
+/** ⋯ menu with the destructive model-level op: delete the whole model from
+ * the repository, gated by typing its name (force covers loaded versions). */
+function DeleteModelAction({ model }: { model: MergedModel }) {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const { instanceId } = useInstance();
+  const queryClient = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
+  const [force, setForce] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const close = () => {
+    setOpen(false);
+    setConfirmText('');
+    setForce(false);
+  };
+
+  const submit = async () => {
+    if (!instanceId) return;
+    setBusy(true);
+    try {
+      await withAdminKeyRetry(instanceId, () => modelOps.deleteModel(instanceId, model.name, force));
+      message.success(t('ops.modelDeleted'));
+      await queryClient.invalidateQueries({ queryKey: [instanceId] });
+      close();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Dropdown
+        menu={{
+          items: [{ key: 'delete', danger: true, label: t('ops.deleteModel') }],
+          onClick: () => setOpen(true),
+        }}
+        trigger={['click']}
+      >
+        <Button type="text" size="small" icon={<MoreOutlined />} aria-label={t('ops.actions')} />
+      </Dropdown>
+      <Modal
+        open={open}
+        title={t('ops.deleteModelTitle', { model: model.name })}
+        okText={t('ops.delete')}
+        okButtonProps={{ danger: true, disabled: confirmText !== model.name || busy }}
+        onOk={submit}
+        onCancel={close}
+      >
+        <p style={{ fontSize: 13 }}>{t('ops.deleteModelBody', { model: model.name })}</p>
+        <Input
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder={model.name}
+          style={{ fontFamily: MONO_FONT }}
+        />
+        <Checkbox checked={force} onChange={(e) => setForce(e.target.checked)} style={{ marginTop: 12 }}>
+          {t('ops.forceDeleteLoaded')}
+        </Checkbox>
+      </Modal>
+    </>
+  );
+}
+
 export function ModelsPage() {
   const { t } = useTranslation();
   const { instanceId } = useInstance();
@@ -124,12 +191,30 @@ export function ModelsPage() {
             })),
           ]}
         />
+        {rows.length > 0 && rows.every((m) => m.status === 'unloaded') && (
+          <Typography.Text
+            type="secondary"
+            style={{ display: 'block', fontSize: TYPE.secondary, marginBottom: 8 }}
+          >
+            {t('models.noneLoaded', { count: rows.length })}
+          </Typography.Text>
+        )}
         <Table<MergedModel>
           rowKey="name"
           loading={merged.isLoading}
           dataSource={rows}
           pagination={false}
-          locale={{ emptyText: <Empty description={t('models.noModels')} /> }}
+          locale={{
+            emptyText: (
+              <Empty description={t('models.emptyGuide')}>
+                {can('operator') && (
+                  <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
+                    {t('upload.title')}
+                  </Button>
+                )}
+              </Empty>
+            ),
+          }}
           expandable={{
             expandedRowKeys: expandedKeys,
             onExpandedRowsChange: (keys) => setExpandedKeys(keys as string[]),
@@ -139,8 +224,18 @@ export function ModelsPage() {
             {
               title: t('models.name'),
               dataIndex: 'name',
-              render: (name: string) => (
-                <Link to={ilink(`/models/${encodeURIComponent(name)}`)}>{name}</Link>
+              render: (name: string, m: MergedModel) => (
+                <span>
+                  <Link to={ilink(`/models/${encodeURIComponent(name)}`)}>{name}</Link>
+                  {m.drifted && (
+                    <Tooltip title={t('models.drifted')}>
+                      <WarningOutlined
+                        aria-label="drift warning"
+                        style={{ color: STATUS_COLORS.warning, marginLeft: 8 }}
+                      />
+                    </Tooltip>
+                  )}
+                </span>
               ),
             },
             {
@@ -169,9 +264,13 @@ export function ModelsPage() {
                   {
                     title: t('ops.actions'),
                     key: 'actions',
-                    width: 110,
-                    render: (_: unknown, m: MergedModel) =>
-                      m.status === 'unloaded' && m.repoVersions.length > 0 ? <LoadAction model={m} /> : null,
+                    width: 130,
+                    render: (_: unknown, m: MergedModel) => (
+                      <span style={{ display: 'inline-flex', gap: 4 }}>
+                        {m.status === 'unloaded' && m.repoVersions.length > 0 ? <LoadAction model={m} /> : null}
+                        <DeleteModelAction model={m} />
+                      </span>
+                    ),
                   },
                 ]
               : []),

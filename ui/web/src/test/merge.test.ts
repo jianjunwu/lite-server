@@ -62,6 +62,25 @@ describe('mergeModelList', () => {
     const repoOnly = mergeModelList([repoEntry('b', '1', 'ensemble')], []);
     expect(repoOnly[0].modelType).toBe('ensemble');
   });
+
+  it('should_flag_loaded_but_missing_from_disk_as_drifted', () => {
+    const merged = mergeModelList([repoEntry('ghost', '1')], [loadedRow('echo', '1')]);
+    const byName = Object.fromEntries(merged.map((m) => [m.name, m]));
+    expect(byName.echo.drifted).toBe(true);
+    expect(byName.ghost.drifted).toBe(false);
+  });
+
+  it('should_not_flag_drift_when_repo_index_is_unavailable', () => {
+    // undefined repo means "no scan data" (old server), not "empty repo" —
+    // flagging drift then would false-alarm on every loaded model.
+    const merged = mergeModelList(undefined, [loadedRow('echo', '1')]);
+    expect(merged[0].drifted).toBe(false);
+  });
+
+  it('should_not_flag_drift_for_repo_only_models', () => {
+    const merged = mergeModelList([repoEntry('echo', '1')], [loadedRow('echo', '1')]);
+    expect(merged[0].drifted).toBe(false);
+  });
 });
 
 describe('mergeVersionList', () => {
