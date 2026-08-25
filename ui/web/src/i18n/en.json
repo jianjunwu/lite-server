@@ -96,6 +96,9 @@
   },
   "ops": {
     "actions": "Actions",
+    "download": "Download",
+    "downloadTaskTitle": "Download {{model}} v{{version}}",
+    "downloadDone": "Downloaded {{fileName}}",
     "reload": "Reload",
     "reloadConfirm": "Hot-reload version {{version}}?",
     "reloaded": "Reloaded",

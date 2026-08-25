@@ -4,6 +4,9 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
+import { downloadModelPackage } from '../api/download';
+import { useTasks } from '../context/TaskContext';
+import { formatBytes } from './format';
 import type { VersionInfo } from '../api/types';
 import { MONO_FONT } from '../theme';
 
@@ -22,6 +25,7 @@ export function VersionActions({ model, version }: VersionActionsProps) {
   const { message, modal } = App.useApp();
   const { instanceId } = useInstance();
   const queryClient = useQueryClient();
+  const { addTask, updateTask } = useTasks();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [forceDelete, setForceDelete] = useState(false);
@@ -71,8 +75,36 @@ export function VersionActions({ model, version }: VersionActionsProps) {
     setForceDelete(false);
   };
 
+  const startDownload = () => {
+    // Resumable when the browser has the File System Access API, plain
+    // anchor navigation otherwise; progress rides the task bell either way.
+    const taskId = addTask({
+      title: t('ops.downloadTaskTitle', { model, version: version.version }),
+      kind: 'download',
+      progress: 0,
+    });
+    downloadModelPackage(instanceId, model, version.version, {
+      onProgress: (percent, loaded, total) =>
+        updateTask(taskId, { progress: percent, detail: `${formatBytes(loaded)} / ${formatBytes(total)}` }),
+    }).promise.then(
+      ({ fileName }) => {
+        updateTask(taskId, { status: 'success', progress: 100 });
+        message.success(t('ops.downloadDone', { fileName }));
+      },
+      (err) => {
+        const text = err instanceof Error ? err.message : String(err);
+        updateTask(taskId, { status: 'error', detail: text });
+        message.error(text);
+      },
+    );
+  };
+
   return (
     <Space size={4} wrap>
+      <Button type="text" size="small" disabled={busy} onClick={startDownload}>
+        {t('ops.download')}
+      </Button>
+
       <Popconfirm
         title={t('ops.reloadConfirm', { version: version.version })}
         onConfirm={() => run(() => modelOps.reloadVersion(instanceId, model, version.version), 'ops.reloaded')}

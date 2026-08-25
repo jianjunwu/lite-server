@@ -5,7 +5,8 @@ import type { UploadFile } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
-import { uploadModelFiles, type UploadHandle } from '../api/mutations';
+import { uploadModelFilesResumable } from '../api/upload';
+import type { UploadHandle } from '../api/mutations';
 import { useTasks } from '../context/TaskContext';
 import { formatBytes } from './format';
 import { MONO_FONT, TYPE } from '../theme';
@@ -57,7 +58,7 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
       kind: 'upload',
       progress: 0,
     });
-    const handle = uploadModelFiles(instanceId, values.model, values.version, files, {
+    const handle = uploadModelFilesResumable(instanceId, values.model, values.version, files, {
       load: values.load,
       onProgress: (percent, loaded, total) => {
         setUploading((cur) => (cur ? { ...cur, percent } : cur));

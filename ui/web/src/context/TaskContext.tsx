@@ -5,7 +5,7 @@ export type TaskStatus = 'running' | 'success' | 'error';
 export interface UiTask {
   id: string;
   title: string;
-  kind: 'upload' | 'load' | 'other';
+  kind: 'upload' | 'download' | 'load' | 'other';
   status: TaskStatus;
   /** 0-100 when known. */
   progress?: number;

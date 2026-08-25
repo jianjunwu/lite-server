@@ -96,6 +96,9 @@
   },
   "ops": {
     "actions": "操作",
+    "download": "下载",
+    "downloadTaskTitle": "下载 {{model}} v{{version}}",
+    "downloadDone": "已下载 {{fileName}}",
     "reload": "热加载",
     "reloadConfirm": "热加载版本 {{version}}？",
     "reloaded": "已热加载",
