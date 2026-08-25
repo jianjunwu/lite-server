@@ -2525,6 +2525,7 @@ mod tests {
         // dispatcher is set — the span creation therefore reaches the fmt
         // layer. tokio::spawn would not work (the task polls after the guard
         // is dropped).
+        crate::test_tracing::ensure_always_on_subscriber();
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2758,6 +2759,7 @@ mod tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2869,6 +2871,7 @@ mod tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(RecLayer(rec_thread)),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             let rt = tokio::runtime::Builder::new_current_thread()

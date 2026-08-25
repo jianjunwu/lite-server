@@ -2551,6 +2551,11 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let dispatch =
             tracing::Dispatch::new(tracing_subscriber::registry().with(AuditCapture(rec)));
+        // Without the global always-on subscriber, a parallel test thread
+        // on the no-op dispatcher can cache NEVER for the audit callsite
+        // between the rebuild below and the audit event (the module-only
+        // flake: full-suite runs install it early via event_counts tests).
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();

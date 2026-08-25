@@ -2099,6 +2099,7 @@ mod request_metrics_tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2900,6 +2901,7 @@ mod request_metrics_tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(SpanRecLayer(recorded_thread)),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             f();
@@ -3456,6 +3458,7 @@ mod request_metrics_tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(G3Layer(recorded.clone())),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效
@@ -3500,6 +3503,7 @@ mod request_metrics_tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(G3Layer(recorded.clone())),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效
@@ -3544,6 +3548,7 @@ mod request_metrics_tests {
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(G3Layer(recorded.clone())),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
             // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效

@@ -73,6 +73,20 @@ fn handle() -> Arc<Mutex<HashMap<ThreadId, Counters>>> {
         .clone()
 }
 
+/// Install the process-global always-on subscriber WITHOUT counting
+/// anything. Scoped-dispatch tests (thread-local `set_default`, usually
+/// paired with `rebuild_interest_cache`) must call this first: once the
+/// global subscriber exists, every interest computation on every thread
+/// resolves to `always`, so a parallel thread running on the no-op
+/// default dispatcher can never poison a callsite to `never` and
+/// short-circuit the scoped layer's events (the
+/// `delete_version_audit_carries_request_context` flake — the module-only
+/// runs lost simply because no `event_counts` test had installed the
+/// global subscriber yet).
+pub fn ensure_always_on_subscriber() {
+    let _ = handle();
+}
+
 /// Run `f` and return the tracing events it emitted ON THIS THREAD, tallied
 /// by level. Work `f` drives onto other threads (a multi-thread runtime,
 /// std::thread) is attributed to those threads and invisible here — keep

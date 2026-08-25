@@ -1050,6 +1050,7 @@ mod otel_health_tests {
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .with(RecLayer(rec.clone())),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();

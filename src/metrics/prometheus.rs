@@ -3502,6 +3502,7 @@ mod tests {
         let dispatch = tracing::Dispatch::new(
             tracing_subscriber::registry().with(CaptureLayer(captured.clone())),
         );
+        crate::test_tracing::ensure_always_on_subscriber();
         tracing::dispatcher::with_default(&dispatch, || {
             // 确定性:并行套件中其他测试可能先把同一 callsite 的 interest 缓存
             // 成 NEVER(此后宏短路,scoped dispatch 不再被咨询)。在 scoped

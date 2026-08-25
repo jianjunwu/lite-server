@@ -111,6 +111,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();
@@ -151,6 +152,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
+        crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();
