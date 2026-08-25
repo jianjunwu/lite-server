@@ -89,6 +89,11 @@ pub enum AppError {
     #[error("payload too large: {max_size} bytes max")]
     PayloadTooLarge { max_size: usize, actual_size: Option<u64> },
 
+    /// A syntactically valid Range header names bytes outside the
+    /// representation (HTTP 416, with `Content-Range: bytes */size`).
+    #[error("range not satisfiable (size: {size} bytes)")]
+    RangeNotSatisfiable { size: u64 },
+
     /// Content-Encoding (compression) is not supported on inference routes
     /// (HTTP 415). The detail is client-facing.
     #[error("unsupported media type: {0}")]
@@ -173,6 +178,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => "invalid request body",
             AppError::InvalidQueryParam(_) => "invalid query parameter",
             AppError::PayloadTooLarge { .. } => "payload too large",
+            AppError::RangeNotSatisfiable { .. } => "range not satisfiable",
             AppError::UnsupportedMediaType(_) => "unsupported media type",
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
             AppError::WorkerRecycling(_) => "worker recycling",
@@ -210,6 +216,10 @@ impl AppError {
                 }
             }
             AppError::UnsupportedMediaType(detail) => detail.clone(),
+            // Server-generated from the representation size — safe to surface.
+            AppError::RangeNotSatisfiable { size } => {
+                format!("requested range is not satisfiable (representation size: {} bytes)", size)
+            }
             AppError::Unauthorized(detail) => detail.clone(),
             // Server-generated, names only model/version/slot — safe like Conflict.
             AppError::WorkerRecycling(detail) => detail.clone(),
@@ -243,6 +253,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => "invalid_request_body",
             AppError::InvalidQueryParam(_) => "invalid_query_param",
             AppError::PayloadTooLarge { .. } => "payload_too_large",
+            AppError::RangeNotSatisfiable { .. } => "range_not_satisfiable",
             AppError::UnsupportedMediaType(_) => "unsupported_media_type",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             AppError::WorkerRecycling(_) => "worker_recycling",
@@ -294,6 +305,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => StatusCode::BAD_REQUEST,
             AppError::InvalidQueryParam(_) => StatusCode::BAD_REQUEST,
             AppError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             AppError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             AppError::WorkerRecycling(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -342,6 +354,24 @@ impl AppError {
                 log_detail: self.to_string(),
             };
         }
+        // RangeNotSatisfiable: 416 + Content-Range: bytes */size (RFC 9110
+        // §14.2 — the client needs the complete length to resume correctly).
+        if let AppError::RangeNotSatisfiable { size } = &self {
+            return CanonicalError {
+                status: StatusCode::RANGE_NOT_SATISFIABLE,
+                error_type: "invalid_request_error".to_string(),
+                code: Some(self.error_code().to_string()),
+                message: self.client_message(),
+                param: None,
+                extra: None,
+                headers: Some(HashMap::from([(
+                    "content-range".to_string(),
+                    format!("bytes */{}", size),
+                )])),
+                from_model: false,
+                log_detail: self.to_string(),
+            };
+        }
         let status = self.http_status();
         let error_type = match &self {
             AppError::ModelNotFound(_) => "not_found_error",
@@ -367,6 +397,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => "invalid_request_error",
             AppError::InvalidQueryParam(_) => "invalid_request_error",
             AppError::PayloadTooLarge { .. } => "invalid_request_error",
+            AppError::RangeNotSatisfiable { .. } => "invalid_request_error",
             AppError::UnsupportedMediaType(_) => "invalid_request_error",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             AppError::WorkerRecycling(_) => "worker_recycling",

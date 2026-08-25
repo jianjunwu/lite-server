@@ -825,14 +825,15 @@ impl Drop for DownloadCleanup {
 
 /// F1: streams the packed .lma file as the response body (memory O(chunk)
 /// instead of O(file)) and removes its temp dir when the stream is done.
+/// Generic over the reader so range downloads can pass a seek+take'd file.
 #[pin_project::pin_project]
-struct LmaDownloadBody {
+struct LmaDownloadBody<R: tokio::io::AsyncRead> {
     #[pin]
-    inner: tokio_util::io::ReaderStream<tokio::fs::File>,
+    inner: tokio_util::io::ReaderStream<R>,
     _cleanup: DownloadCleanup,
 }
 
-impl futures::Stream for LmaDownloadBody {
+impl<R: tokio::io::AsyncRead> futures::Stream for LmaDownloadBody<R> {
     type Item = std::io::Result<bytes::Bytes>;
 
     fn poll_next(
@@ -848,10 +849,11 @@ pub async fn download_model_handler(
     Path((model_name, version)): Path<(String, String)>,
     ApiQuery(query): ApiQuery<DownloadQuery>,
     cx: RequestContext,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref()).await
+    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref(), &headers).await
 }
 
 /// Shared download resolution (HTTP versioned/model-level endpoints + the
@@ -862,6 +864,8 @@ pub async fn download_model_handler(
 pub(crate) struct DownloadSource {
     pub(crate) path: std::path::PathBuf,
     pub(crate) size: u64,
+    /// File mtime (unix secs) — ETag input for If-Range resume validation.
+    pub(crate) mtime_secs: u64,
     /// Content-disposition file name.
     pub(crate) file_name: String,
     pub(crate) content_type: &'static str,
@@ -915,10 +919,11 @@ pub(crate) async fn resolve_download_source(
             return Err(AppError::Validation("path traversal rejected".to_string()));
         }
 
-        let size = tokio::fs::metadata(&canonical_file)
+        let md = tokio::fs::metadata(&canonical_file)
             .await
-            .map_err(AppError::Io)?
-            .len();
+            .map_err(AppError::Io)?;
+        let size = md.len();
+        let mtime_secs = file_mtime_secs(&md);
         let content_type = if file_name.ends_with(".py") || file_name.ends_with(".yaml") || file_name.ends_with(".yml") || file_name.ends_with(".json") || file_name.ends_with(".txt") || file_name.ends_with(".md") {
             "text/plain; charset=utf-8"
         } else {
@@ -927,6 +932,7 @@ pub(crate) async fn resolve_download_source(
         return Ok(DownloadSource {
             path: canonical_file,
             size,
+            mtime_secs,
             file_name: file_name.to_string(),
             content_type,
             audit_detail: format!("file={}", file_name),
@@ -944,13 +950,13 @@ pub(crate) async fn resolve_download_source(
     for dir in [state.repo_path.to_path_buf(), state.repo_path.join(".artifacts")] {
         let candidate = dir.join(&artifact_name);
         if candidate.is_file() {
-            let size = tokio::fs::metadata(&candidate)
+            let md = tokio::fs::metadata(&candidate)
                 .await
-                .map_err(AppError::Io)?
-                .len();
+                .map_err(AppError::Io)?;
             return Ok(DownloadSource {
                 path: candidate,
-                size,
+                size: md.len(),
+                mtime_secs: file_mtime_secs(&md),
                 file_name: artifact_name,
                 content_type: "application/octet-stream",
                 audit_detail: "full (original artifact)".to_string(),
@@ -1002,10 +1008,10 @@ pub(crate) async fn resolve_download_source(
         return Err(AppError::Internal("pack produced no .lma file".to_string()));
     };
 
-    let size = tokio::fs::metadata(&lma_path)
+    let md = tokio::fs::metadata(&lma_path)
         .await
-        .map_err(AppError::Io)?
-        .len();
+        .map_err(AppError::Io)?;
+    let size = md.len();
     let artifact_name = lma_path
         .file_name()
         .unwrap_or_default()
@@ -1015,6 +1021,7 @@ pub(crate) async fn resolve_download_source(
     Ok(DownloadSource {
         path: lma_path,
         size,
+        mtime_secs: file_mtime_secs(&md),
         file_name: artifact_name,
         content_type: "application/octet-stream",
         audit_detail: "full".to_string(),
@@ -1022,15 +1029,57 @@ pub(crate) async fn resolve_download_source(
     })
 }
 
+/// Unix-secs mtime for ETag construction; 0 when the platform can't say
+/// (ETag stays size-only — still collision-safe for swap/repack semantics).
+fn file_mtime_secs(md: &std::fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Shared download core (versioned endpoint + F9's model-level endpoint).
+/// Resumable: advertises Accept-Ranges/ETag on every response, serves a
+/// single byte range as 206, and falls back to the full 200 body when
+/// If-Range names a stale representation (the client restarts from zero).
 async fn download_version_impl(
     state: &AppState,
     cx: &RequestContext,
     model_name: &str,
     version: &str,
     file: Option<&str>,
+    headers: &axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
+    use crate::http::range::{self, ByteRange};
+
     let src = resolve_download_source(state, model_name, version, file).await?;
+    let etag = range::make_etag(src.size, src.mtime_secs);
+
+    let range_header = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    let if_range = headers
+        .get(axum::http::header::IF_RANGE)
+        .and_then(|v| v.to_str().ok());
+    let byte_range = if range::if_range_allows(if_range, &etag) {
+        range::parse_range(range_header, src.size)
+    } else {
+        ByteRange::Full
+    };
+
+    let (status, start, len, audit_suffix) = match byte_range {
+        ByteRange::Full => (axum::http::StatusCode::OK, 0u64, src.size, String::new()),
+        ByteRange::Single { start, end } => (
+            axum::http::StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            format!(" range={}-{}", start, end),
+        ),
+        ByteRange::Unsatisfiable => {
+            return Err(AppError::RangeNotSatisfiable { size: src.size });
+        }
+    };
 
     crate::audit::control_plane(
         Some(cx),
@@ -1039,28 +1088,45 @@ async fn download_version_impl(
         "download",
         model_name,
         Some(version),
-        &src.audit_detail,
+        &format!("{}{}", src.audit_detail, audit_suffix),
     );
 
     // F1: stream the file instead of buffering it whole; Content-Length
     // lets the client see progress/size up front. The pack temp dir (when
     // any) is cleaned when the body stream is dropped.
-    let file = tokio::fs::File::open(&src.path).await.map_err(AppError::Io)?;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(&src.path).await.map_err(AppError::Io)?;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(AppError::Io)?;
+    }
+    let reader = file.take(len);
     let body = match src.cleanup {
         Some(cleanup) => axum::body::Body::from_stream(LmaDownloadBody {
-            inner: tokio_util::io::ReaderStream::new(file),
+            inner: tokio_util::io::ReaderStream::new(reader),
             _cleanup: cleanup,
         }),
-        None => axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        None => axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     };
 
-    Response::builder()
+    let mut builder = Response::builder()
+        .status(status)
         .header(CONTENT_TYPE, src.content_type)
-        .header(CONTENT_LENGTH, src.size.to_string())
+        .header(CONTENT_LENGTH, len.to_string())
         .header(
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", src.file_name),
         )
+        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+        .header(axum::http::header::ETAG, &etag);
+    if let ByteRange::Single { start, end } = byte_range {
+        builder = builder.header(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, src.size),
+        );
+    }
+    builder
         .body(body)
         .map_err(|e| AppError::Internal(format!("build response: {}", e)))
 }
@@ -1079,6 +1145,7 @@ pub async fn download_model_package_handler(
     Path(model_name): Path<String>,
     ApiQuery(query): ApiQuery<ModelDownloadQuery>,
     cx: RequestContext,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let version = match query.version {
@@ -1093,7 +1160,7 @@ pub async fn download_model_package_handler(
             ))
         })?,
     };
-    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref()).await
+    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref(), &headers).await
 }
 
 // ===== List Files =====
@@ -1365,6 +1432,207 @@ mod upload_download_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== Download Range (resumable) Tests =====
+
+    /// Seed a version dir with one known-content file and return the app.
+    async fn range_test_app(tmp: &std::path::Path) -> Router {
+        let model_dir = tmp.join("mymodel").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+        tokio::fs::write(model_dir.join("weights.bin"), b"0123456789abcdef")
+            .await
+            .unwrap();
+        test_router(test_app_state(tmp.to_path_buf()))
+    }
+
+    fn download_req(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_download_full_response_carries_etag_and_accept_ranges() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-hdr-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        let response = app
+            .oneshot(download_req("/v2/repository/models/mymodel/versions/1/download?file=weights.bin"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "all download responses must advertise range support"
+        );
+        let etag = response.headers().get("etag").and_then(|v| v.to_str().ok());
+        assert!(etag.is_some(), "ETag required for If-Range resume validation");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_range_returns_206_with_exact_bytes() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-206-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=4-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 4-9/16")
+        );
+        assert_eq!(
+            response.headers().get("content-length").and_then(|v| v.to_str().ok()),
+            Some("6")
+        );
+        assert_eq!(
+            response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+        assert!(response.headers().get("etag").is_some());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"456789");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_open_and_suffix_ranges() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-open-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        // Open-ended: bytes=8-
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=8-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 8-15/16")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"89abcdef");
+
+        // Suffix: bytes=-4
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 12-15/16")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"cdef");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_unsatisfiable_range_is_416_with_complete_length() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-416-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=16-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes */16"),
+            "416 must carry the complete length so clients can resume correctly"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_download_if_range_matching_etag_resumes_mismatching_restarts() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-ifrange-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        // Discover the ETag from a full response.
+        let response = app
+            .clone()
+            .oneshot(download_req("/v2/repository/models/mymodel/versions/1/download?file=weights.bin"))
+            .await
+            .unwrap();
+        let etag = response
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Matching If-Range → 206.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=8-")
+                    .header("if-range", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+
+        // Stale If-Range → 200 full body (the client restarts from zero).
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=8-")
+                    .header("if-range", "\"stale-tag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a changed representation must restart the download from byte 0"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
@@ -2390,6 +2658,7 @@ mod upload_download_tests {
             Path("mymodel".to_string()),
             ApiQuery(ModelDownloadQuery { file: Some("model.py".to_string()), version: None }),
             crate::http::handlers::admin::audit_tests::test_cx(),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("model-level download must succeed");
@@ -2417,6 +2686,7 @@ mod upload_download_tests {
             Path("mymodel".to_string()),
             ApiQuery(ModelDownloadQuery { file: Some("model.py".to_string()), version: Some("1".to_string()) }),
             crate::http::handlers::admin::audit_tests::test_cx(),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("model-level download must succeed");
@@ -2444,6 +2714,7 @@ mod upload_download_tests {
             Path("mymodel".to_string()),
             ApiQuery(ModelDownloadQuery { file: None, version: None }),
             crate::http::handlers::admin::audit_tests::test_cx(),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect_err("no active version and no ?version= must 404");
@@ -2713,6 +2984,7 @@ mod upload_download_tests {
                     principal: None,
                     api_protocol: None,
                 },
+                axum::http::HeaderMap::new(),
             )
             .await
             .expect("download must succeed");

@@ -2,6 +2,7 @@ pub mod cors;
 pub(crate) mod decompress;
 pub mod handlers;
 pub mod kserve;
+pub mod range;
 pub mod routes;
 pub mod state;
 
