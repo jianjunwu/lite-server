@@ -6,6 +6,7 @@ import { useInstance } from '../context/InstanceContext';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import { downloadModelPackage } from '../api/download';
 import { useTasks } from '../context/TaskContext';
+import { lifecycleKey, useLifecycleOp, type LifecycleAction } from './useLifecycleOp';
 import { formatBytes } from './format';
 import type { VersionInfo } from '../api/types';
 import { MONO_FONT } from '../theme';
@@ -19,6 +20,8 @@ interface VersionActionsProps {
  * Per-version operations, confirmation graded by blast radius:
  * reload/unload → Popconfirm; activate / unload-active → Modal;
  * delete → Modal with type-to-confirm (+ force for the active version).
+ * Lifecycle ops (load/reload/unload/activate) are tracked as tasks until
+ * the registry reaches the target state; delete resolves synchronously.
  */
 export function VersionActions({ model, version }: VersionActionsProps) {
   const { t } = useTranslation();
@@ -26,12 +29,16 @@ export function VersionActions({ model, version }: VersionActionsProps) {
   const { instanceId } = useInstance();
   const queryClient = useQueryClient();
   const { addTask, updateTask } = useTasks();
+  const { runLifecycle, pending } = useLifecycleOp();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [forceDelete, setForceDelete] = useState(false);
   const [busy, setBusy] = useState(false);
 
   if (!instanceId) return null;
+
+  const lifecycleLoading = (action: LifecycleAction) =>
+    pending === lifecycleKey(action, model, version.version);
 
   const run = async (op: () => Promise<unknown>, successKey: string, successValues?: Record<string, string>) => {
     setBusy(true);
@@ -51,7 +58,7 @@ export function VersionActions({ model, version }: VersionActionsProps) {
       title: t('ops.activateTitle'),
       content: t('ops.activateBody', { model, version: version.version }),
       okText: t('ops.activate'),
-      onOk: () => run(() => modelOps.activateVersion(instanceId, model, version.version), 'ops.activated'),
+      onOk: () => runLifecycle('activate', model, version.version),
     });
   };
 
@@ -61,7 +68,7 @@ export function VersionActions({ model, version }: VersionActionsProps) {
       content: t('ops.unloadActiveBody', { model, version: version.version }),
       okText: t('ops.unload'),
       okButtonProps: { danger: true },
-      onOk: () => run(() => modelOps.unloadVersion(instanceId, model, version.version), 'ops.unloaded'),
+      onOk: () => runLifecycle('unload', model, version.version),
     });
   };
 
@@ -111,15 +118,11 @@ export function VersionActions({ model, version }: VersionActionsProps) {
         </Button>
         <Popconfirm
           title={t('ops.loadConfirm', { version: version.version })}
-          onConfirm={() =>
-            run(
-              () => modelOps.loadVersion(instanceId, model, version.version),
-              'ops.loadRequested',
-              { version: version.version },
-            )
-          }
+          onConfirm={() => runLifecycle('load', model, version.version)}
         >
-          <Button type="text" size="small" disabled={busy}>{t('ops.load')}</Button>
+          <Button type="text" size="small" loading={lifecycleLoading('load')} disabled={busy}>
+            {t('ops.load')}
+          </Button>
         </Popconfirm>
         <Button type="text" size="small" danger disabled={busy} onClick={() => setDeleteOpen(true)}>
           {t('ops.delete')}
@@ -155,27 +158,31 @@ export function VersionActions({ model, version }: VersionActionsProps) {
 
       <Popconfirm
         title={t('ops.reloadConfirm', { version: version.version })}
-        onConfirm={() => run(() => modelOps.reloadVersion(instanceId, model, version.version), 'ops.reloaded')}
+        onConfirm={() => runLifecycle('reload', model, version.version)}
       >
-        <Button type="text" size="small" disabled={busy}>{t('ops.reload')}</Button>
+        <Button type="text" size="small" loading={lifecycleLoading('reload')} disabled={busy}>
+          {t('ops.reload')}
+        </Button>
       </Popconfirm>
 
       {!version.active && (
-        <Button type="text" size="small" disabled={busy} onClick={confirmActivate}>
+        <Button type="text" size="small" loading={lifecycleLoading('activate')} disabled={busy} onClick={confirmActivate}>
           {t('ops.activate')}
         </Button>
       )}
 
       {version.active ? (
-        <Button type="text" size="small" disabled={busy} onClick={confirmUnloadActive}>
+        <Button type="text" size="small" loading={lifecycleLoading('unload')} disabled={busy} onClick={confirmUnloadActive}>
           {t('ops.unload')}
         </Button>
       ) : (
         <Popconfirm
           title={t('ops.unloadConfirm', { version: version.version })}
-          onConfirm={() => run(() => modelOps.unloadVersion(instanceId, model, version.version), 'ops.unloaded')}
+          onConfirm={() => runLifecycle('unload', model, version.version)}
         >
-          <Button type="text" size="small" disabled={busy}>{t('ops.unload')}</Button>
+          <Button type="text" size="small" loading={lifecycleLoading('unload')} disabled={busy}>
+            {t('ops.unload')}
+          </Button>
         </Popconfirm>
       )}
 

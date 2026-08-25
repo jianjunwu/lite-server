@@ -15,9 +15,30 @@ const mockMerged: MergedVersionsResult = {
   hasLoaded: false,
 };
 
+const mockModelsList = {
+  data: [
+    {
+      name: 'echo',
+      status: 'ready' as const,
+      versionCount: 1,
+      workers: 1,
+      modelType: 'litapi',
+      repoVersions: ['1'],
+      drifted: false,
+    },
+  ],
+  isLoading: false,
+  repoUnavailable: false,
+};
+const mockHealth: { data: { total_workers: number; workers: never[] } | undefined; isLoading: boolean } = {
+  data: undefined,
+  isLoading: false,
+};
+
 vi.mock('../api/hooks', () => ({
+  useMergedModels: () => mockModelsList,
   useMergedVersions: () => mockMerged,
-  useModelHealth: () => ({ data: undefined, isLoading: false }),
+  useModelHealth: () => mockHealth,
   useTimeline: () => ({ data: undefined, isLoading: false, error: null, refetch: vi.fn() }),
 }));
 
@@ -80,6 +101,7 @@ afterEach(() => {
   mockMerged.isLoading = false;
   mockMerged.inRepo = true;
   mockMerged.hasLoaded = false;
+  mockHealth.data = undefined;
 });
 
 describe('ModelDetailPage unloaded model', () => {
@@ -168,5 +190,50 @@ describe('ModelDetailPage unloaded model', () => {
     );
     fireEvent.click(screen.getByRole('tab', { name: 'Access' }));
     expect(await screen.findByText('u1')).toBeTruthy();
+  });
+
+  it('should_render_a_glyph_labelled_with_the_model_type_in_the_header', () => {
+    mockMerged.versions = [
+      {
+        version: '1',
+        status: 'ready',
+        active: true,
+        weight: 100,
+        workers: { ready: 1, total: 1 },
+        loaded_at: null,
+        loaded: true,
+      },
+    ];
+    mockMerged.activeVersion = '1';
+    mockMerged.hasLoaded = true;
+    renderPage('echo');
+    expect(screen.getByRole('img', { name: /model type: litapi/i })).toBeTruthy();
+  });
+
+  it('should_jump_to_tabs_and_version_detail_from_the_stat_chips', () => {
+    mockMerged.versions = [
+      {
+        version: '1',
+        status: 'ready',
+        active: true,
+        weight: 100,
+        workers: { ready: 1, total: 1 },
+        loaded_at: null,
+        loaded: true,
+      },
+    ];
+    mockMerged.activeVersion = '1';
+    mockMerged.hasLoaded = true;
+    mockHealth.data = { total_workers: 4, workers: [] };
+    renderPage('echo');
+
+    fireEvent.click(screen.getByRole('button', { name: /4 workers/i }));
+    expect(screen.getByRole('tab', { name: 'Workers' }).getAttribute('aria-selected')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', { name: /1\/1 ready/i }));
+    expect(screen.getByRole('tab', { name: 'Versions' }).getAttribute('aria-selected')).toBe('true');
+
+    const activeChip = screen.getByRole('link', { name: /1 · 100%/ });
+    expect(activeChip.getAttribute('href')).toContain('/models/echo/versions/1');
   });
 });

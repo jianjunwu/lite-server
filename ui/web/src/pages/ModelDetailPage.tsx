@@ -1,45 +1,69 @@
-import { Card, Empty, Tabs, Typography, Button, Input, Modal, App, Select } from 'antd';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Card, Empty, Tabs, Typography, Button, Input, Modal, Select } from 'antd';
+import {
+  AimOutlined,
+  ApiOutlined,
+  BranchesOutlined,
+  ClusterOutlined,
+  DiffOutlined,
+  LineChartOutlined,
+  SafetyOutlined,
+  TableOutlined,
+} from '@ant-design/icons';
+import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
 import { apiFetch } from '../api/client';
-import { modelOps, withAdminKeyRetry } from '../api/mutations';
-import { useMergedVersions, useModelHealth, useTimeline } from '../api/hooks';
+import { useMergedModels, useMergedVersions, useModelHealth, useTimeline } from '../api/hooks';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { ModelAccessPanel } from '../components/ModelAccessPanel';
+import { ModelGlyph } from '../components/ModelGlyph';
 import { StatusBadge, statusKind } from '../components/StatusBadge';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
 import { TrafficRiver } from '../components/TrafficRiver';
 import { RoutingEditor } from '../components/RoutingEditor';
+import { useLifecycleOp } from '../components/useLifecycleOp';
 import { buildTimelineOption } from '../components/timelineChart';
 import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
 import { SPACE } from '../tokens';
 
+/** Small inline icon for tab labels — aria-hidden so the tab's accessible
+ * name stays pure text. */
+function tabLabel(icon: React.ReactNode, text: string) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      {icon}
+      {text}
+    </span>
+  );
+}
+
 export function ModelDetailPage() {
   const { t } = useTranslation();
-  const { message } = App.useApp();
   const { name = '' } = useParams();
   const navigate = useNavigate();
   const { instanceId } = useInstance();
   const ilink = useInstanceLink();
   const can = useCanInstance();
-  const queryClient = useQueryClient();
   const [editingRouting, setEditingRouting] = useState(false);
   const [loadOpen, setLoadOpen] = useState(false);
   const [loadVersion, setLoadVersion] = useState('');
+  const [tab, setTab] = useState('versions');
+  const { runLifecycle } = useLifecycleOp();
 
   const chartColors = useChartColors();
   const neutrals = useNeutrals();
   const merged = useMergedVersions(instanceId, name);
+  const modelsList = useMergedModels(instanceId);
+  const modelType = modelsList.data.find((m) => m.name === name)?.modelType ?? 'unknown';
   const versions = merged.versions;
   const unloadedVersions = versions.filter((v) => !v.loaded).map((v) => v.version);
   const healthQuery = useModelHealth(instanceId, name, undefined, merged.hasLoaded);
@@ -54,16 +78,10 @@ export function ModelDetailPage() {
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
 
   const submitLoad = async () => {
-    if (!instanceId || !loadVersion.trim()) return;
-    try {
-      await withAdminKeyRetry(instanceId, () => modelOps.loadVersion(instanceId, name, loadVersion.trim()));
-      message.success(t('ops.loadRequested', { version: loadVersion.trim() }));
-      await queryClient.invalidateQueries({ queryKey: [instanceId] });
-      setLoadOpen(false);
-      setLoadVersion('');
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : String(err));
-    }
+    if (!loadVersion.trim()) return;
+    await runLifecycle('load', name, loadVersion.trim());
+    setLoadOpen(false);
+    setLoadVersion('');
   };
 
   // Neither in the repository nor in the registry — a genuinely unknown model.
@@ -87,6 +105,7 @@ export function ModelDetailPage() {
   const loadedVersions = versions.filter((v) => v.loaded);
   const readyCount = loadedVersions.filter((v) => statusKind(v.status) === 'ready').length;
   const workerTotal = healthQuery.data?.total_workers;
+  const activeWeight = versions.find((v) => v.version === merged.activeVersion)?.weight ?? 0;
   // Hero-layer statement under the title (plan §4.3).
   const statement = !merged.hasLoaded
     ? instanceId
@@ -105,18 +124,21 @@ export function ModelDetailPage() {
         breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
         onBack={() => navigate(ilink('/models'))}
         title={
-          <span>
-            {name}
-            {merged.activeVersion && (
-              <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: neutrals.textSecondary, marginLeft: 12 }}>
-                ● {merged.activeVersion}
-              </span>
-            )}
-            {!merged.hasLoaded && !merged.isLoading && (
-              <span style={{ marginLeft: 12 }}>
-                <StatusBadge status="unloaded" text={t('models.unloaded')} />
-              </span>
-            )}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[3] }}>
+            <ModelGlyph name={name} type={modelType} size={SPACE[7]} />
+            <span>
+              {name}
+              {merged.activeVersion && (
+                <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: neutrals.textSecondary, marginLeft: 12 }}>
+                  ● {merged.activeVersion}
+                </span>
+              )}
+              {!merged.hasLoaded && !merged.isLoading && (
+                <span style={{ marginLeft: 12 }}>
+                  <StatusBadge status="unloaded" text={t('models.unloaded')} />
+                </span>
+              )}
+            </span>
           </span>
         }
         subtitle={statement}
@@ -129,9 +151,51 @@ export function ModelDetailPage() {
         }
       />
 
+      {versions.length > 0 && (
+        <div style={{ display: 'flex', gap: SPACE[2], flexWrap: 'wrap' }}>
+          <button type="button" className="chip" onClick={() => setTab('versions')}>
+            <BranchesOutlined aria-hidden />
+            <span style={dataTextStyle}>
+              {readyCount}/{loadedVersions.length}
+            </span>
+            {t('models.chipReady')}
+          </button>
+          {merged.hasLoaded && (
+            <button type="button" className="chip" onClick={() => setTab('workers')}>
+              <ApiOutlined aria-hidden />
+              <span style={dataTextStyle}>{workerTotal ?? '-'}</span>
+              {t('models.workerLabel', { count: workerTotal ?? 0 })}
+            </button>
+          )}
+          {merged.activeVersion && (
+            <Link
+              className="chip"
+              to={ilink(`/models/${encodeURIComponent(name)}/versions/${encodeURIComponent(merged.activeVersion)}`)}
+            >
+              <AimOutlined aria-hidden />
+              <span style={dataTextStyle}>
+                {merged.activeVersion} · {activeWeight}%
+              </span>
+            </Link>
+          )}
+        </div>
+      )}
+
       {merged.hasLoaded && (
         <Reveal order={1}>
           <Card>
+            <div
+              style={{
+                fontSize: TYPE.eyebrow,
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                letterSpacing: '0.08em',
+                color: neutrals.textSecondary,
+                marginBottom: SPACE[3],
+              }}
+            >
+              {t('models.traffic')}
+            </div>
             <TrafficRiver
               versions={loadedVersions}
               height={16}
@@ -146,10 +210,12 @@ export function ModelDetailPage() {
       )}
 
       <Tabs
+        activeKey={tab}
+        onChange={setTab}
         items={[
           {
             key: 'versions',
-            label: t('models.tabs.versions'),
+            label: tabLabel(<TableOutlined aria-hidden />, t('models.tabs.versions')),
             children: (
               <Card
                 size="small"
@@ -170,7 +236,7 @@ export function ModelDetailPage() {
           },
           {
             key: 'workers',
-            label: t('models.tabs.workers'),
+            label: tabLabel(<ClusterOutlined aria-hidden />, t('models.tabs.workers')),
             children: (
               <Card size="small" loading={merged.hasLoaded && healthQuery.isLoading}>
                 {merged.hasLoaded ? (
@@ -183,7 +249,7 @@ export function ModelDetailPage() {
           },
           {
             key: 'metrics',
-            label: t('models.tabs.metrics'),
+            label: tabLabel(<LineChartOutlined aria-hidden />, t('models.tabs.metrics')),
             children: merged.hasLoaded ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                 <ChartCard
@@ -210,7 +276,7 @@ export function ModelDetailPage() {
           },
           {
             key: 'compare',
-            label: t('models.tabs.compare'),
+            label: tabLabel(<DiffOutlined aria-hidden />, t('models.tabs.compare')),
             children: (
               <Card size="small" loading={merged.hasLoaded && compareQuery.isLoading}>
                 {!merged.hasLoaded ? (
@@ -230,7 +296,7 @@ export function ModelDetailPage() {
             ? [
                 {
                   key: 'access',
-                  label: t('models.tabs.access'),
+                  label: tabLabel(<SafetyOutlined aria-hidden />, t('models.tabs.access')),
                   children: (
                     <Card size="small">
                       <ModelAccessPanel instanceId={instanceId} model={name} />

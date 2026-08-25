@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App as AntdApp } from 'antd';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import '../i18n';
 import { ModelsPage } from '../pages/ModelsPage';
@@ -44,6 +44,12 @@ vi.mock('../context/useEffectiveRole', () => ({
   useEffectiveRole: () => (mockCanInstance ? 'operator' : 'viewer'),
 }));
 
+const runLifecycle = vi.fn();
+vi.mock('../components/useLifecycleOp', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useLifecycleOp: () => ({ runLifecycle, pending: null }),
+}));
+
 vi.mock('../context/TaskContext', () => ({
   useTasks: () => ({ addTask: () => 'task-1', updateTask: vi.fn() }),
 }));
@@ -82,6 +88,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   mockList.data = [];
   mockCanInstance = true;
+  runLifecycle.mockClear();
   for (const k of Object.keys(mockVersions)) delete mockVersions[k];
 });
 
@@ -173,7 +180,7 @@ describe('ModelsPage repository view', () => {
     expect((init as RequestInit).method).toBe('DELETE');
   });
 
-  it('should_show_repo_versions_with_load_action_in_the_model_card', async () => {
+  it('should_collapse_the_versions_table_until_the_disclosure_is_opened', async () => {
     mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
     mockVersions['ghost'] = {
       versions: [
@@ -193,10 +200,82 @@ describe('ModelsPage repository view', () => {
       hasLoaded: false,
     };
     renderPage();
-    // Card view: the versions table is inside the card, no expand step.
+    // Collapsed by default: the card stays a summary until asked.
+    expect(screen.queryByRole('link', { name: '1' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /show versions/i }));
+    // Expanded in place: repo versions with per-version Load actions.
     expect(await screen.findByRole('link', { name: '1' })).toBeTruthy();
-    expect((await screen.findAllByText('Unloaded')).length).toBeGreaterThan(0);
-    // Per-version Load action from VersionActions.
     expect((await screen.findAllByRole('button', { name: 'Load' })).length).toBeGreaterThan(0);
+  });
+
+  it('should_render_a_glyph_labelled_with_the_model_type', () => {
+    mockList.data = [model({ name: 'echo', modelType: 'litapi' })];
+    renderPage();
+    expect(screen.getByRole('img', { name: /model type: litapi/i })).toBeTruthy();
+  });
+
+  it('should_copy_the_model_name_from_the_card_action', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    mockList.data = [model({ name: 'echo' })];
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: /copy model name/i }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('echo'));
+  });
+
+  it('should_navigate_to_the_detail_page_when_clicking_the_card_body', () => {
+    mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={['/models?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <AntdApp>
+            <Routes>
+              <Route path="/models" element={<ModelsPage />} />
+              <Route path="/models/:name" element={<div>detail probe</div>} />
+            </Routes>
+          </AntdApp>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    // The statement is plain card body — clicking it opens the detail page.
+    fireEvent.click(screen.getByText('No versions loaded'));
+    expect(screen.getByText('detail probe')).toBeTruthy();
+  });
+
+  it('should_pluralize_the_stat_rail_labels', () => {
+    mockList.data = [model({ name: 'echo' }), model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    mockVersions['echo'] = {
+      versions: [
+        {
+          version: '1',
+          status: 'ready',
+          active: true,
+          weight: 100,
+          workers: { ready: 1, total: 1 },
+          loaded_at: null,
+          loaded: true,
+        },
+      ],
+      activeVersion: '1',
+      isLoading: false,
+      inRepo: true,
+      hasLoaded: true,
+    };
+    renderPage();
+    // Singular: one version, one worker (label is the rail's own text node).
+    expect(screen.getByText('version')).toBeTruthy();
+    expect(screen.getByText('worker')).toBeTruthy();
+    // Zero: still plural.
+    expect(screen.getByText('versions')).toBeTruthy();
+    expect(screen.getByText('workers')).toBeTruthy();
+  });
+
+  it('should_track_the_card_load_action_through_the_lifecycle_watcher', async () => {
+    mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Load' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
+    await waitFor(() => expect(runLifecycle).toHaveBeenCalledWith('load', 'ghost', '1'));
   });
 });

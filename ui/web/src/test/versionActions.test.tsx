@@ -19,6 +19,12 @@ vi.mock('../context/TaskContext', () => ({
   useTasks: () => ({ addTask: () => 'task-1', updateTask }),
 }));
 
+const runLifecycle = vi.fn();
+vi.mock('../components/useLifecycleOp', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useLifecycleOp: () => ({ runLifecycle, pending: null }),
+}));
+
 const version: VersionInfo = {
   version: '1',
   status: 'ready',
@@ -42,6 +48,7 @@ function renderActions(v: VersionInfo = version) {
 beforeEach(() => {
   vi.mocked(downloadModelPackage).mockReset();
   updateTask.mockClear();
+  runLifecycle.mockClear();
 });
 
 describe('VersionActions download task', () => {
@@ -106,5 +113,19 @@ describe('VersionActions unloaded version', () => {
     renderActions(version);
     expect(screen.getByRole('button', { name: 'Unload' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Load' })).toBeNull();
+  });
+
+  it('should_track_load_through_the_lifecycle_watcher', async () => {
+    renderActions(unloaded);
+    fireEvent.click(screen.getByRole('button', { name: 'Load' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
+    await waitFor(() => expect(runLifecycle).toHaveBeenCalledWith('load', 'm', '2'));
+  });
+
+  it('should_track_unload_through_the_lifecycle_watcher', async () => {
+    renderActions(version);
+    fireEvent.click(screen.getByRole('button', { name: 'Unload' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
+    await waitFor(() => expect(runLifecycle).toHaveBeenCalledWith('unload', 'm', '1'));
   });
 });

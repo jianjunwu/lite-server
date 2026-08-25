@@ -124,6 +124,7 @@ export function TrafficRiver({ versions, height = 12, onSelect, model, editable 
           {versions.map((v, idx) => (
             <Tooltip key={v.version} title={`${v.version} — ${weights[idx]}%${v.active ? ' (active)' : ''}`}>
               <div
+                className="river-seg"
                 onClick={onSelect ? () => onSelect(v.version) : undefined}
                 style={{
                   width: `${(weights[idx] / total) * 100}%`,

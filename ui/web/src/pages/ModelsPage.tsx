@@ -1,6 +1,15 @@
 import { useMemo, useState } from 'react';
 import { Button, Card, Checkbox, Dropdown, Empty, Input, Modal, Popconfirm, Segmented, Tooltip, Typography } from 'antd';
-import { MoreOutlined, UploadOutlined, WarningOutlined } from '@ant-design/icons';
+import {
+  AimOutlined,
+  ApiOutlined,
+  BranchesOutlined,
+  CopyOutlined,
+  DownOutlined,
+  MoreOutlined,
+  UploadOutlined,
+  WarningOutlined,
+} from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
@@ -17,22 +26,25 @@ import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
 import { TrafficRiver } from '../components/TrafficRiver';
 import { UploadDrawer } from '../components/UploadDrawer';
-import { STATUS_COLORS, TYPE, MONO_FONT } from '../theme';
+import { ModelGlyph } from '../components/ModelGlyph';
+import { lifecycleKey, useLifecycleOp } from '../components/useLifecycleOp';
+import { dataTextStyle, MONO_FONT, STATUS_COLORS, TYPE } from '../theme';
 import { SPACE } from '../tokens';
 import { useNeutrals } from '../context/ThemeModeContext';
 
 const STATUS_FILTERS: MergedModelStatus[] = ['ready', 'loading', 'degraded', 'unloaded'];
 
+/** Content column offset: glyph (SPACE[6]) + header gap (SPACE[3]). */
+const GLYPH_OFFSET = SPACE[6] + SPACE[3];
+
 /** Row-level action for an unloaded model: single repo version loads inline,
- * multi-version models jump to the detail page for version choice. */
+ * multi-version models jump to the detail page for version choice. The load
+ * itself is tracked as a task until the version reports ready. */
 function LoadAction({ model }: { model: MergedModel }) {
   const { t } = useTranslation();
-  const { message } = App.useApp();
-  const { instanceId } = useInstance();
   const navigate = useNavigate();
   const ilink = useInstanceLink();
-  const queryClient = useQueryClient();
-  const [busy, setBusy] = useState(false);
+  const { runLifecycle, pending } = useLifecycleOp();
 
   if (model.repoVersions.length !== 1) {
     return (
@@ -43,23 +55,8 @@ function LoadAction({ model }: { model: MergedModel }) {
   }
   const version = model.repoVersions[0];
   return (
-    <Popconfirm
-      title={t('ops.loadConfirm', { version })}
-      onConfirm={async () => {
-        if (!instanceId) return;
-        setBusy(true);
-        try {
-          await withAdminKeyRetry(instanceId, () => modelOps.loadVersion(instanceId, model.name, version));
-          message.success(t('ops.loadRequested', { version }));
-          await queryClient.invalidateQueries({ queryKey: [instanceId] });
-        } catch (err) {
-          message.error(err instanceof Error ? err.message : String(err));
-        } finally {
-          setBusy(false);
-        }
-      }}
-    >
-      <Button type="text" size="small" loading={busy}>
+    <Popconfirm title={t('ops.loadConfirm', { version })} onConfirm={() => runLifecycle('load', model.name, version)}>
+      <Button type="text" size="small" loading={pending === lifecycleKey('load', model.name, version)}>
         {t('ops.load')}
       </Button>
     </Popconfirm>
@@ -134,37 +131,63 @@ function DeleteModelAction({ model }: { model: MergedModel }) {
 }
 
 /**
- * One model = one card (plan §4.2): name + status statement, the traffic
- * river full-width as the card's main visual, versions table beneath.
+ * One model = one card: glyph faceplate + name + status statement, the
+ * traffic river as the card's main visual, a stat rail, and the versions
+ * table behind a disclosure so the list stays scannable. The whole card
+ * navigates to the detail page; nested controls keep their own behavior.
  */
 function ModelCard({ model, order }: { model: MergedModel; order: number }) {
   const { t } = useTranslation();
+  const { message } = App.useApp();
   const { instanceId } = useInstance();
   const can = useCanInstance();
   const ilink = useInstanceLink();
   const navigate = useNavigate();
   const neutrals = useNeutrals();
   const merged = useMergedVersions(instanceId, model.name);
+  const [expanded, setExpanded] = useState(false);
 
   const loaded = merged.versions.filter((v) => v.loaded);
   const active = loaded.find((v) => v.active);
+  const workersReady = loaded.reduce((sum, v) => sum + v.workers.ready, 0);
+  const workersTotal = loaded.reduce((sum, v) => sum + v.workers.total, 0);
   const statement = !merged.hasLoaded
     ? t('models.stmtUnloaded')
     : active
       ? t('models.stmtServing', { version: active.version, weight: active.weight })
       : t('models.stmtNoActive');
 
+  const detailUrl = ilink(`/models/${encodeURIComponent(model.name)}`);
+  const onCardClick = (e: React.MouseEvent) => {
+    const el = e.target as HTMLElement;
+    if (el.closest('a, button, input, [role="slider"], .no-card-nav')) return;
+    navigate(detailUrl);
+  };
+
+  const copyName = async () => {
+    await navigator.clipboard.writeText(model.name);
+    message.success(t('models.copied'));
+  };
+
   return (
     <Reveal order={order}>
-      <Card className="lift" style={{ marginBottom: SPACE[5] }}>
+      <Card className="lift model-card" style={{ marginBottom: SPACE[5], cursor: 'pointer' }} onClick={onCardClick}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: SPACE[3] }}>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[2], minWidth: 0 }}>
-            <Link
-              to={ilink(`/models/${encodeURIComponent(model.name)}`)}
-              style={{ fontSize: TYPE.cardTitle, fontWeight: 600, letterSpacing: '-0.01em' }}
-            >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[3], minWidth: 0 }}>
+            <ModelGlyph name={model.name} type={model.modelType} />
+            <Link to={detailUrl} style={{ fontSize: TYPE.cardTitle, fontWeight: 600, letterSpacing: '-0.01em' }}>
               {model.name}
             </Link>
+            <Tooltip title={t('models.copyName')}>
+              <Button
+                type="text"
+                size="small"
+                className="hover-only"
+                icon={<CopyOutlined aria-hidden />}
+                aria-label={t('models.copyName')}
+                onClick={copyName}
+              />
+            </Tooltip>
             {model.drifted && (
               <Tooltip title={t('models.drifted')}>
                 <WarningOutlined aria-label="drift warning" style={{ color: STATUS_COLORS.warning }} />
@@ -182,10 +205,12 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
           </span>
         </div>
 
-        <div style={{ fontSize: TYPE.lead, color: neutrals.textSecondary, marginTop: SPACE[1] }}>{statement}</div>
+        <div style={{ fontSize: TYPE.lead, color: neutrals.textSecondary, marginTop: SPACE[1], marginLeft: GLYPH_OFFSET }}>
+          {statement}
+        </div>
 
         {loaded.length > 0 && (
-          <div style={{ marginTop: SPACE[4] }}>
+          <div className="no-card-nav" style={{ marginTop: SPACE[4], marginLeft: GLYPH_OFFSET }}>
             <TrafficRiver
               versions={loaded}
               height={16}
@@ -196,14 +221,66 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
           </div>
         )}
 
-        <div style={{ marginTop: SPACE[4], borderTop: `1px solid ${neutrals.border}`, paddingTop: SPACE[3] }}>
-          <VersionsTable
-            model={model.name}
-            versions={merged.versions}
-            loading={merged.isLoading}
-            ops={can('operator')}
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: SPACE[3],
+            marginTop: SPACE[4],
+            borderTop: `1px solid ${neutrals.border}`,
+            paddingTop: SPACE[3],
+          }}
+        >
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: SPACE[5],
+              flexWrap: 'wrap',
+              fontSize: TYPE.secondary,
+              color: neutrals.textSecondary,
+            }}
+          >
+            <span>
+              <BranchesOutlined aria-hidden style={{ marginRight: SPACE[1] }} />
+              <span style={dataTextStyle}>{merged.versions.length}</span>{' '}
+              {t('models.versionLabel', { count: merged.versions.length })}
+            </span>
+            <span>
+              <ApiOutlined aria-hidden style={{ marginRight: SPACE[1] }} />
+              <span style={dataTextStyle}>
+                {workersReady}/{workersTotal}
+              </span>{' '}
+              {t('models.workerLabel', { count: workersTotal })}
+            </span>
+            {active && (
+              <span>
+                <AimOutlined aria-hidden style={{ marginRight: SPACE[1] }} />
+                <span style={dataTextStyle}>{active.version}</span> {t('common.active')}
+              </span>
+            )}
+          </span>
+          <Button
+            type="text"
+            size="small"
+            aria-expanded={expanded}
+            aria-label={t('models.expandVersions')}
+            icon={<DownOutlined aria-hidden className={expanded ? 'chevron open' : 'chevron'} />}
+            onClick={() => setExpanded((v) => !v)}
           />
         </div>
+
+        {expanded && (
+          <div className="expand-in no-card-nav" style={{ marginTop: SPACE[3] }}>
+            <VersionsTable
+              model={model.name}
+              versions={merged.versions}
+              loading={merged.isLoading}
+              ops={can('operator')}
+            />
+          </div>
+        )}
       </Card>
     </Reveal>
   );

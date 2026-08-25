@@ -104,14 +104,115 @@ body {
   box-shadow: var(--shadow-hover);
 }
 
+/* Model glyph plate (ModelGlyph): the card's faceplate. Scales a touch when
+ * its card is hovered — the one decorative motion in the system. */
+.glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+  transition: transform var(--duration-interact) var(--ease-out);
+}
+
+.model-card:hover .glyph {
+  transform: scale(1.06);
+}
+
+/* Utility actions revealed on card hover; keyboard focus reveals them too. */
+.model-card .hover-only {
+  opacity: 0;
+  transition: opacity var(--duration-interact) var(--ease-out);
+}
+
+.model-card:hover .hover-only,
+.model-card .hover-only:focus-visible {
+  opacity: 1;
+}
+
+/* Traffic river segment feedback — brighten on hover regardless of the
+ * inline active/inactive opacity. */
+.river-seg {
+  transition: filter var(--duration-interact) var(--ease-out);
+}
+
+.river-seg:hover {
+  filter: brightness(1.2);
+}
+
+/* Disclosure expand: content fades/slides in on mount (the block is only
+ * rendered while open). */
+@keyframes expand-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.expand-in {
+  animation: expand-in var(--duration-interact) var(--ease-out) both;
+}
+
+/* Disclosure chevron rotation. */
+.chevron {
+  transition: transform var(--duration-interact) var(--ease-out);
+}
+
+.chevron.open {
+  transform: rotate(180deg);
+}
+
+/* Stat chip (model detail header): quiet pill that reads as data and acts
+ * as navigation. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  color: var(--ink-secondary);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 20px;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    color var(--duration-interact) var(--ease-out),
+    border-color var(--duration-interact) var(--ease-out);
+}
+
+.chip:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .reveal {
+  .reveal,
+  .expand-in {
     animation: none;
   }
 
   .lift,
   .lift:hover {
     transition: none;
+    transform: none;
+  }
+
+  .glyph,
+  .river-seg,
+  .chevron,
+  .chip,
+  .model-card .hover-only {
+    transition: none;
+  }
+
+  .model-card:hover .glyph {
     transform: none;
   }
 }
