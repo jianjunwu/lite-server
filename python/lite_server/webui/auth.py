@@ -821,7 +821,8 @@ def create_router(store: UserStore) -> APIRouter:
     @router.post("/api/auth/register")
     async def register(request: Request):
         try:
-            user = store.register(await _json_body(request))
+            # bcrypt at cost 12 blocks the event loop for ~250ms (see login).
+            user = await anyio.to_thread.run_sync(store.register, await _json_body(request))
         except AuthError as e:
             return _error(e)
         ip = _client_ip(request)
@@ -860,7 +861,7 @@ def create_router(store: UserStore) -> APIRouter:
         if new_password == current_password:
             return JSONResponse({"error": "password_reused"}, status_code=400)
         try:
-            store.set_password(payload["username"], new_password)
+            await anyio.to_thread.run_sync(store.set_password, payload["username"], new_password)
         except AuthError as e:
             return _error(e)
         # A password change kicks every other session; the current one stays.
@@ -890,7 +891,7 @@ def create_router(store: UserStore) -> APIRouter:
     @router.post("/api/users")
     async def create_user(request: Request):
         try:
-            user = store.create(await _json_body(request))
+            user = await anyio.to_thread.run_sync(store.create, await _json_body(request))
         except AuthError as e:
             return _error(e)
         store.record_audit("user_created", actor=request.state.user["username"],
@@ -901,7 +902,8 @@ def create_router(store: UserStore) -> APIRouter:
     @router.put("/api/users/{name}")
     async def update_user(name: str, request: Request):
         try:
-            user = store.update(name, await _json_body(request), request.state.user["username"])
+            user = await anyio.to_thread.run_sync(
+                store.update, name, await _json_body(request), request.state.user["username"])
         except AuthError as e:
             return _error(e)
         store.record_audit("user_updated", actor=request.state.user["username"],
