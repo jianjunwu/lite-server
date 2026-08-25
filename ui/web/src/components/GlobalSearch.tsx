@@ -6,7 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api/client';
 import { useInstances } from '../api/hooks';
-import type { ModelList } from '../api/types';
+import type { ModelList, RepoIndexResponse } from '../api/types';
 import { useNeutrals } from '../context/ThemeModeContext';
 import { TYPE } from '../theme';
 
@@ -26,11 +26,21 @@ export function GlobalSearch() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
 
-  // Fetch model lists lazily — only while the search box is active.
+  // Fetch model lists lazily — only while the search box is active. The repo
+  // index complements the loaded-only list so unloaded models stay findable.
   const modelQueries = useQueries({
     queries: instances.map((i) => ({
       queryKey: [i.id, 'models'],
       queryFn: () => apiFetch<ModelList>(i.id, '/v2/models'),
+      enabled: open,
+      staleTime: 15_000,
+      retry: 0,
+    })),
+  });
+  const repoQueries = useQueries({
+    queries: instances.map((i) => ({
+      queryKey: [i.id, 'repo-index'],
+      queryFn: () => apiFetch<RepoIndexResponse>(i.id, '/v2/repository/index', { method: 'POST' }),
       enabled: open,
       staleTime: 15_000,
       retry: 0,
@@ -41,17 +51,18 @@ export function GlobalSearch() {
     const q = query.trim().toLowerCase();
     const all: SearchHit[] = [];
     instances.forEach((inst, idx) => {
-      const models = modelQueries[idx]?.data?.models ?? [];
       const seen = new Set<string>();
-      for (const m of models) {
-        if (seen.has(m.name)) continue;
-        seen.add(m.name);
-        if (q && !m.name.toLowerCase().includes(q)) continue;
-        all.push({ instanceId: inst.id, instanceName: inst.name, model: m.name });
-      }
+      const push = (name: string) => {
+        if (seen.has(name)) return;
+        seen.add(name);
+        if (q && !name.toLowerCase().includes(q)) return;
+        all.push({ instanceId: inst.id, instanceName: inst.name, model: name });
+      };
+      for (const m of modelQueries[idx]?.data?.models ?? []) push(m.name);
+      for (const e of repoQueries[idx]?.data?.models ?? []) push(e.name);
     });
     return all.slice(0, 20);
-  }, [instances, modelQueries, query]);
+  }, [instances, modelQueries, repoQueries, query]);
 
   return (
     <AutoComplete

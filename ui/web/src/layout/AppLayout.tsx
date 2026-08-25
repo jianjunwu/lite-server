@@ -13,6 +13,7 @@ import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstances, useHealthSummary } from '../api/hooks';
 import { useInstance } from '../context/InstanceContext';
+import { useInstanceLink } from '../context/useInstanceLink';
 import { setLanguage } from '../i18n';
 import i18n from '../i18n';
 import { StatusDot, statusKind } from '../components/StatusBadge';
@@ -31,6 +32,7 @@ export function AppLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const { instanceId, setInstanceId } = useInstance();
+  const ilink = useInstanceLink();
   const { dark, toggle } = useThemeMode();
   const neutrals = useNeutrals();
   const instancesQuery = useInstances();
@@ -52,18 +54,18 @@ export function AppLayout() {
       type: 'group' as const,
       label: t('nav.groupMonitor'),
       children: [
-        { key: '/overview', icon: <DashboardOutlined />, label: <Link to="/overview">{t('nav.overview')}</Link> },
-        { key: '/models', icon: <AppstoreOutlined />, label: <Link to="/models">{t('nav.models')}</Link> },
-        { key: '/metrics', icon: <LineChartOutlined />, label: <Link to="/metrics">{t('nav.metrics')}</Link> },
-        { key: '/alerts', icon: <AlertOutlined />, label: <Link to="/alerts">{t('nav.alerts')}</Link> },
+        { key: '/overview', icon: <DashboardOutlined />, label: <Link to={ilink('/overview')}>{t('nav.overview')}</Link> },
+        { key: '/models', icon: <AppstoreOutlined />, label: <Link to={ilink('/models')}>{t('nav.models')}</Link> },
+        { key: '/metrics', icon: <LineChartOutlined />, label: <Link to={ilink('/metrics')}>{t('nav.metrics')}</Link> },
+        { key: '/alerts', icon: <AlertOutlined />, label: <Link to={ilink('/alerts')}>{t('nav.alerts')}</Link> },
       ],
     },
     {
       type: 'group' as const,
       label: t('nav.groupTools'),
       children: [
-        { key: '/playground', icon: <CodeOutlined />, label: <Link to="/playground">{t('nav.playground')}</Link> },
-        { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">{t('nav.settings')}</Link> },
+        { key: '/playground', icon: <CodeOutlined />, label: <Link to={ilink('/playground')}>{t('nav.playground')}</Link> },
+        { key: '/settings', icon: <SettingOutlined />, label: <Link to={ilink('/settings')}>{t('nav.settings')}</Link> },
       ],
     },
   ];
@@ -116,7 +118,7 @@ export function AppLayout() {
                     size="small"
                     icon={<SettingOutlined />}
                     style={{ width: '100%', textAlign: 'left' }}
-                    onClick={() => navigate('/settings?tab=instances')}
+                    onClick={() => navigate(ilink('/settings?tab=instances'))}
                   >
                     {t('settings.instances.manage')}
                   </Button>

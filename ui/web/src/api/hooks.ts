@@ -1,5 +1,7 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { apiFetch, bffFetch } from './client';
+import { ApiError, apiFetch, bffFetch } from './client';
+import { mergeModelList, mergeVersionList, type MergedModel, type MergedVersions } from './merge';
 import type {
   AlertsResponse,
   HealthSummary,
@@ -7,6 +9,7 @@ import type {
   ModelHealth,
   ModelList,
   ReadyResponse,
+  RepoIndexResponse,
   ServerInfo,
   TimelineAllResponse,
   TimelineSnapshot,
@@ -52,33 +55,103 @@ export function useModels(instanceId: string | null) {
 export function useVersions(instanceId: string | null, model: string) {
   return useQuery({
     queryKey: [instanceId, 'versions', model],
-    queryFn: () => apiFetch<VersionsResponse>(instanceId!, `/v2/models/${encodeURIComponent(model)}/versions`),
+    queryFn: async (): Promise<VersionsResponse | null> => {
+      try {
+        return await apiFetch<VersionsResponse>(instanceId!, `/v2/models/${encodeURIComponent(model)}/versions`);
+      } catch (err) {
+        // Nothing loaded 404s here — that is a state (unloaded), not an error.
+        if (err instanceof ApiError && err.status === 404) return null;
+        throw err;
+      }
+    },
     // An empty model would poll /v2/models//versions (404) forever.
     enabled: instanceId !== null && model !== '',
     refetchInterval: 10_000,
   });
 }
 
-export function useModelReady(instanceId: string | null, model: string, version?: string) {
+/** On-disk repository scan (POST is the KServe shape; the call is read-only). */
+export function useRepoIndex(instanceId: string | null) {
+  return useQuery({
+    queryKey: [instanceId, 'repo-index'],
+    queryFn: () => apiFetch<RepoIndexResponse>(instanceId!, '/v2/repository/index', { method: 'POST' }),
+    enabled: instanceId !== null,
+    refetchInterval: 10_000,
+    retry: 1,
+  });
+}
+
+export interface MergedModelsResult {
+  data: MergedModel[];
+  isLoading: boolean;
+  /** True on older servers without /v2/repository/index — the list then
+   * degrades to the loaded-only view. */
+  repoUnavailable: boolean;
+}
+
+/** Models page data: every model in the repository plus runtime state. */
+export function useMergedModels(instanceId: string | null): MergedModelsResult {
+  const repoQuery = useRepoIndex(instanceId);
+  const modelsQuery = useModels(instanceId);
+  const data = useMemo(
+    () => mergeModelList(repoQuery.data?.models, modelsQuery.data?.models),
+    [repoQuery.data, modelsQuery.data],
+  );
+  return {
+    data,
+    isLoading: modelsQuery.isLoading || repoQuery.isLoading,
+    repoUnavailable: repoQuery.isError,
+  };
+}
+
+export interface MergedVersionsResult extends MergedVersions {
+  isLoading: boolean;
+  /** The model exists in the on-disk repository. */
+  inRepo: boolean;
+  /** At least one version is currently loaded. */
+  hasLoaded: boolean;
+}
+
+/** One model's versions: registry state overlaid on the repository scan. */
+export function useMergedVersions(instanceId: string | null, model: string): MergedVersionsResult {
+  const repoQuery = useRepoIndex(instanceId);
+  const versionsQuery = useVersions(instanceId, model);
+  const merged = useMemo(
+    () =>
+      mergeVersionList(
+        (repoQuery.data?.models ?? []).filter((e) => e.name === model),
+        versionsQuery.data ?? null,
+      ),
+    [repoQuery.data, versionsQuery.data, model],
+  );
+  return {
+    ...merged,
+    isLoading: versionsQuery.isLoading || repoQuery.isLoading,
+    inRepo: (repoQuery.data?.models ?? []).some((e) => e.name === model),
+    hasLoaded: merged.versions.some((v) => v.loaded),
+  };
+}
+
+export function useModelReady(instanceId: string | null, model: string, version?: string, active = true) {
   const path = version
     ? `/v2/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version)}/ready`
     : `/v2/models/${encodeURIComponent(model)}/ready`;
   return useQuery({
     queryKey: [instanceId, 'ready', model, version ?? null],
     queryFn: () => apiFetch<ReadyResponse>(instanceId!, path),
-    enabled: instanceId !== null,
+    enabled: instanceId !== null && active,
     refetchInterval: 10_000,
   });
 }
 
-export function useModelHealth(instanceId: string | null, model: string, version?: string) {
+export function useModelHealth(instanceId: string | null, model: string, version?: string, active = true) {
   const path = version
     ? `/v2/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version)}/health`
     : `/v2/models/${encodeURIComponent(model)}/health`;
   return useQuery({
     queryKey: [instanceId, 'model-health', model, version ?? null],
     queryFn: () => apiFetch<ModelHealth>(instanceId!, path),
-    enabled: instanceId !== null,
+    enabled: instanceId !== null && active,
     refetchInterval: 10_000,
   });
 }
@@ -92,14 +165,14 @@ export function useTimelineAll(instanceId: string | null, refetchInterval: numbe
   });
 }
 
-export function useTimeline(instanceId: string | null, model: string, version?: string, refetchInterval = 5_000) {
+export function useTimeline(instanceId: string | null, model: string, version?: string, refetchInterval = 5_000, active = true) {
   const path = version
     ? `/metrics/timeline/${encodeURIComponent(model)}/versions/${encodeURIComponent(version)}`
     : `/metrics/timeline/${encodeURIComponent(model)}`;
   return useQuery({
     queryKey: [instanceId, 'timeline', model, version ?? null],
     queryFn: () => apiFetch<TimelineSnapshot>(instanceId!, path),
-    enabled: instanceId !== null,
+    enabled: instanceId !== null && active,
     refetchInterval,
   });
 }

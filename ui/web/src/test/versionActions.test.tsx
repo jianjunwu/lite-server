@@ -28,12 +28,12 @@ const version: VersionInfo = {
   loaded_at: null,
 };
 
-function renderActions() {
+function renderActions(v: VersionInfo = version) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={queryClient}>
       <AntdApp>
-        <VersionActions model="m" version={version} />
+        <VersionActions model="m" version={v} />
       </AntdApp>
     </QueryClientProvider>,
   );
@@ -79,5 +79,32 @@ describe('VersionActions download task', () => {
         expect.objectContaining({ status: 'error', detail: 'download cancelled' }),
       ),
     );
+  });
+});
+
+describe('VersionActions unloaded version', () => {
+  const unloaded: VersionInfo = {
+    version: '2',
+    status: 'unloaded',
+    active: false,
+    weight: 0,
+    workers: { ready: 0, total: 0 },
+    loaded_at: null,
+    loaded: false,
+  };
+
+  it('should_offer_load_and_delete_but_no_runtime_ops', () => {
+    renderActions(unloaded);
+    expect(screen.getByRole('button', { name: 'Load' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Unload' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Activate' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull();
+  });
+
+  it('should_keep_runtime_ops_for_loaded_versions', () => {
+    renderActions(version);
+    expect(screen.getByRole('button', { name: 'Unload' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Load' })).toBeNull();
   });
 });

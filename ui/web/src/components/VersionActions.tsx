@@ -33,11 +33,11 @@ export function VersionActions({ model, version }: VersionActionsProps) {
 
   if (!instanceId) return null;
 
-  const run = async (op: () => Promise<unknown>, successKey: string) => {
+  const run = async (op: () => Promise<unknown>, successKey: string, successValues?: Record<string, string>) => {
     setBusy(true);
     try {
       await withAdminKeyRetry(instanceId, op);
-      message.success(t(successKey));
+      message.success(t(successKey, successValues));
       await queryClient.invalidateQueries({ queryKey: [instanceId] });
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
@@ -100,6 +100,52 @@ export function VersionActions({ model, version }: VersionActionsProps) {
       },
     );
   };
+
+  // Repository versions that are not loaded get lifecycle ops only:
+  // Load / Download / Delete. Runtime ops would 404 against the registry.
+  if (version.loaded === false) {
+    return (
+      <Space size={4} wrap>
+        <Button type="text" size="small" disabled={busy} onClick={startDownload}>
+          {t('ops.download')}
+        </Button>
+        <Popconfirm
+          title={t('ops.loadConfirm', { version: version.version })}
+          onConfirm={() =>
+            run(
+              () => modelOps.loadVersion(instanceId, model, version.version),
+              'ops.loadRequested',
+              { version: version.version },
+            )
+          }
+        >
+          <Button type="text" size="small" disabled={busy}>{t('ops.load')}</Button>
+        </Popconfirm>
+        <Button type="text" size="small" danger disabled={busy} onClick={() => setDeleteOpen(true)}>
+          {t('ops.delete')}
+        </Button>
+        <Modal
+          open={deleteOpen}
+          title={t('ops.deleteTitle', { version: version.version })}
+          okText={t('ops.delete')}
+          okButtonProps={{ danger: true, disabled: deleteConfirmText !== version.version || busy }}
+          onOk={submitDelete}
+          onCancel={() => {
+            setDeleteOpen(false);
+            setDeleteConfirmText('');
+          }}
+        >
+          <p style={{ fontSize: 13 }}>{t('ops.deleteBody', { model, version: version.version })}</p>
+          <Input
+            value={deleteConfirmText}
+            onChange={(e) => setDeleteConfirmText(e.target.value)}
+            placeholder={version.version}
+            style={{ fontFamily: MONO_FONT }}
+          />
+        </Modal>
+      </Space>
+    );
+  }
 
   return (
     <Space size={4} wrap>

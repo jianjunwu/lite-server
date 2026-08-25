@@ -129,6 +129,24 @@ def test_should_not_let_viewer_smuggle_infer_exemption_via_query_string(rbac_ctx
     assert routing.status_code == 403
 
 
+def test_should_allow_viewer_repository_index_post(rbac_ctx):
+    """POST /v2/repository/index is a read-only repo scan — viewers allowed."""
+    client = rbac_ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    index = client.post("/api/i/plain/v2/repository/index", headers=CSRF)
+    assert index.status_code == 200
+
+
+def test_should_not_let_viewer_broaden_repository_index_exemption(rbac_ctx):
+    """Only the exact index path is exempt; other repository POSTs stay 403."""
+    client = rbac_ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    load = client.post("/api/i/plain/v2/repository/models/m/load", headers=CSRF)
+    assert load.status_code == 403
+    drift = client.post("/api/i/plain/v2/repository/indexx", headers=CSRF)
+    assert drift.status_code == 403
+
+
 def test_should_allow_operator_proxy_mutation_but_forbid_instance_write(rbac_ctx):
     client = rbac_ctx["client"]
     login(client, "op1", "op-pass-1234")

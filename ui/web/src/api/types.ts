@@ -53,6 +53,23 @@ export interface VersionInfo {
   weight: number;
   workers: { ready: number; total: number };
   loaded_at: number | null;
+  /** False for versions present in the repository but not loaded (merged view). */
+  loaded?: boolean;
+}
+
+// POST /v2/repository/index — on-disk scan, includes models that are not
+// loaded. One row per version; .lma artifacts report version: null.
+export interface RepoIndexEntry {
+  name: string;
+  version: string | null;
+  path: string;
+  has_config: boolean;
+  type: string;
+  artifact_source?: string;
+}
+
+export interface RepoIndexResponse {
+  models: RepoIndexEntry[];
 }
 
 export interface VersionsResponse {

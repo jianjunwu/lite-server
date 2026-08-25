@@ -25,7 +25,8 @@
     "loadedAt": "加载时间",
     "unreachable": "实例不可达",
     "requestId": "请求 ID",
-    "comingSoon": "即将推出"
+    "comingSoon": "即将推出",
+    "back": "返回"
   },
   "overview": {
     "title": "概览",
@@ -47,7 +48,7 @@
     "activeVersion": "激活版本",
     "modelType": "类型",
     "traffic": "流量",
-    "noModels": "该实例上没有已加载的模型",
+    "noModels": "仓库中还没有模型",
     "detail": "模型详情",
     "versionDetail": "版本详情",
     "ready": "就绪",
@@ -58,6 +59,16 @@
       "workers": "Worker",
       "metrics": "指标",
       "compare": "对比"
+    },
+    "unloaded": "未加载",
+    "loadToView": "加载版本后可用",
+    "notFound": "仓库中不存在此模型",
+    "filters": {
+      "all": "全部",
+      "ready": "就绪",
+      "loading": "加载中",
+      "degraded": "异常",
+      "unloaded": "未加载"
     }
   },
   "metrics": {
@@ -120,7 +131,8 @@
     "load": "加载",
     "loadVersion": "加载版本",
     "loadBody": "将「{{model}}」的仓库版本加载到内存。",
-    "loadRequested": "已请求加载 {{version}}"
+    "loadRequested": "已请求加载 {{version}}",
+    "loadConfirm": "加载版本 {{version}}?"
   },
   "routing": {
     "edit": "编辑路由",

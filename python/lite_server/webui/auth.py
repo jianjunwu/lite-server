@@ -664,6 +664,11 @@ def _finish_login(request: Request, store: UserStore, user: UserRecord) -> JSONR
 # query strings must never influence the exemption.
 _INFER_RE = re.compile(r"/(infer|events)$")
 
+# POST /v2/repository/index is a read-only disk scan (KServe shape forces POST),
+# so it shares the viewer exemption — the Models page needs it to list
+# repository models that are not loaded.
+_REPOSITORY_INDEX_RE = re.compile(r"/v2/repository/index$")
+
 
 def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResponse | None:
     """RBAC guard, enforced at the route layer (never trusted to the frontend).
@@ -710,7 +715,7 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
         if path.startswith("/api/auth/"):
             return None  # any authenticated user
         if path.startswith("/api/i/"):
-            if _INFER_RE.search(path):
+            if _INFER_RE.search(path) or _REPOSITORY_INDEX_RE.search(path):
                 return None
             if role_rank(role) >= role_rank("operator"):
                 return None

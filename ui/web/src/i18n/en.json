@@ -25,7 +25,8 @@
     "loadedAt": "Loaded at",
     "unreachable": "Instance unreachable",
     "requestId": "Request ID",
-    "comingSoon": "Coming soon"
+    "comingSoon": "Coming soon",
+    "back": "Back"
   },
   "overview": {
     "title": "Overview",
@@ -47,7 +48,7 @@
     "activeVersion": "Active version",
     "modelType": "Type",
     "traffic": "Traffic",
-    "noModels": "No models loaded on this instance",
+    "noModels": "No models in the repository yet",
     "detail": "Model detail",
     "versionDetail": "Version detail",
     "ready": "Ready",
@@ -58,6 +59,16 @@
       "workers": "Workers",
       "metrics": "Metrics",
       "compare": "Compare"
+    },
+    "unloaded": "Unloaded",
+    "loadToView": "Available after loading a version",
+    "notFound": "Model not found in the repository",
+    "filters": {
+      "all": "All",
+      "ready": "Ready",
+      "loading": "Loading",
+      "degraded": "Degraded",
+      "unloaded": "Unloaded"
     }
   },
   "metrics": {
@@ -120,7 +131,8 @@
     "load": "Load",
     "loadVersion": "Load version",
     "loadBody": "Load a repository version of \"{{model}}\" into memory.",
-    "loadRequested": "Load requested for {{version}}"
+    "loadRequested": "Load requested for {{version}}",
+    "loadConfirm": "Load version {{version}}?"
   },
   "routing": {
     "edit": "Edit routing",

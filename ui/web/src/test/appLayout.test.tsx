@@ -84,7 +84,7 @@ describe('AppLayout instance picker', () => {
     renderLayout();
     await openInstanceSelect();
     fireEvent.click(await screen.findByRole('button', { name: /Manage instances/ }));
-    expect(screen.getByTestId('loc').textContent).toBe('/settings?tab=instances');
+    expect(screen.getByTestId('loc').textContent).toBe('/settings?tab=instances&i=echo-local');
   });
 
   it('should_show_manage_entry_when_no_instances', async () => {
@@ -92,5 +92,11 @@ describe('AppLayout instance picker', () => {
     renderLayout();
     await openInstanceSelect();
     expect(await screen.findByRole('button', { name: /Manage instances/ })).toBeTruthy();
+  });
+
+  it('should_keep_the_instance_param_when_navigating_from_the_sider', async () => {
+    renderLayout();
+    fireEvent.click(await screen.findByRole('link', { name: 'Models' }));
+    expect(screen.getByTestId('loc').textContent).toBe('/models?i=echo-local');
   });
 });

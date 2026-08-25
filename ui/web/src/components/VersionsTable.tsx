@@ -7,6 +7,7 @@ import { TrafficRiver } from './TrafficRiver';
 import { VersionActions } from './VersionActions';
 import { formatAge } from './format';
 import { useNeutrals } from '../context/ThemeModeContext';
+import { useInstanceLink } from '../context/useInstanceLink';
 import { dataTextStyle, TYPE } from '../theme';
 
 interface VersionsTableProps {
@@ -24,6 +25,7 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
   const { t } = useTranslation();
   const navigate = useNavigate();
   const neutrals = useNeutrals();
+  const ilink = useInstanceLink();
 
   const columns: TableProps<VersionInfo>['columns'] = [
     {
@@ -31,12 +33,19 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
       dataIndex: 'version',
       width: 110,
       render: (v: string) => (
-        <Link to={`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`} style={dataTextStyle}>
+        <Link to={ilink(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`)} style={dataTextStyle}>
           {v}
         </Link>
       ),
     },
-    { title: t('common.status'), dataIndex: 'status', width: 130, render: (s: string) => <StatusBadge status={s} /> },
+    {
+      title: t('common.status'),
+      dataIndex: 'status',
+      width: 130,
+      render: (s: string) => (
+        <StatusBadge status={s} text={s === 'unloaded' ? t('models.unloaded') : undefined} />
+      ),
+    },
     {
       title: t('common.active'),
       dataIndex: 'active',
@@ -90,7 +99,7 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
             versions={versions}
             model={model}
             editable={ops}
-            onSelect={(v) => navigate(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`)}
+            onSelect={(v) => navigate(ilink(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`))}
           />
         ) : null
       }
