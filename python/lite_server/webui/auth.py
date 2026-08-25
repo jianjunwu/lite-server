@@ -672,6 +672,7 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
     path = request.url.path
     if not enabled:
         request.state.user = {"username": "local", "role": "admin"}
+        request.state.session_id = None
         return None
     if not path.startswith("/api/"):
         return None  # static assets are public
@@ -859,9 +860,11 @@ def create_router(store: UserStore) -> APIRouter:
 
     @router.post("/api/auth/logout")
     async def logout(request: Request):
-        store.revoke_session(request.state.session_id)
-        store.record_audit("session_revoked", actor=request.state.user["username"],
-                           ip=_client_ip(request), detail={"session": request.state.session_id[:12]})
+        session_id = request.state.session_id
+        if session_id is not None:  # None in auth-off mode: nothing to revoke
+            store.revoke_session(session_id)
+            store.record_audit("session_revoked", actor=request.state.user["username"],
+                               ip=_client_ip(request), detail={"session": session_id[:12]})
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
@@ -869,6 +872,11 @@ def create_router(store: UserStore) -> APIRouter:
     @router.get("/api/auth/me")
     async def me(request: Request):
         current = store.get(request.state.user["username"])
+        if current is None:
+            # Auth-off mode: the guard injects a synthetic local admin that
+            # has no row in the user store.
+            return {"user": {**request.state.user, "createdAt": None,
+                             "mustChangePassword": False, "totpEnabled": False}}
         return {"user": public_user(current)}
 
     @router.post("/api/auth/change-password")

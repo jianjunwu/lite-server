@@ -237,6 +237,33 @@ def test_should_pass_everything_through_with_synthetic_admin(tmp_path, upstream,
     assert res.status_code == 200
 
 
+def test_should_return_synthetic_user_on_me_when_auth_off(tmp_path, upstream, client_factory):
+    ctx = make_setup(tmp_path, upstream, env={}, auth_enabled=False)
+    client = client_factory(ctx["app"])
+    res = client.get("/api/auth/me")
+    assert res.status_code == 200
+    user = res.json()["user"]
+    assert user["username"] == "local"
+    assert user["role"] == "admin"
+    assert user["mustChangePassword"] is False
+
+
+def test_should_list_empty_sessions_when_auth_off(tmp_path, upstream, client_factory):
+    ctx = make_setup(tmp_path, upstream, env={}, auth_enabled=False)
+    client = client_factory(ctx["app"])
+    res = client.get("/api/auth/sessions")
+    assert res.status_code == 200
+    assert res.json() == {"sessions": []}
+
+
+def test_should_logout_cleanly_when_auth_off(tmp_path, upstream, client_factory):
+    ctx = make_setup(tmp_path, upstream, env={}, auth_enabled=False)
+    client = client_factory(ctx["app"])
+    res = client.post("/api/auth/logout", headers=CSRF)
+    assert res.status_code == 200
+    assert res.json() == {"ok": True}
+
+
 def test_should_upgrade_cost10_hash_transparently_on_login(ctx, monkeypatch):
     # A legacy cost-10 hash keeps working and is rehashed at the current cost
     # on the next successful verification.
