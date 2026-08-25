@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from . import ownership
+
+_logger = logging.getLogger("lite_server.webui")
 
 # Hop-by-hop headers that must not cross the proxy in either direction.
 HOP_BY_HOP = frozenset({
@@ -99,25 +104,49 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     )
     try:
         upstream = await client.send(req, stream=True)
+    except ClientDisconnect:
+        # The browser aborted mid-upload; no one is left to receive a
+        # response. The send never completed, so there is no upstream
+        # response to close.
+        _logger.info("client disconnected during upload to instance %s: %s",
+                     inst_id, tail)
+        return Response(status_code=499)
     except httpx.HTTPError:
         return JSONResponse({"error": "instance_unreachable", "instance": inst_id}, status_code=502)
 
     headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
 
-    # Session init is the one response the proxy must see: the session id it
-    # carries becomes an ownership record. The body is a small JSON, so this
-    # is the single non-streamed path.
-    if mutation is not None and mutation.kind == "init" and store is not None and user is not None:
-        raw = await upstream.aread()
-        await upstream.aclose()
+    # Two responses the proxy must see in full: session init (the session id
+    # becomes an ownership record) and batch version delete (per-version
+    # results decide which ownership rows to drop). Both are small JSON, so
+    # these are the only non-streamed paths.
+    buffered = (mutation is not None and mutation.kind in ("init", "batch_delete")
+                and store is not None and user is not None)
+    if buffered:
+        try:
+            raw = await upstream.aread()
+        finally:
+            await upstream.aclose()
         if 200 <= upstream.status_code < 300:
-            session_id = None
-            try:
-                session_id = json.loads(raw).get("session_id")
-            except (ValueError, AttributeError):
+            if mutation.kind == "init":
                 session_id = None
-            ownership.record_success(store, inst_id, user, mutation,
-                                     request.method, session_id=session_id)
+                try:
+                    session_id = json.loads(raw).get("session_id")
+                except (ValueError, AttributeError):
+                    session_id = None
+                ownership.record_success(store, inst_id, user, mutation,
+                                         request.method, session_id=session_id)
+            else:
+                deleted_versions = None
+                try:
+                    parsed = json.loads(raw).get("deleted")
+                    if isinstance(parsed, list):
+                        deleted_versions = [v for v in parsed if isinstance(v, str)]
+                except (ValueError, AttributeError):
+                    deleted_versions = None
+                ownership.record_success(store, inst_id, user, mutation,
+                                         request.method,
+                                         deleted_versions=deleted_versions)
         return Response(content=raw, status_code=upstream.status_code, headers=headers)
 
     if (mutation is not None and store is not None and user is not None
@@ -133,7 +162,14 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
             await upstream.aclose()
 
     # Send the body as a stream: SSE / chunked responses pass through unbuffered.
-    return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=headers)
+    # The BackgroundTask is belt-and-braces next to the generator's finally:
+    # if the client disconnects before the generator is first advanced, the
+    # finally never runs (unstarted async generator semantics). aclose is
+    # idempotent, so the double close is safe.
+    return StreamingResponse(
+        body_iter(), status_code=upstream.status_code, headers=headers,
+        background=BackgroundTask(upstream.aclose),
+    )
 
 
 def create_router() -> APIRouter:

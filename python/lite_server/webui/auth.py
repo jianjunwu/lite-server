@@ -35,6 +35,10 @@ IP_LOCK_THRESHOLD = 30
 TOTP_CHALLENGE_TTL = timedelta(minutes=5)
 TOTP_CHALLENGE_MAX_ATTEMPTS = 5
 BACKUP_CODE_COUNT = 8
+# Abandoned chunked-upload sessions (never completed or aborted through the
+# BFF) would leak ownership rows forever. 48h outlives the instance's own
+# 24h staging-dir sweep, so a row never dies before the session it guards.
+SESSION_OWNER_TTL = timedelta(hours=48)
 
 _logger = logging.getLogger("lite_server.webui.audit")
 
@@ -482,6 +486,24 @@ class UserStore:
             " (instance_id, session_id, model, version, owner, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (instance_id, session_id, model, version, owner, _now()))
+        # Lazy sweep of rows from abandoned sessions (same pattern as the
+        # expired-session cleanup in create_session).
+        cutoff = (datetime.now(timezone.utc) - SESSION_OWNER_TTL).isoformat()
+        self._db.execute(
+            "DELETE FROM upload_session_owners WHERE created_at < ?", (cutoff,))
+
+    def remove_instance_ownership(self, instance_id: str) -> None:
+        """Drops every ownership record of an instance; called when the
+        instance is removed from the registry so stale rows cannot
+        resurrect if the same id is recreated later."""
+        self._db.execute(
+            "DELETE FROM version_owners WHERE instance_id = ?", (instance_id,))
+        self._db.execute(
+            "DELETE FROM upload_session_owners WHERE instance_id = ?", (instance_id,))
+
+    def close(self) -> None:
+        """Closes the underlying AuthDB (WAL checkpoint on shutdown)."""
+        self._db.close()
 
     def remove_session_owner(self, instance_id: str, session_id: str) -> None:
         self._db.execute(

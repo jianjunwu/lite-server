@@ -96,6 +96,21 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         if self.path == "/hang":
             # Simulates an instance that accepts but stalls mid-response.
             time.sleep(2)
+        if self.command == "DELETE" and self.path.endswith("/versions"):
+            # Batch version delete: per-version results like the instance
+            # ({"deleted": [...], "failed": [...]}); version "bad" fails.
+            requested = (json.loads(body).get("versions") or []) if body else []
+            payload = json.dumps({
+                "deleted": [v for v in requested if v != "bad"],
+                "failed": [{"version": v, "error": "version is locked"}
+                           for v in requested if v == "bad"],
+            }).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path.endswith("/upload-sessions") and self.command == "POST":
             # Chunked-upload session init: the instance returns a small JSON
             # with the new session id (201 Created).

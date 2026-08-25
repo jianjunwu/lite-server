@@ -4,6 +4,8 @@ identity forwarding."""
 
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -12,8 +14,11 @@ import pytest
 from lite_server.webui.app import build_app
 from lite_server.webui.auth import UserStore
 from lite_server.webui.authdb import AuthDB
+from lite_server.webui.config import InstanceConfig
 from lite_server.webui.ownership import parse_model_mutation
 from lite_server.webui.registry import InstanceStore
+
+from .conftest import MapRegistry
 
 CSRF = {"x-requested-with": "lite-ui"}
 
@@ -180,6 +185,85 @@ def test_batch_delete_is_admin_only(ctx):
     url = "/api/i/plain/v2/models/m/versions"
     assert op1.delete(url, headers=CSRF).status_code == 403
     assert admin.delete(url, headers=CSRF).status_code == 200
+
+
+def test_batch_delete_removes_ownership_of_deleted_versions(ctx):
+    op1 = client_for(ctx, "op1", "Operator-pass-1")
+    admin = client_for(ctx, "admin", "Admin-pass-1234")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/1/upload?load=false",
+             headers=CSRF, content=b"v1")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/2/upload?load=false",
+             headers=CSRF, content=b"v2")
+
+    res = admin.request("DELETE", "/api/i/plain/v2/models/m/versions", headers=CSRF,
+                        json={"versions": ["1", "2"]})
+    assert res.status_code == 200
+    assert ctx.store.version_owner("plain", "m", "1") is None
+    assert ctx.store.version_owner("plain", "m", "2") is None
+
+
+def test_batch_delete_keeps_ownership_of_failed_versions(ctx):
+    op1 = client_for(ctx, "op1", "Operator-pass-1")
+    admin = client_for(ctx, "admin", "Admin-pass-1234")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/1/upload?load=false",
+             headers=CSRF, content=b"v1")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/bad/upload?load=false",
+             headers=CSRF, content=b"v2")
+
+    # The stub upstream fails version "bad"; its ownership row must survive.
+    res = admin.request("DELETE", "/api/i/plain/v2/models/m/versions", headers=CSRF,
+                        json={"versions": ["1", "bad"]})
+    assert res.status_code == 200
+    assert ctx.store.version_owner("plain", "m", "1") is None
+    assert ctx.store.version_owner("plain", "m", "bad") == "op1"
+
+
+# ===== ownership record lifecycle =====
+
+def test_stale_session_owner_rows_are_swept_on_next_init(tmp_path):
+    store = UserStore(str(tmp_path / "auth.db"), {})
+    stale = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+    store._db.execute(
+        "INSERT INTO upload_session_owners"
+        " (instance_id, session_id, model, version, owner, created_at)"
+        " VALUES ('i1', 'stale-sid', 'm', '1', 'op1', ?)",
+        (stale,),
+    )
+    # Recording a new session lazily sweeps rows older than the TTL: the
+    # abandoned one goes, the fresh one stays.
+    store.record_session_owner("i1", "fresh-sid", "m", "1", "op1")
+    assert store.session_owner("i1", "stale-sid") is None
+    assert store.session_owner("i1", "fresh-sid") is not None
+    store.close()
+
+
+def test_removing_instance_cascades_ownership_rows(ctx):
+    op1 = client_for(ctx, "op1", "Operator-pass-1")
+    admin = client_for(ctx, "admin", "Admin-pass-1234")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/1/upload?load=false",
+             headers=CSRF, content=b"v1")
+    op1.post("/api/i/plain/v2/repository/models/m/versions/1/upload-sessions",
+             headers=CSRF, json={"files": [{"name": "w.bin", "size": 64}]})
+    assert ctx.store.version_owner("plain", "m", "1") == "op1"
+    assert ctx.store.session_owner("plain", "stub-session-id") is not None
+
+    res = admin.delete("/api/instances/plain", headers=CSRF)
+    assert res.status_code == 200
+    assert ctx.store.version_owner("plain", "m", "1") is None
+    assert ctx.store.session_owner("plain", "stub-session-id") is None
+
+
+def test_lifespan_closes_auth_db_on_shutdown(tmp_path, upstream, live):
+    store = UserStore(str(tmp_path / "auth.db"), {})
+    registry = MapRegistry([
+        InstanceConfig(id="plain", name="P", base_url=upstream.base_url),
+    ])
+    server = live(build_app(registry, user_store=store))
+    server.stop()
+    # The lifespan teardown closed the store; closing again is a safe no-op.
+    store.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.list()
 
 
 # ===== identity forwarding =====

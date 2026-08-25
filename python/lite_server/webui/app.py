@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from starlette.staticfiles import StaticFiles
 from . import auth as auth_module
 from . import proxy as proxy_module
 from . import registry as registry_module
+
+_logger = logging.getLogger("lite_server.webui")
 
 SECURITY_HEADERS = {
     # antd is CSS-in-JS and injects <style> at runtime, hence style-src
@@ -45,6 +48,14 @@ async def _lifespan(app: FastAPI):
     yield
     await app.state.http.aclose()
     await app.state.http_stream.aclose()
+    # Checkpoint/close the auth SQLite (WAL) on clean shutdown. Tolerant: a
+    # broken store must not turn shutdown into an error.
+    store = getattr(app.state, "user_store", None)
+    if store is not None:
+        try:
+            store.close()
+        except Exception:
+            _logger.warning("auth store close failed during shutdown", exc_info=True)
 
 
 def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = True,
@@ -61,8 +72,13 @@ def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = 
     # lifetime, so the pool must cover the expected concurrent transfer load
     # (httpx's default of 100 would queue new streams). Each active stream
     # also costs 2 fds (browser + upstream): raise ulimit -n accordingly.
+    # read=300 bounds idle gaps so a half-open upstream (TCP alive, zero
+    # bytes) cannot pin a pool slot forever; steady streams are unaffected.
+    # pool=60 surfaces pool saturation as an error instead of an infinite
+    # queue.
     app.state.http_stream = httpx.AsyncClient(
-        timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
+        timeout=httpx.Timeout(None, connect=10.0, read=300.0, pool=60.0),
+        trust_env=False,
         limits=httpx.Limits(max_connections=stream_max_connections),
     )
 

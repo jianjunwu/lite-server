@@ -91,11 +91,16 @@ def create_router(registry) -> APIRouter:
         return public_view(store.list())
 
     @router.delete("/api/instances/{inst_id}")
-    async def delete_instance(inst_id: str):
+    async def delete_instance(inst_id: str, request: Request):
         try:
             store.remove(inst_id)
         except StoreError as e:
             return _error(e)
+        # Cascade: ownership rows are keyed by instance id and would
+        # otherwise resurrect if the same id is recreated later.
+        user_store = getattr(request.app.state, "user_store", None)
+        if user_store is not None:
+            user_store.remove_instance_ownership(inst_id)
         return public_view(store.list())
 
     return router

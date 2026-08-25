@@ -1,5 +1,7 @@
 """Port of ui/server/test/proxy.test.ts."""
 
+import asyncio
+import threading
 import time
 
 import httpx
@@ -187,3 +189,53 @@ def test_should_default_stream_pool_to_500_connections():
 def test_should_honor_stream_max_connections_override():
     app = build_app(MapRegistry([]), stream_max_connections=7)
     assert app.state.http_stream._transport._pool._max_connections == 7
+
+
+def test_stream_client_timeouts_bound_idle_gaps_and_pool_queue():
+    # A half-open upstream (TCP alive, zero bytes) must not pin a pool slot
+    # forever, and pool saturation must surface as an error, not an
+    # infinite queue.
+    app = build_app(MapRegistry([]))
+    timeout = app.state.http_stream.timeout
+    assert timeout.connect == 10.0
+    assert timeout.read == 300.0
+    assert timeout.pool == 60.0
+
+
+def test_should_close_upstream_when_client_disconnects_mid_stream(registry, live, monkeypatch):
+    closed = threading.Event()
+    original_aclose = httpx.Response.aclose
+
+    async def _spy(self):
+        closed.set()
+        await original_aclose(self)
+
+    monkeypatch.setattr(httpx.Response, "aclose", _spy)
+    server = live(build_app(registry))
+    with httpx.Client(base_url=server.base_url) as client:
+        with client.stream("GET", "/api/i/plain/sse-slow") as res:
+            for _ in res.iter_bytes():
+                break  # simulate the browser going away mid-stream
+    assert closed.wait(timeout=5)
+
+
+def test_should_return_499_when_client_aborts_mid_upload(upstream, monkeypatch):
+    from starlette.requests import ClientDisconnect
+
+    async def _abort(self):
+        raise ClientDisconnect()
+        yield b""
+
+    monkeypatch.setattr("starlette.requests.Request.stream", _abort)
+    app = build_app(MapRegistry([
+        InstanceConfig(id="plain", name="Plain", base_url=upstream.base_url),
+    ]))
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            return await c.post("/api/i/plain/v2/repository/models/m/versions/1/upload",
+                                content=b"x" * 16)
+
+    res = asyncio.run(_run())
+    assert res.status_code == 499

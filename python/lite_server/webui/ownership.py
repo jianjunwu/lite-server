@@ -10,7 +10,9 @@ Recording rules:
 - versioned upload / chunked complete returning 2xx → the FIRST committer
   owns the version (INSERT OR IGNORE; force-overwrite does not transfer);
 - upload-session init → the initiating user owns the session id;
-- version delete / session abort-or-complete 2xx → records removed.
+- version delete / session abort-or-complete 2xx → records removed;
+- batch delete 2xx → records removed for the versions the instance
+  reports as deleted (partial failures keep theirs).
 
 Enforcement rules (roles still apply first — see auth.check_request):
 - force=true on a versioned upload or complete → version owner or admin;
@@ -136,10 +138,12 @@ def _require_version_owner(store, inst_id: str, mutation: Mutation,
 
 
 def record_success(store, inst_id: str, user: dict, mutation: Mutation,
-                   method: str, session_id: str | None = None) -> None:
-    """Post-2xx bookkeeping. `session_id` is set only for init (parsed from
-    the instance response by the proxy). Model-level uploads are skipped:
-    their version is only known to the instance."""
+                   method: str, session_id: str | None = None,
+                   deleted_versions: list[str] | None = None) -> None:
+    """Post-2xx bookkeeping. `session_id` is set only for init and
+    `deleted_versions` only for batch delete (both parsed from the instance
+    response by the proxy). Model-level uploads are skipped: their version
+    is only known to the instance."""
     username = user.get("username", "")
     if mutation.kind == "init" and method == "POST" and session_id:
         store.record_session_owner(inst_id, session_id, mutation.model,
@@ -153,3 +157,8 @@ def record_success(store, inst_id: str, user: dict, mutation: Mutation,
             store.remove_version_owner(inst_id, mutation.model, mutation.version)
         else:
             store.remove_session_owner(inst_id, mutation.session_id)
+    elif mutation.kind == "batch_delete" and method == "DELETE":
+        # Only versions the instance actually deleted; partial failures
+        # keep their ownership rows.
+        for version in deleted_versions or []:
+            store.remove_version_owner(inst_id, mutation.model, version)
