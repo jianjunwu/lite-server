@@ -1,5 +1,5 @@
 import { Badge, Button, Drawer, Empty, Progress, Typography } from 'antd';
-import { BellOutlined, CheckCircleFilled, CloseCircleFilled, DeleteOutlined } from '@ant-design/icons';
+import { BellOutlined, CheckCircleFilled, CloseCircleFilled, CloseOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTasks, type UiTask } from '../context/TaskContext';
@@ -7,6 +7,7 @@ import { STATUS_COLORS, TYPE } from '../theme';
 import { useNeutrals } from '../context/ThemeModeContext';
 
 function TaskRow({ task, onDismiss }: { task: UiTask; onDismiss: (id: string) => void }) {
+  const { t } = useTranslation();
   const neutrals = useNeutrals();
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: `1px solid ${neutrals.border}` }}>
@@ -25,6 +26,15 @@ function TaskRow({ task, onDismiss }: { task: UiTask; onDismiss: (id: string) =>
       </div>
       {task.status === 'success' && <CheckCircleFilled style={{ color: STATUS_COLORS.ready }} />}
       {task.status === 'error' && <CloseCircleFilled style={{ color: STATUS_COLORS.error }} />}
+      {task.status === 'running' && task.abort && (
+        <Button
+          type="text"
+          size="small"
+          icon={<CloseOutlined />}
+          aria-label={t('tasks.cancel')}
+          onClick={() => task.abort!()}
+        />
+      )}
       {task.status !== 'running' && (
         <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => onDismiss(task.id)} />
       )}

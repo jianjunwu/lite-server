@@ -126,8 +126,20 @@ export function downloadModelPackage(
     let offset = res.status === 206 && resume ? stored.offset : 0;
     const fileName = stored?.fileName ?? suggestedName(model, version);
 
-    const handle = await window.showSaveFilePicker!({ suggestedName: fileName });
-    const writable = await handle.createWritable({ keepExistingData: true });
+    let writable: FileSystemWritableFileStream;
+    try {
+      const handle = await window.showSaveFilePicker!({ suggestedName: fileName });
+      writable = await handle.createWritable({ keepExistingData: true });
+    } catch (err) {
+      // The response body is still streaming — abort and cancel it so the
+      // connection frees immediately instead of relaying the whole pack.
+      controller.abort();
+      await res.body?.cancel().catch(() => {});
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new ApiError(0, null, null, 'download cancelled');
+      }
+      throw err;
+    }
 
     const persist = () => {
       localStorage.setItem(key, JSON.stringify({ etag, offset, fileName } satisfies ResumeState));

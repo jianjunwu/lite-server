@@ -167,7 +167,8 @@
   "tasks": {
     "title": "Tasks",
     "empty": "No tasks yet",
-    "clearFinished": "Clear finished"
+    "clearFinished": "Clear finished",
+    "cancel": "Cancel"
   },
   "adminKey": {
     "title": "Admin key required",

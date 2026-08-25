@@ -63,6 +63,7 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
       },
     });
     setUploading({ percent: 0, handle });
+    updateTask(taskId, { abort: () => handle.abort() });
     try {
       const result = await handle.promise;
       if (result.loaded) {
@@ -94,6 +95,7 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
       return 'failed';
     } finally {
       setUploading(null);
+      updateTask(taskId, { abort: undefined });
     }
   };
 

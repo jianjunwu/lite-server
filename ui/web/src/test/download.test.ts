@@ -153,6 +153,61 @@ describe('downloadModelPackage', () => {
     expect(stored.etag).toBe('"e1"');
   });
 
+  it('should_release_the_response_stream_when_the_picker_is_cancelled', async () => {
+    (window as unknown as { showSaveFilePicker: unknown }).showSaveFilePicker = vi.fn(
+      async () => {
+        throw new DOMException('The user aborted a request', 'AbortError');
+      },
+    );
+    const cancelSpy = vi.fn();
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('01234'));
+          },
+          cancel: cancelSpy,
+        }),
+        { headers: { etag: '"e1"', 'content-length': '10' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const handle = downloadModelPackage('prod', 'm', '1');
+    await expect(handle.promise).rejects.toThrow('download cancelled');
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.signal?.aborted).toBe(true);
+    expect(cancelSpy).toHaveBeenCalled();
+  });
+
+  it('should_rethrow_and_release_the_stream_when_createWritable_fails', async () => {
+    (window as unknown as { showSaveFilePicker: unknown }).showSaveFilePicker = vi.fn(
+      async () => ({
+        createWritable: async () => {
+          throw new Error('disk full');
+        },
+      }),
+    );
+    const cancelSpy = vi.fn();
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('01234'));
+          },
+          cancel: cancelSpy,
+        }),
+        { headers: { etag: '"e1"', 'content-length': '10' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const handle = downloadModelPackage('prod', 'm', '1');
+    await expect(handle.promise).rejects.toThrow('disk full');
+    expect(cancelSpy).toHaveBeenCalled();
+  });
+
   it('should_fall_back_to_anchor_navigation_without_fs_access_api', async () => {
     // No showSaveFilePicker installed.
     const click = vi

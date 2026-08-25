@@ -83,17 +83,19 @@ export function VersionActions({ model, version }: VersionActionsProps) {
       kind: 'download',
       progress: 0,
     });
-    downloadModelPackage(instanceId, model, version.version, {
+    const handle = downloadModelPackage(instanceId, model, version.version, {
       onProgress: (percent, loaded, total) =>
         updateTask(taskId, { progress: percent, detail: `${formatBytes(loaded)} / ${formatBytes(total)}` }),
-    }).promise.then(
+    });
+    updateTask(taskId, { abort: () => handle.abort() });
+    handle.promise.then(
       ({ fileName }) => {
-        updateTask(taskId, { status: 'success', progress: 100 });
+        updateTask(taskId, { status: 'success', progress: 100, abort: undefined });
         message.success(t('ops.downloadDone', { fileName }));
       },
       (err) => {
         const text = err instanceof Error ? err.message : String(err);
-        updateTask(taskId, { status: 'error', detail: text });
+        updateTask(taskId, { status: 'error', detail: text, abort: undefined });
         message.error(text);
       },
     );

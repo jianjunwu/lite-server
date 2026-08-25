@@ -10,6 +10,8 @@ export interface UiTask {
   /** 0-100 when known. */
   progress?: number;
   detail?: string;
+  /** Cancels the in-flight work; set only while the task is running. */
+  abort?: () => void;
   createdAt: number;
 }
 

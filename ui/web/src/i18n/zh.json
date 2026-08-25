@@ -167,7 +167,8 @@
   "tasks": {
     "title": "任务",
     "empty": "暂无任务",
-    "clearFinished": "清除已完成"
+    "clearFinished": "清除已完成",
+    "cancel": "取消"
   },
   "adminKey": {
     "title": "需要 Admin Key",
