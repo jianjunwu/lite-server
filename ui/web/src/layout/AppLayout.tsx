@@ -23,6 +23,8 @@ import { useAlertNotifier } from '../api/useAlertNotifier';
 import { useThemeMode, useNeutrals } from '../context/ThemeModeContext';
 import { MoonOutlined, SunOutlined } from '@ant-design/icons';
 import { UserMenu } from '../components/UserMenu';
+import { SPACE } from '../tokens';
+import { TYPE } from '../theme';
 
 
 const { Sider, Header, Content } = Layout;
@@ -72,12 +74,12 @@ export function AppLayout() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider width={208} collapsible breakpoint="lg" style={{ borderRight: `1px solid ${neutrals.border}` }}>
-        <div style={{ height: 48, display: 'flex', alignItems: 'center', paddingLeft: 20, gap: 8 }}>
-          <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 18 }} />
-          <Typography.Text strong style={{ fontSize: 15 }}>{t('common.appName')}</Typography.Text>
+      <Sider width={232} collapsible breakpoint="lg" style={{ borderRight: `1px solid ${neutrals.border}` }}>
+        <div style={{ height: 56, display: 'flex', alignItems: 'center', paddingLeft: SPACE[5], gap: SPACE[2] }}>
+          <ThunderboltFilled style={{ color: '#0071E3', fontSize: 18 }} />
+          <Typography.Text strong style={{ fontSize: TYPE.cardTitle }}>{t('common.appName')}</Typography.Text>
         </div>
-        <Menu mode="inline" selectedKeys={[selectedKey]} items={menuItems} style={{ border: 'none' }} />
+        <Menu mode="inline" selectedKeys={[selectedKey]} items={menuItems} style={{ border: 'none', padding: `0 ${SPACE[2]}px` }} />
       </Sider>
       <Layout>
         <Header
@@ -93,7 +95,7 @@ export function AppLayout() {
           }}
         >
           <Space size="middle">
-            <span style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em', color: neutrals.textSecondary }}>{t('common.instance')}</span>
+            <span style={{ fontSize: TYPE.eyebrow, textTransform: 'uppercase', letterSpacing: '0.08em', color: neutrals.textSecondary }}>{t('common.instance')}</span>
             {instanceId && (
               <StatusDot
                 kind={currentHealth.isError ? 'offline' : statusKind(currentHealth.data?.status ?? 'loading')}
@@ -156,24 +158,26 @@ export function AppLayout() {
         {instanceId && currentHealth.isError && (
           <Alert type="warning" showIcon banner message={`${t('common.unreachable')}: ${instanceId}`} />
         )}
-        <Content style={{ padding: 24 }}>
-          {instancesQuery.isSuccess && instanceId && !instances.some((i) => i.id === instanceId) ? (
-            // ?i= points at an instance the BFF filtered out (grant "none")
-            // or that no longer exists — say so instead of rendering a dead shell.
-            <Empty
-              style={{ marginTop: 96 }}
-              description={
-                <>
-                  <div>{t('common.noInstanceAccess')}</div>
-                  <div style={{ fontSize: 12, color: neutrals.textSecondary }}>
-                    {t('common.noInstanceAccessBody')}
-                  </div>
-                </>
-              }
-            />
-          ) : (
-            <Outlet context={{ navigate }} />
-          )}
+        <Content style={{ padding: SPACE[6] }}>
+          <div style={{ maxWidth: 1440, margin: '0 auto' }}>
+            {instancesQuery.isSuccess && instanceId && !instances.some((i) => i.id === instanceId) ? (
+              // ?i= points at an instance the BFF filtered out (grant "none")
+              // or that no longer exists — say so instead of rendering a dead shell.
+              <Empty
+                style={{ marginTop: 96 }}
+                description={
+                  <>
+                    <div>{t('common.noInstanceAccess')}</div>
+                    <div style={{ fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
+                      {t('common.noInstanceAccessBody')}
+                    </div>
+                  </>
+                }
+              />
+            ) : (
+              <Outlet context={{ navigate }} />
+            )}
+          </div>
         </Content>
       </Layout>
     </Layout>

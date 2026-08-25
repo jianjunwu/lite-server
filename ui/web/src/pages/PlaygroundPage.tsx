@@ -326,25 +326,25 @@ export function PlaygroundPage() {
   const responseArea = compare ? (
     <Row gutter={16}>
       <Col span={12}>
-        <Card size="small" title={`A · ${versionA || t('playground.activeVersion')}`}>
+        <Card size="small" title={`A · ${versionA || t('playground.activeVersion')}`} styles={{ body: { background: 'var(--surface)' } }}>
           <SlotView slot={slotA} />
         </Card>
       </Col>
       <Col span={12}>
-        <Card size="small" title={`B · ${versionB || t('playground.activeVersion')}`}>
+        <Card size="small" title={`B · ${versionB || t('playground.activeVersion')}`} styles={{ body: { background: 'var(--surface)' } }}>
           <SlotView slot={slotB} />
         </Card>
       </Col>
       {slotA.text !== null && slotB.text !== null && (
         <Col span={24} style={{ marginTop: 16 }}>
-          <Card size="small" title={t('playground.diff')}>
+          <Card size="small" title={t('playground.diff')} styles={{ body: { background: 'var(--surface)' } }}>
             <DiffView textA={slotA.text} textB={slotB.text} />
           </Card>
         </Col>
       )}
     </Row>
   ) : (
-    <Card size="small" title={t('playground.response')}>
+    <Card size="small" title={t('playground.response')} styles={{ body: { background: 'var(--surface)' } }}>
       <SlotView slot={slotA} />
     </Card>
   );

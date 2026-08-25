@@ -21,7 +21,7 @@ interface PageHeaderProps {
   onBack?: () => void;
 }
 
-/** Single page-title hierarchy: 20px semibold title, optional 12px subtitle. */
+/** Single page-title hierarchy: 32px semibold title, optional 13px subtitle. */
 export function PageHeader({ title, subtitle, extra, breadcrumb, onBack }: PageHeaderProps) {
   const { t } = useTranslation();
   const neutrals = useNeutrals();
@@ -47,7 +47,7 @@ export function PageHeader({ title, subtitle, extra, breadcrumb, onBack }: PageH
             />
           )}
           <div>
-            <h1 style={{ fontSize: TYPE.pageTitle, fontWeight: 600, margin: 0, lineHeight: 1.3 }}>{title}</h1>
+            <h1 style={{ fontSize: TYPE.pageTitle, fontWeight: 600, letterSpacing: '-0.02em', margin: 0, lineHeight: 1.2 }}>{title}</h1>
             {subtitle && (
               <div style={{ fontSize: TYPE.secondary, color: neutrals.textSecondary, marginTop: 2 }}>{subtitle}</div>
             )}

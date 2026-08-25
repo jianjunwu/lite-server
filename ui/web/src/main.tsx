@@ -9,6 +9,7 @@ import { AdminKeyProvider } from './context/AdminKeyContext';
 import { AuthProvider } from './context/AuthContext';
 import { TaskProvider } from './context/TaskContext';
 import { ThemeModeProvider, useThemeMode } from './context/ThemeModeContext';
+import './tokens.css';
 import './i18n';
 
 const queryClient = new QueryClient({

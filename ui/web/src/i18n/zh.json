@@ -41,7 +41,14 @@
     "noInstancesHint": "请在 instances.yaml 或设置页中添加实例。",
     "serverVersion": "服务端版本",
     "loadedModels": "已加载模型",
-    "allReady": "全部 {{versions}} 个版本就绪（{{instances}} 个实例）"
+    "allReady": "全部 {{versions}} 个版本就绪（{{instances}} 个实例）",
+    "stmtChecking": "正在检查集群状态…",
+    "stmtAllReady": "{{versions}} 个版本全部就绪",
+    "stmtAttention": "{{count}} 个版本需要关注",
+    "stmtDown": "{{count}} 个版本故障",
+    "acrossInstances": "共 {{count}} 个实例",
+    "unreachableCount": "{{count}} 个不可达",
+    "fleetP99": "P99 延迟"
   },
   "models": {
     "title": "模型",
@@ -82,7 +89,12 @@
     },
     "drifted": "已加载，但磁盘仓库中已不存在",
     "emptyGuide": "上传模型或运行 example 开始使用",
-    "noneLoaded": "仓库中有 {{count}} 个模型，均未加载"
+    "noneLoaded": "仓库中有 {{count}} 个模型，均未加载",
+    "stmtServing": "{{version}} 承载 {{weight}}% 流量",
+    "stmtUnloaded": "未加载任何版本",
+    "stmtNoActive": "无活跃版本",
+    "detailStmt": "{{total}} 个版本中 {{ready}} 个就绪 · {{workers}} 个 worker",
+    "detailStmtActive": "{{total}} 个版本中 {{ready}} 个就绪 · {{version}} 活跃 · {{workers}} 个 worker"
   },
   "metrics": {
     "title": "指标",
@@ -99,7 +111,13 @@
     "every10s": "10 秒",
     "every30s": "30 秒",
     "warningThreshold": "警告阈值",
-    "criticalThreshold": "严重阈值"
+    "criticalThreshold": "严重阈值",
+    "stmtFaster": "{{fast}} 的 p99 比 {{slow}} 快 {{ms}}",
+    "stmtServing": "{{version}} · {{qps}} QPS · p99 {{p99}}",
+    "stmtWaiting": "等待指标数据…",
+    "currentQps": "当前 QPS",
+    "currentP99": "当前 p99",
+    "currentQueue": "队列深度"
   },
   "alerts": {
     "title": "告警",
@@ -114,7 +132,9 @@
     "notifyOff": "开启通知",
     "notifyEnabled": "浏览器通知已开启（仅在标签页隐藏时推送）",
     "notifyDenied": "浏览器拒绝了通知权限",
-    "notifyUnsupported": "当前浏览器不支持通知"
+    "notifyUnsupported": "当前浏览器不支持通知",
+    "stmtNone": "无告警触发",
+    "stmtFiring": "{{count}} 条告警触发中"
   },
   "search": {
     "placeholder": "跨实例搜索模型"
@@ -389,5 +409,9 @@
       "remove": "移除",
       "modelPlaceholder": "模型名"
     }
+  },
+  "versions": {
+    "ofTraffic": "{{weight}}% 流量",
+    "loadedSince": "已加载 {{age}}"
   }
 }

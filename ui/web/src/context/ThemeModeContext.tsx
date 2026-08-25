@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 
 const STORAGE_KEY = 'lite-ui-theme-mode';
 
@@ -13,22 +13,23 @@ export interface Neutrals {
   diffRemoveBg: string;
 }
 
+// Apple palette — mirrors tokens.css (:root / [data-theme='dark']).
 const LIGHT: Neutrals = {
-  border: '#E5E7EB',
-  textPrimary: '#111827',
-  textSecondary: '#6B7280',
-  textMuted: '#9CA3AF',
-  bgPage: '#F9FAFB',
+  border: '#E8E8ED',
+  textPrimary: '#1D1D1F',
+  textSecondary: '#6E6E73',
+  textMuted: '#86868B',
+  bgPage: '#FFFFFF',
   diffAddBg: '#ECFDF5',
   diffRemoveBg: '#FEF2F2',
 };
 
 const DARK: Neutrals = {
-  border: '#374151',
-  textPrimary: '#F3F4F6',
-  textSecondary: '#9CA3AF',
-  textMuted: '#6B7280',
-  bgPage: '#0B0F19',
+  border: '#38383A',
+  textPrimary: '#F5F5F7',
+  textSecondary: '#98989D',
+  textMuted: '#6E6E73',
+  bgPage: '#000000',
   diffAddBg: 'rgba(22, 163, 74, 0.16)',
   diffRemoveBg: 'rgba(220, 38, 38, 0.16)',
 };
@@ -39,8 +40,8 @@ export interface ChartColors {
   text: string;
 }
 
-const CHART_LIGHT: ChartColors = { axis: '#D1D5DB', split: '#E5E7EB', text: '#6B7280' };
-const CHART_DARK: ChartColors = { axis: '#4B5563', split: '#374151', text: '#9CA3AF' };
+const CHART_LIGHT: ChartColors = { axis: '#D2D2D7', split: '#E8E8ED', text: '#6E6E73' };
+const CHART_DARK: ChartColors = { axis: '#38383A', split: '#2C2C2E', text: '#98989D' };
 
 interface ThemeModeValue {
   dark: boolean;
@@ -58,6 +59,11 @@ const ThemeModeContext = createContext<ThemeModeValue>({
 
 export function ThemeModeProvider({ children }: { children: ReactNode }) {
   const [dark, setDark] = useState(() => localStorage.getItem(STORAGE_KEY) === 'dark');
+
+  // Drive the tokens.css variable set from the same source of truth.
+  useEffect(() => {
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  }, [dark]);
 
   const value = useMemo<ThemeModeValue>(
     () => ({

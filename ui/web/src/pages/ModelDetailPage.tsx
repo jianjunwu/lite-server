@@ -13,13 +13,16 @@ import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { ModelAccessPanel } from '../components/ModelAccessPanel';
-import { StatusBadge } from '../components/StatusBadge';
+import { StatusBadge, statusKind } from '../components/StatusBadge';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
+import { Reveal } from '../components/PageHero';
+import { TrafficRiver } from '../components/TrafficRiver';
 import { RoutingEditor } from '../components/RoutingEditor';
 import { buildTimelineOption } from '../components/timelineChart';
 import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
+import { SPACE } from '../tokens';
 
 export function ModelDetailPage() {
   const { t } = useTranslation();
@@ -66,7 +69,7 @@ export function ModelDetailPage() {
   // Neither in the repository nor in the registry — a genuinely unknown model.
   if (!merged.isLoading && !merged.inRepo && !merged.hasLoaded) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
         <PageHeader
           title={name}
           breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
@@ -81,8 +84,23 @@ export function ModelDetailPage() {
 
   const loadFirstHint = <Empty description={t('models.loadToView')} />;
 
+  const loadedVersions = versions.filter((v) => v.loaded);
+  const readyCount = loadedVersions.filter((v) => statusKind(v.status) === 'ready').length;
+  const workerTotal = healthQuery.data?.total_workers;
+  // Hero-layer statement under the title (plan §4.3).
+  const statement = !merged.hasLoaded
+    ? instanceId
+    : merged.activeVersion
+      ? t('models.detailStmtActive', {
+          ready: readyCount,
+          total: loadedVersions.length,
+          version: merged.activeVersion,
+          workers: workerTotal ?? '-',
+        })
+      : t('models.detailStmt', { ready: readyCount, total: loadedVersions.length, workers: workerTotal ?? '-' });
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
         breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
         onBack={() => navigate(ilink('/models'))}
@@ -101,11 +119,7 @@ export function ModelDetailPage() {
             )}
           </span>
         }
-        subtitle={
-          healthQuery.data
-            ? `${t('models.healthyWorkers')}: ${healthQuery.data.healthy_workers}/${healthQuery.data.total_workers} · ${instanceId}`
-            : instanceId
-        }
+        subtitle={statement}
         extra={
           can('operator') && (unloadedVersions.length > 0 || !merged.inRepo) ? (
             <Button size="small" onClick={() => setLoadOpen(true)}>
@@ -114,6 +128,22 @@ export function ModelDetailPage() {
           ) : undefined
         }
       />
+
+      {merged.hasLoaded && (
+        <Reveal order={1}>
+          <Card>
+            <TrafficRiver
+              versions={loadedVersions}
+              height={16}
+              model={name}
+              editable={can('operator')}
+              onSelect={(v) =>
+                navigate(ilink(`/models/${encodeURIComponent(name)}/versions/${encodeURIComponent(v)}`))
+              }
+            />
+          </Card>
+        </Reveal>
+      )}
 
       <Tabs
         items={[

@@ -41,7 +41,18 @@
     "noInstancesHint": "Add an instance in instances.yaml or via Settings.",
     "serverVersion": "Server version",
     "loadedModels": "Loaded models",
-    "allReady": "All {{versions}} versions ready across {{instances}} instances"
+    "allReady": "All {{versions}} versions ready across {{instances}} instances",
+    "stmtChecking": "Checking fleet status…",
+    "stmtAllReady": "All {{versions}} versions ready",
+    "stmtAttention_one": "{{count}} version needs attention",
+    "stmtAttention_other": "{{count}} versions need attention",
+    "stmtDown_one": "{{count}} version down",
+    "stmtDown_other": "{{count}} versions down",
+    "acrossInstances_one": "Across {{count}} instance",
+    "acrossInstances_other": "Across {{count}} instances",
+    "unreachableCount_one": "{{count}} unreachable",
+    "unreachableCount_other": "{{count}} unreachable",
+    "fleetP99": "P99 latency"
   },
   "models": {
     "title": "Models",
@@ -82,7 +93,12 @@
     },
     "drifted": "Loaded, but missing from the repository on disk",
     "emptyGuide": "Upload a model or run an example to get started",
-    "noneLoaded": "{{count}} models in repository, none loaded"
+    "noneLoaded": "{{count}} models in repository, none loaded",
+    "stmtServing": "{{version}} is serving {{weight}}% of traffic",
+    "stmtUnloaded": "No versions loaded",
+    "stmtNoActive": "No active version",
+    "detailStmt": "{{ready}} of {{total}} versions ready · {{workers}} workers",
+    "detailStmtActive": "{{ready}} of {{total}} versions ready · {{version}} active · {{workers}} workers"
   },
   "metrics": {
     "title": "Metrics",
@@ -99,7 +115,13 @@
     "every10s": "10s",
     "every30s": "30s",
     "warningThreshold": "warning threshold",
-    "criticalThreshold": "critical threshold"
+    "criticalThreshold": "critical threshold",
+    "stmtFaster": "{{fast}} is {{ms}} faster at p99 than {{slow}}",
+    "stmtServing": "{{version}} · {{qps}} QPS · {{p99}} at p99",
+    "stmtWaiting": "Waiting for metrics…",
+    "currentQps": "Current QPS",
+    "currentP99": "Current p99",
+    "currentQueue": "Queue depth"
   },
   "alerts": {
     "title": "Alerts",
@@ -114,7 +136,10 @@
     "notifyOff": "Notify me",
     "notifyEnabled": "Browser notifications enabled (fires only while the tab is hidden)",
     "notifyDenied": "Notification permission denied by the browser",
-    "notifyUnsupported": "This browser does not support notifications"
+    "notifyUnsupported": "This browser does not support notifications",
+    "stmtNone": "No alerts firing",
+    "stmtFiring_one": "{{count}} alert firing",
+    "stmtFiring_other": "{{count}} alerts firing"
   },
   "search": {
     "placeholder": "Search models across instances"
@@ -389,5 +414,9 @@
       "remove": "Remove",
       "modelPlaceholder": "model name"
     }
+  },
+  "versions": {
+    "ofTraffic": "{{weight}}% of traffic",
+    "loadedSince": "loaded {{age}}"
   }
 }

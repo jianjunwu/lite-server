@@ -173,7 +173,7 @@ describe('ModelsPage repository view', () => {
     expect((init as RequestInit).method).toBe('DELETE');
   });
 
-  it('should_show_repo_versions_with_load_action_in_the_expand_row', async () => {
+  it('should_show_repo_versions_with_load_action_in_the_model_card', async () => {
     mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
     mockVersions['ghost'] = {
       versions: [
@@ -193,10 +193,7 @@ describe('ModelsPage repository view', () => {
       hasLoaded: false,
     };
     renderPage();
-    // Expand the row via the antd expand icon.
-    const expandIcon = document.querySelector('.ant-table-row-expand-icon');
-    expect(expandIcon).not.toBeNull();
-    fireEvent.click(expandIcon as Element);
+    // Card view: the versions table is inside the card, no expand step.
     expect(await screen.findByRole('link', { name: '1' })).toBeTruthy();
     expect((await screen.findAllByText('Unloaded')).length).toBeGreaterThan(0);
     // Per-version Load action from VersionActions.

@@ -15,6 +15,7 @@ import { buildTimelineOption } from '../components/timelineChart';
 import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { formatAge } from '../components/format';
 import { dataTextStyle, TYPE } from '../theme';
+import { SPACE } from '../tokens';
 
 export function VersionDetailPage() {
   const { t } = useTranslation();
@@ -35,8 +36,21 @@ export function VersionDetailPage() {
 
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
 
+  // Hero-layer statement: weight · status · age (plan §4.3).
+  const statement =
+    isLoaded && info
+      ? [
+          t('versions.ofTraffic', { weight: info.weight }),
+          info.status,
+          info.loaded_at ? t('versions.loadedSince', { age: formatAge(info.loaded_at) }) : null,
+          instanceId,
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : `${name} · ${instanceId}`;
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
         breadcrumb={[
           { title: t('models.title'), href: ilink('/models') },
@@ -54,7 +68,7 @@ export function VersionDetailPage() {
             )}
           </span>
         }
-        subtitle={`${name} · ${instanceId}`}
+        subtitle={statement}
       />
 
       <Card size="small">

@@ -6,14 +6,12 @@ import { useTranslation } from 'react-i18next';
 import { ApiError } from '../api/client';
 import { useAuth } from '../context/AuthContext';
 import { TYPE } from '../theme';
-import { useNeutrals } from '../context/ThemeModeContext';
 
 export function LoginPage() {
   const { t } = useTranslation();
   const { login, verifyTotp, user, loading } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const neutrals = useNeutrals();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [totpChallenge, setTotpChallenge] = useState<string | null>(null);
@@ -66,11 +64,11 @@ export function LoginPage() {
   };
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: neutrals.bgPage }}>
-      <Card style={{ width: 360 }}>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface)' }}>
+      <Card style={{ width: 400, boxShadow: 'var(--shadow-card)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
-          <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 22 }} />
-          <Typography.Text strong style={{ fontSize: TYPE.pageTitle }}>{t('common.appName')}</Typography.Text>
+          <ThunderboltFilled style={{ color: '#0071E3', fontSize: 22 }} />
+          <Typography.Text strong style={{ fontSize: TYPE.pageTitle, letterSpacing: '-0.02em' }}>{t('common.appName')}</Typography.Text>
         </div>
         {error && <Alert type="error" message={error} showIcon style={{ marginBottom: 16 }} />}
         {totpChallenge ? (

@@ -32,10 +32,10 @@ function ForceChangePassword() {
   };
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: neutrals.bgPage }}>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface)' }}>
       <Card style={{ width: 400 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 22 }} />
+          <ThunderboltFilled style={{ color: '#0071E3', fontSize: 22 }} />
           <Typography.Text strong style={{ fontSize: TYPE.pageTitle }}>{t('common.appName')}</Typography.Text>
         </div>
         <Typography.Paragraph type="secondary" style={{ fontSize: TYPE.body }}>

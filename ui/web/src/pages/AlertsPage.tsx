@@ -11,7 +11,7 @@ import {
 import type { AlertItem } from '../api/types';
 import { STATUS_COLORS, dataTextStyle } from '../theme';
 import { formatTime } from '../components/format';
-import { PageHeader } from '../components/PageHeader';
+import { PageHero, Reveal } from '../components/PageHero';
 import { App } from 'antd';
 
 function SeverityText({ severity }: { severity: AlertItem['severity'] }) {
@@ -54,9 +54,18 @@ export function AlertsPage() {
 
   return (
     <>
-      <PageHeader
-        title={t('alerts.title')}
-        subtitle={instanceId}
+      <PageHero
+        eyebrow={t('alerts.title')}
+        live
+        statement={
+          alertsQuery.isLoading
+            ? t('alerts.title')
+            : alerts.length === 0
+              ? t('alerts.stmtNone')
+              : t('alerts.stmtFiring', { count: alerts.length })
+        }
+        tone={alerts.length === 0 ? 'ink' : 'error'}
+        subline={instanceId}
         extra={
           <Button
             size="small"
@@ -68,7 +77,8 @@ export function AlertsPage() {
           </Button>
         }
       />
-      <Card size="small">
+      <Reveal order={1}>
+        <Card size="small">
         <Table<AlertItem>
           rowKey={(a) => `${a.model}/${a.version}/${a.rule}/${a.severity}`}
           loading={alertsQuery.isLoading}
@@ -98,7 +108,8 @@ export function AlertsPage() {
             },
           ]}
         />
-      </Card>
+        </Card>
+      </Reveal>
     </>
   );
 }

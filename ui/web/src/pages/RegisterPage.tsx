@@ -8,7 +8,6 @@ import { ApiError } from '../api/client';
 import { authApi } from '../api/auth';
 import { useAuth } from '../context/AuthContext';
 import { TYPE } from '../theme';
-import { useNeutrals } from '../context/ThemeModeContext';
 
 interface RegisterFormValues {
   username: string;
@@ -21,7 +20,6 @@ export function RegisterPage() {
   const { t } = useTranslation();
   const { refresh } = useAuth();
   const navigate = useNavigate();
-  const neutrals = useNeutrals();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const statusQuery = useQuery({
@@ -56,11 +54,11 @@ export function RegisterPage() {
   };
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: neutrals.bgPage }}>
-      <Card style={{ width: 360 }}>
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface)' }}>
+      <Card style={{ width: 400, boxShadow: 'var(--shadow-card)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
-          <ThunderboltFilled style={{ color: '#4F46E5', fontSize: 22 }} />
-          <Typography.Text strong style={{ fontSize: TYPE.pageTitle }}>{t('common.appName')}</Typography.Text>
+          <ThunderboltFilled style={{ color: '#0071E3', fontSize: 22 }} />
+          <Typography.Text strong style={{ fontSize: TYPE.pageTitle, letterSpacing: '-0.02em' }}>{t('common.appName')}</Typography.Text>
         </div>
         {error && <Alert type="error" message={error} showIcon style={{ marginBottom: 16 }} />}
         <Form layout="vertical" onFinish={submit} requiredMark={false}>
