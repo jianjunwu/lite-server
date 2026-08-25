@@ -20,16 +20,19 @@ const json = (body: unknown) =>
 
 let inferSignal: AbortSignal | null | undefined;
 let eventsSignal: AbortSignal | null | undefined;
+let inferHeaders: Record<string, string> | undefined;
 
 function installFetch() {
   inferSignal = undefined;
   eventsSignal = undefined;
+  inferHeaders = undefined;
   vi.stubGlobal(
     'fetch',
     vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
       if (url.endsWith('/infer')) {
         inferSignal = init?.signal;
+        inferHeaders = init?.headers as Record<string, string>;
         return new Promise(() => {}); // hangs; only abort can end it
       }
       if (url.endsWith('/events')) {
@@ -89,5 +92,67 @@ describe('PlaygroundPage abort handling', () => {
     await waitFor(() => expect(eventsSignal).toBeTruthy());
     unmount();
     expect(eventsSignal!.aborted).toBe(true);
+  });
+});
+
+describe('PlaygroundPage custom headers', () => {
+  afterEach(() => localStorage.clear());
+
+  it('should_send_added_header_rows_with_unary_request', async () => {
+    installFetch();
+    renderPage();
+    fireEvent.click(await screen.findByText('Headers'));
+    fireEvent.click(await screen.findByRole('button', { name: /add header/i }));
+    fireEvent.change(await screen.findByPlaceholderText('Header name'), { target: { value: 'X-Trace-Id' } });
+    fireEvent.change(await screen.findByPlaceholderText('Value'), { target: { value: 't-42' } });
+    fireEvent.click(await sendEnabled());
+    await waitFor(() => expect(inferHeaders).toBeTruthy());
+    expect(inferHeaders!['x-trace-id']).toBe('t-42');
+    expect(inferHeaders!['x-requested-with']).toBe('lite-ui');
+  });
+
+  it('should_persist_header_rows_across_remounts', async () => {
+    installFetch();
+    const { unmount } = renderPage();
+    fireEvent.click(await screen.findByText('Headers'));
+    fireEvent.click(await screen.findByRole('button', { name: /add header/i }));
+    fireEvent.change(await screen.findByPlaceholderText('Header name'), { target: { value: 'X-A' } });
+    fireEvent.change(await screen.findByPlaceholderText('Value'), { target: { value: '1' } });
+    unmount();
+
+    renderPage();
+    fireEvent.click(await screen.findByText(/Headers/));
+    expect(await screen.findByDisplayValue('X-A')).toBeTruthy();
+    expect(await screen.findByDisplayValue('1')).toBeTruthy();
+  });
+});
+
+describe('PlaygroundPage response headers', () => {
+  function installResolvingFetch() {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL): Promise<Response> => {
+        const url = String(input);
+        if (url.endsWith('/infer')) {
+          return Promise.resolve(
+            new Response('{"output": 10}', {
+              status: 200,
+              headers: { 'content-type': 'application/json', 'x-backend-hdr': 'b-1' },
+            }),
+          );
+        }
+        if (url.includes('/versions')) return Promise.resolve(json(VERSIONS));
+        if (url.includes('/v2/models')) return Promise.resolve(json(MODELS));
+        return Promise.resolve(json({}));
+      }),
+    );
+  }
+
+  it('should_show_response_headers_after_unary_completes', async () => {
+    installResolvingFetch();
+    renderPage();
+    fireEvent.click(await sendEnabled());
+    fireEvent.click(await screen.findByText('Response headers'));
+    expect(await screen.findByText(/x-backend-hdr: b-1/)).toBeTruthy();
   });
 });

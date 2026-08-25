@@ -222,7 +222,13 @@
     "identical": "Responses are identical",
     "history": "History",
     "emptyHistory": "No requests yet (kept in memory, cleared on refresh)",
-    "load": "Load"
+    "load": "Load",
+    "headers": "Headers",
+    "responseHeaders": "Response headers",
+    "headerName": "Header name",
+    "headerValue": "Value",
+    "addHeader": "Add header",
+    "authorizationHint": "Authorization is stripped by the BFF proxy and will not reach the instance."
   },
   "settings": {
     "tabs": {

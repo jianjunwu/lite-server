@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
-  App, Button, Card, Col, Empty, Input, Popconfirm, Row, Segmented, Select, Space, Table, Tag, Typography,
+  App, Button, Card, Col, Collapse, Empty, Input, Popconfirm, Row, Segmented, Select, Space, Table, Tag, Typography,
 } from 'antd';
-import { SendOutlined, StopOutlined, SaveOutlined } from '@ant-design/icons';
+import { DeleteOutlined, PlusOutlined, SendOutlined, StopOutlined, SaveOutlined } from '@ant-design/icons';
 import { diffLines } from 'diff';
 import { useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useModels, useVersions } from '../api/hooks';
 import {
-  addHistory, deleteTemplate, getHistory, inferUnary, listTemplates, saveTemplate,
-  streamEvents, subscribeHistory, type HistoryEntry,
+  addHistory, deleteTemplate, getHistory, inferUnary, listTemplates, loadHeaders, saveHeaders, saveTemplate,
+  streamEvents, subscribeHistory, type HeaderRow, type HistoryEntry,
 } from '../api/playground';
 import { PageHeader } from '../components/PageHeader';
 import { formatMs } from '../components/format';
@@ -26,10 +26,12 @@ interface SlotState {
   events: string[];
   durationMs: number | null;
   requestId: string | null;
+  /** Response headers, null until the first response arrives. */
+  headers: Record<string, string> | null;
   error: string | null;
 }
 
-const IDLE_SLOT: SlotState = { status: 'idle', text: null, events: [], durationMs: null, requestId: null, error: null };
+const IDLE_SLOT: SlotState = { status: 'idle', text: null, events: [], durationMs: null, requestId: null, headers: null, error: null };
 
 function ResponseMeta({ slot }: { slot: SlotState }) {
   const { t } = useTranslation();
@@ -68,6 +70,24 @@ function SlotView({ slot }: { slot: SlotState }) {
     <div>
       <ResponseMeta slot={slot} />
       {slot.error && <Typography.Text type="danger">{slot.error}</Typography.Text>}
+      {slot.headers !== null && (
+        <Collapse
+          ghost
+          size="small"
+          style={{ marginBottom: 8 }}
+          items={[
+            {
+              key: 'response-headers',
+              label: t('playground.responseHeaders'),
+              children: (
+                <pre style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary, margin: 0, maxHeight: 200, overflow: 'auto' }}>
+                  {Object.entries(slot.headers).map(([k, v]) => `${k}: ${v}`).join('\n')}
+                </pre>
+              ),
+            },
+          ]}
+        />
+      )}
       {slot.text !== null && (
         <pre style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary, margin: 0, maxHeight: 400, overflow: 'auto' }}>
           {slot.text}
@@ -112,6 +132,48 @@ function DiffView({ textA, textB }: { textA: string; textB: string }) {
   );
 }
 
+// ---- headers editor ---------------------------------------------------------
+
+function HeadersEditor({ rows, onChange }: { rows: HeaderRow[]; onChange: (rows: HeaderRow[]) => void }) {
+  const { t } = useTranslation();
+  const hasAuthorization = rows.some((r) => r.name.trim().toLowerCase() === 'authorization');
+  const patch = (i: number, part: Partial<HeaderRow>) =>
+    onChange(rows.map((r, j) => (j === i ? { ...r, ...part } : r)));
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size="small">
+      {rows.map((row, i) => (
+        <Space.Compact key={i} style={{ width: '100%' }}>
+          <Input
+            placeholder={t('playground.headerName')}
+            value={row.name}
+            style={{ width: '40%' }}
+            onChange={(e) => patch(i, { name: e.target.value })}
+          />
+          <Input
+            placeholder={t('playground.headerValue')}
+            value={row.value}
+            onChange={(e) => patch(i, { value: e.target.value })}
+          />
+          <Button icon={<DeleteOutlined />} onClick={() => onChange(rows.filter((_, j) => j !== i))} />
+        </Space.Compact>
+      ))}
+      <Button
+        type="dashed"
+        size="small"
+        icon={<PlusOutlined />}
+        onClick={() => onChange([...rows, { name: '', value: '' }])}
+      >
+        {t('playground.addHeader')}
+      </Button>
+      {hasAuthorization && (
+        <Typography.Text type="warning" style={{ fontSize: TYPE.eyebrow }}>
+          {t('playground.authorizationHint')}
+        </Typography.Text>
+      )}
+    </Space>
+  );
+}
+
 // ---- page -------------------------------------------------------------------
 
 export function PlaygroundPage() {
@@ -141,6 +203,7 @@ export function PlaygroundPage() {
   const [protocol, setProtocol] = useState<'unary' | 'stream'>('unary');
   const [body, setBody] = useState('{\n  "input": 21\n}');
   const [templates, setTemplates] = useState(() => (effectiveModel ? listTemplates(effectiveModel) : []));
+  const [headerRows, setHeaderRows] = useState<HeaderRow[]>([]);
   const [slotA, setSlotA] = useState<SlotState>(IDLE_SLOT);
   const [slotB, setSlotB] = useState<SlotState>(IDLE_SLOT);
   const aborts = useRef<Array<() => void>>([]);
@@ -149,6 +212,15 @@ export function PlaygroundPage() {
   useEffect(() => {
     setTemplates(effectiveModel ? listTemplates(effectiveModel) : []);
   }, [effectiveModel]);
+
+  useEffect(() => {
+    setHeaderRows(instanceId && effectiveModel ? loadHeaders(instanceId, effectiveModel) : []);
+  }, [instanceId, effectiveModel]);
+
+  const updateHeaders = (rows: HeaderRow[]) => {
+    setHeaderRows(rows);
+    if (instanceId && effectiveModel) saveHeaders(instanceId, effectiveModel, rows);
+  };
 
   // Abort in-flight requests when the page unmounts; otherwise orphan
   // streams keep generating on the instance after navigation.
@@ -180,9 +252,9 @@ export function PlaygroundPage() {
     if (protocol === 'unary') {
       const controller = new AbortController();
       aborts.current.push(() => controller.abort());
-      return inferUnary(instanceId, effectiveModel, version, requestBody, controller.signal)
+      return inferUnary(instanceId, effectiveModel, version, requestBody, controller.signal, headerRows)
         .then((res) => {
-          setSlot(which, { status: 'done', text: res.text, durationMs: res.durationMs, requestId: res.requestId });
+          setSlot(which, { status: 'done', text: res.text, durationMs: res.durationMs, requestId: res.requestId, headers: res.headers });
           return true;
         })
         .catch((err) => {
@@ -208,7 +280,8 @@ export function PlaygroundPage() {
           setSlot(which, { status: 'error', error: err.message });
           resolve(false);
         },
-      });
+        onHeaders: (headers) => setSlot(which, { headers }),
+      }, headerRows);
       aborts.current.push(abort);
     });
   };
@@ -381,6 +454,17 @@ export function PlaygroundPage() {
                 rows={9}
                 style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary }}
                 spellCheck={false}
+              />
+              <Collapse
+                ghost
+                size="small"
+                items={[
+                  {
+                    key: 'headers',
+                    label: headerRows.length > 0 ? `${t('playground.headers')} (${headerRows.length})` : t('playground.headers'),
+                    children: <HeadersEditor rows={headerRows} onChange={updateHeaders} />,
+                  },
+                ]}
               />
               <Space>
                 {running ? (

@@ -51,12 +51,51 @@ function authHeaders(instanceId: string): Record<string, string> {
   return headers;
 }
 
+// ---- custom headers (localStorage, per instance+model) ---------------------
+
+export interface HeaderRow {
+  name: string;
+  value: string;
+}
+
+const hdrKey = (inst: string, model: string) => `lite-ui-headers:${inst}:${model}`;
+
+export function loadHeaders(inst: string, model: string): HeaderRow[] {
+  try {
+    const raw = localStorage.getItem(hdrKey(inst, model));
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? (parsed as HeaderRow[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveHeaders(inst: string, model: string, rows: HeaderRow[]) {
+  localStorage.setItem(hdrKey(inst, model), JSON.stringify(rows));
+}
+
+/** Merge user rows over the transport defaults (case-insensitive names, later
+ * rows win). `x-requested-with` is the BFF's CSRF contract and always wins
+ * over user input. Note: `authorization` is stripped by the BFF proxy. */
+export function mergeHeaders(instanceId: string, extra: HeaderRow[]): Record<string, string> {
+  const headers = authHeaders(instanceId);
+  for (const row of extra) {
+    const key = row.name.trim().toLowerCase();
+    if (!key) continue;
+    headers[key] = row.value;
+  }
+  headers['x-requested-with'] = 'lite-ui';
+  return headers;
+}
+
 export interface UnaryResult {
   status: number;
   durationMs: number;
   requestId: string | null;
   /** Pretty-printed JSON when parseable, raw text otherwise. */
   text: string;
+  /** Response headers (lower-cased by the Headers API). */
+  headers: Record<string, string>;
 }
 
 export async function inferUnary(
@@ -65,11 +104,12 @@ export async function inferUnary(
   version: string | null,
   body: string,
   signal?: AbortSignal,
+  extraHeaders: HeaderRow[] = [],
 ): Promise<UnaryResult> {
   const started = performance.now();
   const res = await fetch(`/api/i/${enc(instanceId)}${modelPath(model, version, 'infer')}`, {
     method: 'POST',
-    headers: authHeaders(instanceId),
+    headers: mergeHeaders(instanceId, extraHeaders),
     body,
     signal,
   });
@@ -93,13 +133,15 @@ export async function inferUnary(
     }
     throw new ApiError(res.status, res.headers.get('x-request-id'), raw, message);
   }
-  return { status: res.status, durationMs, requestId: res.headers.get('x-request-id'), text };
+  return { status: res.status, durationMs, requestId: res.headers.get('x-request-id'), text, headers: Object.fromEntries(res.headers.entries()) };
 }
 
 export interface StreamCallbacks {
   onEvent: (payload: string) => void;
   onDone: (durationMs: number) => void;
   onError: (err: Error) => void;
+  /** Fired once the response headers arrive (before the first event). */
+  onHeaders?: (headers: Record<string, string>) => void;
 }
 
 /** POST /events and consume the SSE stream; returns an abort function. */
@@ -109,6 +151,7 @@ export function streamEvents(
   version: string | null,
   body: string,
   cb: StreamCallbacks,
+  extraHeaders: HeaderRow[] = [],
 ): () => void {
   const controller = new AbortController();
   const started = performance.now();
@@ -116,7 +159,7 @@ export function streamEvents(
   (async () => {
     const res = await fetch(`/api/i/${enc(instanceId)}${modelPath(model, version, 'events')}`, {
       method: 'POST',
-      headers: authHeaders(instanceId),
+      headers: mergeHeaders(instanceId, extraHeaders),
       body,
       signal: controller.signal,
     });
@@ -130,6 +173,7 @@ export function streamEvents(
       }
       throw new ApiError(res.status, res.headers.get('x-request-id'), text, `HTTP ${res.status}`);
     }
+    cb.onHeaders?.(Object.fromEntries(res.headers.entries()));
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     const parser = new SseParser();

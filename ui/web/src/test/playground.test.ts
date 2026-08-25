@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SseParser, deleteTemplate, listTemplates, saveTemplate, streamEvents } from '../api/playground';
+import {
+  SseParser, deleteTemplate, listTemplates, loadHeaders, mergeHeaders, saveHeaders, saveTemplate, streamEvents,
+} from '../api/playground';
+import { setAdminKey } from '../api/client';
 
 describe('SseParser', () => {
   it('should_parse_complete_frames', () => {
@@ -117,5 +120,84 @@ describe('request templates', () => {
   it('should_return_empty_for_corrupt_storage', () => {
     localStorage.setItem('lite-ui-tpl:echo', 'not-json');
     expect(listTemplates('echo')).toEqual([]);
+  });
+});
+
+describe('mergeHeaders', () => {
+  afterEach(() => sessionStorage.clear());
+
+  it('should_keep_defaults_when_no_extra_rows', () => {
+    expect(mergeHeaders('prod', [])).toEqual({
+      'content-type': 'application/json',
+      'x-requested-with': 'lite-ui',
+    });
+  });
+
+  it('should_add_user_rows_case_insensitively', () => {
+    const merged = mergeHeaders('prod', [{ name: 'X-Trace-Id', value: 't-1' }]);
+    expect(merged['x-trace-id']).toBe('t-1');
+  });
+
+  it('should_let_user_rows_override_content_type_and_admin_key', () => {
+    setAdminKey('prod', 'stored-key');
+    const merged = mergeHeaders('prod', [
+      { name: 'content-type', value: 'text/plain' },
+      { name: 'X-Admin-Key', value: 'explicit-key' },
+    ]);
+    expect(merged['content-type']).toBe('text/plain');
+    expect(merged['x-admin-key']).toBe('explicit-key');
+  });
+
+  it('should_never_let_user_rows_override_csrf_header', () => {
+    const merged = mergeHeaders('prod', [{ name: 'X-Requested-With', value: 'forged' }]);
+    expect(merged['x-requested-with']).toBe('lite-ui');
+  });
+
+  it('should_skip_blank_names_and_empty_rows', () => {
+    const merged = mergeHeaders('prod', [
+      { name: '  ', value: 'x' },
+      { name: '', value: 'y' },
+    ]);
+    expect(Object.keys(merged)).toEqual(['content-type', 'x-requested-with']);
+  });
+});
+
+describe('playground header storage', () => {
+  afterEach(() => localStorage.clear());
+
+  it('should_roundtrip_headers_per_instance_and_model', () => {
+    saveHeaders('prod', 'echo', [{ name: 'x-a', value: '1' }]);
+    saveHeaders('prod', 'other', [{ name: 'x-b', value: '2' }]);
+    saveHeaders('dev', 'echo', [{ name: 'x-c', value: '3' }]);
+    expect(loadHeaders('prod', 'echo')).toEqual([{ name: 'x-a', value: '1' }]);
+    expect(loadHeaders('prod', 'other')).toEqual([{ name: 'x-b', value: '2' }]);
+    expect(loadHeaders('dev', 'echo')).toEqual([{ name: 'x-c', value: '3' }]);
+  });
+
+  it('should_return_empty_for_corrupt_storage', () => {
+    localStorage.setItem('lite-ui-headers:prod:echo', 'not-json');
+    expect(loadHeaders('prod', 'echo')).toEqual([]);
+  });
+});
+
+describe('inferUnary response headers', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('should_return_response_headers_with_result', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response('{"output": 10}', {
+            status: 200,
+            headers: { 'content-type': 'application/json', 'x-request-id': 'r-1', 'x-backend-hdr': 'b-1' },
+          }),
+        ),
+      ),
+    );
+    const { inferUnary } = await import('../api/playground');
+    const res = await inferUnary('prod', 'm', null, '{}');
+    expect(res.headers['x-backend-hdr']).toBe('b-1');
+    expect(res.headers['content-type']).toBe('application/json');
   });
 });

@@ -222,7 +222,13 @@
     "identical": "两个版本的响应完全一致",
     "history": "历史记录",
     "emptyHistory": "暂无请求（仅内存保存，刷新即清空）",
-    "load": "载入"
+    "load": "载入",
+    "headers": "请求头",
+    "responseHeaders": "响应头",
+    "headerName": "名称",
+    "headerValue": "值",
+    "addHeader": "添加请求头",
+    "authorizationHint": "Authorization 头会被 BFF 代理剥离,不会到达实例。"
   },
   "settings": {
     "tabs": {
