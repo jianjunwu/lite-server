@@ -153,6 +153,18 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
             post(upload_model_handler).route_layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/v2/repository/models/:model_name/versions/:version/download", get(download_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/files", get(list_files_handler))
+        // Admin: resumable chunked upload sessions (>1GiB files). Chunk PUT
+        // bodies stream to disk like the multipart upload — the global body
+        // cap is disabled on that route only (the handler enforces the
+        // per-chunk size itself); session control messages stay JSON-small.
+        .route("/v2/repository/models/:model_name/versions/:version/upload-sessions",
+            post(create_upload_session))
+        .route("/v2/repository/models/:model_name/versions/:version/upload-sessions/:session_id",
+            get(get_upload_session).delete(delete_upload_session))
+        .route("/v2/repository/models/:model_name/versions/:version/upload-sessions/:session_id/complete",
+            post(complete_upload_session))
+        .route("/v2/repository/models/:model_name/versions/:version/upload-sessions/:session_id/files/:file_index/chunks/:chunk_index",
+            put(put_session_chunk).route_layer(axum::extract::DefaultBodyLimit::disable()))
         // Admin: model-level upload (F8, .lma only — version from manifest)
         .route("/v2/repository/models/:model_name/upload",
             post(upload_model_package_handler).route_layer(axum::extract::DefaultBodyLimit::disable()))

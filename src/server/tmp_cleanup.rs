@@ -78,7 +78,7 @@ pub(super) async fn startup_tmp_cleanup(
             }
             if name.starts_with(".tmp-upload-") || name.starts_with(".tmp-unpack-") {
                 if path.is_dir()
-                    && is_stale(&path, now, max_age).await
+                    && staging_dir_is_stale(&path, &name, now, max_age).await
                     && tokio::fs::remove_dir_all(&path).await.is_ok()
                 {
                     removed += 1;
@@ -193,6 +193,25 @@ async fn sweep_swap_backup(
     }
 }
 
+/// Staleness for staging dirs. Chunked upload sessions keep their liveness
+/// in `session.json`'s mtime (every chunk PUT touches it; writes into the
+/// `.chunks/` subdirs do NOT refresh the top-level dir's mtime), so a
+/// `.tmp-upload-*` dir with a session.json is stale only when BOTH mtimes
+/// are past the gate — an active long-running resumable upload must never
+/// be swept mid-flight.
+async fn staging_dir_is_stale(path: &Path, name: &str, now: SystemTime, max_age: Duration) -> bool {
+    if !is_stale(path, now, max_age).await {
+        return false;
+    }
+    if name.starts_with(".tmp-upload-") {
+        let meta = path.join("session.json");
+        if meta.is_file() && !is_stale(&meta, now, max_age).await {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `path` is older than `max_age` relative to `now`. Missing
 /// metadata counts as stale (removal is safe — the entry is already broken).
 async fn is_stale(path: &Path, now: SystemTime, max_age: Duration) -> bool {
@@ -265,6 +284,51 @@ mod tests {
         .await;
         assert_eq!(removed, 0, "fresh temp dir must be kept");
         let _ = tokio::fs::remove_dir_all(&temp_root).await;
+    }
+
+    #[tokio::test]
+    async fn keeps_active_chunked_upload_sessions() {
+        // A chunked-upload staging dir whose session.json was touched
+        // recently is ACTIVE — it must survive the sweep even when the
+        // top-level dir mtime is old (chunk writes don't refresh it).
+        let repo_active = unique_tmp("staging-active");
+        let active = repo_active.join(format!(".tmp-upload-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&active).await.unwrap();
+        tokio::fs::write(active.join("session.json"), "{}")
+            .await
+            .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        std::fs::File::open(&active)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let (removed_active, _) = startup_tmp_cleanup(
+            &repo_active,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            DEFAULT_MAX_AGE,
+        )
+        .await;
+        assert_eq!(removed_active, 0, "an active upload session must not be swept");
+        assert!(active.exists());
+
+        // Once session.json ALSO ages out, the dir is swept.
+        std::fs::File::open(active.join("session.json"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let (removed_stale, _) = startup_tmp_cleanup(
+            &repo_active,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            DEFAULT_MAX_AGE,
+        )
+        .await;
+        assert_eq!(removed_stale, 1, "a fully-stale session dir must be swept");
+        assert!(!active.exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo_active).await;
     }
 
     #[tokio::test]

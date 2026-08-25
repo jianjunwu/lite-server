@@ -357,6 +357,8 @@ pub mod bidi;
 pub use bidi::*;
 pub mod files;
 pub use files::*;
+pub mod upload_sessions;
+pub use upload_sessions::*;
 
 #[cfg(test)]
 mod tests;
