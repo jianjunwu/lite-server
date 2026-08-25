@@ -48,7 +48,7 @@ async def _lifespan(app: FastAPI):
 
 
 def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = True,
-              unary_timeout: float = 60.0) -> FastAPI:
+              unary_timeout: float = 60.0, stream_max_connections: int = 500) -> FastAPI:
     app = FastAPI(lifespan=_lifespan)
     app.state.registry = registry
     # trust_env=False: instance forwarding must not honor system/env proxy
@@ -57,8 +57,13 @@ def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = 
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(unary_timeout, connect=10.0), trust_env=False
     )
+    # Each SSE stream or file transfer pins one upstream connection for its
+    # lifetime, so the pool must cover the expected concurrent transfer load
+    # (httpx's default of 100 would queue new streams). Each active stream
+    # also costs 2 fds (browser + upstream): raise ulimit -n accordingly.
     app.state.http_stream = httpx.AsyncClient(
-        timeout=httpx.Timeout(None, connect=10.0), trust_env=False
+        timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
+        limits=httpx.Limits(max_connections=stream_max_connections),
     )
 
     if user_store is not None:

@@ -174,3 +174,16 @@ def test_should_not_time_out_slow_download_pack(registry, live):
     with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
         res = c.get("/api/i/plain/v2/repository/models/m/versions/1/download")
     assert res.status_code == 200
+
+
+def test_should_default_stream_pool_to_500_connections():
+    # SSE inference streams and file transfers each pin one upstream
+    # connection for their lifetime; the default httpx pool (100) would
+    # queue new streams well below expected concurrent load.
+    app = build_app(MapRegistry([]))
+    assert app.state.http_stream._transport._pool._max_connections == 500
+
+
+def test_should_honor_stream_max_connections_override():
+    app = build_app(MapRegistry([]), stream_max_connections=7)
+    assert app.state.http_stream._transport._pool._max_connections == 7
