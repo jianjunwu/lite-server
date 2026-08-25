@@ -255,6 +255,7 @@
       "totpResetAction": "重置 2FA"
     },
     "instances": {
+      "manage": "管理实例",
       "add": "添加实例",
       "addTitle": "添加实例",
       "editTitle": "编辑实例 {{id}}",

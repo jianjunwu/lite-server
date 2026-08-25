@@ -255,6 +255,7 @@
       "totpResetAction": "Reset 2FA"
     },
     "instances": {
+      "manage": "Manage instances",
       "add": "Add instance",
       "addTitle": "Add instance",
       "editTitle": "Edit instance {{id}}",

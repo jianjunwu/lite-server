@@ -4,6 +4,7 @@ import { PlusOutlined } from '@ant-design/icons';
 import { QRCodeSVG } from 'qrcode.react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import { bffFetch, setAdminKey } from '../api/client';
 import { auditApi, authApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
 import { useInstances } from '../api/hooks';
@@ -862,6 +863,7 @@ function InvitesTab() {
 export function SettingsPage() {
   const { t } = useTranslation();
   const { can } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   const tabs = [
     { key: 'instances', label: t('settings.tabs.instances'), children: <InstancesTab /> },
     { key: 'keys', label: t('settings.tabs.keys'), children: <AdminKeysTab /> },
@@ -872,10 +874,16 @@ export function SettingsPage() {
     tabs.push({ key: 'invites', label: t('settings.tabs.invites'), children: <InvitesTab /> });
     tabs.push({ key: 'audit', label: t('settings.tabs.audit'), children: <AuditTab /> });
   }
+  const requested = searchParams.get('tab');
+  const activeTab = tabs.some((tab) => tab.key === requested) ? requested! : 'instances';
   return (
     <>
       <PageHeader title={t('nav.settings')} />
-      <Tabs items={tabs} />
+      <Tabs
+        activeKey={activeTab}
+        onChange={(key) => setSearchParams({ tab: key }, { replace: true })}
+        items={tabs}
+      />
     </>
   );
 }

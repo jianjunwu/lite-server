@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Alert, Button, Layout, Menu, Select, Space, Typography } from 'antd';
+import { Alert, Button, Divider, Layout, Menu, Select, Space, Typography } from 'antd';
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -104,6 +104,24 @@ export function AppLayout() {
               onChange={(id) => setInstanceId(id)}
               options={instances.map((i) => ({ value: i.id, label: `${i.name} (${i.base_url})` }))}
               placeholder={t('common.instance')}
+              notFoundContent={
+                <div style={{ padding: '4px 8px', color: neutrals.textSecondary }}>{t('common.empty')}</div>
+              }
+              popupRender={(menu) => (
+                <>
+                  {menu}
+                  <Divider style={{ margin: '4px 0' }} />
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<SettingOutlined />}
+                    style={{ width: '100%', textAlign: 'left' }}
+                    onClick={() => navigate('/settings?tab=instances')}
+                  >
+                    {t('settings.instances.manage')}
+                  </Button>
+                </>
+              )}
             />
           </Space>
           <Space size="middle">
