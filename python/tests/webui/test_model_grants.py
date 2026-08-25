@@ -233,3 +233,78 @@ def test_should_audit_model_grant_changes(ctx):
     assert entries[0]["actor"] == "admin"
     assert entries[0]["target"] == "op1"
     assert entries[0]["detail"] == {"instance_id": "dev", "model": "alpha", "role": "viewer"}
+
+
+# ---- observability endpoints: same isolation as the model lists ----
+
+def test_should_deny_single_model_timeline_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    assert client.get("/api/i/dev/metrics/timeline/alpha").status_code == 200
+    res = client.get("/api/i/dev/metrics/timeline/beta")
+    assert res.status_code == 403
+    assert res.json()["reason"] == "model_denied"
+
+
+def test_should_filter_timeline_all_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/metrics/timeline")
+    assert [s["model"] for s in res.json()["snapshots"]] == ["alpha"]
+
+
+def test_should_filter_alerts_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/metrics/alerts")
+    assert [a["model"] for a in res.json()["alerts"]] == ["alpha"]
+
+
+def test_should_filter_health_models_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/health")
+    body = res.json()
+    assert body["status"] == "ready"  # non-model fields survive
+    assert [m["name"] for m in body["models"]] == ["alpha"]
+
+
+def test_should_filter_info_loaded_models_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/info")
+    body = res.json()
+    assert body["version"] == "0.1.0"
+    assert body["loaded_models"] == ["alpha"]
+
+
+def test_should_filter_drift_entries_when_whitelist_active(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/v2/repository/drift")
+    body = res.json()
+    assert [e["model"] for e in body["configured_missing"]] == ["alpha"]
+    assert [e["model"] for e in body["on_disk_unconfigured"]] == ["alpha"]
+
+
+def test_should_not_filter_observability_when_whitelist_inactive(ctx):
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/metrics/timeline")
+    assert {s["model"] for s in res.json()["snapshots"]} == {"alpha", "beta"}
+    res = client.get("/api/i/dev/info")
+    assert res.json()["loaded_models"] == ["alpha", "beta"]
+
+
+def test_should_not_filter_observability_for_admin(ctx):
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "admin", "admin-pass-1")
+    res = client.get("/api/i/dev/metrics/timeline")
+    assert {s["model"] for s in res.json()["snapshots"]} == {"alpha", "beta"}

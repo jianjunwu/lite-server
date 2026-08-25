@@ -41,6 +41,13 @@ class MapRegistry:
 class _UpstreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _send_json(self, payload: bytes, status: int = 200):
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _record_and_route(self):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
@@ -155,6 +162,46 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+            return
+        if self.path == "/metrics/timeline":
+            payload = json.dumps({"snapshots": [
+                {"model": "alpha", "version": "1", "entries": []},
+                {"model": "beta", "version": "1", "entries": []},
+            ]}).encode()
+            self._send_json(payload)
+            return
+        if self.path == "/metrics/alerts":
+            payload = json.dumps({"alerts": [
+                {"model": "alpha", "version": "1", "rule": "qps", "message": "a",
+                 "severity": "warning", "timestamp": 1, "value": 1, "threshold": 2},
+                {"model": "beta", "version": "1", "rule": "qps", "message": "b",
+                 "severity": "warning", "timestamp": 1, "value": 1, "threshold": 2},
+            ]}).encode()
+            self._send_json(payload)
+            return
+        if self.path == "/health":
+            payload = json.dumps({"status": "ready", "models": [
+                {"name": "alpha", "active_version": "1", "versions": []},
+                {"name": "beta", "active_version": "1", "versions": []},
+            ]}).encode()
+            self._send_json(payload)
+            return
+        if self.path == "/info":
+            payload = json.dumps({"server": "lite-server", "version": "0.1.0",
+                                  "loaded_models": ["alpha", "beta"]}).encode()
+            self._send_json(payload)
+            return
+        if self.path == "/v2/repository/drift":
+            payload = json.dumps({
+                "configured_missing": [{"model": "alpha", "version": "9"}],
+                "on_disk_unconfigured": [
+                    {"model": "alpha", "version": "3", "size_bytes": 1,
+                     "ensemble_referenced": False},
+                    {"model": "beta", "version": "2", "size_bytes": 1,
+                     "ensemble_referenced": False},
+                ],
+            }).encode()
+            self._send_json(payload)
             return
         if self.path == "/fail500":
             payload = json.dumps({"error": "boom"}).encode()

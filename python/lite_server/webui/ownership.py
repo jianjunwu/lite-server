@@ -45,8 +45,18 @@ class Mutation:
 # viewers at the role layer — same regex as auth._INFER_RE).
 _INFER_TAIL_RE = re.compile(r"/(infer|events)$")
 
-# Small-JSON list endpoints whose responses are filtered for whitelist users.
-_MODEL_LIST_TAILS = frozenset({"v2/models", "v2/repository/index"})
+# Small-JSON list responses filtered for whitelist users: tail -> list of
+# (array field, per-row model key; None means the rows are model-name strings).
+_LIST_FILTERS: dict[str, list[tuple[str, str | None]]] = {
+    "v2/models": [("models", "name")],
+    "v2/repository/index": [("models", "name")],
+    "metrics/timeline": [("snapshots", "model")],
+    "metrics/alerts": [("alerts", "model")],
+    "health": [("models", "name")],
+    "info": [("loaded_models", None)],
+    "v2/repository/drift": [("configured_missing", "model"),
+                            ("on_disk_unconfigured", "model")],
+}
 
 
 def parse_model_path(tail: str) -> str | None:
@@ -56,6 +66,8 @@ def parse_model_path(tail: str) -> str | None:
         return segs[2]
     if len(segs) >= 4 and segs[:3] == ["v2", "repository", "models"]:
         return segs[3]
+    if len(segs) >= 3 and segs[:2] == ["metrics", "timeline"]:
+        return segs[2]
     return None
 
 
@@ -63,8 +75,8 @@ def is_inference_tail(tail: str) -> bool:
     return bool(_INFER_TAIL_RE.search(tail))
 
 
-def is_model_list_tail(tail: str) -> bool:
-    return tail.strip("/") in _MODEL_LIST_TAILS
+def list_filter_for(tail: str) -> list[tuple[str, str | None]] | None:
+    return _LIST_FILTERS.get(tail.strip("/"))
 
 
 def whitelist_active(store, inst_id: str, user: dict) -> bool:
@@ -90,18 +102,30 @@ def check_model_grant(store, inst_id: str, user: dict, model: str, *,
     return None
 
 
-def filter_model_list(store, inst_id: str, user: dict, payload):
-    """Drop non-granted models from a {"models": [...]} list response.
-    Only called when the whitelist is active for this user."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+def filter_list_response(store, inst_id: str, user: dict, tail: str, payload):
+    """Drop non-granted models from a list response. The shape to filter is
+    declared per path in _LIST_FILTERS; only called when the whitelist is
+    active for this user. Non-list payloads pass through untouched."""
+    specs = list_filter_for(tail)
+    if specs is None or not isinstance(payload, dict):
         return payload
     username = user.get("username", "")
+
+    def granted(model: str) -> bool:
+        return store.model_grant(username, inst_id, model) is not None
+
     payload = dict(payload)
-    payload["models"] = [
-        row for row in payload["models"]
-        if not isinstance(row, dict)
-        or store.model_grant(username, inst_id, str(row.get("name", ""))) is not None
-    ]
+    for field, model_key in specs:
+        rows = payload.get(field)
+        if not isinstance(rows, list):
+            continue
+        if model_key is None:
+            payload[field] = [r for r in rows if not isinstance(r, str) or granted(r)]
+        else:
+            payload[field] = [
+                r for r in rows
+                if not isinstance(r, dict) or granted(str(r.get(model_key, "")))
+            ]
     return payload
 
 

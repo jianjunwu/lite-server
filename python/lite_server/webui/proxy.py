@@ -125,10 +125,11 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
 
     headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
 
-    # Model whitelist read filtering (M3): the two small-JSON list endpoints
-    # are buffered and stripped of models the caller has no grant for.
+    # Model whitelist read filtering (M3): small-JSON list responses (model
+    # lists, repo scan, timeline/alerts/health/info/drift) are buffered and
+    # stripped of models the caller has no grant for.
     if (store is not None and user is not None
-            and ownership.is_model_list_tail(tail)
+            and ownership.list_filter_for(tail) is not None
             and ownership.whitelist_active(store, inst_id, user)):
         try:
             raw = await upstream.aread()
@@ -136,7 +137,8 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
             await upstream.aclose()
         if 200 <= upstream.status_code < 300:
             try:
-                payload = ownership.filter_model_list(store, inst_id, user, json.loads(raw))
+                payload = ownership.filter_list_response(
+                    store, inst_id, user, tail, json.loads(raw))
                 raw = json.dumps(payload).encode()
             except ValueError:
                 pass  # non-JSON list response passes through untouched
