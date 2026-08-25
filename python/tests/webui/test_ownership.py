@@ -187,6 +187,15 @@ def test_batch_delete_is_admin_only(ctx):
     assert admin.delete(url, headers=CSRF).status_code == 200
 
 
+def test_get_on_mutation_shaped_paths_is_not_policed(ctx):
+    """Mutations are classified by path shape; a GET on the same path is a
+    read and must not be judged by mutation rules (regression: operators
+    were denied the versions list as 'batch delete is admin-only')."""
+    op1 = client_for(ctx, "op1", "Operator-pass-1")
+    assert op1.get("/api/i/plain/v2/models/m/versions").status_code == 200
+    assert op1.get("/api/i/plain/v2/models/m/versions/1").status_code == 200
+
+
 def test_batch_delete_removes_ownership_of_deleted_versions(ctx):
     op1 = client_for(ctx, "op1", "Operator-pass-1")
     admin = client_for(ctx, "admin", "Admin-pass-1234")

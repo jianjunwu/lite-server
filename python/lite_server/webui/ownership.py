@@ -27,6 +27,7 @@ Enforcement rules (roles still apply first — see auth.check_request):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from fastapi.responses import JSONResponse
@@ -38,6 +39,70 @@ class Mutation:
     model: str
     version: str | None
     session_id: str | None
+
+
+# Inference calls are read-class for the model whitelist (they are open to
+# viewers at the role layer — same regex as auth._INFER_RE).
+_INFER_TAIL_RE = re.compile(r"/(infer|events)$")
+
+# Small-JSON list endpoints whose responses are filtered for whitelist users.
+_MODEL_LIST_TAILS = frozenset({"v2/models", "v2/repository/index"})
+
+
+def parse_model_path(tail: str) -> str | None:
+    """Model name carried by a model-scoped proxied path, or None."""
+    segs = [s for s in tail.split("/") if s]
+    if len(segs) >= 3 and segs[:2] == ["v2", "models"]:
+        return segs[2]
+    if len(segs) >= 4 and segs[:3] == ["v2", "repository", "models"]:
+        return segs[3]
+    return None
+
+
+def is_inference_tail(tail: str) -> bool:
+    return bool(_INFER_TAIL_RE.search(tail))
+
+
+def is_model_list_tail(tail: str) -> bool:
+    return tail.strip("/") in _MODEL_LIST_TAILS
+
+
+def whitelist_active(store, inst_id: str, user: dict) -> bool:
+    """Instance/global admins bypass the model whitelist entirely."""
+    if user.get("role") == "admin":
+        return False
+    return store.has_model_grants(user.get("username", ""), inst_id)
+
+
+def check_model_grant(store, inst_id: str, user: dict, model: str, *,
+                      write: bool) -> JSONResponse | None:
+    """Model whitelist gate, run AFTER the role guard and BEFORE ownership.
+    Active (any grant row for this user on this instance): reads need a
+    viewer+ grant on the target model, mutations need operator. Inactive:
+    unrestricted — this keeps pre-v8 behavior."""
+    if not whitelist_active(store, inst_id, user):
+        return None
+    grant = store.model_grant(user.get("username", ""), inst_id, model)
+    if write and grant != "operator":
+        return _deny("model_denied", model=model)
+    if not write and grant is None:
+        return _deny("model_denied", model=model)
+    return None
+
+
+def filter_model_list(store, inst_id: str, user: dict, payload):
+    """Drop non-granted models from a {"models": [...]} list response.
+    Only called when the whitelist is active for this user."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        return payload
+    username = user.get("username", "")
+    payload = dict(payload)
+    payload["models"] = [
+        row for row in payload["models"]
+        if not isinstance(row, dict)
+        or store.model_grant(username, inst_id, str(row.get("name", ""))) is not None
+    ]
+    return payload
 
 
 def parse_model_mutation(tail: str) -> Mutation | None:
@@ -84,9 +149,21 @@ def _deny(reason: str, **extra) -> JSONResponse:
 
 
 def check_ownership(store, inst_id: str, user: dict, mutation: Mutation,
-                    query_params) -> JSONResponse | None:
+                    query_params, method: str = "GET") -> JSONResponse | None:
     """Ownership gate, run AFTER the role guard. Returns a deny response or
-    None when the request may proceed. `store` is the UserStore."""
+    None when the request may proceed. `store` is the UserStore.
+
+    Mutations are classified by path shape, so the method must agree before
+    any rule fires — a GET on /v2/models/{m}/versions is a read, not the
+    batch delete the same path is for DELETE."""
+    method_for = {"upload": "POST", "model_upload": "POST", "init": "POST",
+                  "complete": "POST", "chunk": "PUT",
+                  "delete": "DELETE", "batch_delete": "DELETE"}
+    expected = method_for.get(mutation.kind)
+    if expected is not None and method != expected:
+        return None
+    # "session" is deliberately unlisted: both GET (status) and DELETE
+    # (abort) stay owner-gated.
     role = user.get("role", "viewer")
     if role == "admin":
         return None

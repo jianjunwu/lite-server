@@ -51,6 +51,10 @@ def role_rank(role: str) -> int:
 # fully denied). Ranked checks never see "none" — the guard rejects it first.
 GRANT_ROLES = ROLES + ("none",)
 
+# Model-grant roles: admin is deliberately absent — instance/global admins
+# bypass the model whitelist instead of holding per-model admin rows.
+MODEL_GRANT_ROLES = ("viewer", "operator")
+
 
 class AuthError(Exception):
     def __init__(self, code: str, message: str):
@@ -246,6 +250,7 @@ class UserStore:
             raise AuthError("forbidden", "cannot delete the last admin")
         self._db.execute("DELETE FROM users WHERE username = ?", (username,))
         self._db.execute("DELETE FROM instance_grants WHERE username = ?", (username,))
+        self._db.execute("DELETE FROM model_grants WHERE username = ?", (username,))
 
     def _admin_count(self) -> int:
         return self._db.query_one("SELECT COUNT(*) FROM users WHERE role = 'admin'")[0]
@@ -508,6 +513,8 @@ class UserStore:
             "DELETE FROM upload_session_owners WHERE instance_id = ?", (instance_id,))
         self._db.execute(
             "DELETE FROM instance_grants WHERE instance_id = ?", (instance_id,))
+        self._db.execute(
+            "DELETE FROM model_grants WHERE instance_id = ?", (instance_id,))
 
     # ---- per-instance role grants (M2) ----
 
@@ -539,6 +546,58 @@ class UserStore:
         self._db.execute(
             "DELETE FROM instance_grants WHERE username = ? AND instance_id = ?",
             (username, instance_id))
+
+    # ---- per-model ACL (M3) ----
+
+    def model_grant(self, username: str, instance_id: str, model: str) -> str | None:
+        row = self._db.query_one(
+            "SELECT role FROM model_grants"
+            " WHERE username = ? AND instance_id = ? AND model = ?",
+            (username, instance_id, model))
+        return row["role"] if row else None
+
+    def has_model_grants(self, username: str, instance_id: str) -> bool:
+        """Any row activates whitelist mode for this user on this instance."""
+        return self._db.query_one(
+            "SELECT 1 FROM model_grants WHERE username = ? AND instance_id = ? LIMIT 1",
+            (username, instance_id)) is not None
+
+    def list_model_grants(self, username: str, instance_id: str | None = None) -> list[dict]:
+        if instance_id is None:
+            rows = self._db.query(
+                "SELECT instance_id, model, role FROM model_grants"
+                " WHERE username = ? ORDER BY instance_id, model",
+                (username,))
+        else:
+            rows = self._db.query(
+                "SELECT instance_id, model, role FROM model_grants"
+                " WHERE username = ? AND instance_id = ? ORDER BY model",
+                (username, instance_id))
+        return [{"instance_id": r["instance_id"], "model": r["model"], "role": r["role"]}
+                for r in rows]
+
+    def list_model_grant_users(self, instance_id: str, model: str) -> list[dict]:
+        rows = self._db.query(
+            "SELECT username, role FROM model_grants"
+            " WHERE instance_id = ? AND model = ? ORDER BY username",
+            (instance_id, model))
+        return [{"username": r["username"], "role": r["role"]} for r in rows]
+
+    def set_model_grant(self, username: str, instance_id: str, model: str,
+                        role: str) -> None:
+        if role not in MODEL_GRANT_ROLES:
+            raise AuthError("invalid", f'unknown model grant role "{role}"')
+        self._db.execute(
+            "INSERT INTO model_grants (username, instance_id, model, role, created_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(username, instance_id, model)"
+            " DO UPDATE SET role = excluded.role",
+            (username, instance_id, model, role, _now()))
+
+    def remove_model_grant(self, username: str, instance_id: str, model: str) -> None:
+        self._db.execute(
+            "DELETE FROM model_grants WHERE username = ? AND instance_id = ? AND model = ?",
+            (username, instance_id, model))
 
     def close(self) -> None:
         """Closes the underlying AuthDB (WAL checkpoint on shutdown)."""
@@ -779,7 +838,7 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
 
     # GETs: any authenticated user — except the user directory, audit trail,
     # and invite list.
-    if path.startswith(("/api/users", "/api/audit", "/api/invites")) and role_rank(role) < role_rank("admin"):
+    if path.startswith(("/api/users", "/api/audit", "/api/invites", "/api/model-grants")) and role_rank(role) < role_rank("admin"):
         return JSONResponse({"error": "forbidden", "required": "admin"}, status_code=403)
     return None
 
@@ -1049,6 +1108,37 @@ def create_router(store: UserStore) -> APIRouter:
                            target=name, ip=_client_ip(request),
                            detail={"instance_id": instance_id, "role": role})
         return {"grants": store.list_instance_grants(name)}
+
+    @router.get("/api/users/{name}/model-grants")
+    async def list_user_model_grants(name: str, instance_id: str | None = None):
+        if store.get(name) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return {"grants": store.list_model_grants(name, instance_id)}
+
+    @router.put("/api/users/{name}/model-grants/{instance_id}/{model}")
+    async def put_user_model_grant(name: str, instance_id: str, model: str,
+                                   request: Request):
+        if store.get(name) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        body = await _json_body(request)
+        role = (body or {}).get("role")
+        if role == "default":
+            # Removing the row may deactivate the whitelist (last row).
+            store.remove_model_grant(name, instance_id, model)
+        else:
+            try:
+                store.set_model_grant(name, instance_id, model, role)
+            except AuthError as e:
+                return _error(e)
+        store.record_audit("model_grant", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request),
+                           detail={"instance_id": instance_id, "model": model, "role": role})
+        return {"grants": store.list_model_grants(name, instance_id)}
+
+    @router.get("/api/model-grants")
+    async def list_model_grants_for_model(instance_id: str, model: str):
+        """Model-centric view: which users hold grants on this model."""
+        return {"grants": store.list_model_grant_users(instance_id, model)}
 
     @router.delete("/api/users/{name}/sessions/{session_id}")
     async def kick_user_session(name: str, session_id: str, request: Request):

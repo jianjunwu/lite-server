@@ -12,6 +12,7 @@ import { useMergedVersions, useModelHealth, useTimeline } from '../api/hooks';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
+import { ModelAccessPanel } from '../components/ModelAccessPanel';
 import { StatusBadge } from '../components/StatusBadge';
 import { VersionsTable } from '../components/VersionsTable';
 import { PageHeader } from '../components/PageHeader';
@@ -194,6 +195,20 @@ export function ModelDetailPage() {
               </Card>
             ),
           },
+          // Per-model whitelist management — instance admins only.
+          ...(can('admin') && instanceId
+            ? [
+                {
+                  key: 'access',
+                  label: t('models.tabs.access'),
+                  children: (
+                    <Card size="small">
+                      <ModelAccessPanel instanceId={instanceId} model={name} />
+                    </Card>
+                  ),
+                },
+              ]
+            : []),
         ]}
       />
 

@@ -79,10 +79,19 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     # has no user store (single-user local mode).
     user = getattr(request.state, "user", None)
     store = getattr(request.app.state, "user_store", None)
+    if store is not None and user is not None:
+        # Model whitelist (M3) runs before ownership: it decides whether the
+        # caller may touch this model at all on this instance.
+        model = ownership.parse_model_path(tail)
+        if model is not None:
+            write = request.method != "GET" and not ownership.is_inference_tail(tail)
+            deny = ownership.check_model_grant(store, inst_id, user, model, write=write)
+            if deny is not None:
+                return deny
     mutation = ownership.parse_model_mutation(tail)
     if store is not None and user is not None and mutation is not None:
         deny = ownership.check_ownership(store, inst_id, user, mutation,
-                                         request.query_params)
+                                         request.query_params, request.method)
         if deny is not None:
             return deny
 
@@ -115,6 +124,23 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
         return JSONResponse({"error": "instance_unreachable", "instance": inst_id}, status_code=502)
 
     headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
+
+    # Model whitelist read filtering (M3): the two small-JSON list endpoints
+    # are buffered and stripped of models the caller has no grant for.
+    if (store is not None and user is not None
+            and ownership.is_model_list_tail(tail)
+            and ownership.whitelist_active(store, inst_id, user)):
+        try:
+            raw = await upstream.aread()
+        finally:
+            await upstream.aclose()
+        if 200 <= upstream.status_code < 300:
+            try:
+                payload = ownership.filter_model_list(store, inst_id, user, json.loads(raw))
+                raw = json.dumps(payload).encode()
+            except ValueError:
+                pass  # non-JSON list response passes through untouched
+        return Response(content=raw, status_code=upstream.status_code, headers=headers)
 
     # Two responses the proxy must see in full: session init (the session id
     # becomes an ownership record) and batch version delete (per-version

@@ -60,7 +60,8 @@
       "versions": "Versions",
       "workers": "Workers",
       "metrics": "Metrics",
-      "compare": "Compare"
+      "compare": "Compare",
+      "access": "Access"
     },
     "unloaded": "Unloaded",
     "loadToView": "Available after loading a version",
@@ -71,6 +72,13 @@
       "loading": "Loading",
       "degraded": "Degraded",
       "unloaded": "Unloaded"
+    },
+    "access": {
+      "hint": "Per-model whitelist for this instance. Users not listed lose access once any grant exists.",
+      "empty": "No per-model grants — whitelist inactive for this model.",
+      "addUser": "Grant user",
+      "userPlaceholder": "username",
+      "saved": "Access updated"
     }
   },
   "metrics": {
@@ -365,7 +373,13 @@
       "hint": "Per-instance role overrides the global role on that instance. Hidden removes the instance entirely.",
       "default": "Default ({{role}})",
       "hidden": "Hidden",
-      "saved": "Access updated"
+      "saved": "Access updated",
+      "modelSection": "Model access",
+      "modelHint": "The first grant on an instance enables whitelist mode there: only listed models stay accessible to this user.",
+      "modelColumn": "Model",
+      "addModel": "Add grant",
+      "remove": "Remove",
+      "modelPlaceholder": "model name"
     }
   }
 }

@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { App, Button, Card, Checkbox, Drawer, Form, Input, Modal, Popconfirm, Select, Table, Tabs, Tag, Typography } from 'antd';
+import { App, Button, Card, Checkbox, Divider, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, Typography } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { QRCodeSVG } from 'qrcode.react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import { bffFetch, setAdminKey } from '../api/client';
-import { auditApi, authApi, grantsApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
+import { auditApi, authApi, grantsApi, modelGrantsApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
 import { useInstances } from '../api/hooks';
 import { useAuth } from '../context/AuthContext';
 import type { InstanceInfo } from '../api/types';
@@ -484,17 +484,42 @@ function GrantsDrawer({ user, onClose }: { user: UserRow; onClose: () => void })
   const { t } = useTranslation();
   const { message } = App.useApp();
   const instancesQuery = useInstances();
+  const instances = instancesQuery.data?.instances ?? [];
   const grantsQuery = useQuery({
     queryKey: ['bff', 'grants', user.username],
     queryFn: () => grantsApi.list(user.username),
   });
   const grants = new Map((grantsQuery.data?.grants ?? []).map((g) => [g.instance_id, g.role]));
 
+  const [modelInst, setModelInst] = useState<string | null>(null);
+  const [newModel, setNewModel] = useState('');
+  const [newModelRole, setNewModelRole] = useState('viewer');
+  const effectiveInst = modelInst ?? instances[0]?.id ?? null;
+  const modelGrantsQuery = useQuery({
+    queryKey: ['bff', 'model-grants', user.username],
+    queryFn: () => modelGrantsApi.listForUser(user.username),
+  });
+  const modelGrants = (modelGrantsQuery.data?.grants ?? []).filter(
+    (g) => g.instance_id === effectiveInst,
+  );
+
   const setRole = async (instanceId: string, role: string) => {
     try {
       await grantsApi.set(user.username, instanceId, role);
       message.success(t('settings.grants.saved'));
       await grantsQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const setModelRole = async (model: string, role: string) => {
+    if (!effectiveInst) return;
+    try {
+      await modelGrantsApi.set(user.username, effectiveInst, model, role);
+      message.success(t('settings.grants.saved'));
+      setNewModel('');
+      await modelGrantsQuery.refetch();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -515,7 +540,7 @@ function GrantsDrawer({ user, onClose }: { user: UserRow; onClose: () => void })
         rowKey="id"
         pagination={false}
         loading={instancesQuery.isLoading || grantsQuery.isLoading}
-        dataSource={instancesQuery.data?.instances ?? []}
+        dataSource={instances}
         columns={[
           {
             title: t('settings.instances.name'),
@@ -545,6 +570,70 @@ function GrantsDrawer({ user, onClose }: { user: UserRow; onClose: () => void })
           },
         ]}
       />
+
+      <Divider style={{ margin: '20px 0 12px' }}>{t('settings.grants.modelSection')}</Divider>
+      <Typography.Paragraph type="secondary" style={{ fontSize: TYPE.secondary }}>
+        {t('settings.grants.modelHint')}
+      </Typography.Paragraph>
+      <Select
+        style={{ width: 240, marginBottom: 12 }}
+        value={effectiveInst ?? undefined}
+        onChange={setModelInst}
+        options={instances.map((i) => ({ value: i.id, label: `${i.name} (${i.id})` }))}
+        placeholder={t('common.instance')}
+      />
+      {effectiveInst && (
+        <>
+          <Table
+            size="small"
+            rowKey="model"
+            pagination={false}
+            loading={modelGrantsQuery.isLoading}
+            dataSource={modelGrants}
+            columns={[
+              {
+                title: t('settings.grants.modelColumn'),
+                dataIndex: 'model',
+                render: (v: string) => <span style={dataTextStyle}>{v}</span>,
+              },
+              { title: t('settings.users.role'), dataIndex: 'role', width: 110, render: (r: string) => <Tag>{r}</Tag> },
+              {
+                title: '',
+                width: 90,
+                render: (_: unknown, g: { model: string }) => (
+                  <Button type="text" size="small" danger onClick={() => void setModelRole(g.model, 'default')}>
+                    {t('settings.grants.remove')}
+                  </Button>
+                ),
+              },
+            ]}
+          />
+          <Space.Compact block style={{ marginTop: 12 }}>
+            <Input
+              value={newModel}
+              onChange={(e) => setNewModel(e.target.value)}
+              placeholder={t('settings.grants.modelPlaceholder')}
+              style={{ fontFamily: MONO_FONT }}
+            />
+            <Select
+              style={{ width: 120 }}
+              value={newModelRole}
+              onChange={setNewModelRole}
+              options={[
+                { value: 'viewer', label: 'viewer' },
+                { value: 'operator', label: 'operator' },
+              ]}
+            />
+            <Button
+              type="primary"
+              disabled={!newModel.trim()}
+              onClick={() => void setModelRole(newModel.trim(), newModelRole)}
+            >
+              {t('settings.grants.addModel')}
+            </Button>
+          </Space.Compact>
+        </>
+      )}
     </Drawer>
   );
 }

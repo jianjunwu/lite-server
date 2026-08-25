@@ -29,6 +29,14 @@ function installFetch() {
     vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
       calls.push({ url, method: init?.method ?? 'GET', body: (init?.body as string) ?? null });
+      if (url.includes('/api/users/u1/model-grants')) {
+        if (init?.method === 'PUT') {
+          return Promise.resolve(
+            json({ grants: [{ instance_id: 'prod', model: 'alpha', role: 'viewer' }] }),
+          );
+        }
+        return Promise.resolve(json({ grants: [] }));
+      }
       if (url.includes('/api/users/u1/grants')) return Promise.resolve(json({ grants: [] }));
       if (url.includes('/api/users')) {
         return Promise.resolve(
@@ -103,8 +111,9 @@ describe('SettingsPage instance grants', () => {
     renderSettings();
     fireEvent.click(await screen.findByRole('tab', { name: 'Users' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Access' }));
-    // The drawer lists each visible instance with a role select.
-    const combobox = await screen.findByRole('combobox');
+    // The drawer lists each visible instance with a role select (first
+    // combobox; the model-access section adds more below).
+    const [combobox] = await screen.findAllByRole('combobox');
     fireEvent.mouseDown(combobox);
     fireEvent.click(await screen.findByText('operator', { selector: '.ant-select-item-option *' }));
     await waitFor(() =>
@@ -112,5 +121,20 @@ describe('SettingsPage instance grants', () => {
     );
     const grantPut = putCalls().find((c) => c.url.includes('/api/users/u1/grants/prod'));
     expect(grantPut?.body).toBe('{"role":"operator"}');
+  });
+
+  it('should_add_a_model_grant_from_the_access_drawer', async () => {
+    installFetch();
+    renderSettings();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Users' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Access' }));
+    const input = await screen.findByPlaceholderText('model name');
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add grant' }));
+    await waitFor(() =>
+      expect(putCalls().some((c) => c.url.includes('/api/users/u1/model-grants/prod/alpha'))).toBe(true),
+    );
+    const grantPut = putCalls().find((c) => c.url.includes('/api/users/u1/model-grants/prod/alpha'));
+    expect(grantPut?.body).toBe('{"role":"viewer"}');
   });
 });

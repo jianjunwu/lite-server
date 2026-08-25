@@ -126,6 +126,36 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             # response headers arrive (bounded by the transfer timeout, not
             # the unary one).
             time.sleep(1)
+        if self.path == "/v2/models":
+            # Loaded-models list, shaped like the instance handler.
+            payload = json.dumps({"models": [
+                {"name": "alpha", "version": "1", "status": "ready",
+                 "model_type": "LitAPI", "workers": 1},
+                {"name": "beta", "version": "1", "status": "ready",
+                 "model_type": "LitAPI", "workers": 1},
+            ]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/v2/repository/index" and self.command == "POST":
+            # On-disk scan, shaped like the instance handler.
+            payload = json.dumps({"models": [
+                {"name": "alpha", "version": "1", "path": "/r/alpha/1",
+                 "has_config": True, "type": "litapi"},
+                {"name": "beta", "version": "2", "path": "/r/beta/2",
+                 "has_config": True, "type": "litapi"},
+                {"name": "gamma", "version": "1", "path": "/r/gamma/1",
+                 "has_config": True, "type": "litapi"},
+            ]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/fail500":
             payload = json.dumps({"error": "boom"}).encode()
             self.send_response(500)

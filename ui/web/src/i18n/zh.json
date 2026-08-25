@@ -60,7 +60,8 @@
       "versions": "版本",
       "workers": "Worker",
       "metrics": "指标",
-      "compare": "对比"
+      "compare": "对比",
+      "access": "权限"
     },
     "unloaded": "未加载",
     "loadToView": "加载版本后可用",
@@ -71,6 +72,13 @@
       "loading": "加载中",
       "degraded": "异常",
       "unloaded": "未加载"
+    },
+    "access": {
+      "hint": "该实例的模型级白名单。一旦存在任何授权记录，未列出的用户将失去访问。",
+      "empty": "无模型级授权——该模型的白名单未启用。",
+      "addUser": "授权用户",
+      "userPlaceholder": "用户名",
+      "saved": "权限已更新"
     }
   },
   "metrics": {
@@ -365,7 +373,13 @@
       "hint": "按实例覆盖全局角色；\"不可见\" 将对该用户完全隐藏此实例。",
       "default": "默认（{{role}}）",
       "hidden": "不可见",
-      "saved": "权限已更新"
+      "saved": "权限已更新",
+      "modelSection": "模型权限",
+      "modelHint": "某实例上的首个模型授权将启用白名单：该用户在该实例只能访问列出的模型。",
+      "modelColumn": "模型",
+      "addModel": "添加授权",
+      "remove": "移除",
+      "modelPlaceholder": "模型名"
     }
   }
 }

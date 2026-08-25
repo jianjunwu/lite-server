@@ -153,3 +153,34 @@ export const grantsApi = {
       },
     ),
 };
+
+export interface ModelGrant {
+  instance_id: string;
+  model: string;
+  role: string;
+}
+
+export interface ModelGrantUser {
+  username: string;
+  role: string;
+}
+
+/** Per-model ACL (admin). The first grant on an instance activates whitelist
+ * mode there; role "default" removes the row. */
+export const modelGrantsApi = {
+  listForUser: (username: string) =>
+    bffFetch<{ grants: ModelGrant[] }>(`/api/users/${encodeURIComponent(username)}/model-grants`),
+  set: (username: string, instanceId: string, model: string, role: string) =>
+    bffFetch<{ grants: ModelGrant[] }>(
+      `/api/users/${encodeURIComponent(username)}/model-grants/${encodeURIComponent(instanceId)}/${encodeURIComponent(model)}`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role }),
+      },
+    ),
+  listForModel: (instanceId: string, model: string) =>
+    bffFetch<{ grants: ModelGrantUser[] }>(
+      `/api/model-grants?instance_id=${encodeURIComponent(instanceId)}&model=${encodeURIComponent(model)}`,
+    ),
+};

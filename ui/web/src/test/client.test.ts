@@ -94,3 +94,28 @@ describe('admin key storage', () => {
     expect(getAdminKey('a')).toBeNull();
   });
 });
+
+describe('apiFetch error messages', () => {
+  it('should_explain_model_denied_with_the_model_name', async () => {
+    mockFetch({
+      ok: false,
+      status: 403,
+      text: () =>
+        Promise.resolve(JSON.stringify({ error: 'forbidden', reason: 'model_denied', model: 'beta' })),
+    });
+    const err = (await apiFetch('prod', '/v2/models/beta/reload', { method: 'POST' }).catch((e) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.message).toBe('No access to model "beta"');
+  });
+
+  it('should_fall_back_to_the_plain_error_string_for_other_forbidden_bodies', async () => {
+    mockFetch({
+      ok: false,
+      status: 403,
+      text: () =>
+        Promise.resolve(JSON.stringify({ error: 'forbidden', reason: 'instance_denied', instance: 'prod' })),
+    });
+    const err = (await apiFetch('prod', '/v2/models', { method: 'GET' }).catch((e) => e)) as ApiError;
+    expect(err.message).toBe('forbidden');
+  });
+});

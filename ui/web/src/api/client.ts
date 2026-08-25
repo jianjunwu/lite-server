@@ -57,6 +57,10 @@ async function parseErrorBody(res: Response): Promise<unknown> {
 function errorMessage(body: unknown, status: number): string {
   if (body && typeof body === 'object' && 'error' in body) {
     const err = (body as { error: unknown }).error;
+    if (err === 'forbidden' && (body as { reason?: unknown }).reason === 'model_denied') {
+      const model = (body as { model?: unknown }).model;
+      return `No access to model "${typeof model === 'string' ? model : '?'}"`;
+    }
     if (typeof err === 'string') return err;
     if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
       return (err as { message: string }).message;

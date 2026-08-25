@@ -129,4 +129,44 @@ describe('ModelDetailPage unloaded model', () => {
     expect(screen.getByText(/not found/i)).toBeTruthy();
     expect(screen.getByRole('link', { name: /Models/ })).toBeTruthy();
   });
+
+  it('should_list_model_grants_in_the_access_tab_for_instance_admins', async () => {
+    mockMerged.versions = [
+      {
+        version: '1',
+        status: 'ready',
+        active: true,
+        weight: 100,
+        workers: { ready: 1, total: 1 },
+        loaded_at: null,
+        loaded: true,
+      },
+    ];
+    mockMerged.activeVersion = '1';
+    mockMerged.hasLoaded = true;
+    renderPage('echo');
+    // The access panel queries the BFF once its tab is opened (lazy panes).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/model-grants')) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ grants: [{ username: 'u1', role: 'viewer' }] }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'not found' }), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }),
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Access' }));
+    expect(await screen.findByText('u1')).toBeTruthy();
+  });
 });

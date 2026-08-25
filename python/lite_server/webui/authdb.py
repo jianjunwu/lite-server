@@ -132,6 +132,20 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (username, instance_id)
     )
     """,
+    # v8: per-model ACL. The FIRST row for a (user, instance) pair activates
+    # whitelist mode there: only granted models stay accessible (viewer =
+    # read/infer, operator = mutations too); deleting all rows restores full
+    # access. Exact model names only, no wildcards.
+    """
+    CREATE TABLE IF NOT EXISTS model_grants (
+        username TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (username, instance_id, model)
+    )
+    """,
 ]
 
 
