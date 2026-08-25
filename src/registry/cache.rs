@@ -35,10 +35,12 @@ use crate::registry::ModelRegistry;
 
 /// On-disk snapshot file, written at the model-repository root.
 const SNAPSHOT_FILENAME: &str = ".lite-server-registry.json";
-/// Tmp suffix for the atomic write (same dir → same filesystem → atomic rename).
-/// NOT `.lma` — the scanner's `auto_unpack_lma_files` would otherwise try to
-/// unpack it.
-const SNAPSHOT_TMP_SUFFIX: &str = ".tmp";
+/// Tmp name for the atomic write (same dir → same filesystem → atomic
+/// rename). NOT `.lma` — the scanner's `auto_unpack_lma_files` would
+/// otherwise try to unpack it. A crash between write and rename leaves
+/// this file behind; the tmp cleanup sweep removes it (it is
+/// write-transient, so any age is residue).
+pub(crate) const SNAPSHOT_TMP_FILENAME: &str = ".lite-server-registry.json.tmp";
 
 /// On-disk snapshot. `BTreeMap` for stable, diff-friendly JSON key ordering
 /// (the live registry uses `DashMap`/`HashMap`, whose iteration order is random).
@@ -102,7 +104,7 @@ pub async fn save(registry: &ModelRegistry, repo_path: &Path) -> Result<(), AppE
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| AppError::Internal(format!("registry snapshot serialize: {e}")))?;
     let dest = snapshot_path(repo_path);
-    let tmp = repo_path.join(format!("{SNAPSHOT_FILENAME}{SNAPSHOT_TMP_SUFFIX}"));
+    let tmp = repo_path.join(SNAPSHOT_TMP_FILENAME);
     tokio::fs::write(&tmp, json)
         .await
         .map_err(|e| AppError::Internal(format!("registry snapshot write: {e}")))?;
@@ -279,9 +281,7 @@ mod tests {
             "snapshot file must exist after save"
         );
         assert!(
-            !repo_path
-                .join(format!("{SNAPSHOT_FILENAME}{SNAPSHOT_TMP_SUFFIX}"))
-                .exists(),
+            !repo_path.join(SNAPSHOT_TMP_FILENAME).exists(),
             "tmp file must be renamed away"
         );
 

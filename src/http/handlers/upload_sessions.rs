@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Fixed chunk size — server-side constant so the received-bitmap semantics
 /// stay trivial (clients learn it from the init response).
@@ -63,6 +63,11 @@ struct SessionFile {
 enum SessionState {
     Uploading,
     Completing,
+    /// Terminal state, persisted just before the staging dir is removed
+    /// after a successful complete — a failed removal must not leave the
+    /// session wedged in `Completing` (every further PUT/complete would
+    /// 409 until the reaper sweeps the dir).
+    Completed,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -187,8 +192,9 @@ async fn load_session(
     Ok((staging, meta))
 }
 
-/// Per-staging-dir mutex so concurrent `complete` calls for one session
-/// serialize (and the loser sees state != uploading → 409).
+/// Per-staging-dir mutex serializing `complete` calls for one session
+/// (the loser sees state != uploading → 409), and the delete handler
+/// against an in-flight complete.
 fn complete_locks()
 -> &'static dashmap::DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>> {
     static LOCKS: std::sync::OnceLock<
@@ -317,6 +323,7 @@ pub async fn get_upload_session(
         "state": match meta.state {
             SessionState::Uploading => "uploading",
             SessionState::Completing => "completing",
+            SessionState::Completed => "completed",
         },
         "files": files,
     })))
@@ -407,6 +414,15 @@ pub async fn put_session_chunk(
     tokio::fs::rename(&part, &final_path)
         .await
         .map_err(AppError::Io)?;
+    // A session delete racing this PUT may have removed the staging dir
+    // after load_session — without this re-check the recreated chunk tree
+    // would linger as an orphan without session.json.
+    if !meta_path(&staging).is_file() {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(AppError::ModelNotFound(
+            "upload session not found".to_string(),
+        ));
+    }
     touch_meta(&staging).await;
 
     Ok(Json(json!({ "received": chunk_index })))
@@ -462,10 +478,30 @@ pub async fn complete_upload_session(
     let result = assemble_and_finalize(&state, &model_name, &staging, &meta, &query).await;
     match result {
         Ok(response) => {
+            // Persist a terminal state BEFORE removing the staging dir: a
+            // removal failure with a stale "completing" meta would wedge
+            // the session (every further PUT/complete 409s). A leftover
+            // "completed" dir is swept by the staging reaper once it ages
+            // out.
+            let mut done = completing;
+            done.state = SessionState::Completed;
+            let _ = write_meta(&staging, &done).await;
+            // The entry is removed only after the session reached a
+            // terminal state — a waiter on the old Arc 404s on its meta
+            // re-read, so no two critical sections overlap (the dashmap
+            // removal/waiter race). Delete keeps its entry instead
+            // (insert-only — it races in-flight completes, not terminal
+            // ones).
             complete_locks().remove(&staging);
             // The commit already moved the version dir out of staging;
             // chunks and the assembled artifacts are session residue.
-            let _ = tokio::fs::remove_dir_all(&staging).await;
+            if let Err(e) = remove_completed_staging(&staging).await {
+                warn!(
+                    error = %e,
+                    staging = %staging.display(),
+                    "completed upload session staging removal failed; the staging reaper will sweep it"
+                );
+            }
             info!(model = %model_name, version = %response.1, "Chunked upload completed");
             crate::audit::control_plane(
                 Some(&cx),
@@ -480,7 +516,10 @@ pub async fn complete_upload_session(
         }
         Err(e) => {
             // Roll back to uploading so the client can fix (re-PUT the bad
-            // chunks after a hash mismatch) and retry complete.
+            // chunks after a hash mismatch) and retry complete. The
+            // assembled output (up to the full model size) is session
+            // residue — remove it, keeping .chunks/ for the retry.
+            let _ = tokio::fs::remove_dir_all(staging.join(".assembled")).await;
             let mut revert = completing;
             revert.state = SessionState::Uploading;
             let _ = write_meta(&staging, &revert).await;
@@ -489,10 +528,29 @@ pub async fn complete_upload_session(
     }
 }
 
+/// Remove a completed session's staging dir, chunk trees first and the
+/// rest (session.json) last: the meta records the terminal Completed
+/// state and must survive a partial removal failure — a failed chunk
+/// removal leaves fully-described residue for the staging reaper, never a
+/// session wedged in Completing.
+async fn remove_completed_staging(staging: &std::path::Path) -> std::io::Result<()> {
+    if let Err(e) = tokio::fs::remove_dir_all(staging.join(".chunks")).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    tokio::fs::remove_dir_all(staging).await
+}
+
 struct FinalizedResponse(Json<Value>, String);
 
 /// Concatenate chunks into the standard staged layout and run the shared
 /// upload tail. Returns the success JSON and the effective version.
+///
+/// Files are assembled into a `.assembled/` subdir and THAT is handed to
+/// finalize_upload: commit_staging moves every entry of the dir it is
+/// given, so finalizing the session staging root would commit `.chunks/`
+/// and `session.json` into the model directory.
 async fn assemble_and_finalize(
     state: &AppState,
     model_name: &str,
@@ -500,12 +558,14 @@ async fn assemble_and_finalize(
     meta: &SessionMeta,
     query: &UploadQuery,
 ) -> Result<FinalizedResponse, AppError> {
+    let asm = staging.join(".assembled");
+    tokio::fs::create_dir_all(&asm).await.map_err(AppError::Io)?;
     let mut staged: Vec<StagedUploadFile> = Vec::new();
     for (i, f) in meta.files.iter().enumerate() {
         let dest = if f.is_lma {
-            staging.join(&f.name)
+            asm.join(&f.name)
         } else {
-            let version_dir = staging.join(&meta.version);
+            let version_dir = asm.join(&meta.version);
             tokio::fs::create_dir_all(&version_dir)
                 .await
                 .map_err(AppError::Io)?;
@@ -527,7 +587,7 @@ async fn assemble_and_finalize(
     let outcome = finalize_upload(
         state,
         model_name,
-        staging,
+        &asm,
         &staged,
         Some(&meta.version),
         auto_load,
@@ -603,11 +663,35 @@ pub async fn delete_upload_session(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
     let (staging, _meta) = load_session(&state, &model_name, &version, &sid).await?;
-    complete_locks().remove(&staging);
-    tokio::fs::remove_dir_all(&staging)
-        .await
-        .map_err(AppError::Io)?;
-    Ok(Json(json!({ "success": true })))
+    // Serialize against an in-flight complete: it holds this per-session
+    // lock across assemble + finalize, so the delete must wait for it
+    // rather than yanking the staging dir mid-commit. The lock entry is
+    // kept (insert-only) — removing it here would reintroduce the dashmap
+    // removal/waiter race (see the VersionOpLocks comment in files.rs).
+    let lock = complete_locks()
+        .entry(staging.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+    // A complete that won the race already committed and removed the
+    // staging dir — that is a successful delete outcome. A chunk PUT
+    // racing the removal can recreate entries mid-sweep
+    // (DirectoryNotEmpty); the PUT's own orphan re-check removes what it
+    // recreated, so a bounded retry converges.
+    let mut retries = 0;
+    loop {
+        match tokio::fs::remove_dir_all(&staging).await {
+            Ok(()) => return Ok(Json(json!({ "success": true }))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(json!({ "success": true })));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && retries < 3 => {
+                retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(AppError::Io(e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,6 +1070,17 @@ mod tests {
         }
         assert!(!found_staging, "staging must be removed after complete");
 
+        // Session internals (.chunks/, session.json) are upload state, not
+        // model content — they must never be committed into the model dir.
+        assert!(
+            !tmp.join("mymodel").join(".chunks").exists(),
+            "chunk state must not land in the model directory"
+        );
+        assert!(
+            !tmp.join("mymodel").join("session.json").exists(),
+            "session meta must not land in the model directory"
+        );
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
@@ -1034,6 +1129,90 @@ mod tests {
         assert_eq!(session["state"], "uploading");
         assert_eq!(session["files"][0]["received_chunks"], json!([0]));
 
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// On a finalize failure the assembled output files must not linger
+    /// next to .chunks/ (up to 2x the model size would stay pinned); the
+    /// chunks themselves are kept for the retry.
+    #[tokio::test]
+    async fn test_complete_finalize_failure_removes_assembled_files() {
+        let tmp = unique_tmp("asmresidue");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+
+        // Land version 1 via a first session.
+        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
+        let response = complete(&app, "mymodel", "1", &sid1).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A second session assembles fine but finalize rejects the commit
+        // (existing version, no force) — the assembled output must go.
+        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
+        let response = complete(&app, "mymodel", "1", &sid2).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let staging = tmp.join(format!(".tmp-upload-{}", sid2));
+        assert!(
+            staging.join(".chunks").join("0").join("0").exists(),
+            "chunks are kept for the retry"
+        );
+        assert!(
+            !staging.join(".assembled").exists(),
+            "the assembled output must be removed on finalize failure"
+        );
+        let session = get_session(&app, "mymodel", "1", &sid2).await;
+        assert_eq!(session["state"], "uploading", "session stays retryable");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// A failed staging removal after a successful complete must not wedge
+    /// the session in Completing: the terminal Completed state is
+    /// persisted BEFORE the removal attempt, and the upload still reports
+    /// success (the staging reaper sweeps the residue).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_complete_staging_removal_failure_persists_completed_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_tmp("wedge");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+
+        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64]).await;
+
+        // Make the chunk-tree removal fail: a read-only subdir blocks
+        // unlinking its entries. session.json is removed AFTER the chunk
+        // tree (remove_completed_staging), so it survives deterministically.
+        let staging = tmp.join(format!(".tmp-upload-{}", sid));
+        let chunk_sub = staging.join(".chunks").join("0");
+        tokio::fs::set_permissions(&chunk_sub, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let response = complete(&app, "mymodel", "1", &sid).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a staging-removal failure must not fail the committed upload"
+        );
+        // The version content committed fine.
+        assert!(tmp.join("mymodel").join("1").join("w.bin").exists());
+        // The residue carries the terminal state, not a wedging Completing.
+        assert!(staging.exists(), "the failed removal leaves the staging dir");
+        let session = get_session(&app, "mymodel", "1", &sid).await;
+        assert_eq!(
+            session["state"], "completed",
+            "the terminal state must be persisted before the removal attempt"
+        );
+
+        // Restore perms so teardown can remove the fixture.
+        tokio::fs::set_permissions(&chunk_sub, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
@@ -1189,6 +1368,50 @@ mod tests {
         if dir.exists() {
             let committed = tokio::fs::read(dir.join("w.bin")).await.unwrap();
             assert_eq!(committed, vec![b'b'; 64], "complete won: exact new content, no mix");
+        }
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// A delete racing a chunk PUT must leave no orphan staging dir
+    /// without session.json: either the session is fully gone, or it is
+    /// intact (PUT won before the delete's removal).
+    #[tokio::test]
+    async fn test_delete_and_put_chunk_leave_no_orphan_staging() {
+        let tmp = unique_tmp("delput");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+
+        let app2 = app.clone();
+        let sid2 = sid.clone();
+        let delete = async move {
+            app2.oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/v2/repository/models/mymodel/versions/1/upload-sessions/{}",
+                        sid2
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (rd, rp) = tokio::join!(
+            delete,
+            put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64])
+        );
+        assert_eq!(rd.status(), StatusCode::OK);
+
+        let staging = tmp.join(format!(".tmp-upload-{}", sid));
+        if staging.exists() {
+            assert!(
+                staging.join("session.json").exists(),
+                "no orphan staging dir without session.json (put status: {})",
+                rp.status()
+            );
         }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

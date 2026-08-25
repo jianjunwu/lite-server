@@ -588,6 +588,13 @@ pub(crate) async fn delete_version_impl(
     crate::validation::validate_identifier(model_name)?;
     crate::validation::validate_version(version)?;
 
+    // Whole-model-delete serialization (lock order: model lock first, then
+    // the version mutex — never the reverse): delete_model_core holds the
+    // model WRITE guard across its directory removal, so this READ guard
+    // closes the delete-model vs delete-version dir-removal race.
+    let model_lock = crate::http::handlers::files::model_op_lock(model_name);
+    let _model_guard = model_lock.read().await;
+
     // Serialize against concurrent uploads of the same version:
     // finalize_upload holds this lock across its exists-check + commit +
     // artifact housekeeping. The guard must cover the WHOLE impl — unload,
@@ -633,13 +640,16 @@ pub(crate) async fn delete_version_impl(
         }
     }
 
-    // Delete directory
+    // Delete directory. The artifact/swap-backup sweep below must run even
+    // when the removal fails: those files live OUTSIDE the version dir,
+    // and a leftover root .lma would resurrect the version via auto-unpack
+    // on restart. The removal error is reported after the sweep.
     let version_dir = state.repo_path.join(model_name).join(version);
-    if version_dir.exists() {
-        tokio::fs::remove_dir_all(&version_dir)
-            .await
-            .map_err(AppError::Io)?;
-    }
+    let removal = if version_dir.exists() {
+        tokio::fs::remove_dir_all(&version_dir).await
+    } else {
+        Ok(())
+    };
 
     // G5: linked artifact cleanup — the scanner-placed root .lma and the
     // .artifacts/ copy would otherwise resurrect the version on restart.
@@ -648,6 +658,7 @@ pub(crate) async fn delete_version_impl(
     // backups.
     let mut linked = remove_linked_artifacts(&state.repo_path, model_name, version).await;
     linked.extend(remove_swap_backups(&state.repo_path.join(model_name), version).await);
+    removal.map_err(AppError::Io)?;
 
     // G4: deleting the active version is a traffic-shaping event — make the
     // resulting active state explicit in the logs.
@@ -1145,6 +1156,15 @@ pub(crate) async fn delete_model_core(
 ) -> Result<String, AppError> {
     crate::validation::validate_identifier(model_name)?;
 
+    // Serialize against in-flight uploads of any version of this model:
+    // finalize_upload and delete_version_impl hold the model READ guard
+    // (across commit + auto-load / removal), so this WRITE guard means no
+    // upload can commit after the delete and resurrect the model on disk +
+    // registry. Tokio's RwLock is write-preferring — the delete does not
+    // starve behind a stream of reads.
+    let model_lock = crate::http::handlers::files::model_op_lock(model_name);
+    let _model_guard = model_lock.write().await;
+
     info!(model = %model_name, "delete model requested");
     // E3: whole-model delete is the biggest accident surface — refuse while
     // an active version exists unless forced.
@@ -1183,6 +1203,16 @@ pub(crate) async fn delete_model_core(
         }
     }
 
+    // G5: linked artifacts — root .lma files would resurrect the model via
+    // auto-unpack on restart; .artifacts/ copies are F10a's.
+    // O1: the root-level swap backup (.{name}.old-*) is the same kind of
+    // resurrection vector — the H7 startup sweep restores target-missing
+    // backups. These sweeps run BEFORE the directory removal: they target
+    // paths outside the model dir, so a failed removal cannot leave
+    // resurrection vectors behind.
+    let mut removed = remove_model_artifacts(&state.repo_path, model_name).await;
+    removed.extend(remove_swap_backups(&state.repo_path, model_name).await);
+
     // Delete the whole model directory (idempotent when absent).
     let model_dir = state.repo_path.join(model_name);
     if model_dir.exists() {
@@ -1190,14 +1220,6 @@ pub(crate) async fn delete_model_core(
             .await
             .map_err(AppError::Io)?;
     }
-
-    // G5: linked artifacts — root .lma files would resurrect the model via
-    // auto-unpack on restart; .artifacts/ copies are F10a's.
-    // O1: the root-level swap backup (.{name}.old-*) is the same kind of
-    // resurrection vector — the H7 startup sweep restores target-missing
-    // backups.
-    let mut removed = remove_model_artifacts(&state.repo_path, model_name).await;
-    removed.extend(remove_swap_backups(&state.repo_path, model_name).await);
 
     let details = if removed.is_empty() {
         "model deleted".to_string()
@@ -1906,6 +1928,91 @@ mod delete_swap_backup_tests {
         assert!(
             no_dot_backup_under(&repo, ".mymodel.old-").await,
             "the root-level swap backup must be deleted with the model"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// F4: the artifact/swap-backup sweep targets paths OUTSIDE the
+    /// version dir, so it must run even when the version-dir removal
+    /// fails — a leftover root .lma would resurrect the version via
+    /// auto-unpack on restart. A FILE at the version path makes
+    /// remove_dir_all fail (NotADirectory) on any platform.
+    #[tokio::test]
+    async fn delete_version_dir_removal_failure_still_sweeps_artifacts() {
+        let repo = unique_repo("vfail");
+        tokio::fs::create_dir_all(repo.join("f4vmodel")).await.unwrap();
+        tokio::fs::write(repo.join("f4vmodel").join("1"), "not a dir")
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("f4vmodel_v1.lma"), "artifact")
+            .await
+            .unwrap();
+        let artifacts = repo.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts).await.unwrap();
+        tokio::fs::write(artifacts.join("f4vmodel_v1.lma"), "artifact")
+            .await
+            .unwrap();
+
+        let state = drift_tests::state_with_repo(Config::default(), &repo);
+        let result = delete_version_impl(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "f4vmodel",
+            "1",
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "the dir-removal failure must still error");
+        assert!(
+            !repo.join("f4vmodel_v1.lma").exists(),
+            "the root artifact must be swept even when the dir removal fails"
+        );
+        assert!(
+            !artifacts.join("f4vmodel_v1.lma").exists(),
+            "the .artifacts copy must be swept even when the dir removal fails"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// F4: delete_model_core runs the artifact/swap-backup sweeps BEFORE
+    /// the model-dir removal, so a failed removal cannot leave
+    /// resurrection vectors behind.
+    #[tokio::test]
+    async fn delete_model_dir_removal_failure_still_sweeps_artifacts_first() {
+        let repo = unique_repo("mfail");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        // A FILE at the model path (same trick as the version test above).
+        tokio::fs::write(repo.join("f4mmodel"), "not a dir")
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("f4mmodel_v1.lma"), "artifact")
+            .await
+            .unwrap();
+        let backup = repo.join(format!(".f4mmodel.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&backup).await.unwrap();
+
+        let state = drift_tests::state_with_repo(Config::default(), &repo);
+        let result = delete_model_core(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "f4mmodel",
+            false,
+        )
+        .await;
+        assert!(result.is_err(), "the dir-removal failure must still error");
+        assert!(
+            !repo.join("f4mmodel_v1.lma").exists(),
+            "root artifacts must be swept before the failing dir removal"
+        );
+        assert!(
+            no_dot_backup_under(&repo, ".f4mmodel.old-").await,
+            "swap backups must be swept before the failing dir removal"
         );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;

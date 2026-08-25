@@ -60,11 +60,15 @@ pub(super) async fn startup_tmp_cleanup(
         }
     }
 
-    // 2. Repo-root staging dirs and swap backups, plus version-level swap
-    // backups one level down: the scanner's root unpack swap parks
-    // `.{model}.old-*` at the repo root, while the HTTP upload swap
-    // (files.rs swap_dir_into) parks `.{version}.old-*` next to the
-    // version dir — both crash windows need the same recovery.
+    // 2. Repo-root staging dirs (shared with the hourly reaper, F5).
+    removed += sweep_staging_dirs(repo_path, now, max_age).await;
+
+    // 3. Repo-root swap backups, plus version-level swap backups one level
+    // down: the scanner's root unpack swap parks `.{model}.old-*` at the
+    // repo root, while the HTTP upload swap (files.rs swap_dir_into) parks
+    // `.{version}.old-*` next to the version dir — both crash windows need
+    // the same recovery. Also swept here: the registry snapshot's
+    // write-transient tmp file (crash residue, removed regardless of age).
     if let Ok(mut entries) = tokio::fs::read_dir(repo_path).await {
         let mut model_dirs: Vec<std::path::PathBuf> = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -77,12 +81,15 @@ pub(super) async fn startup_tmp_cleanup(
                 continue;
             }
             if name.starts_with(".tmp-upload-") || name.starts_with(".tmp-unpack-") {
-                if path.is_dir()
-                    && staging_dir_is_stale(&path, &name, now, max_age).await
-                    && tokio::fs::remove_dir_all(&path).await.is_ok()
-                {
+                continue; // handled by sweep_staging_dirs above
+            }
+            // The registry snapshot is written tmp-then-rename (cache.rs);
+            // a crash between the two leaves the tmp file forever. It is
+            // write-transient — any age is residue.
+            if name == crate::registry::cache::SNAPSHOT_TMP_FILENAME {
+                if path.is_file() && tokio::fs::remove_file(&path).await.is_ok() {
                     removed += 1;
-                    info!(path = %path.display(), "startup cleanup: removed stale staging dir");
+                    info!(path = %path.display(), "startup cleanup: removed registry snapshot tmp residue");
                 }
                 continue;
             }
@@ -111,7 +118,7 @@ pub(super) async fn startup_tmp_cleanup(
         }
     }
 
-    // 3. Dead-pid worker sockets (unix only — pid-scoped paths).
+    // 4. Dead-pid worker sockets (unix only — pid-scoped paths).
     #[cfg(unix)]
     {
         let sock_dir = temp_root.join("lite-server");
@@ -136,6 +143,37 @@ pub(super) async fn startup_tmp_cleanup(
     }
 
     (removed, restored)
+}
+
+/// Sweep stale repo-root staging dirs `.tmp-upload-*` / `.tmp-unpack-*`,
+/// honouring the same age gate + session.json liveness double-gate
+/// (staging_dir_is_stale) as the startup sweep. Shared by
+/// startup_tmp_cleanup and the hourly reaper (server/mod.rs) — upload
+/// sessions abandoned while the server runs must not wait for a restart.
+/// Returns the number of dirs removed.
+pub(super) async fn sweep_staging_dirs(
+    repo_path: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> u64 {
+    let mut removed = 0u64;
+    if let Ok(mut entries) = tokio::fs::read_dir(repo_path).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !(name.starts_with(".tmp-upload-") || name.starts_with(".tmp-unpack-")) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir()
+                && staging_dir_is_stale(&path, &name, now, max_age).await
+                && tokio::fs::remove_dir_all(&path).await.is_ok()
+            {
+                removed += 1;
+                info!(path = %path.display(), "cleanup: removed stale staging dir");
+            }
+        }
+    }
+    removed
 }
 
 /// Handle one `.{name}.old-{uuid}` swap backup parked inside `parent`:
@@ -352,6 +390,68 @@ mod tests {
         .await;
         assert_eq!(removed, 2, "both stale staging dirs removed");
         assert!(repo.join("mymodel").join("1").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// F5: the extracted staging-dir sweep (shared by startup and the
+    /// hourly reaper) removes fully-stale staging dirs, keeps active
+    /// upload sessions (session.json liveness double-gate) and never
+    /// touches real model dirs.
+    #[tokio::test]
+    async fn sweep_staging_dirs_removes_stale_and_keeps_active_sessions() {
+        let repo = unique_tmp("sweep");
+        let stale = repo.join(format!(".tmp-upload-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&stale).await.unwrap();
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let active = repo.join(format!(".tmp-upload-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&active).await.unwrap();
+        tokio::fs::write(active.join("session.json"), "{}")
+            .await
+            .unwrap();
+        // The active dir's top-level mtime is old; session.json is fresh.
+        std::fs::File::open(&active)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // A real model dir (dot-free) must never be touched.
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+
+        let removed = sweep_staging_dirs(&repo, SystemTime::now(), DEFAULT_MAX_AGE).await;
+        assert_eq!(removed, 1, "only the fully-stale staging dir is swept");
+        assert!(!stale.exists());
+        assert!(active.exists(), "an active upload session must survive");
+        assert!(repo.join("mymodel").join("1").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// The registry snapshot is written tmp-then-rename (cache.rs); a
+    /// crash between the two leaves the tmp file forever. The name is
+    /// write-transient — the sweep removes it regardless of age.
+    #[tokio::test]
+    async fn removes_registry_snapshot_tmp_residue_regardless_of_age() {
+        let repo = unique_tmp("regtmp");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let tmp_file = repo.join(crate::registry::cache::SNAPSHOT_TMP_FILENAME);
+        // A FRESH file: age must not matter for the write-transient name.
+        tokio::fs::write(&tmp_file, "{}").await.unwrap();
+
+        let (removed, _) = startup_tmp_cleanup(
+            &repo,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            DEFAULT_MAX_AGE,
+        )
+        .await;
+        assert_eq!(removed, 1, "fresh registry tmp residue must be removed");
+        assert!(!tmp_file.exists());
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }

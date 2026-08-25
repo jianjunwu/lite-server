@@ -29,7 +29,27 @@ pub struct UploadQuery {
 /// entry would reintroduce the classic dashmap removal/waiter race (a
 /// waiter on the old Arc and a newcomer on a fresh Arc could enter the
 /// critical section together).
+///
+/// Lock order everywhere: the per-model RwLock (below) first, then this
+/// version mutex — never the reverse.
 type VersionOpLocks = dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
+
+/// Per-model RwLock serializing whole-model deletes against in-flight
+/// uploads of any of its versions: delete_model_core holds the WRITE
+/// guard across unload + directory removal + artifact sweeps, while
+/// finalize_upload and delete_version_impl hold a READ guard. Insert-only
+/// for the same dashmap removal/waiter reason as VersionOpLocks.
+type ModelOpLocks = dashmap::DashMap<String, Arc<tokio::sync::RwLock<()>>>;
+
+/// Clone the Arc'd RwLock for one model; the caller holds a read or write
+/// guard across its critical section.
+pub(crate) fn model_op_lock(model: &str) -> Arc<tokio::sync::RwLock<()>> {
+    static LOCKS: std::sync::OnceLock<ModelOpLocks> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(dashmap::DashMap::new)
+        .entry(model.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+        .clone()
+}
 
 pub(crate) fn version_op_locks() -> &'static VersionOpLocks {
     static LOCKS: std::sync::OnceLock<VersionOpLocks> = std::sync::OnceLock::new();
@@ -403,12 +423,17 @@ pub(crate) async fn finalize_upload(
         }
     }
 
-    // Overwrite guard + commit under the per-version op lock: the
-    // exists-check and the swap below are atomic against concurrent
-    // completes/uploads, and against delete_version_impl (which holds the
-    // same lock across unload + removal + artifact cleanup). Without force,
-    // committing onto an existing version directory is refused — the
-    // committed content is someone's truth, never silently clobbered.
+    // Overwrite guard + commit under the op locks. Lock order: the model
+    // READ guard first (held to the end of the function, across the
+    // auto-load below), then the version mutex — delete_model_core holds
+    // the model WRITE guard across unload + directory removal, so a
+    // whole-model delete cannot interleave between "version committed"
+    // and "model loaded" and resurrect the model on disk + registry.
+    // Without force, committing onto an existing version directory is
+    // refused — the committed content is someone's truth, never silently
+    // clobbered.
+    let model_lock = model_op_lock(model_name);
+    let _model_guard = model_lock.read().await;
     let version_lock = version_op_lock(model_name, &effective_version).await;
     let version_guard = version_lock.lock().await;
 
@@ -440,9 +465,8 @@ pub(crate) async fn finalize_upload(
         let artifacts_dir = state.repo_path.join(".artifacts");
         let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
         let retain = async {
-            tokio::fs::create_dir_all(&artifacts_dir).await?;
             for f in staged.iter().filter(|f| f.is_lma) {
-                tokio::fs::copy(&f.path, artifacts_dir.join(&artifact_name)).await?;
+                retain_artifact(&f.path, &artifacts_dir, &artifact_name).await?;
             }
             Ok::<(), std::io::Error>(())
         };
@@ -472,12 +496,12 @@ pub(crate) async fn finalize_upload(
         .await;
     }
 
-    // Artifact retention and the drift patch above stay INSIDE the lock:
-    // delete_version_impl removes exactly those artifacts under the same
-    // lock, so a delete can never slip between commit and housekeeping and
-    // leave an orphan .lma that would resurrect the version on restart.
-    // Auto-load, by contrast, runs outside the lock — a delete interleaving
-    // here surfaces as a load_error, a defined outcome.
+    // Artifact retention and the drift patch above stay INSIDE the version
+    // lock: delete_version_impl removes exactly those artifacts under the
+    // same lock, so a delete can never slip between commit and housekeeping
+    // and leave an orphan .lma that would resurrect the version on restart.
+    // Auto-load runs outside the version lock but still under the model
+    // read guard — delete_model_core cannot interleave here either.
     drop(version_guard);
 
     let load_error = auto_load_uploaded(state, model_name, &effective_version, load).await;
@@ -487,6 +511,30 @@ pub(crate) async fn finalize_upload(
         files: staged.iter().map(|f| f.name.clone()).collect(),
         load_error,
     })
+}
+
+/// F2: retain one staged artifact atomically — copy to a temp name in the
+/// same directory (dot-prefixed: invisible to the scanner and never served
+/// by resolve_download_source), then rename over the final name. A partial
+/// copy (ENOSPC, cancellation) can therefore never become the served
+/// artifact; the temp file is removed best-effort on any failure.
+async fn retain_artifact(
+    src: &std::path::Path,
+    artifacts_dir: &std::path::Path,
+    artifact_name: &str,
+) -> Result<(), std::io::Error> {
+    tokio::fs::create_dir_all(artifacts_dir).await?;
+    let final_path = artifacts_dir.join(artifact_name);
+    let tmp_path = artifacts_dir.join(format!(".{}.tmp-{}", artifact_name, uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::copy(src, &tmp_path).await?;
+        tokio::fs::rename(&tmp_path, &final_path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+    result.map(|_| ())
 }
 
 /// F8: model-level upload — accepts exactly one `.lma` artifact; the
@@ -754,6 +802,10 @@ pub(crate) async fn run_unpack(
     if let Some(v) = expect_version {
         cmd.args(["--expect-version", v]);
     }
+    // kill_on_drop: a dropped Child (e.g. future cancellation of the
+    // caller) must not orphan the python subprocess. The explicit
+    // kill+reap in wait_child_bounded's timeout path is unaffected.
+    cmd.kill_on_drop(true);
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -784,6 +836,9 @@ async fn run_pack(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // kill_on_drop: a dropped Child must not orphan the python
+        // subprocess (see run_unpack).
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| AppError::Internal(format!("failed to run python pack: {}", e)))?;
     wait_child_bounded(&mut child, timeout, "artifact pack").await
@@ -3618,6 +3673,111 @@ mod upload_download_tests {
             result.is_ok(),
             "a child that exits 0 after writing >pipe-buffer output must \
              complete, not be killed as 'timed out': {result:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== F1: whole-model delete serializes against in-flight uploads =====
+
+    /// delete_model_core holds the model WRITE guard; finalize_upload holds
+    /// a READ guard across commit + auto-load. A delete must wait for the
+    /// in-flight upload instead of interleaving with it.
+    #[tokio::test]
+    async fn test_delete_model_waits_for_inflight_upload_read_guard() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-f1wait-{}",
+            std::process::id()
+        ));
+        let model_dir = tmp.join("f1model").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
+
+        let state = test_app_state(tmp.clone());
+        // Simulate an in-flight finalize_upload: the model READ guard is
+        // held across commit + auto-load.
+        let model_lock = model_op_lock("f1model");
+        let read_guard = model_lock.read().await;
+
+        let state2 = state.clone();
+        let delete = tokio::spawn(async move {
+            crate::http::handlers::admin::delete_model_core(
+                &state2,
+                &state2.access_control,
+                None,
+                crate::callback::Protocol::Http,
+                "f1model",
+                false,
+            )
+            .await
+        });
+
+        // The delete must block on the WRITE guard while the read guard is
+        // held — it must not slip past the in-flight upload.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !delete.is_finished(),
+            "delete_model_core must wait for the in-flight upload's read guard"
+        );
+        assert!(tmp.join("f1model").exists());
+
+        drop(read_guard);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+            .await
+            .expect("delete must proceed once the read guard is dropped")
+            .unwrap();
+        assert!(result.is_ok(), "delete failed: {:?}", result.err());
+        assert!(!tmp.join("f1model").exists());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Lock-order smoke test: model lock first, then the version mutex —
+    /// never the reverse.
+    #[tokio::test]
+    async fn test_model_then_version_lock_order_smoke() {
+        let model_lock = model_op_lock("lockordersmoke");
+        let model_guard = model_lock.read().await;
+        let version_lock = version_op_lock("lockordersmoke", "1").await;
+        let version_guard = version_lock.lock().await;
+        drop(version_guard);
+        drop(model_guard);
+        // A writer must then get in (write-preferring, no deadlock).
+        let _write = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            model_lock.write(),
+        )
+        .await
+        .expect("write guard must be acquirable after readers release");
+    }
+
+    // ===== F2: atomic artifact retention =====
+
+    /// A failed retention copy (missing source) must leave nothing at the
+    /// served artifact name and no temp residue — a partial copy would
+    /// otherwise be served forever by resolve_download_source.
+    #[tokio::test]
+    async fn test_retain_artifact_failed_copy_leaves_no_residue() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-f2retain-{}",
+            std::process::id()
+        ));
+        let artifacts = tmp.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts).await.unwrap();
+
+        let missing = tmp.join("missing.lma");
+        let result = retain_artifact(&missing, &artifacts, "mymodel_v1.lma").await;
+        assert!(result.is_err(), "copy from a missing source must fail");
+        assert!(
+            !artifacts.join("mymodel_v1.lma").exists(),
+            "a failed copy must never appear at the served artifact name"
+        );
+        let mut entries = tokio::fs::read_dir(&artifacts).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "no tmp residue may remain in .artifacts"
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

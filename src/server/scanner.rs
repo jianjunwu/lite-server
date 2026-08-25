@@ -103,6 +103,10 @@ pub(super) async fn auto_unpack_lma_files(
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // kill_on_drop: a dropped Child (e.g. future cancellation) must
+            // not orphan the python subprocess; the timeout path below
+            // still kills + reaps explicitly.
+            .kill_on_drop(true)
             .spawn();
 
         let output = match child {

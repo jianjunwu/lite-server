@@ -263,6 +263,32 @@ impl LiteServer {
             })
         };
 
+        // F5: hourly reaper for abandoned upload/unpack staging dirs — the
+        // startup sweep (below) runs once, but sessions abandoned mid-run
+        // would otherwise linger until the next restart. Same 24h gate and
+        // session.json liveness double-gate as the startup sweep.
+        let staging_reaper_handle = {
+            let repo = std::path::PathBuf::from(&self.config.model_repository.path);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                // Consume the immediate first tick — startup_tmp_cleanup
+                // just ran the same sweep.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let removed = tmp_cleanup::sweep_staging_dirs(
+                        &repo,
+                        std::time::SystemTime::now(),
+                        tmp_cleanup::DEFAULT_MAX_AGE,
+                    )
+                    .await;
+                    if removed > 0 {
+                        info!(removed, "staging reaper: swept abandoned staging dirs");
+                    }
+                }
+            })
+        };
+
         // Start respawn listener for health-check-kill / rolling-recycle
         // worker restarts
         self.worker_manager.start_respawn_listener().await;
@@ -675,6 +701,7 @@ impl LiteServer {
         reload_handle.abort();
         rate_limit_sweep_handle.abort();
         sequence_sweep_handle.abort();
+        staging_reaper_handle.abort();
         if let Some(h) = cert_reloader_handle {
             h.abort();
         }
