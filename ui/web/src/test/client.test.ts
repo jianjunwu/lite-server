@@ -48,6 +48,31 @@ describe('apiFetch', () => {
     expect(err.message).toBe('unauthorized');
   });
 
+  it('should_extract_message_from_object_error_envelope', async () => {
+    mockFetch({
+      ok: false,
+      status: 404,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            error: { code: 'route_not_found', message: 'route not found', param: null, type: 'not_found_error' },
+          }),
+        ),
+    });
+    const err = (await apiFetch('prod', '/x').catch((e) => e)) as ApiError;
+    expect(err.message).toBe('route not found');
+  });
+
+  it('should_fall_back_to_http_status_when_error_has_no_message', async () => {
+    mockFetch({
+      ok: false,
+      status: 500,
+      text: () => Promise.resolve(JSON.stringify({ error: { code: 'internal' } })),
+    });
+    const err = (await apiFetch('prod', '/x').catch((e) => e)) as ApiError;
+    expect(err.message).toBe('HTTP 500');
+  });
+
   it('should_wrap_network_failure_as_status_0', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('conn refused')));
     const err = (await apiFetch('prod', '/x').catch((e) => e)) as ApiError;

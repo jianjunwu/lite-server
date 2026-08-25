@@ -52,6 +52,19 @@ async function parseErrorBody(res: Response): Promise<unknown> {
   }
 }
 
+/** Human-readable message out of an upstream error envelope: `error` may be a
+ * plain string (BFF) or an object `{code, message, ...}` (instance server). */
+function errorMessage(body: unknown, status: number): string {
+  if (body && typeof body === 'object' && 'error' in body) {
+    const err = (body as { error: unknown }).error;
+    if (typeof err === 'string') return err;
+    if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
+      return (err as { message: string }).message;
+    }
+  }
+  return `HTTP ${status}`;
+}
+
 /** Fetch against the BFF; throws ApiError carrying the upstream x-request-id. */
 export async function apiFetch<T>(instanceId: string, path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -68,10 +81,7 @@ export async function apiFetch<T>(instanceId: string, path: string, init?: Reque
   if (!res.ok) {
     const body = await parseErrorBody(res);
     notifyBffUnauthorized(res.status, body);
-    const message =
-      body && typeof body === 'object' && 'error' in body
-        ? String((body as { error: unknown }).error)
-        : `HTTP ${res.status}`;
+    const message = errorMessage(body, res.status);
     throw new ApiError(res.status, res.headers.get('x-request-id'), body, message);
   }
   return res.json() as Promise<T>;
