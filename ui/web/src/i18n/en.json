@@ -26,7 +26,9 @@
     "unreachable": "Instance unreachable",
     "requestId": "Request ID",
     "comingSoon": "Coming soon",
-    "back": "Back"
+    "back": "Back",
+    "noInstanceAccess": "No access to this instance",
+    "noInstanceAccessBody": "It is hidden for your account or does not exist. Pick another instance above."
   },
   "overview": {
     "title": "Overview",
@@ -356,6 +358,14 @@
       "copyCodes": "Copy codes",
       "copied": "Backup codes copied",
       "done": "Done"
+    },
+    "grants": {
+      "access": "Access",
+      "title": "Instance access: {{name}}",
+      "hint": "Per-instance role overrides the global role on that instance. Hidden removes the instance entirely.",
+      "default": "Default ({{role}})",
+      "hidden": "Hidden",
+      "saved": "Access updated"
     }
   }
 }

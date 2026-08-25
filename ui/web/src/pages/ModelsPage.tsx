@@ -7,7 +7,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { App } from 'antd';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
-import { useAuth } from '../context/AuthContext';
+import { useCanInstance } from '../context/useEffectiveRole';
 import { useMergedModels, useMergedVersions } from '../api/hooks';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import type { MergedModel, MergedModelStatus } from '../api/merge';
@@ -21,7 +21,7 @@ const STATUS_FILTERS: MergedModelStatus[] = ['ready', 'loading', 'degraded', 'un
 
 function ModelExpandRow({ model }: { model: string }) {
   const { instanceId } = useInstance();
-  const { can } = useAuth();
+  const can = useCanInstance();
   const merged = useMergedVersions(instanceId, model);
   return (
     <VersionsTable
@@ -79,7 +79,7 @@ function LoadAction({ model }: { model: MergedModel }) {
 export function ModelsPage() {
   const { t } = useTranslation();
   const { instanceId } = useInstance();
-  const { can } = useAuth();
+  const can = useCanInstance();
   const ilink = useInstanceLink();
   const merged = useMergedModels(instanceId);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);

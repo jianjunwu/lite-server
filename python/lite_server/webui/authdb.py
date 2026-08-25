@@ -119,6 +119,19 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (instance_id, session_id)
     )
     """,
+    # v7: per-instance role grants. A row overrides the user's global role on
+    # that instance (role "none" hides/denies the instance entirely); no row
+    # means the global role applies, which keeps pre-v7 behavior.
+    """
+    CREATE TABLE IF NOT EXISTS instance_grants (
+        username TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (username, instance_id)
+    )
+    """,
 ]
 
 

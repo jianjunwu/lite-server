@@ -38,6 +38,12 @@ vi.mock('../context/AuthContext', () => ({
   useAuth: () => ({ user: { username: 'op', role: 'operator' }, can: (r: string) => r !== 'admin' }),
 }));
 
+let mockCanInstance = true;
+vi.mock('../context/useEffectiveRole', () => ({
+  useCanInstance: () => () => mockCanInstance,
+  useEffectiveRole: () => (mockCanInstance ? 'operator' : 'viewer'),
+}));
+
 vi.mock('../context/TaskContext', () => ({
   useTasks: () => ({ addTask: () => 'task-1', updateTask: vi.fn() }),
 }));
@@ -73,6 +79,7 @@ function renderPage() {
 
 afterEach(() => {
   mockList.data = [];
+  mockCanInstance = true;
   for (const k of Object.keys(mockVersions)) delete mockVersions[k];
 });
 
@@ -106,6 +113,14 @@ describe('ModelsPage repository view', () => {
     fireEvent.click(await screen.findByText(/Unloaded/, { selector: '.ant-segmented-item *' }));
     expect(screen.queryByText('echo')).toBeNull();
     expect(screen.getByText('ghost')).toBeTruthy();
+  });
+
+  it('should_hide_load_and_upload_actions_for_an_effective_viewer', () => {
+    mockCanInstance = false;
+    mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    renderPage();
+    expect(screen.queryByRole('button', { name: 'Load' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Upload model' })).toBeNull();
   });
 
   it('should_show_repo_versions_with_load_action_in_the_expand_row', async () => {

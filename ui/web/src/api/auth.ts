@@ -133,3 +133,23 @@ export const auditApi = {
     return bffFetch<{ entries: AuditEntry[] }>(`/api/audit${suffix}`);
   },
 };
+
+export interface InstanceGrant {
+  instance_id: string;
+  role: string;
+}
+
+/** Per-instance role grants (admin). role "default" removes the row. */
+export const grantsApi = {
+  list: (username: string) =>
+    bffFetch<{ grants: InstanceGrant[] }>(`/api/users/${encodeURIComponent(username)}/grants`),
+  set: (username: string, instanceId: string, role: string) =>
+    bffFetch<{ grants: InstanceGrant[] }>(
+      `/api/users/${encodeURIComponent(username)}/grants/${encodeURIComponent(instanceId)}`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role }),
+      },
+    ),
+};

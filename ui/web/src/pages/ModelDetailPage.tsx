@@ -5,7 +5,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
-import { useAuth } from '../context/AuthContext';
+import { useCanInstance } from '../context/useEffectiveRole';
 import { apiFetch } from '../api/client';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import { useMergedVersions, useModelHealth, useTimeline } from '../api/hooks';
@@ -27,7 +27,7 @@ export function ModelDetailPage() {
   const navigate = useNavigate();
   const { instanceId } = useInstance();
   const ilink = useInstanceLink();
-  const { can } = useAuth();
+  const can = useCanInstance();
   const queryClient = useQueryClient();
   const [editingRouting, setEditingRouting] = useState(false);
   const [loadOpen, setLoadOpen] = useState(false);

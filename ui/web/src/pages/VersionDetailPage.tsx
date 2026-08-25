@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
-import { useAuth } from '../context/AuthContext';
+import { useCanInstance } from '../context/useEffectiveRole';
 import { useMergedVersions, useModelHealth, useModelReady, useTimeline } from '../api/hooks';
 import { StatusBadge } from '../components/StatusBadge';
 import { WorkerMatrix } from '../components/WorkerMatrix';
@@ -22,7 +22,7 @@ export function VersionDetailPage() {
   const navigate = useNavigate();
   const { instanceId } = useInstance();
   const ilink = useInstanceLink();
-  const { can } = useAuth();
+  const can = useCanInstance();
 
   const chartColors = useChartColors();
   const neutrals = useNeutrals();

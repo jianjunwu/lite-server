@@ -29,12 +29,21 @@ function installFetch() {
     vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
       calls.push({ url, method: init?.method ?? 'GET', body: (init?.body as string) ?? null });
+      if (url.includes('/api/users/u1/grants')) return Promise.resolve(json({ grants: [] }));
       if (url.includes('/api/users')) {
         return Promise.resolve(
           json({ users: [{ username: 'u1', role: 'viewer', createdAt: '2026-01-01', mustChangePassword: false }] }),
         );
       }
-      if (url.includes('/api/instances')) return Promise.resolve(json({ instances: [] }));
+      if (url.includes('/api/instances')) {
+        return Promise.resolve(
+          json({
+            instances: [
+              { id: 'prod', name: 'Prod', base_url: 'http://p', has_admin_key: false, readonly: false },
+            ],
+          }),
+        );
+      }
       return Promise.resolve(json({}));
     }),
   );
@@ -85,5 +94,23 @@ describe('SettingsPage user edit', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(putCalls()).toHaveLength(1));
     expect(putCalls()[0].body).toContain('"password":"long-enough-1"');
+  });
+});
+
+describe('SettingsPage instance grants', () => {
+  it('should_save_an_instance_grant_from_the_access_drawer', async () => {
+    installFetch();
+    renderSettings();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Users' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Access' }));
+    // The drawer lists each visible instance with a role select.
+    const combobox = await screen.findByRole('combobox');
+    fireEvent.mouseDown(combobox);
+    fireEvent.click(await screen.findByText('operator', { selector: '.ant-select-item-option *' }));
+    await waitFor(() =>
+      expect(putCalls().some((c) => c.url.includes('/api/users/u1/grants/prod'))).toBe(true),
+    );
+    const grantPut = putCalls().find((c) => c.url.includes('/api/users/u1/grants/prod'));
+    expect(grantPut?.body).toBe('{"role":"operator"}');
   });
 });

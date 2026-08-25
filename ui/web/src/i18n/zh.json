@@ -26,7 +26,9 @@
     "unreachable": "实例不可达",
     "requestId": "请求 ID",
     "comingSoon": "即将推出",
-    "back": "返回"
+    "back": "返回",
+    "noInstanceAccess": "无权访问该实例",
+    "noInstanceAccessBody": "该实例对你的账号不可见或不存在，请在上方选择其他实例。"
   },
   "overview": {
     "title": "概览",
@@ -356,6 +358,14 @@
       "copyCodes": "复制备用码",
       "copied": "备用码已复制",
       "done": "完成"
+    },
+    "grants": {
+      "access": "实例权限",
+      "title": "实例权限：{{name}}",
+      "hint": "按实例覆盖全局角色；\"不可见\" 将对该用户完全隐藏此实例。",
+      "default": "默认（{{role}}）",
+      "hidden": "不可见",
+      "saved": "权限已更新"
     }
   }
 }

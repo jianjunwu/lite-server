@@ -7,6 +7,8 @@ export interface InstanceInfo {
   base_url: string;
   has_admin_key: boolean;
   readonly: boolean;
+  /** Caller's role on this instance after per-instance grants (BFF-annotated). */
+  effective_role?: 'viewer' | 'operator' | 'admin';
 }
 
 export interface ServerInfo {

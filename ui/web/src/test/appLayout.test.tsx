@@ -5,12 +5,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import '../i18n';
 import { AppLayout } from '../layout/AppLayout';
 
-const INSTANCES = [{ id: 'echo-local', name: 'Echo Local', base_url: 'http://127.0.0.1:8000' }];
+const INSTANCES = [
+  { id: 'echo-local', name: 'Echo Local', base_url: 'http://127.0.0.1:8000', effective_role: 'admin' as const },
+];
 
 let mockInstances: typeof INSTANCES = INSTANCES;
+let mockInstanceId: string | null = 'echo-local';
 
 vi.mock('../api/hooks', () => ({
-  useInstances: () => ({ data: { instances: mockInstances }, isLoading: false }),
+  useInstances: () => ({ data: { instances: mockInstances }, isLoading: false, isSuccess: true }),
   useHealthSummary: () => ({ isError: false, data: { status: 'healthy' } }),
 }));
 
@@ -20,7 +23,7 @@ vi.mock('../api/useAlertNotifier', () => ({ useAlertNotifier: () => {} }));
 vi.mock('../components/TaskBell', () => ({ TaskBell: () => null }));
 
 vi.mock('../context/InstanceContext', () => ({
-  useInstance: () => ({ instanceId: 'echo-local', setInstanceId: vi.fn() }),
+  useInstance: () => ({ instanceId: mockInstanceId, setInstanceId: vi.fn() }),
 }));
 
 vi.mock('../context/AuthContext', async (importOriginal) => {
@@ -44,6 +47,7 @@ vi.mock('../context/ThemeModeContext', () => ({
 afterEach(() => {
   vi.unstubAllGlobals();
   mockInstances = INSTANCES;
+  mockInstanceId = 'echo-local';
 });
 
 function LocationProbe() {
@@ -98,5 +102,20 @@ describe('AppLayout instance picker', () => {
     renderLayout();
     fireEvent.click(await screen.findByRole('link', { name: 'Models' }));
     expect(screen.getByTestId('loc').textContent).toBe('/models?i=echo-local');
+  });
+
+  it('should_show_the_effective_role_tag_in_the_instance_picker', async () => {
+    renderLayout();
+    await openInstanceSelect();
+    expect((await screen.findAllByText('admin')).length).toBeGreaterThan(0);
+  });
+
+  it('should_show_a_no_access_page_for_an_instance_outside_the_visible_list', async () => {
+    // A ?i= deep link to an instance the BFF filtered out (grant "none") —
+    // or a typo — gets a page-level empty state instead of a dead shell.
+    mockInstanceId = 'ghost';
+    renderLayout();
+    expect(await screen.findByText(/no access/i)).toBeTruthy();
+    expect(screen.queryByTestId('loc')).toBeNull();
   });
 });

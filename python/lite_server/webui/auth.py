@@ -47,6 +47,11 @@ def role_rank(role: str) -> int:
     return ROLES.index(role)
 
 
+# Instance-grant roles: the three base roles plus "none" (instance hidden and
+# fully denied). Ranked checks never see "none" — the guard rejects it first.
+GRANT_ROLES = ROLES + ("none",)
+
+
 class AuthError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -240,6 +245,7 @@ class UserStore:
         if existing.role == "admin" and self._admin_count() <= 1:
             raise AuthError("forbidden", "cannot delete the last admin")
         self._db.execute("DELETE FROM users WHERE username = ?", (username,))
+        self._db.execute("DELETE FROM instance_grants WHERE username = ?", (username,))
 
     def _admin_count(self) -> int:
         return self._db.query_one("SELECT COUNT(*) FROM users WHERE role = 'admin'")[0]
@@ -500,6 +506,39 @@ class UserStore:
             "DELETE FROM version_owners WHERE instance_id = ?", (instance_id,))
         self._db.execute(
             "DELETE FROM upload_session_owners WHERE instance_id = ?", (instance_id,))
+        self._db.execute(
+            "DELETE FROM instance_grants WHERE instance_id = ?", (instance_id,))
+
+    # ---- per-instance role grants (M2) ----
+
+    def effective_role(self, username: str, global_role: str, instance_id: str) -> str:
+        """Grant overrides the global role on one instance; no row = global."""
+        row = self._db.query_one(
+            "SELECT role FROM instance_grants WHERE username = ? AND instance_id = ?",
+            (username, instance_id))
+        return row["role"] if row else global_role
+
+    def list_instance_grants(self, username: str) -> list[dict]:
+        rows = self._db.query(
+            "SELECT instance_id, role FROM instance_grants"
+            " WHERE username = ? ORDER BY instance_id",
+            (username,))
+        return [{"instance_id": r["instance_id"], "role": r["role"]} for r in rows]
+
+    def set_instance_grant(self, username: str, instance_id: str, role: str) -> None:
+        if role not in GRANT_ROLES:
+            raise AuthError("invalid", f'unknown grant role "{role}"')
+        self._db.execute(
+            "INSERT INTO instance_grants (username, instance_id, role, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(username, instance_id)"
+            " DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at",
+            (username, instance_id, role, _now(), _now()))
+
+    def remove_instance_grant(self, username: str, instance_id: str) -> None:
+        self._db.execute(
+            "DELETE FROM instance_grants WHERE username = ? AND instance_id = ?",
+            (username, instance_id))
 
     def close(self) -> None:
         """Closes the underlying AuthDB (WAL checkpoint on shutdown)."""
@@ -707,6 +746,19 @@ def check_request(store: UserStore, enabled: bool, request: Request) -> JSONResp
     is_password_flow = path in ("/api/auth/me", "/api/auth/change-password", "/api/auth/logout")
     if must_change and not is_password_flow:
         return JSONResponse({"error": "password_change_required"}, status_code=403)
+
+    if path.startswith("/api/i/"):
+        # Per-instance grant overrides the global role on the proxied paths;
+        # "none" hides the instance entirely (reads included). The effective
+        # role is what ownership.py and the operator check below consume.
+        parts = path.split("/")
+        inst_id = parts[3] if len(parts) > 3 else ""
+        role = store.effective_role(session["username"], role, inst_id)
+        if role == "none":
+            return JSONResponse(
+                {"error": "forbidden", "reason": "instance_denied", "instance": inst_id},
+                status_code=403)
+        request.state.user = {"username": session["username"], "role": role}
 
     if request.method != "GET":
         # CSRF: cookie auth + custom header a cross-site form cannot send.
@@ -972,6 +1024,31 @@ def create_router(store: UserStore) -> APIRouter:
     @router.get("/api/users/{name}/sessions")
     async def user_sessions(name: str):
         return {"sessions": store.list_sessions(name)}
+
+    @router.get("/api/users/{name}/grants")
+    async def list_user_grants(name: str):
+        if store.get(name) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return {"grants": store.list_instance_grants(name)}
+
+    @router.put("/api/users/{name}/grants/{instance_id}")
+    async def put_user_grant(name: str, instance_id: str, request: Request):
+        if store.get(name) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        body = await _json_body(request)
+        role = (body or {}).get("role")
+        if role == "default":
+            # Removing the row restores the global role on that instance.
+            store.remove_instance_grant(name, instance_id)
+        else:
+            try:
+                store.set_instance_grant(name, instance_id, role)
+            except AuthError as e:
+                return _error(e)
+        store.record_audit("instance_grant", actor=request.state.user["username"],
+                           target=name, ip=_client_ip(request),
+                           detail={"instance_id": instance_id, "role": role})
+        return {"grants": store.list_instance_grants(name)}
 
     @router.delete("/api/users/{name}/sessions/{session_id}")
     async def kick_user_session(name: str, session_id: str, request: Request):

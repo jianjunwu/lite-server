@@ -6,7 +6,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import { bffFetch, setAdminKey } from '../api/client';
-import { auditApi, authApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
+import { auditApi, authApi, grantsApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
 import { useInstances } from '../api/hooks';
 import { useAuth } from '../context/AuthContext';
 import type { InstanceInfo } from '../api/types';
@@ -276,6 +276,7 @@ function UsersTab() {
   const users = usersQuery.data?.users ?? [];
 
   const [sessionsFor, setSessionsFor] = useState<string | null>(null);
+  const [accessFor, setAccessFor] = useState<UserRow | null>(null);
   const userSessionsQuery = useQuery({
     queryKey: ['bff', 'user-sessions', sessionsFor],
     queryFn: () => sessionsApi.listFor(sessionsFor as string),
@@ -393,6 +394,9 @@ function UsersTab() {
             width: 290,
             render: (_: unknown, u: UserRow) => (
               <span>
+                <Button type="text" size="small" onClick={() => setAccessFor(u)}>
+                  {t('settings.grants.access')}
+                </Button>
                 <Button type="text" size="small" onClick={() => setSessionsFor(u.username)}>
                   {t('settings.sessions.view')}
                 </Button>
@@ -468,7 +472,80 @@ function UsersTab() {
           onRevoke={(id) => void kick(id)}
         />
       </Drawer>
+
+      {accessFor && <GrantsDrawer user={accessFor} onClose={() => setAccessFor(null)} />}
     </>
+  );
+}
+
+/** Per-instance role overrides for one user: a row per visible instance,
+ * saved immediately on change (role "default" removes the grant row). */
+function GrantsDrawer({ user, onClose }: { user: UserRow; onClose: () => void }) {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const instancesQuery = useInstances();
+  const grantsQuery = useQuery({
+    queryKey: ['bff', 'grants', user.username],
+    queryFn: () => grantsApi.list(user.username),
+  });
+  const grants = new Map((grantsQuery.data?.grants ?? []).map((g) => [g.instance_id, g.role]));
+
+  const setRole = async (instanceId: string, role: string) => {
+    try {
+      await grantsApi.set(user.username, instanceId, role);
+      message.success(t('settings.grants.saved'));
+      await grantsQuery.refetch();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <Drawer
+      title={t('settings.grants.title', { name: user.username })}
+      open
+      onClose={onClose}
+      width={560}
+    >
+      <Typography.Paragraph type="secondary" style={{ fontSize: TYPE.secondary }}>
+        {t('settings.grants.hint')}
+      </Typography.Paragraph>
+      <Table<InstanceInfo>
+        size="small"
+        rowKey="id"
+        pagination={false}
+        loading={instancesQuery.isLoading || grantsQuery.isLoading}
+        dataSource={instancesQuery.data?.instances ?? []}
+        columns={[
+          {
+            title: t('settings.instances.name'),
+            render: (_: unknown, i: InstanceInfo) => (
+              <span>
+                {i.name} <span style={dataTextStyle}>({i.id})</span>
+              </span>
+            ),
+          },
+          {
+            title: t('settings.users.role'),
+            width: 220,
+            render: (_: unknown, i: InstanceInfo) => (
+              <Select
+                style={{ width: 200 }}
+                value={grants.get(i.id) ?? 'default'}
+                onChange={(role) => void setRole(i.id, role)}
+                options={[
+                  { value: 'default', label: t('settings.grants.default', { role: user.role }) },
+                  { value: 'viewer', label: 'viewer' },
+                  { value: 'operator', label: 'operator' },
+                  { value: 'admin', label: 'admin' },
+                  { value: 'none', label: t('settings.grants.hidden') },
+                ]}
+              />
+            ),
+          },
+        ]}
+      />
+    </Drawer>
   );
 }
 

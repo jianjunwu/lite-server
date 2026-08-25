@@ -11,7 +11,7 @@ from .config import InstanceConfig, InstanceStore, StoreError
 _STATUS_FOR = {"invalid": 400, "duplicate": 409, "not_found": 404, "readonly": 403}
 
 
-def public_view(instances: list[InstanceConfig]) -> dict:
+def public_view(instances: list[InstanceConfig], effective_roles: dict | None = None) -> dict:
     return {
         "instances": [
             {
@@ -20,6 +20,7 @@ def public_view(instances: list[InstanceConfig]) -> dict:
                 "base_url": i.base_url,
                 "has_admin_key": bool(i.admin_key),
                 "readonly": i.readonly,
+                **({"effective_role": effective_roles[i.id]} if effective_roles else {}),
             }
             for i in instances
         ]
@@ -52,8 +53,23 @@ def create_router(registry) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/instances")
-    async def list_instances():
-        return public_view(registry.list())
+    async def list_instances(request: Request):
+        instances = registry.list()
+        user_store = getattr(request.app.state, "user_store", None)
+        user = getattr(request.state, "user", None)
+        if user_store is None or user is None:
+            return public_view(instances)
+        # Per-instance grants: "none" hides the instance; everything else is
+        # annotated so the UI can gate operations on the effective role.
+        visible = []
+        roles = {}
+        for inst in instances:
+            eff = user_store.effective_role(user["username"], user["role"], inst.id)
+            if eff == "none":
+                continue
+            visible.append(inst)
+            roles[inst.id] = eff
+        return public_view(visible, roles)
 
     # Write routes require a mutable store; a plain read-only registry (tests,
     # embedding) only gets the list endpoint.

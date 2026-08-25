@@ -32,6 +32,11 @@ vi.mock('../context/AuthContext', () => ({
   useAuth: () => ({ user: { username: 'op', role: 'operator' }, can: (r: string) => r !== 'admin' }),
 }));
 
+vi.mock('../context/useEffectiveRole', () => ({
+  useCanInstance: () => () => true,
+  useEffectiveRole: () => 'operator',
+}));
+
 vi.mock('../context/TaskContext', () => ({
   useTasks: () => ({ addTask: () => 'task-1', updateTask: vi.fn() }),
 }));

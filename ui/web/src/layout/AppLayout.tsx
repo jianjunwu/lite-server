@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Alert, Button, Divider, Layout, Menu, Select, Space, Typography } from 'antd';
+import { Alert, Button, Divider, Empty, Layout, Menu, Select, Space, Tag, Typography } from 'antd';
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -104,7 +104,17 @@ export function AppLayout() {
               value={instanceId ?? undefined}
               loading={instancesQuery.isLoading}
               onChange={(id) => setInstanceId(id)}
-              options={instances.map((i) => ({ value: i.id, label: `${i.name} (${i.base_url})` }))}
+              options={instances.map((i) => ({
+                value: i.id,
+                label: (
+                  <span style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <span>
+                      {i.name} ({i.base_url})
+                    </span>
+                    {i.effective_role && <Tag style={{ marginInlineEnd: 0 }}>{i.effective_role}</Tag>}
+                  </span>
+                ),
+              }))}
               placeholder={t('common.instance')}
               notFoundContent={
                 <div style={{ padding: '4px 8px', color: neutrals.textSecondary }}>{t('common.empty')}</div>
@@ -147,7 +157,23 @@ export function AppLayout() {
           <Alert type="warning" showIcon banner message={`${t('common.unreachable')}: ${instanceId}`} />
         )}
         <Content style={{ padding: 24 }}>
-          <Outlet context={{ navigate }} />
+          {instancesQuery.isSuccess && instanceId && !instances.some((i) => i.id === instanceId) ? (
+            // ?i= points at an instance the BFF filtered out (grant "none")
+            // or that no longer exists — say so instead of rendering a dead shell.
+            <Empty
+              style={{ marginTop: 96 }}
+              description={
+                <>
+                  <div>{t('common.noInstanceAccess')}</div>
+                  <div style={{ fontSize: 12, color: neutrals.textSecondary }}>
+                    {t('common.noInstanceAccessBody')}
+                  </div>
+                </>
+              }
+            />
+          ) : (
+            <Outlet context={{ navigate }} />
+          )}
         </Content>
       </Layout>
     </Layout>
