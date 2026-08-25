@@ -29,6 +29,16 @@ _STRIP_RESPONSE = HOP_BY_HOP | {"set-cookie"}
 
 _METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
+# File-transfer routes: upload finalize (unpack/commit) and first-time
+# download pack can take minutes before the first response byte, so they
+# must not be bounded by the unary read timeout.
+_TRANSFER_LAST_SEGMENTS = frozenset({"upload", "download"})
+
+
+def _is_transfer_route(tail: str) -> bool:
+    segments = tail.split("/")
+    return "upload-sessions" in segments or segments[-1] in _TRANSFER_LAST_SEGMENTS
+
 
 def _upstream_headers(request: Request, inst) -> dict[str, str]:
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST}
@@ -50,12 +60,13 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     query = request.url.query
     url = f"{inst.base_url}/{tail}" + (f"?{query}" if query else "")
 
-    # SSE responses are long-lived: they go through the client with no read
-    # timeout; everything else is bounded so a stalled instance can't exhaust
-    # the connection pool.
+    # SSE responses and file transfers are long-lived: they go through the
+    # client with no read timeout; everything else is bounded so a stalled
+    # instance can't exhaust the connection pool.
     accept = request.headers.get("accept", "")
+    unbounded = "text/event-stream" in accept or _is_transfer_route(tail)
     client: httpx.AsyncClient = (
-        request.app.state.http_stream if "text/event-stream" in accept else request.app.state.http
+        request.app.state.http_stream if unbounded else request.app.state.http
     )
     # Stream the request body: large uploads must not be buffered in BFF memory.
     body = None if request.method in ("GET", "HEAD") else request.stream()

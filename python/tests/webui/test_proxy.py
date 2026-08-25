@@ -155,3 +155,22 @@ def test_should_not_time_out_sse_stream(registry, live):
         res = c.get("/api/i/plain/sse-slow", headers={"accept": "text/event-stream"})
     assert res.status_code == 200
     assert res.text == "data: one\n\ndata: two\n\n"
+
+
+def test_should_not_time_out_slow_upload_finalize(registry, live):
+    # Upload routes are exempt from the unary read timeout: the instance may
+    # spend minutes unpacking/committing a multi-GB artifact before responding.
+    app = build_app(registry, unary_timeout=0.3)
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.post("/api/i/plain/v2/repository/models/m/versions/1/upload",
+                     content=b"chunk-bytes")
+    assert res.status_code == 200
+
+
+def test_should_not_time_out_slow_download_pack(registry, live):
+    # Download routes are exempt too: a first-time download repacks the
+    # version tree before the first response byte.
+    app = build_app(registry, unary_timeout=0.3)
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.get("/api/i/plain/v2/repository/models/m/versions/1/download")
+    assert res.status_code == 200

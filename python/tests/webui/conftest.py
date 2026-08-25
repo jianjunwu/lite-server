@@ -96,6 +96,11 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         if self.path == "/hang":
             # Simulates an instance that accepts but stalls mid-response.
             time.sleep(2)
+        if self.path.endswith(("/upload", "/download")):
+            # Simulates a long upload-finalize / download-pack before the
+            # response headers arrive (bounded by the transfer timeout, not
+            # the unary one).
+            time.sleep(1)
         if self.path == "/fail500":
             payload = json.dumps({"error": "boom"}).encode()
             self.send_response(500)
