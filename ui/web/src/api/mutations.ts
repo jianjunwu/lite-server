@@ -108,11 +108,11 @@ export function uploadModelFiles(
   model: string,
   version: string,
   files: File[],
-  opts: { load?: boolean; onProgress?: (percent: number, loaded: number, total: number) => void } = {},
+  opts: { load?: boolean; force?: boolean; onProgress?: (percent: number, loaded: number, total: number) => void } = {},
 ): UploadHandle {
   const xhr = new XMLHttpRequest();
   const load = opts.load ?? true;
-  const url = `/api/i/${enc(instanceId)}/v2/repository/models/${enc(model)}/versions/${enc(version)}/upload?load=${load}`;
+  const url = `/api/i/${enc(instanceId)}/v2/repository/models/${enc(model)}/versions/${enc(version)}/upload?load=${load}${opts.force ? '&force=true' : ''}`;
 
   const promise = new Promise<UploadResult>((resolve, reject) => {
     xhr.upload.addEventListener('progress', (e) => {

@@ -152,7 +152,17 @@
     "noFiles": "请至少选择一个文件",
     "success": "已上传 {{model}}/{{version}}",
     "loadedOk": "已加载并服务中",
-    "taskTitle": "上传 {{model}}/{{version}}"
+    "taskTitle": "上传 {{model}}/{{version}}",
+    "overwriteTitle": "覆盖已存在的版本？",
+    "overwriteContent": "服务器上已存在 {{model}} 的版本 {{version}}。用上传的文件替换其内容？",
+    "overwriteOk": "覆盖",
+    "overwriteCancelled": "已取消覆盖，现有版本未变",
+    "forbidden": {
+      "not_version_owner": "该版本由 {{owner}} 创建，无权覆盖",
+      "not_session_owner": "该上传会话属于其他用户",
+      "admin_required": "该操作需要管理员权限",
+      "session_binding_mismatch": "上传会话与该模型版本不匹配"
+    }
   },
   "tasks": {
     "title": "任务",

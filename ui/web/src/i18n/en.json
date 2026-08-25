@@ -152,7 +152,17 @@
     "noFiles": "Select at least one file",
     "success": "Uploaded {{model}}/{{version}}",
     "loadedOk": "Loaded and serving",
-    "taskTitle": "Upload {{model}}/{{version}}"
+    "taskTitle": "Upload {{model}}/{{version}}",
+    "overwriteTitle": "Overwrite existing version?",
+    "overwriteContent": "{{model}} version {{version}} already exists on the server. Replace its contents with the uploaded files?",
+    "overwriteOk": "Overwrite",
+    "overwriteCancelled": "Overwrite cancelled — the existing version is unchanged",
+    "forbidden": {
+      "not_version_owner": "Version is owned by {{owner}} — no permission to overwrite",
+      "not_session_owner": "This upload session belongs to another user",
+      "admin_required": "Admin permission required for this operation",
+      "session_binding_mismatch": "Upload session does not match this model version"
+    }
   },
   "tasks": {
     "title": "Tasks",

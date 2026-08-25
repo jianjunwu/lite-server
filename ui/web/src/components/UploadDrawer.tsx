@@ -5,7 +5,7 @@ import type { UploadFile } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
-import { uploadModelFilesResumable } from '../api/upload';
+import { isVersionExistsConflict, ownershipDenial, uploadModelFilesResumable } from '../api/upload';
 import type { UploadHandle } from '../api/mutations';
 import { useTasks } from '../context/TaskContext';
 import { formatBytes } from './format';
@@ -26,7 +26,7 @@ interface UploadDrawerProps {
  */
 export function UploadDrawer({ open, onClose, existingModels, model }: UploadDrawerProps) {
   const { t } = useTranslation();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const { instanceId } = useInstance();
   const queryClient = useQueryClient();
   const { addTask, updateTask } = useTasks();
@@ -46,20 +46,17 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
   const lmaCount = fileList.filter((f) => f.name.endsWith('.lma')).length;
   const lmaConflict = lmaCount > 0 && fileList.length > 1;
 
-  const submit = async (values: { model: string; version: string; load: boolean }) => {
-    if (!instanceId) return;
-    const files = fileList.map((f) => f.originFileObj as File).filter(Boolean);
-    if (files.length === 0) {
-      message.error(t('upload.noFiles'));
-      return;
-    }
-    const taskId = addTask({
-      title: t('upload.taskTitle', { model: values.model, version: values.version }),
-      kind: 'upload',
-      progress: 0,
-    });
-    const handle = uploadModelFilesResumable(instanceId, values.model, values.version, files, {
+  type Values = { model: string; version: string; load: boolean };
+
+  const runUpload = async (
+    values: Values,
+    files: File[],
+    force: boolean,
+    taskId: string,
+  ): Promise<'ok' | 'conflict' | 'failed'> => {
+    const handle = uploadModelFilesResumable(instanceId!, values.model, values.version, files, {
       load: values.load,
+      force,
       onProgress: (percent, loaded, total) => {
         setUploading((cur) => (cur ? { ...cur, percent } : cur));
         updateTask(taskId, { progress: percent, detail: `${formatBytes(loaded)} / ${formatBytes(total)}` });
@@ -80,13 +77,50 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
       setFileList([]);
       form.resetFields();
       onClose();
+      return 'ok';
     } catch (err) {
-      const text = err instanceof Error ? err.message : String(err);
+      // Version exists (M1 guard): the caller decides — offer the overwrite
+      // confirm rather than failing outright. Chunked uploads resume, so the
+      // force retry does not resend bytes.
+      if (!force && isVersionExistsConflict(err)) return 'conflict';
+      const denial = ownershipDenial(err);
+      const text = denial
+        ? t(`upload.forbidden.${denial.reason}`, { owner: denial.owner })
+        : err instanceof Error
+          ? err.message
+          : String(err);
       updateTask(taskId, { status: 'error', detail: text });
       message.error(text);
+      return 'failed';
     } finally {
       setUploading(null);
     }
+  };
+
+  const submit = async (values: Values) => {
+    if (!instanceId) return;
+    const files = fileList.map((f) => f.originFileObj as File).filter(Boolean);
+    if (files.length === 0) {
+      message.error(t('upload.noFiles'));
+      return;
+    }
+    const taskId = addTask({
+      title: t('upload.taskTitle', { model: values.model, version: values.version }),
+      kind: 'upload',
+      progress: 0,
+    });
+    const outcome = await runUpload(values, files, false, taskId);
+    if (outcome !== 'conflict') return;
+    modal.confirm({
+      title: t('upload.overwriteTitle'),
+      content: t('upload.overwriteContent', { model: values.model, version: values.version }),
+      okText: t('upload.overwriteOk'),
+      okButtonProps: { danger: true },
+      onOk: () => runUpload(values, files, true, taskId),
+      onCancel: () => {
+        updateTask(taskId, { status: 'error', detail: t('upload.overwriteCancelled') });
+      },
+    });
   };
 
   return (

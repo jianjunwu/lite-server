@@ -10,10 +10,13 @@ vi.mock('../api/mutations', () => ({
 
 import { uploadModelFiles } from '../api/mutations';
 import {
+  isVersionExistsConflict,
+  ownershipDenial,
   uploadModelChunked,
   uploadModelFilesResumable,
   __test__,
 } from '../api/upload';
+import { ApiError } from '../api/client';
 
 interface RecordedReq {
   url: string;
@@ -30,6 +33,7 @@ function makeServer(opts: {
   const chunkSize = opts.chunkSize ?? 8;
   const requests: RecordedReq[] = [];
   const chunks = new Map<string, Blob>();
+  const sessions = new Set<string>();
   let sessionCounter = 0;
   let failedOnce = false;
 
@@ -48,6 +52,7 @@ function makeServer(opts: {
     if (url === base && method === 'POST') {
       const body = JSON.parse(String(init?.body)) as { files: { name: string; size: number }[] };
       const sid = `sess-${++sessionCounter}`;
+      sessions.add(sid);
       for (const f of body.files) {
         for (let ci = 0; ci < Math.ceil(f.size / chunkSize); ci++) {
           if (opts.sessionExists && ci === 0) chunks.set(`0/${ci}`, new Blob(['x'.repeat(chunkSize)]));
@@ -57,13 +62,27 @@ function makeServer(opts: {
     }
     const getMatch = url.match(/upload-sessions\/([^/?]+)$/);
     if (getMatch && method === 'GET') {
-      if (!opts.sessionExists) return json({ error: 'upload session not found' }, 404);
-      // Chunk 0 already landed in a previous browser session.
+      if (opts.sessionExists) {
+        // Chunk 0 already landed in a previous browser session.
+        return json({
+          session_id: getMatch[1],
+          chunk_size: chunkSize,
+          state: 'uploading',
+          files: [{ name: 'w.bin', size: 24, received_chunks: [0], complete: false }],
+        });
+      }
+      if (!sessions.has(getMatch[1])) return json({ error: 'upload session not found' }, 404);
+      // Rebuild the bitmap from what actually landed (the server's own
+      // resume semantics): a retried complete must not re-receive chunks.
+      const received = [...chunks.keys()]
+        .filter((k) => k.startsWith('0/'))
+        .map((k) => Number(k.slice(2)))
+        .sort((a, b) => a - b);
       return json({
         session_id: getMatch[1],
         chunk_size: chunkSize,
         state: 'uploading',
-        files: [{ name: 'w.bin', size: 24, received_chunks: [0], complete: false }],
+        files: [{ name: 'w.bin', size: 24, received_chunks: received, complete: false }],
       });
     }
     const putMatch = url.match(/upload-sessions\/([^/]+)\/files\/(\d+)\/chunks\/(\d+)$/);
@@ -236,6 +255,89 @@ describe('uploadModelChunked', () => {
     handle.abort();
     await expect(handle.promise).rejects.toThrow(/cancelled|aborted/i);
     expect(server.requests.some((r) => r.url.includes('complete'))).toBe(false);
+  });
+
+  it('should_pass_force_to_the_complete_url', async () => {
+    const server = makeServer({ chunkSize: 8 });
+    vi.stubGlobal('fetch', server.fetchMock);
+
+    const file = fileOf(['abcdefgh']);
+    const handle = uploadModelChunked('prod', 'm', '1', [file], { retryDelayMs: 0, force: true });
+    await handle.promise;
+
+    const complete = server.requests.find((r) => r.url.includes('complete'));
+    expect(complete?.url).toContain('force=true');
+  });
+
+  it('should_resume_with_force_after_a_409_without_reuploading_chunks', async () => {
+    const server = makeServer({ chunkSize: 8 });
+    // The first complete answers 409 (version exists); the retry succeeds.
+    let conflicted = false;
+    const baseMock = server.fetchMock.getMockImplementation();
+    server.fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('complete') && !conflicted) {
+        conflicted = true;
+        return new Response(
+          JSON.stringify({
+            code: 'conflict',
+            message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+          }),
+          { status: 409, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return baseMock!(input, init);
+    });
+    vi.stubGlobal('fetch', server.fetchMock);
+
+    const file = fileOf(['abcdefgh']);
+    const first = uploadModelChunked('prod', 'm', '1', [file], { retryDelayMs: 0 });
+    const err = await first.promise.catch((e: unknown) => e);
+    expect(isVersionExistsConflict(err)).toBe(true);
+    // The session record survives the 409 — the force retry resumes it.
+    expect(localStorage.getItem(__test__.storageKey('prod', 'm', '1'))).not.toBeNull();
+
+    server.requests.length = 0;
+    const second = uploadModelChunked('prod', 'm', '1', [file], { retryDelayMs: 0, force: true });
+    const result = await second.promise;
+    expect(result.success).toBe(true);
+    // Zero chunk PUTs: everything was already on the server.
+    expect(server.requests.filter((r) => r.method === 'PUT')).toHaveLength(0);
+    const complete = server.requests.find((r) => r.url.includes('complete'));
+    expect(complete?.url).toContain('force=true');
+  });
+});
+
+describe('error classification', () => {
+  it('should_detect_the_version_exists_conflict_only', () => {
+    const conflict = new ApiError(
+      409,
+      null,
+      { code: 'conflict', message: 'version 1 of model m already exists; pass ?force=true to overwrite' },
+      'conflict',
+    );
+    expect(isVersionExistsConflict(conflict)).toBe(true);
+    // Other 409s (missing chunks, session completing, too many sessions)
+    // must NOT trigger the overwrite flow.
+    const other = new ApiError(409, null, { code: 'conflict', message: "file 'w.bin' is missing 2 chunks" }, 'conflict');
+    expect(isVersionExistsConflict(other)).toBe(false);
+    expect(isVersionExistsConflict(new ApiError(500, null, null, 'boom'))).toBe(false);
+    expect(isVersionExistsConflict(new Error('nope'))).toBe(false);
+  });
+
+  it('should_extract_ownership_denial_details', () => {
+    const denied = new ApiError(
+      403,
+      null,
+      { error: 'forbidden', reason: 'not_version_owner', owner: 'op1' },
+      'forbidden',
+    );
+    expect(ownershipDenial(denied)).toEqual({ reason: 'not_version_owner', owner: 'op1' });
+    const adminOnly = new ApiError(403, null, { error: 'forbidden', reason: 'admin_required' }, 'forbidden');
+    expect(ownershipDenial(adminOnly)).toEqual({ reason: 'admin_required', owner: undefined });
+    // CSRF 403s and role 403s have a different shape — not ownership denials.
+    expect(ownershipDenial(new ApiError(403, null, { error: 'csrf_header_missing' }, 'forbidden'))).toBeNull();
+    expect(ownershipDenial(new ApiError(401, null, null, 'nope'))).toBeNull();
   });
 });
 

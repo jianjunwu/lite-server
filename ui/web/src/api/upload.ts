@@ -19,9 +19,40 @@ const MAX_CHUNK_ATTEMPTS = 5;
 
 export interface ChunkedUploadOptions {
   load?: boolean;
+  /** Overwrite an existing version (the server 409s without it). */
+  force?: boolean;
   onProgress?: (percent: number, loaded: number, total: number) => void;
   /** Constant per-retry delay in ms (tests pass 0; default is exponential). */
   retryDelayMs?: number;
+}
+
+/**
+ * The server's overwrite guard answers 409 with a canonical conflict body;
+ * only the "already exists" variant may trigger the overwrite-confirm flow —
+ * other 409s (missing chunks, session already completing, too many sessions)
+ * are plain errors. Couples to the M1 server message on purpose.
+ */
+export function isVersionExistsConflict(err: unknown): boolean {
+  if (!(err instanceof ApiError) || err.status !== 409) return false;
+  const body = err.body as { code?: unknown; message?: unknown } | null;
+  return (
+    body?.code === 'conflict' &&
+    typeof body?.message === 'string' &&
+    body.message.includes('already exists')
+  );
+}
+
+export interface OwnershipDenial {
+  reason: string;
+  owner?: string;
+}
+
+/** BFF ownership gate (M2): 403 {error:'forbidden', reason, owner?}. */
+export function ownershipDenial(err: unknown): OwnershipDenial | null {
+  if (!(err instanceof ApiError) || err.status !== 403) return null;
+  const body = err.body as { error?: unknown; reason?: unknown; owner?: unknown } | null;
+  if (body?.error !== 'forbidden' || typeof body?.reason !== 'string') return null;
+  return { reason: body.reason, owner: typeof body.owner === 'string' ? body.owner : undefined };
 }
 
 interface SessionRecord {
@@ -188,7 +219,7 @@ export function uploadModelChunked(
     throwIfAborted();
     const result = await apiFetch<UploadResult>(
       instanceId,
-      `${base}/${enc(sessionId)}/complete?load=${opts.load ?? true}`,
+      `${base}/${enc(sessionId)}/complete?load=${opts.load ?? true}${opts.force ? '&force=true' : ''}`,
       { method: 'POST', signal },
     );
     localStorage.removeItem(key);
