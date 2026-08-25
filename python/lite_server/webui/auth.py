@@ -442,6 +442,53 @@ class UserStore:
         _logger.info("action=%s actor=%s target=%s ip=%s detail=%s",
                      action, actor, target, ip, detail)
 
+    # ---- ownership records (M2, see ownership.py) ----
+
+    def version_owner(self, instance_id: str, model: str, version: str) -> str | None:
+        row = self._db.query_one(
+            "SELECT owner FROM version_owners"
+            " WHERE instance_id = ? AND model = ? AND version = ?",
+            (instance_id, model, version))
+        return row["owner"] if row else None
+
+    def record_version_owner(self, instance_id: str, model: str, version: str,
+                             owner: str) -> None:
+        # First committer owns; force-overwrite does not transfer ownership.
+        self._db.execute(
+            "INSERT OR IGNORE INTO version_owners"
+            " (instance_id, model, version, owner, created_at) VALUES (?, ?, ?, ?, ?)",
+            (instance_id, model, version, owner, _now()))
+
+    def remove_version_owner(self, instance_id: str, model: str, version: str) -> None:
+        self._db.execute(
+            "DELETE FROM version_owners"
+            " WHERE instance_id = ? AND model = ? AND version = ?",
+            (instance_id, model, version))
+
+    def session_owner_row(self, instance_id: str, session_id: str):
+        return self._db.query_one(
+            "SELECT * FROM upload_session_owners"
+            " WHERE instance_id = ? AND session_id = ?",
+            (instance_id, session_id))
+
+    def session_owner(self, instance_id: str, session_id: str):
+        """Row lookup alias kept for tests/diagnostics."""
+        return self.session_owner_row(instance_id, session_id)
+
+    def record_session_owner(self, instance_id: str, session_id: str, model: str,
+                             version: str, owner: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO upload_session_owners"
+            " (instance_id, session_id, model, version, owner, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (instance_id, session_id, model, version, owner, _now()))
+
+    def remove_session_owner(self, instance_id: str, session_id: str) -> None:
+        self._db.execute(
+            "DELETE FROM upload_session_owners"
+            " WHERE instance_id = ? AND session_id = ?",
+            (instance_id, session_id))
+
     def list_audit(self, *, limit: int = 100, offset: int = 0,
                    action: str | None = None, actor: str | None = None) -> list[dict]:
         sql = "SELECT * FROM audit"

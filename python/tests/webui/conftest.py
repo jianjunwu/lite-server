@@ -96,6 +96,16 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         if self.path == "/hang":
             # Simulates an instance that accepts but stalls mid-response.
             time.sleep(2)
+        if self.path.endswith("/upload-sessions") and self.command == "POST":
+            # Chunked-upload session init: the instance returns a small JSON
+            # with the new session id (201 Created).
+            payload = json.dumps({"session_id": "stub-session-id", "chunk_size": 64}).encode()
+            self.send_response(201)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path.endswith(("/upload", "/download")):
             # Simulates a long upload-finalize / download-pack before the
             # response headers arrive (bounded by the transfer timeout, not

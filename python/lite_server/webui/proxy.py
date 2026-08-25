@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from . import ownership
 
 # Hop-by-hop headers that must not cross the proxy in either direction.
 HOP_BY_HOP = frozenset({
@@ -22,7 +26,10 @@ HOP_BY_HOP = frozenset({
 # upstream instances (a compromised instance could harvest session JWTs).
 # content-length is kept: the streamed body is byte-identical, and having the
 # length lets upstreams that don't read chunked bodies work unchanged.
-_STRIP_REQUEST = (HOP_BY_HOP - {"content-length"}) | {"cookie", "authorization"}
+# x-lite-user is BFF-asserted identity — the browser's own value is forged.
+_STRIP_REQUEST = (HOP_BY_HOP - {"content-length"}) | {
+    "cookie", "authorization", "x-lite-user",
+}
 
 # Response direction: upstream cookies must not be planted on the BFF origin.
 _STRIP_RESPONSE = HOP_BY_HOP | {"set-cookie"}
@@ -49,6 +56,11 @@ def _upstream_headers(request: Request, inst) -> dict[str, str]:
         headers["x-admin-key"] = inst.admin_key
     else:
         headers.pop("x-admin-key", None)
+    # BFF-asserted identity for the instance's audit trail (M2). Set from
+    # the authenticated session, never from the browser (stripped above).
+    user = getattr(request.state, "user", None)
+    if user and user.get("username"):
+        headers["x-lite-user"] = user["username"]
     return headers
 
 
@@ -56,6 +68,18 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     inst = request.app.state.registry.get(inst_id)
     if inst is None:
         return JSONResponse({"error": "unknown_instance", "instance": inst_id}, status_code=404)
+
+    # Ownership policy (M2): version/session-scoped authorization, run after
+    # the auth guard has populated request.state.user. Inactive when the app
+    # has no user store (single-user local mode).
+    user = getattr(request.state, "user", None)
+    store = getattr(request.app.state, "user_store", None)
+    mutation = ownership.parse_model_mutation(tail)
+    if store is not None and user is not None and mutation is not None:
+        deny = ownership.check_ownership(store, inst_id, user, mutation,
+                                         request.query_params)
+        if deny is not None:
+            return deny
 
     query = request.url.query
     url = f"{inst.base_url}/{tail}" + (f"?{query}" if query else "")
@@ -78,6 +102,28 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     except httpx.HTTPError:
         return JSONResponse({"error": "instance_unreachable", "instance": inst_id}, status_code=502)
 
+    headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
+
+    # Session init is the one response the proxy must see: the session id it
+    # carries becomes an ownership record. The body is a small JSON, so this
+    # is the single non-streamed path.
+    if mutation is not None and mutation.kind == "init" and store is not None and user is not None:
+        raw = await upstream.aread()
+        await upstream.aclose()
+        if 200 <= upstream.status_code < 300:
+            session_id = None
+            try:
+                session_id = json.loads(raw).get("session_id")
+            except (ValueError, AttributeError):
+                session_id = None
+            ownership.record_success(store, inst_id, user, mutation,
+                                     request.method, session_id=session_id)
+        return Response(content=raw, status_code=upstream.status_code, headers=headers)
+
+    if (mutation is not None and store is not None and user is not None
+            and 200 <= upstream.status_code < 300):
+        ownership.record_success(store, inst_id, user, mutation, request.method)
+
     async def body_iter():
         try:
             # Raw bytes: body and content-encoding stay consistent end to end.
@@ -86,7 +132,6 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
         finally:
             await upstream.aclose()
 
-    headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _STRIP_RESPONSE}
     # Send the body as a stream: SSE / chunked responses pass through unbuffered.
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=headers)
 

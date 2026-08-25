@@ -95,6 +95,30 @@ MIGRATIONS: list[str] = [
         attempts INTEGER NOT NULL DEFAULT 0
     )
     """,
+    # v6: ownership records (M2) — who created a model version and who owns
+    # an in-flight chunked-upload session, per proxied instance. The first
+    # committer owns a version; force-overwrite does not transfer ownership.
+    # Versions with no record (pre-v6, direct writes) fall to the admin-only
+    # reclaim rule at the policy layer.
+    """
+    CREATE TABLE IF NOT EXISTS version_owners (
+        instance_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        version TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (instance_id, model, version)
+    );
+    CREATE TABLE IF NOT EXISTS upload_session_owners (
+        instance_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        version TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (instance_id, session_id)
+    )
+    """,
 ]
 
 
