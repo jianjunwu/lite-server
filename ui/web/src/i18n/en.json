@@ -237,7 +237,7 @@
   },
   "playground": {
     "single": "Single",
-    "activeVersion": "active",
+    "activeVersion": "Auto (weighted routing)",
     "templates": "Templates",
     "templateName": "Template name",
     "saveTemplate": "Save",

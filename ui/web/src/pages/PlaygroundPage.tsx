@@ -194,7 +194,9 @@ export function PlaygroundPage() {
   const versionOptions = useMemo(() => {
     const vs = versionsQuery.data;
     const opts = (vs?.versions ?? []).map((v) => ({ value: v.version, label: v.version }));
-    return [{ value: '', label: `${t('playground.activeVersion')} (${vs?.active_version ?? '-'})` }, ...opts];
+    // Empty = no version in the URL: the request goes through weighted
+    // routing (active version is only the no-weights fallback).
+    return [{ value: '', label: t('playground.activeVersion') }, ...opts];
   }, [versionsQuery.data, t]);
 
   const [versionA, setVersionA] = useState<string>(searchParams.get('version') ?? '');
@@ -505,8 +507,8 @@ export function PlaygroundPage() {
               width: 150,
               render: (_: unknown, h: HistoryEntry) => (
                 <span style={dataTextStyle}>
-                  {h.versionA || 'active'}
-                  {h.versionB !== null ? ` ↔ ${h.versionB || 'active'}` : ''}
+                  {h.versionA || 'auto'}
+                  {h.versionB !== null ? ` ↔ ${h.versionB || 'auto'}` : ''}
                 </span>
               ),
             },

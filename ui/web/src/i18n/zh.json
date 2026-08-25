@@ -237,7 +237,7 @@
   },
   "playground": {
     "single": "单版本",
-    "activeVersion": "激活版本",
+    "activeVersion": "自动（加权路由）",
     "templates": "请求模板",
     "templateName": "模板名称",
     "saveTemplate": "存为模板",

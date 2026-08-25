@@ -73,6 +73,20 @@ async function sendEnabled() {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe('PlaygroundPage version selector', () => {
+  it('should_label_the_unversioned_option_as_weighted_routing_not_active', async () => {
+    installFetch();
+    renderPage();
+    // Model select is first; version-A select is second.
+    const comboboxes = await screen.findAllByRole('combobox');
+    fireEvent.mouseDown(comboboxes[1]);
+    // The bare (unversioned) choice goes through weighted routing — "active"
+    // is only the fallback, so the label must not claim it pins active.
+    expect(await screen.findByText('Auto (weighted routing)')).toBeTruthy();
+    expect(screen.queryByText(/^active/)).toBeNull();
+  });
+});
+
 describe('PlaygroundPage abort handling', () => {
   it('should_abort_unary_request_when_stop_is_clicked', async () => {
     installFetch();
