@@ -352,7 +352,13 @@
       "save": "保存",
       "created": "实例已添加",
       "updated": "实例已更新",
-      "deleted": "实例已删除"
+      "deleted": "实例已删除",
+      "actions": "操作",
+      "idRequired": "请输入 ID",
+      "idPattern": "ID 只能包含 a-z、0-9 和 -",
+      "nameRequired": "请输入名称",
+      "urlRequired": "请输入 URL",
+      "urlInvalid": "请输入合法的 URL，如 http://host:8000"
     },
     "keys": {
       "hint": "浏览器侧密钥存于 sessionStorage（标签页关闭即清除），随请求以 x-admin-key 发送。两者同时存在时，浏览器密钥优先于服务端实例密钥。",

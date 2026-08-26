@@ -113,8 +113,8 @@ function InstancesTab() {
         pagination={false}
         columns={[
           { title: 'ID', dataIndex: 'id', width: 130, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
-          { title: t('settings.instances.name'), dataIndex: 'name' },
-          { title: 'URL', dataIndex: 'base_url', render: (v: string) => <span style={dataTextStyle}>{v}</span> },
+          { title: t('settings.instances.name'), dataIndex: 'name', ellipsis: true },
+          { title: 'URL', dataIndex: 'base_url', ellipsis: true, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
           {
             title: t('settings.instances.adminKey'),
             width: 110,
@@ -122,8 +122,9 @@ function InstancesTab() {
               i.has_admin_key ? <Tag color="#16A34A" style={{ border: 'none', color: '#fff' }}>server</Tag> : '-',
           },
           {
-            title: '',
+            title: t('settings.instances.actions'),
             width: 160,
+            align: 'right',
             render: (_: unknown, i: InstanceInfo) =>
               i.readonly ? (
                 <Typography.Text type="secondary" style={{ fontSize: TYPE.secondary }}>env · readonly</Typography.Text>
@@ -153,14 +154,28 @@ function InstancesTab() {
           <Form.Item
             name="id"
             label="ID"
-            rules={[{ required: true, pattern: /^[a-z0-9][a-z0-9-]*$/, message: 'a-z, 0-9, -' }]}
+            rules={[
+              { required: true, message: t('settings.instances.idRequired') },
+              { pattern: /^[a-z0-9][a-z0-9-]*$/, message: t('settings.instances.idPattern') },
+            ]}
           >
             <Input disabled={editing !== null} style={{ fontFamily: MONO_FONT }} placeholder="prod-gpu" />
           </Form.Item>
-          <Form.Item name="name" label={t('settings.instances.name')} rules={[{ required: true }]}>
+          <Form.Item
+            name="name"
+            label={t('settings.instances.name')}
+            rules={[{ required: true, message: t('settings.instances.nameRequired') }]}
+          >
             <Input placeholder="Prod GPU cluster" />
           </Form.Item>
-          <Form.Item name="base_url" label="URL" rules={[{ required: true, type: 'url' }]}>
+          <Form.Item
+            name="base_url"
+            label="URL"
+            rules={[
+              { required: true, message: t('settings.instances.urlRequired') },
+              { type: 'url', message: t('settings.instances.urlInvalid') },
+            ]}
+          >
             <Input style={{ fontFamily: MONO_FONT }} placeholder="http://10.0.0.11:8000" />
           </Form.Item>
           <Form.Item

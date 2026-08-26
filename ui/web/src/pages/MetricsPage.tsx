@@ -148,7 +148,9 @@ export function MetricsPage() {
         </div>
       </Reveal>
       <Reveal order={2}>
-        <Card size="small" style={{ marginBottom: SPACE[5] }}>
+        {/* fit-content: a full-width card half-filled with controls reads as
+            an empty, not-yet-loaded panel. */}
+        <Card size="small" style={{ marginBottom: SPACE[5], width: 'fit-content', maxWidth: '100%' }}>
         <Space wrap size="middle">
           <Select
             style={{ minWidth: 200 }}
