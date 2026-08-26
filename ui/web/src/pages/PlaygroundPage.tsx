@@ -293,7 +293,11 @@ export function PlaygroundPage() {
     try {
       JSON.parse(body);
     } catch {
-      message.error(t('playground.invalidJson'));
+      // Surface the failure in the response panel; otherwise the stale
+      // response from a previous send stays visible and reads as success.
+      const error = t('playground.invalidJson');
+      setSlot('a', { ...IDLE_SLOT, status: 'error', error });
+      if (compare) setSlot('b', { ...IDLE_SLOT, status: 'error', error });
       return;
     }
     aborts.current = [];

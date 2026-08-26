@@ -169,4 +169,19 @@ describe('PlaygroundPage response headers', () => {
     fireEvent.click(await screen.findByText('Response headers'));
     expect(await screen.findByText(/x-backend-hdr: b-1/)).toBeTruthy();
   });
+
+  it('should_replace_old_response_with_error_when_body_is_invalid_json', async () => {
+    installResolvingFetch();
+    renderPage();
+    fireEvent.click(await sendEnabled());
+    expect(await screen.findByText(/"output": 10/)).toBeTruthy();
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '{invalid json' } });
+    fireEvent.click(await sendEnabled());
+
+    // The stale success must not survive a failed send: the panel switches
+    // to the error state instead of showing both.
+    await waitFor(() => expect(screen.queryByText(/"output": 10/)).toBeNull());
+    expect(await screen.findByText('Request body is not valid JSON')).toBeTruthy();
+  });
 });
