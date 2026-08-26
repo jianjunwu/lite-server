@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Alert, Button, Card, Collapse, Empty, Input, Table, Tabs, Tag, Typography } from 'antd';
-import { ReloadOutlined, SearchOutlined, SettingOutlined, TableOutlined } from '@ant-design/icons';
+import { DashboardOutlined, ReloadOutlined, SearchOutlined, SettingOutlined, TableOutlined } from '@ant-design/icons';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
@@ -9,6 +9,7 @@ import { useInstances, useModels, useServerInfo, useTimelineAll } from '../api/h
 import { useServerConfig } from '../api/config';
 import type { ModelListItem } from '../api/types';
 import { PageHeader } from '../components/PageHeader';
+import { AcceleratorPanel } from '../components/AcceleratorPanel';
 import { StatNum } from '../components/StatNum';
 import { StatusBadge } from '../components/StatusBadge';
 import { groupServerConfig, sourceTagColor } from '../components/config/serverConfigSchema';
@@ -329,6 +330,12 @@ export function InstanceDetailPage() {
             key: 'config',
             label: tabLabel(<SettingOutlined aria-hidden />, t('instance.detail.tabs.config')),
             children: <ConfigTab instanceId={id} />,
+          },
+          {
+            key: 'accelerator',
+            label: tabLabel(<DashboardOutlined aria-hidden />, t('instance.detail.tabs.accelerator')),
+            // active-only polling: no reason to poll while the tab is hidden.
+            children: <AcceleratorPanel instanceId={id} />,
           },
         ]}
       />

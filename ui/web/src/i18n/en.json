@@ -538,7 +538,8 @@
       "unreachable": "Instance unreachable — showing the last known state.",
       "tabs": {
         "overview": "Overview",
-        "config": "Configuration"
+        "config": "Configuration",
+        "accelerator": "Accelerator"
       },
       "stats": {
         "version": "Version",

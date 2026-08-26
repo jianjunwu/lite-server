@@ -533,7 +533,8 @@
       "unreachable": "实例不可达 —— 展示最近一次已知状态。",
       "tabs": {
         "overview": "概览",
-        "config": "配置"
+        "config": "配置",
+        "accelerator": "加速器"
       },
       "stats": {
         "version": "版本",
