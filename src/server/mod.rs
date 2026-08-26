@@ -526,9 +526,9 @@ impl LiteServer {
             loop {
                 tick.tick().await;
                 let models = registry_for_timeline.list_loaded_keys();
-                for (name, version) in models {
-                    crate::metrics::aggregator::TIMELINE.sample(&name, &version).await;
-                }
+                // M2/L1: one tick-level gather/refresh/CPU window shared by
+                // all loaded keys, instead of per-key repetition.
+                crate::metrics::aggregator::TIMELINE.sample_tick(&models).await;
             }
         });
 

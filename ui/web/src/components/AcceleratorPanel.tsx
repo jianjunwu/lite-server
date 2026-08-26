@@ -56,14 +56,16 @@ interface AcceleratorPanelProps {
   instanceId: string | null;
   /** Poll interval; false pauses (MetricsPage pause control). */
   pollMs?: number | false;
+  /** Set false while the panel is hidden (inactive tab) to stop polling. */
+  active?: boolean;
 }
 
 /** M4: per-device accelerator cards fed by GET /metrics/accelerator. Stands
  * alone (fetches its own data) so the instance detail page can mount it
  * directly; GPU/MLU/NPU share one render path. */
-export function AcceleratorPanel({ instanceId, pollMs = 10_000 }: AcceleratorPanelProps) {
+export function AcceleratorPanel({ instanceId, pollMs = 10_000, active = true }: AcceleratorPanelProps) {
   const { t } = useTranslation();
-  const query = useAcceleratorMetrics(instanceId, pollMs);
+  const query = useAcceleratorMetrics(instanceId, pollMs, active);
 
   if (query.isLoading) {
     return <Skeleton active paragraph={{ rows: 4 }} />;

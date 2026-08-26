@@ -157,13 +157,15 @@ export function MetricsPage() {
   // Only polled while the accelerator tab is active.
   const acceleratorQuery = useAcceleratorMetrics(instanceId, paused ? false : 10_000, group === 'accelerator');
 
-  // Track the freshest coverage/interval the instance reported.
+  // Track the freshest coverage/interval the instance reported. Switching
+  // instances does not remount this page, so reset on instanceId change —
+  // otherwise a pre-M3 instance (no headers) inherits the previous coverage.
   const dataCoverage = timelineQuery.data?.coverageSeconds;
   const dataInterval = timelineQuery.data?.intervalSeconds;
   useEffect(() => {
-    if (dataCoverage != null) setCoverageSeconds(dataCoverage);
-    if (dataInterval != null) setIntervalSeconds(dataInterval);
-  }, [dataCoverage, dataInterval]);
+    setCoverageSeconds(dataCoverage);
+    setIntervalSeconds(dataInterval);
+  }, [instanceId, dataCoverage, dataInterval]);
 
   const snapshots = useMemo(() => {
     const trimmed = trimToRange(timelineQuery.data?.snapshots ?? [], RANGE_SECONDS[effectiveRange]);

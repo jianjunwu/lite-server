@@ -19,6 +19,10 @@ import { SPACE } from '../tokens';
 
 type ProbeName = 'livez' | 'readyz' | 'startupz';
 
+/** Step far beyond any retention window: the server answers with only the
+ * freshest point — all the overview stats below ever read. */
+const LATEST_POINT_STEP = 1_000_000;
+
 /** Probe result: 'ok' (2xx), 'fail' (HTTP error, e.g. 503 draining), or
  * 'unreachable' (network/BFF-level failure). */
 function useProbe(instanceId: string | null, name: ProbeName) {
@@ -147,7 +151,7 @@ export function InstanceDetailPage() {
   const instance = (instancesQuery.data?.instances ?? []).find((i) => i.id === id);
   const infoQuery = useServerInfo(id);
   const modelsQuery = useModels(id);
-  const timelineQuery = useTimelineAll(id);
+  const timelineQuery = useTimelineAll(id, 5_000, LATEST_POINT_STEP);
   const livez = useProbe(id, 'livez');
   const readyz = useProbe(id, 'readyz');
   const startupz = useProbe(id, 'startupz');
@@ -334,8 +338,9 @@ export function InstanceDetailPage() {
           {
             key: 'accelerator',
             label: tabLabel(<DashboardOutlined aria-hidden />, t('instance.detail.tabs.accelerator')),
-            // active-only polling: no reason to poll while the tab is hidden.
-            children: <AcceleratorPanel instanceId={id} />,
+            // active-only polling: antd keeps an activated pane mounted, so
+            // the gate must be explicit or polling continues while hidden.
+            children: <AcceleratorPanel instanceId={id} active={tab === 'accelerator'} />,
           },
         ]}
       />

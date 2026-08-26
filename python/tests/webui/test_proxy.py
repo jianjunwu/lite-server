@@ -178,6 +178,36 @@ def test_should_not_time_out_slow_download_pack(registry, live):
     assert res.status_code == 200
 
 
+def test_should_not_time_out_slow_config_patch(registry, live):
+    # Config PATCH waits for a synchronous reload_model on the instance,
+    # which takes minutes for large models; it must not be bounded by the
+    # unary read timeout, or a successful write+reload surfaces as a 502.
+    app = build_app(registry, unary_timeout=0.3)
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.patch("/api/i/plain/v2/models/m/versions/1/config",
+                      content=b'{"max_batch_size": 8}',
+                      headers={"content-type": "application/json"})
+    assert res.status_code == 200
+
+
+def test_should_still_time_out_config_get(registry, live):
+    # Only the PATCH is long-running; config GET stays on the bounded unary
+    # client so a stalled instance cannot pin a connection.
+    app = build_app(registry, unary_timeout=0.3)
+    start = time.monotonic()
+    with httpx.Client(base_url=live(app).base_url, timeout=10) as c:
+        res = c.get("/api/i/plain/v2/models/m/versions/1/config")
+    assert res.status_code == 502
+    assert time.monotonic() - start < 2
+
+
+def test_should_default_config_patch_timeout_to_600_seconds():
+    # Reload of a large model is minute-scale; align with worker startup
+    # timeout magnitude rather than the 60s unary default.
+    app = build_app(MapRegistry([]))
+    assert app.state.http_long.timeout.read == 600.0
+
+
 def test_should_default_stream_pool_to_500_connections():
     # SSE inference streams and file transfers each pin one upstream
     # connection for their lifetime; the default httpx pool (100) would

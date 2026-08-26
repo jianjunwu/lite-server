@@ -52,6 +52,13 @@ def _is_transfer_route(tail: str) -> bool:
     return "upload-sessions" in segments or segments[-1] in _TRANSFER_LAST_SEGMENTS
 
 
+def _is_config_patch(method: str, tail: str) -> bool:
+    # Model config PATCH (v2/models/{m}/versions/{v}/config) triggers a
+    # synchronous reload_model upstream, minute-scale for large models.
+    segments = tail.split("/")
+    return method == "PATCH" and segments[-1] == "config" and segments[:2] == ["v2", "models"]
+
+
 def _upstream_headers(request: Request, inst) -> dict[str, str]:
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQUEST}
     # Admin key priority: explicit browser header > instance-level key.
@@ -99,13 +106,16 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     url = f"{inst.base_url}/{tail}" + (f"?{query}" if query else "")
 
     # SSE responses and file transfers are long-lived: they go through the
-    # client with no read timeout; everything else is bounded so a stalled
-    # instance can't exhaust the connection pool.
+    # client with no read timeout; config PATCH goes through the long-timeout
+    # client (synchronous upstream reload); everything else is bounded so a
+    # stalled instance can't exhaust the connection pool.
     accept = request.headers.get("accept", "")
-    unbounded = "text/event-stream" in accept or _is_transfer_route(tail)
-    client: httpx.AsyncClient = (
-        request.app.state.http_stream if unbounded else request.app.state.http
-    )
+    if "text/event-stream" in accept or _is_transfer_route(tail):
+        client: httpx.AsyncClient = request.app.state.http_stream
+    elif _is_config_patch(request.method, tail):
+        client = request.app.state.http_long
+    else:
+        client = request.app.state.http
     # Stream the request body: large uploads must not be buffered in BFF memory.
     body = None if request.method in ("GET", "HEAD") else request.stream()
     req = client.build_request(

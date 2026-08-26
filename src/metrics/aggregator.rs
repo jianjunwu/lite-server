@@ -71,6 +71,16 @@ struct CounterBaseline {
     ejections: f64,
 }
 
+/// Tick-level sampling context (M2/L1): the per-tick work — sysinfo refresh,
+/// registry gather, process-wide CPU rate — done ONCE and shared by every key
+/// sampled in the tick. cpu_percent is process-scoped, so all keys of a tick
+/// must see the same value; per-key computation gave the 2nd+ key a few-ms
+/// rate window (noise spikes) and repeated the refresh/gather per key.
+struct TickContext {
+    families: Vec<prometheus::proto::MetricFamily>,
+    cpu_percent: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TimelineSnapshot {
     pub model: String,
@@ -219,8 +229,48 @@ impl TimelineAggregator {
         }
     }
 
+    /// Tick-level work, once per tick: refresh process/worker memory + CPU
+    /// gauges (so rss_mb / cpu_percent are fresh even when no Prometheus
+    /// scraper hits /metrics), gather the registry, and advance the
+    /// process-wide CPU baseline.
+    async fn begin_tick(&self) -> TickContext {
+        super::prometheus::refresh_process_metrics();
+        let families = super::prometheus::REGISTRY.gather();
+        let cpu_percent = {
+            let now = now_secs();
+            let cpu_secs = super::prometheus::PROCESS_CPU_SECONDS_TOTAL.get();
+            let mut last = self.last_cpu.lock().await;
+            let pct = match *last {
+                Some((prev_cpu, prev_wall)) if cpu_secs >= prev_cpu && now > prev_wall => {
+                    round((cpu_secs - prev_cpu) / (now - prev_wall) * 100.0, 1)
+                }
+                _ => 0.0,
+            };
+            *last = Some((cpu_secs, now));
+            pct
+        };
+        TickContext {
+            families,
+            cpu_percent,
+        }
+    }
+
     /// Sample current metrics into the timeline. Call periodically (e.g. every 10s).
     pub async fn sample(&self, model: &str, version: &str) {
+        let ctx = self.begin_tick().await;
+        self.sample_with_ctx(model, version, &ctx).await;
+    }
+
+    /// Sample every key of one tick, sharing the tick-level work (M2/L1) —
+    /// the server sampling loop's entry point.
+    pub async fn sample_tick(&self, keys: &[(String, String)]) {
+        let ctx = self.begin_tick().await;
+        for (model, version) in keys {
+            self.sample_with_ctx(model, version, &ctx).await;
+        }
+    }
+
+    async fn sample_with_ctx(&self, model: &str, version: &str, ctx: &TickContext) {
         let key = (model.to_string(), version.to_string());
         let now = now_secs();
 
@@ -234,12 +284,6 @@ impl TimelineAggregator {
                 }
             }
         }
-
-        // M3: refresh process/worker memory + CPU gauges so rss_mb /
-        // cpu_percent are fresh even when no Prometheus scraper hits /metrics
-        // (those gauges are otherwise scrape-time only). One sysinfo refresh
-        // per sample — the same work a scrape does, at the sample cadence.
-        super::prometheus::refresh_process_metrics();
 
         // Capture the rate window BEFORE compute_qps advances last_check, so
         // every counter-derived rate below shares one elapsed window.
@@ -256,14 +300,13 @@ impl TimelineAggregator {
         let queue_depth = read_gauge(&super::prometheus::QUEUE_DEPTH, &[model, version]);
         let active_workers = read_gauge(&super::prometheus::ACTIVE_WORKERS, &[model, version]);
 
-        // M3: one registry gather feeds every family-scan below (streaming
-        // connections, TTFT/TBT histograms, stream bytes, tokens) instead of
-        // one gather per family.
-        let families = super::prometheus::REGISTRY.gather();
+        // M3: the tick-level gather feeds every family-scan below (streaming
+        // connections, TTFT/TBT histograms, stream bytes, tokens).
+        let families = &ctx.families;
 
         // G6:活跃流式连接——跨 protocol 求和(read_gauge 传固定 label 会因
         // 基数不符 panic,须遍历子序列过滤)。
-        let active_streams = read_active_streams(&families, model, version);
+        let active_streams = read_active_streams(families, model, version);
 
         let in_flight = read_gauge(&super::prometheus::IN_FLIGHT_REQUESTS, &[model, version]) as i64;
         let worker_saturation = read_gauge(&super::prometheus::WORKER_SATURATION, &[model, version]);
@@ -274,13 +317,13 @@ impl TimelineAggregator {
                 / 1_048_576.0,
             1,
         );
-        let ttft_p99_ms = histogram_p99_ms(&families, "liteserver_streaming_ttft_seconds", model, version);
-        let tbt_p99_ms = histogram_p99_ms(&families, "liteserver_streaming_tbt_seconds", model, version);
+        let ttft_p99_ms = histogram_p99_ms(families, "liteserver_streaming_ttft_seconds", model, version);
+        let tbt_p99_ms = histogram_p99_ms(families, "liteserver_streaming_tbt_seconds", model, version);
 
         let stream_bytes =
-            counter_family_sum(&families, "liteserver_stream_output_bytes_total", model, version)
+            counter_family_sum(families, "liteserver_stream_output_bytes_total", model, version)
                 .unwrap_or(0.0);
-        let tokens = counter_family_sum(&families, "lite_server_tokens_generated_total", model, version);
+        let tokens = counter_family_sum(families, "lite_server_tokens_generated_total", model, version);
         let retries = read_counter(&super::prometheus::RETRIES_TOTAL, &[model, version]);
         let ejections = read_counter(&super::prometheus::WORKER_EJECTIONS_TOTAL, &[model, version]);
 
@@ -319,18 +362,9 @@ impl TimelineAggregator {
             result
         };
 
-        let cpu_percent = {
-            let cpu_secs = super::prometheus::PROCESS_CPU_SECONDS_TOTAL.get();
-            let mut last = self.last_cpu.lock().await;
-            let pct = match *last {
-                Some((prev_cpu, prev_wall)) if cpu_secs >= prev_cpu && now > prev_wall => {
-                    round((cpu_secs - prev_cpu) / (now - prev_wall) * 100.0, 1)
-                }
-                _ => 0.0,
-            };
-            *last = Some((cpu_secs, now));
-            pct
-        };
+        // M2: process-wide CPU rate computed once per tick (begin_tick) and
+        // shared by every key.
+        let cpu_percent = ctx.cpu_percent;
 
         let entry = TimelineEntry {
             timestamp: now,
@@ -1283,6 +1317,62 @@ mod tests {
         let entries = agg.get_timeline("m3_no_stream", "1").await;
         assert_eq!(entries[0].ttft_p99_ms, 0.0);
         assert_eq!(entries[0].tbt_p99_ms, 0.0);
+    }
+
+    // ===== M2/L1: tick-level sampling =====
+
+    /// Spin one core for `dur` so process CPU seconds measurably advance.
+    fn burn_cpu(dur: std::time::Duration) {
+        let start = std::time::Instant::now();
+        let mut acc = 0.0f64;
+        while start.elapsed() < dur {
+            acc += (acc + 1.0).sqrt();
+        }
+        std::hint::black_box(acc);
+    }
+
+    /// M2: cpu_percent is process-wide, so every key sampled in the same tick
+    /// must report the SAME value from one shared rate window. Per-key
+    /// computation made the 2nd+ key's window a few milliseconds, turning
+    /// cpu_percent into noise spikes on multi-version deployments.
+    #[tokio::test]
+    async fn test_sample_tick_shares_cpu_percent_across_keys() {
+        use crate::metrics::prometheus;
+        let _ = prometheus::register_metrics();
+        let agg = TimelineAggregator::new();
+        agg.configure(30, 0, 1000, 0.0); // interval 0 = no throttle
+        let keys = vec![k("tick_m", "1"), k("tick_m", "2")];
+
+        agg.sample_tick(&keys).await; // baseline tick
+        burn_cpu(std::time::Duration::from_millis(250));
+        agg.sample_tick(&keys).await;
+
+        let e1 = agg.get_timeline("tick_m", "1").await;
+        let e2 = agg.get_timeline("tick_m", "2").await;
+        assert_eq!(e1.len(), 2);
+        assert_eq!(e2.len(), 2);
+        assert!(
+            e1[1].cpu_percent > 0.0,
+            "a 250ms CPU burn between ticks must register (got {})",
+            e1[1].cpu_percent
+        );
+        assert_eq!(
+            e1[1].cpu_percent, e2[1].cpu_percent,
+            "same-tick keys must share one process-wide cpu_percent"
+        );
+    }
+
+    /// L1: one tick samples every loaded key (the server loop entry point).
+    #[tokio::test]
+    async fn test_sample_tick_records_all_keys() {
+        use crate::metrics::prometheus;
+        let _ = prometheus::register_metrics();
+        let agg = TimelineAggregator::new();
+        let keys = vec![k("tick_all", "1"), k("tick_all", "2"), k("tick_all", "3")];
+        agg.sample_tick(&keys).await;
+        for (_, v) in &keys {
+            assert_eq!(agg.get_timeline("tick_all", v).await.len(), 1);
+        }
     }
 
     // ===== M3: step downsampling =====
