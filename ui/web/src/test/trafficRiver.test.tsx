@@ -51,6 +51,19 @@ describe('TrafficRiver read-only', () => {
     renderRiver(<TrafficRiver versions={[version('v1', 100, true)]} model="m" editable />);
     expect(screen.queryAllByRole('slider')).toHaveLength(0);
   });
+
+  it('should_render_full_bar_not_dash_for_a_single_active_version', () => {
+    // mergeVersionList normalizes "no routing configured" to weight 100, so
+    // single-version models must show a river, not a bare placeholder dash.
+    renderRiver(<TrafficRiver versions={[version('1', 100, true)]} />);
+    expect(screen.queryByText('-')).not.toBeInTheDocument();
+    expect(screen.getByText(/1 100%/)).toBeInTheDocument();
+  });
+
+  it('should_render_dash_only_when_no_version_carries_weight', () => {
+    renderRiver(<TrafficRiver versions={[version('1', 0)]} />);
+    expect(screen.getByText('-')).toBeInTheDocument();
+  });
 });
 
 describe('TrafficRiver editable', () => {

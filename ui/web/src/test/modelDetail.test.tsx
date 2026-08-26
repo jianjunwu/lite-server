@@ -104,6 +104,51 @@ afterEach(() => {
   mockHealth.data = undefined;
 });
 
+const loadedVersionRow = (version: string, weight: number, active: boolean) => ({
+  version,
+  status: 'ready',
+  active,
+  weight,
+  workers: { ready: 1, total: 1 },
+  loaded_at: null,
+  loaded: true,
+});
+
+describe('ModelDetailPage statement', () => {
+  const loadedVersion = loadedVersionRow;
+
+  it('should_count_workers_across_all_loaded_versions_not_just_one', () => {
+    // The model-level health endpoint describes a single version; the
+    // statement must sum per-version workers instead of inheriting that
+    // partial count (multi_version showed "1 workers" while running 2).
+    mockMerged.versions = [loadedVersion('v1', 70, false), loadedVersion('v2', 30, true)];
+    mockMerged.activeVersion = 'v2';
+    mockMerged.hasLoaded = true;
+    mockHealth.data = { total_workers: 1, workers: [] };
+    renderPage('echo');
+    expect(screen.getByText(/2 of 2 versions ready · v2 active · 2 workers/)).toBeInTheDocument();
+  });
+
+  it('should_use_singular_forms_for_one_version_and_one_worker', () => {
+    mockMerged.versions = [loadedVersion('1', 100, true)];
+    mockMerged.activeVersion = '1';
+    mockMerged.hasLoaded = true;
+    mockHealth.data = { total_workers: 1, workers: [] };
+    renderPage('echo');
+    expect(screen.getByText(/1 of 1 version ready · 1 active · 1 worker(?!s)/)).toBeInTheDocument();
+  });
+});
+
+describe('ModelDetailPage traffic river', () => {
+  it('should_render_the_river_once_not_duplicated_in_hero_and_table', () => {
+    mockMerged.versions = [loadedVersionRow('v1', 70, false), loadedVersionRow('v2', 30, true)];
+    mockMerged.activeVersion = 'v2';
+    mockMerged.hasLoaded = true;
+    renderPage('echo');
+    expect(screen.getAllByRole('img', { name: /%/ })).toHaveLength(1);
+  });
+});
+
 describe('ModelDetailPage unloaded model', () => {
   it('should_show_unloaded_state_with_per_version_load_actions_instead_of_a_dead_page', () => {
     mockMerged.versions = [
@@ -217,14 +262,13 @@ describe('ModelDetailPage unloaded model', () => {
         status: 'ready',
         active: true,
         weight: 100,
-        workers: { ready: 1, total: 1 },
+        workers: { ready: 4, total: 4 },
         loaded_at: null,
         loaded: true,
       },
     ];
     mockMerged.activeVersion = '1';
     mockMerged.hasLoaded = true;
-    mockHealth.data = { total_workers: 4, workers: [] };
     renderPage('echo');
 
     fireEvent.click(screen.getByRole('button', { name: /4 workers/i }));

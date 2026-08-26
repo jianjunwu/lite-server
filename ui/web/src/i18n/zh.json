@@ -28,7 +28,8 @@
     "comingSoon": "即将推出",
     "back": "返回",
     "noInstanceAccess": "无权访问该实例",
-    "noInstanceAccessBody": "该实例对你的账号不可见或不存在，请在上方选择其他实例。"
+    "noInstanceAccessBody": "该实例对你的账号不可见或不存在，请在上方选择其他实例。",
+    "ageAgo": "{{age}}前"
   },
   "overview": {
     "title": "概览",
@@ -102,8 +103,11 @@
     "stmtServing": "{{version}} 承载 {{weight}}% 流量",
     "stmtUnloaded": "未加载任何版本",
     "stmtNoActive": "无活跃版本",
-    "detailStmt": "{{total}} 个版本中 {{ready}} 个就绪 · {{workers}} 个 worker",
-    "detailStmtActive": "{{total}} 个版本中 {{ready}} 个就绪 · {{version}} 活跃 · {{workers}} 个 worker"
+    "detailReady_one": "{{count}} 个版本中 {{ready}} 个就绪",
+    "detailReady_other": "{{count}} 个版本中 {{ready}} 个就绪",
+    "detailActive": "{{version}} 活跃",
+    "detailWorkers_one": "{{count}} 个 worker",
+    "detailWorkers_other": "{{count}} 个 worker"
   },
   "metrics": {
     "title": "指标",

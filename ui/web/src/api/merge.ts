@@ -107,5 +107,15 @@ export function mergeVersionList(
       loaded: false,
     });
   }
-  return { versions, activeVersion: resp?.active_version ?? null };
+  const result = { versions, activeVersion: resp?.active_version ?? null };
+  // Weight 0 on every loaded version means "no routing configured": the
+  // router then sends all traffic to the active version. Surface that
+  // effective 100% instead of a misleading "serving 0% of traffic".
+  if (result.activeVersion !== null) {
+    const loaded = result.versions.filter((v) => v.loaded);
+    if (loaded.length > 0 && loaded.every((v) => v.weight === 0)) {
+      for (const v of loaded) if (v.active) v.weight = 100;
+    }
+  }
+  return result;
 }

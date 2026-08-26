@@ -112,4 +112,45 @@ describe('mergeVersionList', () => {
     const merged = mergeVersionList([repoEntry('pkg', null, 'artifact')], null);
     expect(merged.versions).toHaveLength(0);
   });
+
+  it('should_show_active_version_at_full_weight_when_no_routing_is_configured', () => {
+    // Registry weight 0 everywhere means "no routing configured" — the hot
+    // path then sends everything to the active version. Display the effective
+    // 100% instead of a misleading "serving 0% of traffic".
+    const noRouting = {
+      name: 'echo',
+      active_version: '1',
+      versions: [
+        { version: '1', status: 'ready', active: true, weight: 0, workers: { ready: 1, total: 1 }, loaded_at: 1000 },
+      ],
+    };
+    const merged = mergeVersionList([], noRouting);
+    expect(merged.versions.find((v) => v.version === '1')?.weight).toBe(100);
+  });
+
+  it('should_keep_explicit_zero_weights_when_routing_is_configured', () => {
+    const routed = {
+      name: 'm',
+      active_version: 'v2',
+      versions: [
+        { version: 'v1', status: 'ready', active: false, weight: 0, workers: { ready: 1, total: 1 }, loaded_at: 1 },
+        { version: 'v2', status: 'ready', active: true, weight: 100, workers: { ready: 1, total: 1 }, loaded_at: 1 },
+      ],
+    };
+    const merged = mergeVersionList([], routed);
+    expect(merged.versions.find((v) => v.version === 'v1')?.weight).toBe(0);
+    expect(merged.versions.find((v) => v.version === 'v2')?.weight).toBe(100);
+  });
+
+  it('should_not_invent_weight_without_an_active_version', () => {
+    const noActive = {
+      name: 'm',
+      active_version: null,
+      versions: [
+        { version: '1', status: 'ready', active: false, weight: 0, workers: { ready: 1, total: 1 }, loaded_at: 1 },
+      ],
+    };
+    const merged = mergeVersionList([], noActive);
+    expect(merged.versions[0].weight).toBe(0);
+  });
 });

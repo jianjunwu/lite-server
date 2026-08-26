@@ -104,19 +104,21 @@ export function ModelDetailPage() {
 
   const loadedVersions = versions.filter((v) => v.loaded);
   const readyCount = loadedVersions.filter((v) => statusKind(v.status) === 'ready').length;
-  const workerTotal = healthQuery.data?.total_workers;
+  // Sum per-version workers: the model-level health endpoint describes only
+  // one version, so its total undercounts multi-version models.
+  const workerTotal = loadedVersions.reduce((sum, v) => sum + v.workers.total, 0);
   const activeWeight = versions.find((v) => v.version === merged.activeVersion)?.weight ?? 0;
-  // Hero-layer statement under the title (plan §4.3).
+  // Hero-layer statement under the title (plan §4.3), composed from atomic
+  // plural-aware parts ("1 of 1 version ready · v2 active · 2 workers").
   const statement = !merged.hasLoaded
     ? instanceId
-    : merged.activeVersion
-      ? t('models.detailStmtActive', {
-          ready: readyCount,
-          total: loadedVersions.length,
-          version: merged.activeVersion,
-          workers: workerTotal ?? '-',
-        })
-      : t('models.detailStmt', { ready: readyCount, total: loadedVersions.length, workers: workerTotal ?? '-' });
+    : [
+        t('models.detailReady', { ready: readyCount, count: loadedVersions.length }),
+        merged.activeVersion ? t('models.detailActive', { version: merged.activeVersion }) : null,
+        t('models.detailWorkers', { count: workerTotal }),
+      ]
+        .filter(Boolean)
+        .join(' · ');
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>

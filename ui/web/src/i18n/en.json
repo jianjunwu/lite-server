@@ -28,7 +28,8 @@
     "comingSoon": "Coming soon",
     "back": "Back",
     "noInstanceAccess": "No access to this instance",
-    "noInstanceAccessBody": "It is hidden for your account or does not exist. Pick another instance above."
+    "noInstanceAccessBody": "It is hidden for your account or does not exist. Pick another instance above.",
+    "ageAgo": "{{age}} ago"
   },
   "overview": {
     "title": "Overview",
@@ -106,8 +107,11 @@
     "stmtServing": "{{version}} is serving {{weight}}% of traffic",
     "stmtUnloaded": "No versions loaded",
     "stmtNoActive": "No active version",
-    "detailStmt": "{{ready}} of {{total}} versions ready · {{workers}} workers",
-    "detailStmtActive": "{{ready}} of {{total}} versions ready · {{version}} active · {{workers}} workers"
+    "detailReady_one": "{{ready}} of {{count}} version ready",
+    "detailReady_other": "{{ready}} of {{count}} versions ready",
+    "detailActive": "{{version}} active",
+    "detailWorkers_one": "{{count}} worker",
+    "detailWorkers_other": "{{count}} workers"
   },
   "metrics": {
     "title": "Metrics",
@@ -437,6 +441,6 @@
   },
   "versions": {
     "ofTraffic": "{{weight}}% of traffic",
-    "loadedSince": "loaded {{age}}"
+    "loadedSince": "loaded {{age}} ago"
   }
 }
