@@ -17,6 +17,7 @@ const MetricsPage = lazy(() => import('./pages/MetricsPage').then((m) => ({ defa
 const AlertsPage = lazy(() => import('./pages/AlertsPage').then((m) => ({ default: m.AlertsPage })));
 const PlaygroundPage = lazy(() => import('./pages/PlaygroundPage').then((m) => ({ default: m.PlaygroundPage })));
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })));
+const InstanceDetailPage = lazy(() => import('./pages/InstanceDetailPage').then((m) => ({ default: m.InstanceDetailPage })));
 
 function Lazy({ children }: { children: React.ReactNode }) {
   return (
@@ -54,6 +55,7 @@ export function App() {
           <Route path="/alerts" element={<Lazy><AlertsPage /></Lazy>} />
           <Route path="/playground" element={<Lazy><PlaygroundPage /></Lazy>} />
           <Route path="/settings" element={<Lazy><SettingsPage /></Lazy>} />
+          <Route path="/instances/:id" element={<Lazy><InstanceDetailPage /></Lazy>} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
         </Route>
       </Routes>

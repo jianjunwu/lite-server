@@ -179,6 +179,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         // Admin: model version config read (M1) and merge-patch write (M2)
         .route("/v2/models/:model_name/versions/:version/config",
             get(model_version_config_handler).patch(model_version_config_patch_handler))
+        // Admin: effective server config read with source labels (M5). No
+        // model segment → access_log_target None → classify_http_path Admin
+        // (fail-closed to loopback when access_control is unconfigured).
+        .route("/v2/server/config", get(server_config_handler))
         // Admin: weighted/canary routing weights (§4.3)
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())

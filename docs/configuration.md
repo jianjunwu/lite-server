@@ -631,6 +631,65 @@ events are lost (e.g. on network filesystems):
 - For large repositories (>1000 models) increase `poll_interval` to reduce
   resync overhead.
 
+## Online Config View / Edit (HTTP API)
+
+Admin endpoints (fail-closed to loopback unless `access_control.admin`
+credentials are configured) expose configuration at runtime; the Web UI's
+model version page and instance detail page are built on them.
+
+### Model version config
+
+`GET /v2/models/{model}/versions/{version}/config` returns the version's
+`config.yaml` as a JSON tree of **file** values (keys not written in the file
+do not appear; CLI/default overlays are a load-time concern). Secrets are
+redacted (`policies.auth.keys`, any `*_key`/`*_secret` leaf). The response
+carries an `etag` over the file content.
+
+`PATCH /v2/models/{model}/versions/{version}/config` applies an RFC 7386
+JSON merge-patch to the file:
+
+```json
+{ "patch": { "max_batch_size": 32 }, "if_match": "<etag>", "mode": "apply_reload" }
+```
+
+- `mode: apply_reload` (default): write → validate-then-reload; a failed
+  reload **rolls the file back** to its previous content.
+- `mode: write_only`: atomic write (temp file + rename, `.bak` backup) with
+  no reload; the in-memory config changes on the next reload.
+- `mode: dry_run`: parse + validate the merged result only; nothing is
+  written.
+- `if_match` implements optimistic concurrency: a stale etag returns `409`
+  with `current_etag`; `force: true` bypasses the check (same convention as
+  destructive deletes).
+
+PATCH always targets the file, never the in-memory object — memory state is
+produced by load/reload only, so the drift report (`/v2/repository/drift`)
+stays unambiguous.
+
+### Server (instance) config
+
+`GET /v2/server/config` returns the **effective** server `Config` as a JSON
+tree plus per-leaf source labels:
+
+```json
+{
+  "config": { "server": { "http_port": 8000, "...": "..." }, "...": "..." },
+  "sources": { "server.http_port": "cli", "metrics.timeline_max_points": "file", "...": "default" },
+  "redacted": ["access_control.admin.http.value", "..."]
+}
+```
+
+- `sources` maps every leaf dot-path to `cli` | `file` | `default`. The
+  attribution is **approximate**: fields set by CLI flags are `cli`; of the
+  rest, a leaf equal to the built-in default reads as `default`, anything
+  else as `file`. A value explicitly written into the file that happens to
+  equal the default is labeled `default`.
+- Redaction covers the literal secret of every access-control/openai-compact
+  `key` cell, `telemetry.otlp_headers`, and any `*_key`/`*_secret` scalar
+  leaf; the `redacted` array lists the affected paths.
+- There is no write endpoint for server config yet; changes require editing
+  `server.yaml` and restarting.
+
 ## CLI Flags
 
 All server config fields can be overridden via CLI flags:

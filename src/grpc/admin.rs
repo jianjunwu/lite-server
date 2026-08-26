@@ -1194,6 +1194,30 @@ impl Admin for GrpcAdminService {
         }))
     }
 
+    async fn get_server_config(
+        &self,
+        _req: Request<pb::GetServerConfigRequest>,
+    ) -> Result<Response<pb::GetServerConfigResponse>, Status> {
+        // Shared core with the HTTP handler — same redaction and sources.
+        let out = crate::http::handlers::config::server_config_json(&self.app_state)
+            .map_err(to_status)?;
+        Ok(Response::new(pb::GetServerConfigResponse {
+            config_json: out["config"].to_string(),
+            sources: out["sources"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            redacted: out["redacted"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+        }))
+    }
+
     async fn list_files(
         &self,
         req: Request<pb::ListFilesRequest>,
@@ -1755,6 +1779,7 @@ mod tests {
                 tls: None,
                 config,
                 has_hot_reload: Arc::new(AtomicBool::new(false)),
+                cli_overrides: crate::config::CliOverrides::default(),
             },
             shutdown_rx,
         ));
@@ -3080,6 +3105,54 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // ===== GetServerConfig (M5) =====
+
+    #[tokio::test]
+    async fn get_server_config_returns_tree_sources_and_redaction() {
+        use crate::config::{EndpointControl, ProtocolControl};
+        let mut config = Config::default();
+        config.metrics.timeline_max_points = 1440;
+        config.access_control.admin = ProtocolControl {
+            http: Some(EndpointControl::Key {
+                key: "x-api-key".to_string(),
+                value: Some("topsecret".to_string()),
+                value_env: None,
+                value_file: None,
+            }),
+            grpc: None,
+        };
+        let svc = build_admin_service_with_config(
+            Arc::new(ModelRegistry::new()),
+            std::env::temp_dir(),
+            config,
+        );
+
+        let resp = svc
+            .get_server_config(Request::new(pb::GetServerConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let tree: serde_json::Value = serde_json::from_str(&resp.config_json).unwrap();
+        assert_eq!(tree["metrics"]["timeline_max_points"], serde_json::json!(1440));
+        // Secret redacted; source labels still attached per leaf.
+        assert_eq!(
+            tree["access_control"]["admin"]["http"]["value"],
+            serde_json::json!("***")
+        );
+        assert!(!resp.config_json.contains("topsecret"));
+        assert_eq!(
+            resp.sources.get("metrics.timeline_max_points").map(String::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            resp.sources.get("server.http_port").map(String::as_str),
+            Some("default")
+        );
+        assert!(resp
+            .redacted
+            .contains(&"access_control.admin.http.value".to_string()));
     }
 
     // ===== UpdateModelConfig (M2) =====

@@ -75,3 +75,27 @@ export function patchModelConfig(
     },
   );
 }
+
+// ---- M5: server (instance) config read (plan §3.6) -------------------------
+
+export type ServerConfigSource = 'cli' | 'file' | 'default';
+
+/** Effective server Config as a JSON tree with per-leaf source labels.
+ * Sources are approximate (see plan §3.6): a value explicitly written into
+ * the file that equals the built-in default reads as "default". Secrets
+ * arrive already redacted server-side. */
+export interface ServerConfigResponse {
+  config: Record<string, unknown>;
+  sources: Record<string, ServerConfigSource>;
+  redacted: string[];
+}
+
+export function useServerConfig(instanceId: string | null) {
+  return useQuery({
+    queryKey: [instanceId, 'server-config'],
+    queryFn: () => apiFetch<ServerConfigResponse>(instanceId!, '/v2/server/config'),
+    enabled: instanceId !== null,
+    refetchInterval: 30_000,
+    retry: 1,
+  });
+}

@@ -124,6 +124,41 @@ lite-server config-check server.yaml
 
 ---
 
+### `web` — Launch the Web Console
+
+```bash
+lite-server web [--host 0.0.0.0] [--port 8600] [--instances-file ./instances.yaml]
+                [--auth on|off] [--auth-file ./auth.yaml] [--web-dist <dir>]
+```
+
+Starts the Web UI: a React console served by a built-in Python BFF
+(`lite_server.webui`, FastAPI) that reverse-proxies every configured
+lite-server instance. Defaults to `http://0.0.0.0:8600`. On first run with an
+empty user store, open registration is available (the first registered user
+becomes `admin`); afterwards registration requires an invite code.
+
+Instances are registered in `./instances.yaml` (see
+`python/lite_server/webui/instances.example.yaml`) or via `LITE_UI_INSTANCES`.
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `LITE_UI_PORT` / `LITE_UI_HOST` | `8600` / `0.0.0.0` | BFF listen address |
+| `LITE_UI_INSTANCES_FILE` | `./instances.yaml` | Instance registry file |
+| `LITE_UI_INSTANCES` | — | JSON array of extra instances (marked readonly) |
+| `LITE_UI_AUTH` | `true` | Set `false` to disable login entirely (local use) |
+| `LITE_UI_AUTH_DB` | `./auth.db` | SQLite auth store (users, sessions, invites, audit) |
+| `LITE_UI_AUTH_FILE` | `./auth.yaml` | Legacy user file, imported once into the DB |
+| `LITE_UI_ADMIN_PASSWORD` | — | Bootstrap admin password (skips open registration) |
+| `LITE_UI_PROXY_HEADERS` | `false` | Trust `X-Forwarded-Proto`/`-For` — only behind a trusted reverse proxy |
+| `LITE_UI_AUDIT_LOG` | — | Optional rotating file sink for the audit trail |
+| `LITE_UI_AUDIT_LOG_MAX_BYTES` | `10485760` | Per-file size cap for the audit log sink |
+| `LITE_UI_AUDIT_LOG_BACKUPS` | `5` | Rotated audit log files to keep |
+| `LITE_UI_WEB_DIST` | bundled | Override the SPA assets directory |
+
+See `ui/README.md` for the full console guide (auth, RBAC, development setup).
+
+---
+
 ### `benchmark` — Run Benchmark
 
 ```bash
