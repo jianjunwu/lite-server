@@ -101,7 +101,13 @@ function DeleteModelAction({ model }: { model: MergedModel }) {
       <Dropdown
         menu={{
           items: [{ key: 'delete', danger: true, label: t('ops.deleteModel') }],
-          onClick: () => setOpen(true),
+          // Stop the React-tree bubble: the menu lives in a portal, so the
+          // card's onCardClick guard (closest a/button/input) can't see it and
+          // would navigate away, unmounting the modal that just opened.
+          onClick: ({ domEvent }) => {
+            domEvent.stopPropagation();
+            setOpen(true);
+          },
         }}
         trigger={['click']}
       >
