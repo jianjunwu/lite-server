@@ -255,7 +255,7 @@ describe('ModelDetailPage unloaded model', () => {
     expect(screen.getByRole('img', { name: /model type: litapi/i })).toBeTruthy();
   });
 
-  it('should_jump_to_tabs_and_version_detail_from_the_stat_chips', () => {
+  it('should_state_ready_active_worker_counts_once_in_the_subtitle_without_stat_chips', () => {
     mockMerged.versions = [
       {
         version: '1',
@@ -271,13 +271,11 @@ describe('ModelDetailPage unloaded model', () => {
     mockMerged.hasLoaded = true;
     renderPage('echo');
 
-    fireEvent.click(screen.getByRole('button', { name: /4 workers/i }));
-    expect(screen.getByRole('tab', { name: 'Workers' }).getAttribute('aria-selected')).toBe('true');
-
-    fireEvent.click(screen.getByRole('button', { name: /1\/1 ready/i }));
-    expect(screen.getByRole('tab', { name: 'Versions' }).getAttribute('aria-selected')).toBe('true');
-
-    const activeChip = screen.getByRole('link', { name: /1 · 100%/ });
-    expect(activeChip.getAttribute('href')).toContain('/models/echo/versions/1');
+    // The subtitle statement carries the counts; a separate chip row must
+    // not repeat them.
+    expect(screen.getByText('1 of 1 version ready · 1 active · 4 workers')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /4 workers/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /1\/1 ready/i })).toBeNull();
+    expect(screen.queryByRole('link', { name: /1 · 100%/ })).toBeNull();
   });
 });

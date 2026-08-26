@@ -1,8 +1,5 @@
 import { Card, Empty, Tabs, Typography, Button, Input, Modal, Select } from 'antd';
 import {
-  AimOutlined,
-  ApiOutlined,
-  BranchesOutlined,
   ClusterOutlined,
   DiffOutlined,
   LineChartOutlined,
@@ -11,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
@@ -91,7 +88,6 @@ export function ModelDetailPage() {
         <PageHeader
           title={name}
           breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
-          onBack={() => navigate(ilink('/models'))}
         />
         <Card size="small">
           <Empty description={t('models.notFound')} />
@@ -107,7 +103,6 @@ export function ModelDetailPage() {
   // Sum per-version workers: the model-level health endpoint describes only
   // one version, so its total undercounts multi-version models.
   const workerTotal = loadedVersions.reduce((sum, v) => sum + v.workers.total, 0);
-  const activeWeight = versions.find((v) => v.version === merged.activeVersion)?.weight ?? 0;
   // Hero-layer statement under the title (plan §4.3), composed from atomic
   // plural-aware parts ("1 of 1 version ready · v2 active · 2 workers").
   const statement = !merged.hasLoaded
@@ -124,7 +119,6 @@ export function ModelDetailPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
         breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
-        onBack={() => navigate(ilink('/models'))}
         title={
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[3] }}>
             <ModelGlyph name={name} type={modelType} size={SPACE[7]} />
@@ -152,36 +146,6 @@ export function ModelDetailPage() {
           ) : undefined
         }
       />
-
-      {versions.length > 0 && (
-        <div style={{ display: 'flex', gap: SPACE[2], flexWrap: 'wrap' }}>
-          <button type="button" className="chip" onClick={() => setTab('versions')}>
-            <BranchesOutlined aria-hidden />
-            <span style={dataTextStyle}>
-              {readyCount}/{loadedVersions.length}
-            </span>
-            {t('models.chipReady')}
-          </button>
-          {merged.hasLoaded && (
-            <button type="button" className="chip" onClick={() => setTab('workers')}>
-              <ApiOutlined aria-hidden />
-              <span style={dataTextStyle}>{workerTotal ?? '-'}</span>
-              {t('models.workerLabel', { count: workerTotal ?? 0 })}
-            </button>
-          )}
-          {merged.activeVersion && (
-            <Link
-              className="chip"
-              to={ilink(`/models/${encodeURIComponent(name)}/versions/${encodeURIComponent(merged.activeVersion)}`)}
-            >
-              <AimOutlined aria-hidden />
-              <span style={dataTextStyle}>
-                {merged.activeVersion} · {activeWeight}%
-              </span>
-            </Link>
-          )}
-        </div>
-      )}
 
       {merged.hasLoaded && (
         <Reveal order={1}>
