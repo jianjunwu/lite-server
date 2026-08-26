@@ -44,3 +44,6 @@ CLAUDE.md
 
 # Built SPA copied here by CI before wheel packaging
 python/lite_server/webui/static/
+
+# Demo recording intermediates (re-record anytime via record.py)
+tools/record-demo/out/

@@ -2,6 +2,8 @@
 name = "lite-server"
 version = "0.8.12-rc0"
 edition = "2021"
+# Demo videos and the WebUI bundle are not part of the published crate.
+exclude = [".assets/", "ui/", "docs/"]
 
 [[bin]]
 name = "lite-server-core"
