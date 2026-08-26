@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { Card, Col, Row, Segmented, Select, Space, Tabs, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
-import { useAlerts, useModels, useTimelineAll, useVersions } from '../api/hooks';
+import { useAlerts, useModels, useTimelineAll, useVersions, useAcceleratorMetrics } from '../api/hooks';
 import type { TimelineEntry } from '../api/types';
+import { AcceleratorPanel } from '../components/AcceleratorPanel';
+import { summarizeReadings } from '../components/accelerator';
 import { ChartCard } from '../components/ChartCard';
 import { PageHero, Reveal } from '../components/PageHero';
 import { StatNum } from '../components/StatNum';
@@ -23,7 +25,8 @@ import { SPACE } from '../tokens';
 const REFRESH_KEY = 'lite-ui-metrics-refresh-ms';
 const CHART_GROUP = 'metrics-page';
 
-type GroupKey = 'throughput' | 'latency' | 'queue' | 'resources' | 'health';
+type GroupKey = 'throughput' | 'latency' | 'queue' | 'resources' | 'health' | 'accelerator';
+type ChartGroupKey = Exclude<GroupKey, 'accelerator'>;
 type RangeKey = '5m' | '15m' | '1h' | 'all';
 
 /** null = the full retention window. */
@@ -42,8 +45,9 @@ interface ChartSpec {
   yAxisName?: string;
 }
 
-/** Chart groups (plan §4.4): Tabs replace the flat 4-chart grid. */
-const GROUP_CHARTS: Record<GroupKey, ChartSpec[]> = {
+/** Chart groups (plan §4.4): Tabs replace the flat 4-chart grid. The sixth
+ * tab (M4 accelerator) renders AcceleratorPanel instead of timeline charts. */
+const GROUP_CHARTS: Record<ChartGroupKey, ChartSpec[]> = {
   throughput: [
     { key: 'qps', titleKey: 'metrics.qps' },
     { key: 'tokens_per_s', titleKey: 'metrics.tokensPerS' },
@@ -70,6 +74,9 @@ const GROUP_CHARTS: Record<GroupKey, ChartSpec[]> = {
     { key: 'ejections_per_s', titleKey: 'metrics.ejectionsPerS' },
   ],
 };
+
+/** Tab order: the five timeline chart groups, then the M4 accelerator panel. */
+const GROUP_ORDER: GroupKey[] = ['throughput', 'latency', 'queue', 'resources', 'health', 'accelerator'];
 
 function loadRefresh(): number {
   const v = Number(localStorage.getItem(REFRESH_KEY));
@@ -145,6 +152,10 @@ export function MetricsPage() {
 
   const timelineQuery = useTimelineAll(instanceId, paused ? false : refreshMs, step);
   const alertsQuery = useAlerts(instanceId, paused ? false : 10_000);
+  // M4: also fetched here for the accelerator hero stats; the panel's own
+  // hook shares this react-query cache entry (same key, no extra request).
+  // Only polled while the accelerator tab is active.
+  const acceleratorQuery = useAcceleratorMetrics(instanceId, paused ? false : 10_000, group === 'accelerator');
 
   // Track the freshest coverage/interval the instance reported.
   const dataCoverage = timelineQuery.data?.coverageSeconds;
@@ -268,8 +279,22 @@ export function MetricsPage() {
           { label: t('metrics.retriesPerS'), value: num(sumField(latest, (e) => e.retries_per_s)) },
           { label: t('metrics.ejectionsPerS'), value: num(sumField(latest, (e) => e.ejections_per_s)) },
         ];
+      case 'accelerator': {
+        const summary = summarizeReadings(acceleratorQuery.data ?? []);
+        return [
+          { label: t('accelerator.devices'), value: String(summary.devices) },
+          {
+            label: t('accelerator.utilization'),
+            value: summary.avgUtilization == null ? '-' : `${formatNumber(summary.avgUtilization)}%`,
+          },
+          {
+            label: t('accelerator.memory'),
+            value: summary.memoryUsedBytes == null ? '-' : formatBytes(summary.memoryUsedBytes),
+          },
+        ];
+      }
     }
-  }, [group, latest, t]);
+  }, [group, latest, t, acceleratorQuery.data]);
 
   const rangeOptions = (Object.keys(RANGE_SECONDS) as RangeKey[]).map((rk) => {
     const seconds = RANGE_SECONDS[rk];
@@ -367,11 +392,14 @@ export function MetricsPage() {
         <Tabs
           activeKey={group}
           onChange={(k) => setGroup(k as GroupKey)}
-          items={(Object.keys(GROUP_CHARTS) as GroupKey[]).map((g) => ({
+          items={GROUP_ORDER.map((g) => ({
             key: g,
             label: t(`metrics.group${g.charAt(0).toUpperCase()}${g.slice(1)}`),
           }))}
         />
+        {group === 'accelerator' ? (
+          <AcceleratorPanel instanceId={instanceId} pollMs={paused ? false : 10_000} />
+        ) : (
         <Row gutter={[SPACE[5], SPACE[5]]}>
           {GROUP_CHARTS[group].map((c) => {
             const state = isEmpty ? ('ok' as const) : fieldState(snapshots, c.key);
@@ -404,6 +432,7 @@ export function MetricsPage() {
             );
           })}
         </Row>
+        )}
       </Reveal>
     </>
   );

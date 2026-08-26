@@ -737,6 +737,13 @@ pub struct FeaturesConfig {
     /// `streaming && websocket_streaming && decoupled` for WS). Default true.
     pub decoupled: bool,
     pub streaming_metrics: bool,
+    /// M4: vendor-neutral accelerator metrics — mount GET /metrics/accelerator
+    /// and record worker-reported readings into the
+    /// `lite_server_accelerator_*` families. Default true: the families are
+    /// server-fixed with cardinality-capped labels (unlike the worker-named
+    /// custom_metrics, which stays opt-in) and there is no background sampler
+    /// (unlike timeline) — zero cost until a model reports.
+    pub accelerator_metrics: bool,
     /// P5-2 (蓝图 §4.4, D16): 允许 `x-lite-version` pin 绕过权重路由（HTTP 与
     /// gRPC 双侧门控一致）。默认 false（breaking）——生产上 pin 可绕过灰度
     /// 权重，仅灰度/调试环境显式开启。
@@ -757,6 +764,7 @@ impl Default for FeaturesConfig {
             http_bidi: true,
             decoupled: true,
             streaming_metrics: true,
+            accelerator_metrics: true,
             canary_override: false,
         }
     }

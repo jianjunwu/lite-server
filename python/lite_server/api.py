@@ -15,7 +15,7 @@ import logging
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, ClassVar, Iterator, List, Protocol, Tuple
+from typing import Any, ClassVar, Dict, Iterator, List, Protocol, Tuple
 
 from lite_server.context import RequestContext
 
@@ -169,6 +169,9 @@ class LitAPI:
         self._metric_specs: List[_MetricSpec] = []
         self._metric_values: List[Tuple[int, float]] = []
         self._metric_lock = threading.Lock()
+        # M4: latest accelerator reading per (device, accel); drained into the
+        # next response's Metrics proto (see report_accelerator_metrics).
+        self._accelerator_readings: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     @property
     def logger(self) -> logging.Logger:
@@ -309,6 +312,55 @@ class LitAPI:
         from lite_server.pipeline import collect_metrics
 
         return collect_metrics(self)
+
+    def report_accelerator_metrics(
+        self,
+        device: str,
+        accel: str,
+        *,
+        utilization_percent: float | None = None,
+        memory_used_bytes: float | None = None,
+        memory_total_bytes: float | None = None,
+        temperature_celsius: float | None = None,
+    ) -> None:
+        """Report a vendor-neutral accelerator reading (M4).
+
+        Readings are device-scoped, not request-scoped: each call overwrites
+        the buffered reading for its ``(device, accel)`` pair, and the latest
+        reading per device rides the next response's Metrics proto (the same
+        piggyback channel as ``tokens_generated``). With no inference traffic
+        nothing is sent until the next response — report from your own timer
+        (e.g. a background thread started in ``setup()``) at a modest period
+        (~10s); the server keeps the latest value per device.
+
+        The server side exports the ``lite_server_accelerator_*`` Prometheus
+        families and serves ``GET /metrics/accelerator``; the core never links
+        a vendor SDK, so read the values with whatever your accelerator stack
+        provides (pynvml, torch.mlu, torch_npu, ...). Fields left as ``None``
+        are reported as absent (some accelerators expose no temperature).
+
+        Thread-safe: shares ``_metric_lock`` with :meth:`report_metric`.
+
+        Args:
+            device: Device identifier (e.g. ``"0"`` or ``"cuda:0"``).
+            accel: Accelerator kind — ``"cuda"``/``"mlu"``/``"npu"``/...
+                (bounded cardinality; one tag per vendor stack).
+            utilization_percent: Compute utilization, 0-100.
+            memory_used_bytes: Device memory in use.
+            memory_total_bytes: Device memory capacity.
+            temperature_celsius: Device temperature.
+        """
+        reading: Dict[str, Any] = {"device": device, "accel": accel}
+        if utilization_percent is not None:
+            reading["utilization_percent"] = float(utilization_percent)
+        if memory_used_bytes is not None:
+            reading["memory_used_bytes"] = float(memory_used_bytes)
+        if memory_total_bytes is not None:
+            reading["memory_total_bytes"] = float(memory_total_bytes)
+        if temperature_celsius is not None:
+            reading["temperature_celsius"] = float(temperature_celsius)
+        with self._metric_lock:
+            self._accelerator_readings[(device, accel)] = reading
 
     # ===== Streaming Hooks (optional) =====
 

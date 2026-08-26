@@ -147,3 +147,17 @@ export interface AlertItem {
 export interface AlertsResponse {
   alerts: AlertItem[];
 }
+
+/** M4: latest worker-reported accelerator reading per device
+ * (GET /metrics/accelerator). Value fields are null when the model did not
+ * report that field; the array itself is empty until any model reports. */
+export interface AcceleratorReading {
+  device: string;
+  accel: string;
+  utilization_percent: number | null;
+  memory_used_bytes: number | null;
+  memory_total_bytes: number | null;
+  temperature_celsius: number | null;
+  /** Epoch seconds of the last report carrying this device. */
+  updated_at: number;
+}

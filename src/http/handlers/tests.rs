@@ -543,6 +543,68 @@ mod version_routing_tests {
         TIMELINE.remove("m3_step", "1").await;
     }
 
+    // ===== M4: accelerator endpoint =====
+
+    #[tokio::test]
+    #[serial_test::serial(accelerator)]
+    async fn accelerator_endpoint_empty_until_reported_then_serves_latest() {
+        use crate::metrics::accelerator;
+        crate::metrics::prometheus::register_metrics().ok();
+        accelerator::reset_for_tests();
+        let app =
+            Router::new().route("/metrics/accelerator", axum::routing::get(accelerator_handler));
+
+        // No reports → empty array (not an error).
+        let resp = get(app.clone(), "/metrics/accelerator").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0);
+
+        accelerator::record_readings(&[crate::proto::liteserver::AcceleratorReading {
+            device: "0".to_string(),
+            accel: "cuda".to_string(),
+            utilization_percent: Some(55.0),
+            memory_used_bytes: Some(2.0e9),
+            memory_total_bytes: Some(1.6e10),
+            temperature_celsius: None,
+        }]);
+
+        let resp = get(app, "/metrics/accelerator").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let entries = json.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["device"], "0");
+        assert_eq!(entries[0]["accel"], "cuda");
+        assert_eq!(entries[0]["utilization_percent"], 55.0);
+        assert_eq!(entries[0]["memory_used_bytes"], 2.0e9);
+        // Unreported fields serialize as null; updated_at is stamped.
+        assert!(entries[0]["temperature_celsius"].is_null());
+        assert!(entries[0]["updated_at"].as_f64().unwrap() > 0.0);
+
+        accelerator::reset_for_tests();
+    }
+
+    #[tokio::test]
+    async fn accelerator_route_unmounted_when_feature_disabled() {
+        let mut config = Config::default();
+        config.features.accelerator_metrics = false;
+        let state = test_state_with(config);
+        let app = crate::http::routes::create_routes(state);
+        let resp = get(app, "/metrics/accelerator").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "features.accelerator_metrics=false must unmount the route"
+        );
+
+        let app = crate::http::routes::create_routes(test_state());
+        let resp = get(app, "/metrics/accelerator").await;
+        assert_eq!(resp.status(), StatusCode::OK, "default config mounts the route");
+    }
+
     // ===== §4.5: multi-version health =====
 
     #[tokio::test]

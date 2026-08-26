@@ -180,6 +180,10 @@ features:
                                # Gating boundary + exempt metrics: observability.md §Streaming metrics.
                                # Independent of metrics.enabled — that one controls the dedicated
                                # listener, this one controls which series are recorded.
+  accelerator_metrics: true    # Vendor-neutral accelerator families (lite_server_accelerator_*,
+                               # device/accel labels) + GET /metrics/accelerator. Record path and
+                               # route are gated together; zero cost until a model reports via
+                               # lit_api.report_accelerator_metrics. observability.md §Accelerator metrics.
 
 model_defaults:                # CLI-level defaults applied to all models
   max_queue_size: null         # Override max_queue_size for all models

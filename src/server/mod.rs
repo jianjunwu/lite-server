@@ -499,6 +499,9 @@ impl LiteServer {
             self.config.metrics.p99_window_max_samples,
             self.config.metrics.p99_window_max_age_secs,
         );
+        // M4: gate the accelerator record path on the feature toggle (route
+        // mounting is gated in routes.rs).
+        crate::metrics::accelerator::set_enabled(self.config.features.accelerator_metrics);
         let timeline_enabled = self.config.features.timeline;
         let timeline_sample_interval = self.config.metrics.timeline_sample_interval_secs.max(1);
         let registry_for_timeline = self.registry.clone();
