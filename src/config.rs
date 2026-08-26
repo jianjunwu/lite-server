@@ -1634,6 +1634,20 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     Ok(config)
 }
 
+/// Validate a would-be config.yaml without touching the filesystem (M2 PATCH
+/// dry-run / pre-write gate): the same serde parse, env expansion and warmup
+/// sentinel as [`load_model_config`], plus the duration/range gate the reload
+/// chain applies after model_defaults.
+pub fn validate_model_config_yaml(content: &str) -> anyhow::Result<ModelConfig> {
+    let mut config: ModelConfig = serde_yaml::from_str(content)?;
+    expand_policy_env_vars(&mut config)?;
+    if let Some(w) = &config.policies.warmup {
+        w.validate()?;
+    }
+    config.validate()?;
+    Ok(config)
+}
+
 /// Expand `${VAR}` entries in `policies.auth.keys` from the environment.
 /// Fail-closed: an unset variable is a load error, never an empty key.
 fn expand_policy_env_vars(config: &mut ModelConfig) -> anyhow::Result<()> {

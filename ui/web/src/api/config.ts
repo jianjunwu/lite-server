@@ -13,7 +13,12 @@ export interface ModelConfigResponse {
   loaded_at: number | null;
 }
 
-export function useModelConfig(instanceId: string | null, model: string, version: string) {
+export function useModelConfig(
+  instanceId: string | null,
+  model: string,
+  version: string,
+  opts?: { pausePolling?: boolean },
+) {
   return useQuery({
     queryKey: [instanceId, 'model-config', model, version],
     queryFn: () =>
@@ -22,7 +27,51 @@ export function useModelConfig(instanceId: string | null, model: string, version
         `/v2/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version)}/config`,
       ),
     enabled: instanceId !== null && model !== '' && version !== '',
-    refetchInterval: 30_000,
+    // Edit mode pauses polling so a background refresh can't clobber the
+    // local draft (plan §4.0).
+    refetchInterval: opts?.pausePolling ? false : 30_000,
     retry: 1,
   });
+}
+
+// ---- M2: PATCH (plan §3.3) -------------------------------------------------
+
+export type ConfigPatchMode = 'apply_reload' | 'write_only' | 'dry_run';
+
+export interface ModelConfigPatchRequest {
+  /** RFC 7386 merge-patch against the on-disk config.yaml tree. */
+  patch: Record<string, unknown>;
+  /** etag from the last read; optimistic-concurrency precondition. */
+  if_match?: string | null;
+  /** Bypass the etag precondition (after a 409). */
+  force?: boolean;
+  mode?: ConfigPatchMode;
+}
+
+export interface ModelConfigPatchResponse {
+  model: string;
+  version: string;
+  mode: string;
+  valid: boolean;
+  written: boolean;
+  reloaded: boolean;
+  etag: string | null;
+  warnings: string[];
+}
+
+export function patchModelConfig(
+  instanceId: string,
+  model: string,
+  version: string,
+  req: ModelConfigPatchRequest,
+): Promise<ModelConfigPatchResponse> {
+  return apiFetch<ModelConfigPatchResponse>(
+    instanceId,
+    `/v2/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version)}/config`,
+    {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'apply_reload', ...req }),
+    },
+  );
 }
