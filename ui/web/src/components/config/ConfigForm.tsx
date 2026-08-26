@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Collapse, Empty, Input, InputNumber, Switch, Typography } from 'antd';
 import { WarningOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
@@ -186,6 +186,11 @@ export function ConfigForm({
   const { t } = useTranslation();
   // Per-field JSON validity (keyed by field key); aggregate reported upward.
   const validity = useRef(new Map<string, boolean>());
+  // An edit session's reports must not leak into the next one — a stale
+  // `false` would lock the Save button even when every field is valid.
+  useEffect(() => {
+    if (!editing) validity.current.clear();
+  }, [editing]);
   if (!hasFile) return <Empty description={t('modelConfig.noFile')} />;
   if (!editing && Object.keys(config).length === 0) {
     return <Empty description={t('modelConfig.empty')} />;

@@ -19,6 +19,11 @@ from typing import Any, ClassVar, Dict, Iterator, List, Protocol, Tuple
 
 from lite_server.context import RequestContext
 
+# Mirror of the server's MAX_ACCELERATOR_DEVICES (src/metrics/accelerator.rs):
+# bound the per-worker accelerator buffer against model-code-controlled
+# (device, accel) strings.
+_MAX_ACCELERATOR_DEVICES = 64
+
 
 @dataclass
 class _MetricSpec:
@@ -360,6 +365,14 @@ class LitAPI:
         if temperature_celsius is not None:
             reading["temperature_celsius"] = float(temperature_celsius)
         with self._metric_lock:
+            # Bound the buffer by the server-side cap: (device, accel) keys
+            # are model-code-controlled strings, so without a limit a buggy
+            # model grows per-worker memory without bound between responses.
+            if (
+                (device, accel) not in self._accelerator_readings
+                and len(self._accelerator_readings) >= _MAX_ACCELERATOR_DEVICES
+            ):
+                return
             self._accelerator_readings[(device, accel)] = reading
 
     # ===== Streaming Hooks (optional) =====

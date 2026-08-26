@@ -314,6 +314,16 @@ class AdminStub(object):
                 request_serializer=liteserver__pb2.GetModelConfigRequest.SerializeToString,
                 response_deserializer=liteserver__pb2.GetModelConfigResponse.FromString,
                 )
+        self.UpdateModelConfig = channel.unary_unary(
+                '/liteserver.Admin/UpdateModelConfig',
+                request_serializer=liteserver__pb2.UpdateModelConfigRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.UpdateModelConfigResponse.FromString,
+                )
+        self.GetServerConfig = channel.unary_unary(
+                '/liteserver.Admin/GetServerConfig',
+                request_serializer=liteserver__pb2.GetServerConfigRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.GetServerConfigResponse.FromString,
+                )
 
 
 class AdminServicer(object):
@@ -444,6 +454,22 @@ class AdminServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UpdateModelConfig(self, request, context):
+        """M2: model version config write — mirrors
+        PATCH /v2/models/:m/versions/:v/config. Additive-only.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetServerConfig(self, request, context):
+        """M5: server config read with source labels — mirrors
+        GET /v2/server/config. Additive-only.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AdminServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -541,6 +567,16 @@ def add_AdminServicer_to_server(servicer, server):
                     servicer.GetModelConfig,
                     request_deserializer=liteserver__pb2.GetModelConfigRequest.FromString,
                     response_serializer=liteserver__pb2.GetModelConfigResponse.SerializeToString,
+            ),
+            'UpdateModelConfig': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateModelConfig,
+                    request_deserializer=liteserver__pb2.UpdateModelConfigRequest.FromString,
+                    response_serializer=liteserver__pb2.UpdateModelConfigResponse.SerializeToString,
+            ),
+            'GetServerConfig': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetServerConfig,
+                    request_deserializer=liteserver__pb2.GetServerConfigRequest.FromString,
+                    response_serializer=liteserver__pb2.GetServerConfigResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -878,5 +914,39 @@ class Admin(object):
         return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/GetModelConfig',
             liteserver__pb2.GetModelConfigRequest.SerializeToString,
             liteserver__pb2.GetModelConfigResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def UpdateModelConfig(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/UpdateModelConfig',
+            liteserver__pb2.UpdateModelConfigRequest.SerializeToString,
+            liteserver__pb2.UpdateModelConfigResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetServerConfig(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/GetServerConfig',
+            liteserver__pb2.GetServerConfigRequest.SerializeToString,
+            liteserver__pb2.GetServerConfigResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

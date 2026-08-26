@@ -286,15 +286,26 @@ impl TimelineAggregator {
 
         let (stream_bytes_per_s, tokens_per_s, retries_per_s, ejections_per_s) = {
             let mut last = self.last_counters.lock().await;
-            let prev = last.get(&key).copied().unwrap_or_default();
+            let prev = last.get(&key).copied();
+            // First sample after the counter already advanced (model served
+            // traffic before the sampler's first tick): baseline on the
+            // current values — the same pattern qps (unwrap_or(current)) and
+            // tokens use — instead of rating the lifetime counter over the
+            // 1ms fallback window.
+            let baseline = prev.unwrap_or(CounterBaseline {
+                stream_bytes,
+                tokens,
+                retries,
+                ejections,
+            });
             let rate = |cur: f64, base: f64| round((cur - base).max(0.0) / elapsed, 2);
             let result = (
-                rate(stream_bytes, prev.stream_bytes),
+                rate(stream_bytes, baseline.stream_bytes),
                 // The rate exists only while the token counter series does;
                 // the first sample after it appears is the baseline (0.0).
-                tokens.map(|t| rate(t, prev.tokens.unwrap_or(t))),
-                rate(retries, prev.retries),
-                rate(ejections, prev.ejections),
+                tokens.map(|t| rate(t, baseline.tokens.unwrap_or(t))),
+                rate(retries, baseline.retries),
+                rate(ejections, baseline.ejections),
             );
             last.insert(
                 key.clone(),
@@ -1371,5 +1382,57 @@ mod tests {
         let deque = entry.value().lock().unwrap();
         assert_eq!(deque.len(), 1, "stale sample must be evicted on record");
         assert_eq!(deque[0].1, 0.7);
+    }
+
+    // ===== audit repro: first-sample rate spike =====
+
+    /// Audit M1: a counter that advanced BEFORE the sampler's first tick
+    /// (model loaded and serving before the timeline task started) must
+    /// establish the baseline — like qps (unwrap_or(current)) and tokens
+    /// (unwrap_or(t)) already do — not rate the lifetime counter over the
+    /// 1ms fallback window. Repro: 2 retries before the first sample must
+    /// not become thousands per second.
+    #[tokio::test]
+    async fn test_first_sample_after_traffic_baselines_retry_counter() {
+        use crate::metrics::prometheus;
+        let _ = prometheus::register_metrics();
+        let agg = TimelineAggregator::new();
+        agg.configure(30, 0, 1000, 0.0);
+        let (m, v) = ("m3_first_retry", "1");
+        prometheus::inc_retry(m, v);
+        prometheus::inc_retry(m, v);
+        agg.sample(m, v).await;
+
+        let entries = agg.get_timeline(m, v).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].retries_per_s, 0.0,
+            "first sample must baseline the counter (got {} — lifetime counter / 1ms window)",
+            entries[0].retries_per_s
+        );
+    }
+
+    /// Audit M1, stream-bytes path: same zero-baseline bug via the
+    /// counter_family_sum branch (10MB streamed pre-sample must not report
+    /// as ~10GB/s on the first point).
+    #[tokio::test]
+    async fn test_first_sample_after_traffic_baselines_stream_bytes() {
+        use crate::metrics::prometheus;
+        let _ = prometheus::register_metrics();
+        let agg = TimelineAggregator::new();
+        agg.configure(30, 0, 1000, 0.0);
+        let (m, v) = ("m3_first_bytes", "1");
+        prometheus::STREAM_OUTPUT_BYTES_TOTAL
+            .with_label_values(&[m, v, "sse"])
+            .inc_by(10_000_000.0);
+        agg.sample(m, v).await;
+
+        let entries = agg.get_timeline(m, v).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].stream_bytes_per_s, 0.0,
+            "first sample must baseline the counter (got {})",
+            entries[0].stream_bytes_per_s
+        );
     }
 }

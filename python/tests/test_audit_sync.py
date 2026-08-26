@@ -3,8 +3,8 @@ schema parity after the ensemble-streaming (batches 0-6) and
 model-upload-and-retire (batches 0-4) plans.
 
 Mechanically verifies:
-- pb2 exposes the 7 repository RPCs on the Admin service with the right
-  streaming flags and request/response types (18 RPCs total);
+- pb2 exposes the repository and config RPCs on the Admin service with the
+  right streaming flags and request/response types (21 RPCs total);
 - the new messages carry the fields/numbers declared in
   src/proto/liteserver.proto;
 - python/lite_server/ensemble.py dataclass field surfaces match the Rust
@@ -63,6 +63,15 @@ ADMIN_RPCS = {
     "UploadModel": (True, False, "UploadModelRequest", "UploadModelResponse"),
     "DownloadModel": (False, True, "DownloadModelRequest", "DownloadModelChunk"),
     "ListFiles": (False, False, "ListFilesRequest", "ListFilesResponse"),
+    # --- admin-enhancement plan (M1/M2/M5 config RPCs) ---
+    "GetModelConfig": (False, False, "GetModelConfigRequest", "GetModelConfigResponse"),
+    "UpdateModelConfig": (
+        False,
+        False,
+        "UpdateModelConfigRequest",
+        "UpdateModelConfigResponse",
+    ),
+    "GetServerConfig": (False, False, "GetServerConfigRequest", "GetServerConfigResponse"),
 }
 
 # field name -> number, transcribed from src/proto/liteserver.proto
@@ -103,6 +112,34 @@ MESSAGE_FIELDS = {
     "ListFilesRequest": {"model_name": 1, "version": 2},
     "ListFilesResponse": {"model": 1, "version": 2, "files": 3},
     "FileEntry": {"name": 1, "size": 2, "modified": 3, "is_dir": 4},
+    # --- admin-enhancement plan config messages ---
+    "GetModelConfigRequest": {"model_name": 1, "version": 2},
+    "GetModelConfigResponse": {
+        "model": 1,
+        "version": 2,
+        "config_json": 3,
+        "has_file": 4,
+        "redacted": 5,
+        "etag": 6,
+        "loaded_at": 7,
+    },
+    "UpdateModelConfigRequest": {
+        "model_name": 1,
+        "version": 2,
+        "patch_json": 3,
+        "if_match": 4,
+        "force": 5,
+        "mode": 6,
+    },
+    "UpdateModelConfigResponse": {
+        "valid": 1,
+        "written": 2,
+        "reloaded": 3,
+        "etag": 4,
+        "warnings": 5,
+    },
+    "GetServerConfigRequest": {},
+    "GetServerConfigResponse": {"config_json": 1, "sources": 2, "redacted": 3},
 }
 
 
@@ -110,7 +147,7 @@ def _admin_service():
     return pb2.DESCRIPTOR.services_by_name["Admin"]
 
 
-def test_admin_service_has_18_rpcs_with_expected_shapes():
+def test_admin_service_rpcs_with_expected_shapes():
     svc = _admin_service()
     assert set(ADMIN_RPCS) == {m.name for m in svc.methods}
     for name, (cs, ss, req, resp) in ADMIN_RPCS.items():

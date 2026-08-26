@@ -132,8 +132,9 @@ fn now_secs() -> f64 {
 
 /// Record readings reported by a worker (Metrics.accelerator). No-op when
 /// the feature is off. Readings with empty/oversized device or accel strings
-/// are skipped; new (device, accel) pairs beyond MAX_ACCELERATOR_DEVICES are
-/// dropped before any series is created.
+/// are skipped; when the store is full, the stalest (oldest updated_at) slot
+/// is evicted for a genuinely new (device, accel) pair so a garbage-name
+/// flood cannot lock real devices out until restart.
 pub fn record_readings(readings: &[AcceleratorReading]) {
     if readings.is_empty() || !enabled() {
         return;
@@ -150,41 +151,67 @@ pub fn record_readings(readings: &[AcceleratorReading]) {
         }
         let key = (r.device.clone(), r.accel.clone());
         if !store.readings.contains_key(&key) && store.readings.len() >= MAX_ACCELERATOR_DEVICES {
-            if !store.cap_warned {
-                store.cap_warned = true;
-                tracing::warn!(
-                    cap = MAX_ACCELERATOR_DEVICES,
-                    "accelerator device cap reached; dropping readings for new (device, accel) pairs"
-                );
+            // Evict the stalest slot (oldest updated_at) instead of dropping
+            // the new device forever: a worker reporting garbage device
+            // names must not lock real devices out until process restart.
+            let stalest = store
+                .readings
+                .iter()
+                .min_by(|a, b| {
+                    a.1.updated_at
+                        .partial_cmp(&b.1.updated_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(old) = stalest {
+                let old_labels: [&str; 2] = [&old.0, &old.1];
+                let _ = ACCELERATOR_UTILIZATION_PERCENT.remove_label_values(&old_labels);
+                let _ = ACCELERATOR_MEMORY_USED_BYTES.remove_label_values(&old_labels);
+                let _ = ACCELERATOR_MEMORY_TOTAL_BYTES.remove_label_values(&old_labels);
+                let _ = ACCELERATOR_TEMPERATURE_CELSIUS.remove_label_values(&old_labels);
+                store.readings.remove(&old);
+                if !store.cap_warned {
+                    store.cap_warned = true;
+                    tracing::warn!(
+                        cap = MAX_ACCELERATOR_DEVICES,
+                        "accelerator device cap reached; evicting stalest slots for new (device, accel) pairs"
+                    );
+                }
             }
-            continue;
         }
+        // Non-finite readings (NaN/±inf) are dropped: a NaN gauge renders as
+        // `NaN` in the text exposition, and serde_json turns Some(NaN) into
+        // null — indistinguishable from "never reported".
+        let utilization = r.utilization_percent.filter(|v| v.is_finite()).map(|v| v as f64);
+        let memory_used = r.memory_used_bytes.filter(|v| v.is_finite());
+        let memory_total = r.memory_total_bytes.filter(|v| v.is_finite());
+        let temperature = r.temperature_celsius.filter(|v| v.is_finite()).map(|v| v as f64);
         let labels: [&str; 2] = [&r.device, &r.accel];
-        if let Some(v) = r.utilization_percent {
+        if let Some(v) = utilization {
             ACCELERATOR_UTILIZATION_PERCENT
                 .with_label_values(&labels)
-                .set(v as f64);
+                .set(v);
         }
-        if let Some(v) = r.memory_used_bytes {
+        if let Some(v) = memory_used {
             ACCELERATOR_MEMORY_USED_BYTES.with_label_values(&labels).set(v);
         }
-        if let Some(v) = r.memory_total_bytes {
+        if let Some(v) = memory_total {
             ACCELERATOR_MEMORY_TOTAL_BYTES.with_label_values(&labels).set(v);
         }
-        if let Some(v) = r.temperature_celsius {
+        if let Some(v) = temperature {
             ACCELERATOR_TEMPERATURE_CELSIUS
                 .with_label_values(&labels)
-                .set(v as f64);
+                .set(v);
         }
         store.readings.insert(
             key,
             AcceleratorSnapshot {
                 device: r.device.clone(),
                 accel: r.accel.clone(),
-                utilization_percent: r.utilization_percent.map(|v| v as f64),
-                memory_used_bytes: r.memory_used_bytes,
-                memory_total_bytes: r.memory_total_bytes,
-                temperature_celsius: r.temperature_celsius.map(|v| v as f64),
+                utilization_percent: utilization,
+                memory_used_bytes: memory_used,
+                memory_total_bytes: memory_total,
+                temperature_celsius: temperature,
                 updated_at: now,
             },
         );
@@ -309,23 +336,24 @@ mod tests {
 
     #[test]
     #[serial(accelerator)]
-    fn should_drop_new_devices_beyond_the_cardinality_cap() {
+    fn should_evict_stalest_slot_for_new_devices_beyond_the_cardinality_cap() {
         reset_for_tests();
         for i in 0..MAX_ACCELERATOR_DEVICES {
             record_readings(&[reading(&format!("dev-{i}"), "cuda")]);
         }
         assert_eq!(latest().len(), MAX_ACCELERATOR_DEVICES);
-        // One more distinct pair must be dropped, not created.
+        // A new distinct pair evicts the stalest slot — the store stays at
+        // the cap and the new device is accepted, never dropped forever.
         record_readings(&[reading("dev-overflow", "cuda")]);
         let snapshots = latest();
         assert_eq!(snapshots.len(), MAX_ACCELERATOR_DEVICES);
-        assert!(!snapshots.iter().any(|s| s.device == "dev-overflow"));
+        assert!(snapshots.iter().any(|s| s.device == "dev-overflow"));
         // Existing pairs still update under a full store.
-        let mut update = reading("dev-0", "cuda");
+        let mut update = reading("dev-1", "cuda");
         update.utilization_percent = Some(7.0);
         record_readings(&[update]);
-        let d0 = latest().into_iter().find(|s| s.device == "dev-0").unwrap();
-        assert_eq!(d0.utilization_percent, Some(7.0));
+        let d1 = latest().into_iter().find(|s| s.device == "dev-1").unwrap();
+        assert_eq!(d1.utilization_percent, Some(7.0));
         reset_for_tests();
     }
 
@@ -339,6 +367,59 @@ mod tests {
         set_enabled(true);
         record_readings(&[reading("0", "cuda")]);
         assert_eq!(latest().len(), 1);
+        reset_for_tests();
+    }
+
+    /// Audit L3: non-finite readings must be dropped, not stored/exported —
+    /// a NaN gauge renders as `NaN` in the Prometheus text exposition, and
+    /// serde_json turns Some(NaN) into null, making it indistinguishable
+    /// from "never reported".
+    #[test]
+    #[serial(accelerator)]
+    fn should_drop_non_finite_readings() {
+        reset_for_tests();
+        let mut r = reading("0", "cuda");
+        r.utilization_percent = Some(f32::NAN);
+        r.temperature_celsius = Some(f32::NEG_INFINITY);
+        r.memory_used_bytes = Some(f64::NAN);
+        record_readings(&[r]);
+
+        let s = latest().into_iter().find(|s| s.device == "0").unwrap();
+        assert_eq!(
+            s.utilization_percent, None,
+            "NaN utilization must be dropped, not stored"
+        );
+        assert_eq!(
+            s.temperature_celsius, None,
+            "-inf temperature must be dropped, not stored"
+        );
+        assert_eq!(
+            s.memory_used_bytes, None,
+            "NaN memory_used must be dropped, not stored"
+        );
+        reset_for_tests();
+    }
+
+    /// Audit M3: the cardinality cap must evict the stalest slot for a new
+    /// device instead of dropping new devices forever. Otherwise a worker
+    /// reporting garbage device names (e.g. a uuid suffix bug) permanently
+    /// locks real GPUs out of the feature until process restart — the store
+    /// has no eviction path at all today.
+    #[test]
+    #[serial(accelerator)]
+    fn should_evict_stale_slot_for_new_device_when_cap_is_full() {
+        reset_for_tests();
+        for i in 0..MAX_ACCELERATOR_DEVICES {
+            record_readings(&[reading(&format!("junk-{i}"), "cuda")]);
+        }
+        assert_eq!(latest().len(), MAX_ACCELERATOR_DEVICES);
+
+        record_readings(&[reading("real-gpu-0", "cuda")]);
+        let snapshots = latest();
+        assert!(
+            snapshots.iter().any(|s| s.device == "real-gpu-0"),
+            "a real device must not be permanently locked out by stale junk slots"
+        );
         reset_for_tests();
     }
 }

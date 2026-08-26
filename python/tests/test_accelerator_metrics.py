@@ -47,6 +47,18 @@ class TestReportAcceleratorMetrics:
 
         assert len(api._accelerator_readings) == 4
 
+    def test_should_cap_unique_device_pairs(self):
+        """Audit BFF-#8: the buffer is keyed by worker-controlled (device,
+        accel) strings with no bound — a buggy model reporting unique device
+        names grows per-worker memory without limit between responses. The
+        Rust side caps at MAX_ACCELERATOR_DEVICES=64; the Python buffer must
+        apply the same bound."""
+        api = _api()
+        for i in range(1000):
+            api.report_accelerator_metrics(f"junk-{i}", "cuda", utilization_percent=1.0)
+
+        assert len(api._accelerator_readings) <= 64
+
 
 class TestCollectMetricsAccelerator:
     def test_should_attach_readings_to_metrics_proto(self):

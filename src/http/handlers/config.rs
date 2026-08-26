@@ -91,6 +91,21 @@ pub(crate) fn redact_tree(
                     redacted.push(child_path);
                     continue;
                 }
+                // Header maps are secret carriers by design (warmup sample
+                // Authorization, webhook tokens) — same policy as the server
+                // side's telemetry.otlp_headers: mask every value, keep the
+                // header names. Empty maps carry no secret.
+                if key.eq_ignore_ascii_case("headers") {
+                    if let Value::Object(headers) = child {
+                        if !headers.is_empty() {
+                            for v in headers.values_mut() {
+                                *v = json!(REDACTED);
+                            }
+                            redacted.push(child_path);
+                        }
+                        continue;
+                    }
+                }
                 redact_tree(&child_path, child, redacted, subtrees);
             }
         }
@@ -264,6 +279,7 @@ impl ConfigPatchMode {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigPatchRequest {
     /// RFC 7386 JSON merge-patch against the on-disk config.yaml tree.
     pub patch: Value,
@@ -287,9 +303,9 @@ pub enum ConfigPatchError {
     Conflict { current_etag: Option<String> },
     /// The merged config is unusable; nothing was written.
     Invalid { message: String, warnings: Vec<String> },
-    /// The reload after a successful write failed; the file was rolled back
-    /// to its pre-write bytes.
-    ReloadFailed { message: String },
+    /// The reload after a successful write failed; carries whether the file
+    /// rollback actually succeeded so the response never claims otherwise.
+    ReloadFailed { message: String, rolled_back: bool },
 }
 
 /// RFC 7386 JSON merge-patch: objects merge recursively, null deletes a key,
@@ -326,19 +342,28 @@ fn known_model_config_keys() -> std::collections::BTreeSet<String> {
 }
 
 /// Write bytes to `path` atomically: temp file in the same directory, fsync,
-/// then rename (mirrors python/lite_server/profile/config_writer.py).
+/// then rename (mirrors python/lite_server/profile/config_writer.py). The
+/// temp name carries a per-process counter so concurrent writers never
+/// share one inode, and the new file inherits the replaced file's
+/// permissions (config.yaml may hold secrets — a PATCH must not widen them).
 async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config.yaml");
-    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
     let write_result = async {
         let mut f = tokio::fs::File::create(&tmp).await?;
         tokio::io::AsyncWriteExt::write_all(&mut f, bytes).await?;
         tokio::io::AsyncWriteExt::flush(&mut f).await?;
         f.sync_all().await?;
         drop(f);
+        #[cfg(unix)]
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
+        }
         tokio::fs::rename(&tmp, path).await
     }
     .await;
@@ -348,11 +373,36 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     write_result
 }
 
+/// Per-config-path write locks: serialize writers of the same file so the
+/// etag re-check in `write_prepared` and the rename are one atomic
+/// check-and-set. Weak entries so idle paths don't accumulate.
+fn config_write_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    use dashmap::DashMap;
+    use std::sync::Weak;
+    lazy_static::lazy_static! {
+        static ref LOCKS: DashMap<std::path::PathBuf, Weak<tokio::sync::Mutex<()>>> =
+            DashMap::new();
+    }
+    let mut slot = LOCKS.entry(path.to_path_buf()).or_default();
+    if let Some(lock) = slot.upgrade() {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    *slot = Arc::downgrade(&lock);
+    lock
+}
+
 /// A validated, not-yet-written patch.
 pub(crate) struct PreparedPatch {
     path: std::path::PathBuf,
     /// Pre-write file bytes; None when the file did not exist.
     original: Option<Vec<u8>>,
+    /// The etag this patch was validated against. Re-checked at write time
+    /// (under the per-path lock) so a patch whose precondition was
+    /// superseded between prepare and write conflicts instead of silently
+    /// overwriting the intervening write. None = blind write (no if_match
+    /// given, or force).
+    expected_etag: Option<String>,
     merged_yaml: String,
     new_etag: String,
     warnings: Vec<String>,
@@ -378,21 +428,26 @@ impl PreparedPatch {
     }
 
     /// Restore the file to its pre-write state (byte-exact; a file the patch
-    /// created is removed). The .bak backup is kept either way.
-    async fn rollback(&self) {
+    /// created is removed). The .bak backup is kept either way. Failure is
+    /// returned, not just logged — the caller must not claim a rollback
+    /// that did not happen.
+    async fn rollback(&self) -> Result<(), AppError> {
         let result = match &self.original {
             Some(bytes) => atomic_write(&self.path, bytes).await,
             None => tokio::fs::remove_file(&self.path).await,
         };
-        if let Err(e) = result {
+        result.map_err(|e| {
             tracing::error!(
-                "config rollback failed for {}/{}: {} — restore {} manually",
+                "config rollback failed for {}/{}: {} — restore config.yaml.bak manually",
                 self.model,
                 self.version,
-                e,
-                self.path.with_file_name("config.yaml.bak").display(),
+                e
             );
-        }
+            AppError::Internal(format!(
+                "rollback failed for {}/{}: {e} — restore config.yaml.bak manually",
+                self.model, self.version
+            ))
+        })
     }
 }
 
@@ -510,6 +565,12 @@ pub(crate) async fn prepare_config_patch(
     Ok(PrepareOutcome::Ready(Box::new(PreparedPatch {
         path,
         original,
+        // Re-checked at write time; force and absent if_match mean blind write.
+        expected_etag: if !req.force && req.if_match.is_some() {
+            current_etag
+        } else {
+            None
+        },
         merged_yaml,
         new_etag,
         warnings,
@@ -520,12 +581,38 @@ pub(crate) async fn prepare_config_patch(
 }
 
 /// Persist a prepared patch: back up the current file, then atomically swap.
-pub(crate) async fn write_prepared(prepared: &PreparedPatch) -> Result<(), AppError> {
+/// Holds the per-path lock across the etag re-check and the rename so two
+/// patches validated against the same etag cannot both land (lost update).
+pub(crate) async fn write_prepared(prepared: &PreparedPatch) -> Result<(), ConfigPatchError> {
+    let lock = config_write_lock(&prepared.path);
+    let _guard = lock.lock().await;
+
+    if let Some(expected) = &prepared.expected_etag {
+        let current: Option<String> = match tokio::fs::read(&prepared.path).await {
+            Ok(bytes) => Some(content_etag(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(ConfigPatchError::App(AppError::Io(e))),
+        };
+        if current.as_deref() != Some(expected.as_str()) {
+            return Err(ConfigPatchError::Conflict { current_etag: current });
+        }
+    }
+
     if let Some(bytes) = &prepared.original {
         let bak = prepared.path.with_file_name("config.yaml.bak");
-        tokio::fs::write(&bak, bytes).await.map_err(AppError::Io)?;
+        tokio::fs::write(&bak, bytes)
+            .await
+            .map_err(|e| ConfigPatchError::App(AppError::Io(e)))?;
+        // The .bak preserves pre-rotation secrets — never leave it more
+        // permissive than the file it backs up.
+        #[cfg(unix)]
+        if let Ok(meta) = tokio::fs::metadata(&prepared.path).await {
+            let _ = tokio::fs::set_permissions(&bak, meta.permissions()).await;
+        }
     }
-    atomic_write(&prepared.path, prepared.merged_yaml.as_bytes()).await.map_err(AppError::Io)
+    atomic_write(&prepared.path, prepared.merged_yaml.as_bytes())
+        .await
+        .map_err(|e| ConfigPatchError::App(AppError::Io(e)))
 }
 
 /// Fold the reload outcome into the PATCH response. The write already
@@ -541,10 +628,18 @@ pub(crate) async fn finish_apply_reload(
             &["version not loaded; written to disk only, a later load picks it up"],
         )),
         Err(e) => {
-            prepared.rollback().await;
-            Err(ConfigPatchError::ReloadFailed {
-                message: format!("{e}"),
-            })
+            match prepared.rollback().await {
+                Ok(()) => Err(ConfigPatchError::ReloadFailed {
+                    message: format!("{e}"),
+                    rolled_back: true,
+                }),
+                Err(rb) => Err(ConfigPatchError::ReloadFailed {
+                    message: format!(
+                        "{e}; rollback also failed: {rb} — config.yaml left in the patched state"
+                    ),
+                    rolled_back: false,
+                }),
+            }
         }
     }
 }
@@ -562,7 +657,7 @@ pub async fn model_version_config_patch(
         PrepareOutcome::DryRun(report) => return Ok(report),
         PrepareOutcome::Ready(p) => p,
     };
-    write_prepared(&prepared).await.map_err(ConfigPatchError::App)?;
+    write_prepared(&prepared).await?;
     if req.mode == ConfigPatchMode::WriteOnly {
         return Ok(prepared.response(
             false,
@@ -625,16 +720,20 @@ pub async fn model_version_config_patch_handler(
             })),
         )
             .into_response()),
-        Err(ConfigPatchError::ReloadFailed { message }) => Ok((
+        Err(ConfigPatchError::ReloadFailed { message, rolled_back }) => Ok((
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": {
                     "type": "invalid_request_error",
-                    "message": format!("reload failed: {message}; config.yaml rolled back to the previous content"),
+                    "message": if rolled_back {
+                        format!("reload failed: {message}; config.yaml rolled back to the previous content")
+                    } else {
+                        format!("reload failed: {message}")
+                    },
                     "code": "reload_failed",
                     "param": Value::Null,
                 },
-                "rolled_back": true,
+                "rolled_back": rolled_back,
             })),
         )
             .into_response()),
@@ -1400,5 +1499,199 @@ mod tests {
         let non_default: Vec<_> = sources.iter().filter(|(_, s)| s.as_str() != Some("default")).collect();
         assert!(non_default.is_empty(), "non-default sources: {non_default:?}");
         assert!(out["redacted"].as_array().unwrap().is_empty());
+    }
+
+    // ===== audit repros (feat/admin-enhancement review) =====
+
+    /// Audit config-M2: a camelCase `ifMatch` (or any unknown field) must be
+    /// rejected, not silently dropped — dropping it disables the etag
+    /// precondition the client believes it holds.
+    #[test]
+    fn patch_request_rejects_unknown_fields() {
+        let body = r#"{"patch": {"max_batch_size": 32}, "ifMatch": "abc123"}"#;
+        let result = serde_json::from_str::<ConfigPatchRequest>(body);
+        assert!(
+            result.is_err(),
+            "unknown request fields must be a 400, got {result:?}"
+        );
+    }
+
+    /// Audit config-M1 (secrets at rest): PATCH must not widen the
+    /// permissions of a config file that holds secrets, and the .bak backup
+    /// (which preserves the PRE-rotation secrets) must be at least as
+    /// strict as the original file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = temp_repo("perms");
+        write_config(&repo, "m", "1", "max_batch_size: 16\npolicies:\n  auth:\n    keys: [secret]\n");
+        let path = repo.join("m").join("1").join("config.yaml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let state = test_state(repo.clone());
+
+        model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &patch_req(json!({"max_batch_size": 32}), ConfigPatchMode::WriteOnly),
+        )
+        .await
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "PATCH widened config.yaml permissions (secrets inside): {mode:o}"
+        );
+        let bak_mode = std::fs::metadata(path.with_file_name("config.yaml.bak"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            bak_mode, 0o600,
+            "config.yaml.bak holds the pre-rotation secrets: {bak_mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Audit config-H1a: the temp name is `.{file}.{pid}.tmp` — constant per
+    /// process — so two concurrent writes to the same path share one inode.
+    /// The interleaving (both create before either rename) makes the second
+    /// rename fail with ENOENT, and overlapping writes can tear the content.
+    #[tokio::test]
+    async fn concurrent_atomic_writes_do_not_collide_on_temp_name() {
+        let repo = temp_repo("atomic-race");
+        let path = repo.join("m").join("1").join("config.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let payload_a = "a: 1\n".repeat(500).into_bytes();
+        let payload_b = "bb: 2\n".repeat(300).into_bytes();
+        for round in 0..20 {
+            let (ra, rb) = tokio::join!(
+                atomic_write(&path, &payload_a),
+                atomic_write(&path, &payload_b),
+            );
+            assert!(
+                ra.is_ok() && rb.is_ok(),
+                "round {round}: both concurrent writes must succeed ({ra:?} / {rb:?})"
+            );
+            let content = std::fs::read(&path).unwrap();
+            assert!(
+                content == payload_a || content == payload_b,
+                "round {round}: file must be one intact payload, not a torn mix"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Audit config-H1b (lost update): two requests both validated against
+    /// the same etag E (the concurrent-PATCH window between check and
+    /// write). Once the first lands, the second's precondition is stale and
+    /// applying it must conflict — otherwise the first patch is silently
+    /// lost. There is no per-path lock and no re-check at write time.
+    #[tokio::test]
+    async fn write_prepared_against_superseded_etag_is_rejected() {
+        let repo = temp_repo("lost-update");
+        write_config(&repo, "m", "1", "max_batch_size: 16\n");
+        let state = test_state(repo.clone());
+        let etag = model_version_config_json(&state, "m", "1").await.unwrap()["etag"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let req = |v: i64| ConfigPatchRequest {
+            patch: json!({"max_batch_size": v}),
+            if_match: Some(etag.clone()),
+            force: false,
+            mode: ConfigPatchMode::WriteOnly,
+        };
+        // Both prepare against etag E before either writes (the race window).
+        let prepare = |r: ConfigPatchRequest| {
+            let state = state.clone();
+            async move {
+                match prepare_config_patch(&state, "m", "1", &r).await.unwrap() {
+                    PrepareOutcome::Ready(p) => p,
+                    PrepareOutcome::DryRun(_) => panic!("write_only never yields a dry-run report"),
+                }
+            }
+        };
+        let a = prepare(req(32)).await;
+        let b = prepare(req(64)).await;
+
+        write_prepared(&a).await.unwrap();
+        let result = write_prepared(&b).await;
+        assert!(
+            result.is_err(),
+            "applying a patch whose etag was superseded must fail (lost update)"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Audit config-H2 (false reporting): when the rollback itself fails,
+    /// the client must be told the file was left in the broken state — the
+    /// current code only logs the rollback failure and the HTTP response
+    /// still claims "rolled back to the previous content".
+    #[tokio::test]
+    async fn rollback_failure_is_surfaced_in_the_error() {
+        let repo = temp_repo("rollback-fail");
+        write_config(&repo, "m", "1", "max_batch_size: 16\n");
+        let state = test_state(repo.clone());
+        let prepared = match prepare_config_patch(
+            &state,
+            "m",
+            "1",
+            &patch_req(json!({"max_batch_size": 32}), ConfigPatchMode::ApplyReload),
+        )
+        .await
+        .unwrap()
+        {
+            PrepareOutcome::Ready(p) => p,
+            PrepareOutcome::DryRun(_) => panic!("apply_reload never yields a dry-run report"),
+        };
+        write_prepared(&prepared).await.unwrap();
+        // Make the rollback impossible: the version directory is gone.
+        std::fs::remove_dir_all(repo.join("m").join("1")).unwrap();
+
+        let err = finish_apply_reload(*prepared, Err(AppError::Config("worker refused".to_string())))
+            .await
+            .unwrap_err();
+        match err {
+            ConfigPatchError::ReloadFailed { message, rolled_back } => {
+                assert!(
+                    !rolled_back,
+                    "rolled_back must be false when the rollback itself failed"
+                );
+                assert!(
+                    message.to_lowercase().contains("rollback"),
+                    "the client must learn the rollback ALSO failed (file left broken), got: {message}"
+                );
+            }
+            other => panic!("expected reload failure, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Audit BFF-#4 (redaction gap): warmup sample headers are a designed
+    /// secret carrier (e.g. `Authorization: Bearer …` sent on the warmup
+    /// request), but the redaction rules only cover `*_key`/`*_secret`
+    /// leaves and the `policies.auth.keys` subtree — the bearer token is
+    /// returned in plaintext by GET /config.
+    #[tokio::test]
+    async fn warmup_sample_headers_are_redacted() {
+        let repo = temp_repo("redact-warmup");
+        write_config(
+            &repo,
+            "m",
+            "1",
+            "max_batch_size: 8\npolicies:\n  warmup:\n    samples:\n      - input_ref: w.json\n        headers:\n          authorization: Bearer topsecret-token\n",
+        );
+        let state = test_state(repo.clone());
+
+        let out = model_version_config_json(&state, "m", "1").await.unwrap();
+        assert!(
+            !out.to_string().contains("topsecret-token"),
+            "warmup Authorization header must not be served in plaintext: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

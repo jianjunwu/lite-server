@@ -1171,9 +1171,13 @@ impl Admin for GrpcAdminService {
                 "config.yaml changed since the provided etag; re-read and retry, or set force",
             ),
             ConfigPatchError::Invalid { message, .. } => Status::invalid_argument(message),
-            ConfigPatchError::ReloadFailed { message } => Status::internal(format!(
-                "reload failed: {message}; config.yaml rolled back to the previous content"
-            )),
+            ConfigPatchError::ReloadFailed { message, rolled_back } => Status::internal(
+                if rolled_back {
+                    format!("reload failed: {message}; config.yaml rolled back to the previous content")
+                } else {
+                    format!("reload failed: {message}")
+                },
+            ),
         })?;
         self.audit(
             &cx,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, App, Button, Space, Tag } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -46,6 +46,22 @@ export function ConfigEditor({
   const [validationError, setValidationError] = useState<string | null>(null);
 
   useEffect(() => () => onEditingChange(false), [onEditingChange]);
+
+  // Identity change without remount (the instance switcher only swaps a
+  // search param): drop the edit session. A draft built from another
+  // config's tree must never become submittable against this config's etag.
+  const identity = `${instanceId} ${model} ${version}`;
+  const prevIdentity = useRef(identity);
+  useEffect(() => {
+    if (prevIdentity.current !== identity) {
+      prevIdentity.current = identity;
+      setEditing(false);
+      setDraft({});
+      setValidationError(null);
+      setDiffOpen(false);
+      onEditingChange(false);
+    }
+  }, [identity, onEditingChange]);
 
   const built = buildPatch(data.config, draft);
   const dirty = editing && Object.keys(built.patch).length > 0;
