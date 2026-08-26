@@ -143,6 +143,7 @@
     "groupQueue": "队列与并发",
     "groupResources": "资源",
     "groupHealth": "健康",
+    "groupAccelerator": "加速器",
     "tokensPerS": "Tokens/s",
     "streamBytesPerS": "流字节/s",
     "ttftP99": "TTFT p99",
@@ -156,6 +157,16 @@
     "ejectionsPerS": "弹出/s",
     "unsupported": "该实例版本不支持此指标",
     "notReported": "模型未上报 token 指标"
+  },
+  "accelerator": {
+    "devices": "设备数",
+    "utilization": "利用率",
+    "memory": "显存",
+    "temperature": "温度",
+    "updated": "最近上报",
+    "empty": "模型未上报加速器指标",
+    "emptyHint": "在模型代码中调用 lit_api.report_accelerator_metrics(...) 上报——见 docs/observability.md",
+    "unsupported": "该实例不支持加速器指标(版本过旧或 features.accelerator_metrics 未开启)"
   },
   "alerts": {
     "title": "告警",

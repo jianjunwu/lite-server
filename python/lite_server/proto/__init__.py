@@ -1,5 +1,6 @@
 """Generated protobuf code for lite-server protocol."""
 from .liteserver_pb2 import (
+    AcceleratorReading,
     BatchInferRequest,
     BatchInferResponse,
     BatchItem,
@@ -41,6 +42,7 @@ from .liteserver_pb2 import (
 )
 
 __all__ = [
+    "AcceleratorReading",
     "BatchInferRequest",
     "BatchInferResponse",
     "BatchItem",

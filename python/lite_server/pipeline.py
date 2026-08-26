@@ -47,7 +47,7 @@ from lite_server.callbacks._base import (
 )
 from lite_server.context import RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
-from lite_server.proto import Metrics, MetricValue, Status
+from lite_server.proto import AcceleratorReading, Metrics, MetricValue, Status
 from lite_server.response import Response as LiteResponse
 
 logger = logging.getLogger("lite_server.pipeline")
@@ -389,10 +389,17 @@ def collect_metrics(lit_api: LitAPI, tokens_generated: int | None = None) -> Met
     (Done/close 处)传入,作为参数直接进 Metrics,``不进`` ``_metric_values``
     共享通道(该通道是 per-worker、跨并发流共享的,走它会跨流误归)。
     unary 不传(默认 None → 0):无 chunk 概念,精确计数依赖 tokenizer(D3 后续项)。
+
+    M4 accelerator readings are drained in the same swap: latest-per-device,
+    so an idle model (no responses to piggyback on) simply keeps its buffer
+    until traffic resumes — it cannot grow without bound.
     """
     with lit_api._metric_lock:
         values = getattr(lit_api, "_metric_values", None) or []
         lit_api._metric_values = []
+        accel_readings = list(getattr(lit_api, "_accelerator_readings", {}).values())
+        if accel_readings:
+            lit_api._accelerator_readings = {}
     specs = lit_api._metric_specs
     gauges, counters, histograms = [], [], []
     for mid, val in values:
@@ -405,10 +412,11 @@ def collect_metrics(lit_api: LitAPI, tokens_generated: int | None = None) -> Met
                 counters.append(mv)
             elif spec.metric_type == "histogram":
                 histograms.append(mv)
-    if not gauges and not counters and not histograms and not tokens_generated:
+    accelerator = [AcceleratorReading(**r) for r in accel_readings]
+    if not gauges and not counters and not histograms and not tokens_generated and not accelerator:
         return None
     return Metrics(gauges=gauges, counters=counters, histograms=histograms,
-                   tokens_generated=tokens_generated or 0)
+                   tokens_generated=tokens_generated or 0, accelerator=accelerator)
 
 
 # ---------------------------------------------------------------------------

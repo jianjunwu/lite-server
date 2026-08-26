@@ -232,6 +232,15 @@ pub async fn alerts_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     Json(json!({ "alerts": alerts }))
 }
 
+// ===== Accelerator (M4) =====
+
+/// Latest worker-reported accelerator reading per (device, accel). Read-only
+/// and model-agnostic (device-scoped data carries no model label); empty
+/// array until a model reports via the Metrics piggyback channel.
+pub async fn accelerator_handler() -> impl IntoResponse {
+    Json(json!(crate::metrics::accelerator::latest()))
+}
+
 // ===== Version Compare =====
 
 pub async fn compare_versions_handler(

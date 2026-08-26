@@ -291,6 +291,47 @@ and decode includes downstream backpressure (ZMQ HWM blocking inflates the
 worker-side window). Both move to the tokenizer follow-up item together with
 exact token counting.
 
+### Accelerator metrics (vendor-neutral)
+
+Added in the M4 admin-enhancement round. The core links **no vendor SDK** —
+model code reads its own stack (pynvml, torch.mlu, torch_npu, …) and reports
+through the same worker `Metrics` piggyback channel as `tokens_generated`,
+via `lit_api.report_accelerator_metrics(device, accel, ...)` (all value
+fields optional; omitted fields stay absent). Readings are device-scoped,
+latest-per-device: the worker buffers one reading per `(device, accel)` pair
+and attaches it to the next response's `Metrics.accelerator`, so an idle
+model simply reports nothing until traffic resumes.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `lite_server_accelerator_utilization_percent` | `device, accel` | Compute utilization 0-100. |
+| `lite_server_accelerator_memory_used_bytes` | `device, accel` | Device memory in use. |
+| `lite_server_accelerator_memory_total_bytes` | `device, accel` | Device memory capacity. |
+| `lite_server_accelerator_temperature_celsius` | `device, accel` | Device temperature. |
+
+Label whitelist: `device` (slot id, e.g. `"0"`/`"cuda:0"`) and `accel`
+(vendor tag: `cuda`/`mlu`/`npu`/…, bounded in practice) are admitted for
+these families only; both values are length-capped (64 chars) and the
+distinct `(device, accel)` pair count is capped at 64 — pairs beyond the cap
+are dropped (one-shot warning), never created as series. Because the
+families carry no `model`/`version` labels they are not part of the
+version-unload purge (a device may be shared by several versions); the pair
+cap is the bounding mechanism.
+
+`GET /metrics/accelerator` (feature `features.accelerator_metrics`, default
+on — fixed families with capped labels and no background sampler, unlike the
+opt-in worker-named `custom_metrics`) returns the latest reading per device
+as a JSON array:
+`[{device, accel, utilization_percent, memory_used_bytes, memory_total_bytes, temperature_celsius, updated_at}]`.
+Unreported fields are `null`; `updated_at` (epoch seconds) exposes
+staleness. With no reports the array is empty (`[]`) — clients should show a
+"model has not reported" empty state, not an error. With the feature off the
+route is unmounted (404).
+
+`kv_cache_utilization` is deliberately untouched: device memory is **not** a
+KV-cache proxy, and the GIE gauge stays NaN until a model reports KV
+utilization explicitly.
+
 ## OpenTelemetry
 
 Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**, for

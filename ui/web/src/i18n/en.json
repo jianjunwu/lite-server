@@ -147,6 +147,7 @@
     "groupQueue": "Queue & concurrency",
     "groupResources": "Resources",
     "groupHealth": "Health",
+    "groupAccelerator": "Accelerator",
     "tokensPerS": "Tokens/s",
     "streamBytesPerS": "Stream bytes/s",
     "ttftP99": "TTFT p99",
@@ -160,6 +161,16 @@
     "ejectionsPerS": "Ejections/s",
     "unsupported": "This instance version does not report this metric",
     "notReported": "The model has not reported token metrics"
+  },
+  "accelerator": {
+    "devices": "Devices",
+    "utilization": "Utilization",
+    "memory": "Memory",
+    "temperature": "Temperature",
+    "updated": "Last report",
+    "empty": "The model has not reported accelerator metrics",
+    "emptyHint": "Report from model code via lit_api.report_accelerator_metrics(...) — see docs/observability.md",
+    "unsupported": "This instance does not support accelerator metrics (old version or features.accelerator_metrics off)"
   },
   "alerts": {
     "title": "Alerts",

@@ -228,6 +228,20 @@ message MetricValue {
   float value = 2;
 }
 
+// M4 (admin-enhancement plan): vendor-neutral accelerator reading reported
+// by model code. Device-scoped, not request-scoped — the worker attaches the
+// latest reading per device to a response's Metrics (same piggyback channel
+// as tokens_generated). Absent optional fields mean "not reported" (some
+// accelerators expose no temperature, etc.).
+message AcceleratorReading {
+  string device = 1;  // device identifier, e.g. "0" or "cuda:0"
+  string accel = 2;   // accelerator kind: cuda/mlu/npu/... (bounded cardinality)
+  optional float utilization_percent = 3;
+  optional double memory_used_bytes = 4;
+  optional double memory_total_bytes = 5;
+  optional float temperature_celsius = 6;
+}
+
 message Metrics {
   float prefill_ms = 1;
   float decode_ms = 2;
@@ -235,6 +249,7 @@ message Metrics {
   repeated MetricValue gauges = 4;
   repeated MetricValue counters = 5;
   repeated MetricValue histograms = 6;
+  repeated AcceleratorReading accelerator = 7;
 }
 
 // ===== gRPC Service =====

@@ -569,6 +569,10 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKERS_RSS_BYTES.clone()))?;
     INFO.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1.0);
     REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
+    // M4: vendor-neutral accelerator families (fixed names, device+accel
+    // labels; empty until a worker reports — registration is ungated, the
+    // record path is gated on features.accelerator_metrics).
+    crate::metrics::accelerator::register(&REGISTRY)?;
     Ok(())
 }
 
@@ -1544,6 +1548,12 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
             });
             counter.with_label_values(&[model, version]).inc_by(m.tokens_generated as f64);
         }
+        // M4: device-scoped accelerator readings ride the same piggyback
+        // channel but are NOT (model, version) tagged — the neutral families
+        // key on (device, accel) only.
+        if !m.accelerator.is_empty() {
+            crate::metrics::accelerator::record_readings(&m.accelerator);
+        }
         // Pre-registered custom metrics (numeric ID path)
         record_custom_metrics(model, version, &m.gauges, &m.counters, &m.histograms);
     }
@@ -2001,6 +2011,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
         let m = Some(&metrics);
 
@@ -2049,6 +2060,7 @@ mod tests {
             gauges: vec![MetricValue { id: 0, value: 99.5 }],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
         record_worker_metrics("rwmc_model", "1", Some(&metrics));
 
@@ -2084,6 +2096,7 @@ mod tests {
                 gauges: vec![],
                 counters: vec![],
                 histograms: vec![],
+                accelerator: vec![],
             }),
         );
         // Pre-registered custom family path (worker-local gauge ordinal 0).
@@ -2540,6 +2553,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
 
         // Must NOT panic — the poisoned lock is recovered via into_inner().
@@ -2567,6 +2581,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
 
         let model = "b1_single_m";

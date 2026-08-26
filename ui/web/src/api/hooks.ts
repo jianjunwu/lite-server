@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { ApiError, apiFetch, apiFetchWithHeaders, bffFetch } from './client';
 import { mergeModelList, mergeVersionList, type MergedModel, type MergedVersions } from './merge';
 import type {
+  AcceleratorReading,
   AlertsResponse,
   HealthSummary,
   InstanceInfo,
@@ -203,6 +204,24 @@ export function useAlerts(instanceId: string | null, refetchInterval: number | f
     queryKey: [instanceId, 'alerts'],
     queryFn: () => apiFetch<AlertsResponse>(instanceId!, '/metrics/alerts'),
     enabled: instanceId !== null,
+    refetchInterval,
+  });
+}
+
+/** M4: per-device accelerator readings. `null` data on 404 — the instance
+ * predates the endpoint or runs with features.accelerator_metrics off. */
+export function useAcceleratorMetrics(instanceId: string | null, refetchInterval: number | false = 10_000, active = true) {
+  return useQuery({
+    queryKey: [instanceId, 'accelerator'],
+    queryFn: async (): Promise<AcceleratorReading[] | null> => {
+      try {
+        return await apiFetch<AcceleratorReading[]>(instanceId!, '/metrics/accelerator');
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) return null;
+        throw err;
+      }
+    },
+    enabled: instanceId !== null && active,
     refetchInterval,
   });
 }

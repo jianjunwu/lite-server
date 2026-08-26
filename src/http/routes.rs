@@ -205,6 +205,9 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     if features.alerts {
         router = router.route("/metrics/alerts", get(alerts_handler));
     }
+    if features.accelerator_metrics {
+        router = router.route("/metrics/accelerator", get(accelerator_handler));
+    }
     if features.version_compare {
         router = router.route("/v2/models/:model_name/compare", get(compare_versions_handler));
     }
