@@ -218,6 +218,63 @@ Records go to the dedicated log target `lite_server::audit` at `info` level
 RUST_LOG=lite_server::audit=info
 ```
 
+### Timeline endpoint
+
+`GET /metrics/timeline` (all loaded versions), `GET /metrics/timeline/{model}`
+(active version), and `GET /metrics/timeline/{model}/versions/{version}`
+return the in-memory ring buffer sampled every
+`metrics.timeline_sample_interval_secs` (default 10s) with up to
+`metrics.timeline_max_points` (default 30) points per model/version. Sampling
+reads the existing Prometheus registry only — no extra recording points.
+
+Each entry carries:
+
+| Field | Source | Notes |
+|---|---|---|
+| `timestamp` | sample time | Unix seconds. |
+| `qps` | `liteserver_requests_total` delta | All status families. |
+| `p99_ms` | in-process latency window | Sliding window (`p99_window_*` knobs). |
+| `queue_depth` | `liteserver_queue_depth` | |
+| `active_workers` | `liteserver_active_workers` | |
+| `active_streams` | `liteserver_streaming_connections` | Summed across `protocol`; 0 while `features.streaming_metrics` is off. |
+| `in_flight` | `liteserver_in_flight_requests` | Queued + processing. |
+| `worker_saturation` | `liteserver_worker_saturation` | Hottest worker's concurrent batches. |
+| `ttft_p99_ms` | `liteserver_streaming_ttft_seconds` | Bucket-interpolated, merged across `protocol`. Process-lifetime histogram, **not** a sliding window; 0 without streaming traffic. |
+| `tbt_p99_ms` | `liteserver_streaming_tbt_seconds` | Same derivation as `ttft_p99_ms`. |
+| `stream_bytes_per_s` | `liteserver_stream_output_bytes_total` delta | Summed across `stream_kind`, rated over the sample window. |
+| `tokens_per_s` | `lite_server_tokens_generated_total` delta | `null` until the model reports tokens via the worker callback channel. |
+| `rss_mb` | `liteserver_workers_resident_memory_bytes` | Live-worker RSS sum for the version, MiB. |
+| `cpu_percent` | `liteserver_process_cpu_seconds_total` delta | Process-wide, cumulative across cores — may exceed 100. The sampler refreshes process metrics itself, so no scraper is required. |
+| `retries_per_s` | `liteserver_retries_total` delta | Rated over the sample window. |
+| `ejections_per_s` | `liteserver_worker_ejections_total` delta | Rated over the sample window. |
+
+Instances older than this schema omit the new fields entirely; clients must
+treat absent fields as "not supported by this instance version".
+
+**Downsampling**: `?step=N` (integer ≥ 1) keeps every Nth point anchored at
+the latest sample, so the freshest point is always included. `step=0` is
+rejected with 400. Example: with a 24h window (1440 points), `?step=5`
+returns ~288 points covering the full window.
+
+**Response headers**:
+
+| Header | Meaning |
+|---|---|
+| `X-Timeline-Coverage` | Retention window in seconds (`timeline_max_points` × `timeline_sample_interval_secs`) — the longest range a client can honestly display. |
+| `X-Timeline-Interval` | Point spacing in seconds; clients use it to convert a desired time range into a `step`. |
+
+**Retention window**: the defaults (30 × 10s = 5 minutes) suit live
+debugging. For a 24h window at 1-minute resolution:
+
+```yaml
+metrics:
+  timeline_max_points: 1440        # 24h at 60s spacing
+  timeline_sample_interval_secs: 60
+```
+
+Memory cost is bounded by `timeline_max_points` × loaded versions; the ring
+is per model/version and reaped on unload.
+
 ### `tokens_generated` semantics
 
 Python workers report `tokens_generated` in the Done-frame `Metrics` —

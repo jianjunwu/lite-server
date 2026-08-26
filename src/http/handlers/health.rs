@@ -2,10 +2,11 @@ use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderName, StatusCode},
     response::{IntoResponse, Json, Response},
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -135,18 +136,67 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 // ===== Timeline =====
 
-pub async fn timeline_handler() -> impl IntoResponse {
-    let snapshots = crate::metrics::aggregator::TIMELINE.all_snapshots().await;
-    Json(json!({ "snapshots": snapshots }))
+#[derive(Debug, Deserialize)]
+pub struct TimelineQuery {
+    /// M3: server-side downsampling — keep every Nth point (anchored at the
+    /// latest). Absent/1 = full resolution.
+    step: Option<usize>,
 }
 
-async fn timeline_json(model_name: &str, version: &str) -> Json<Value> {
+fn parse_step(query: &TimelineQuery) -> Result<usize, AppError> {
+    match query.step {
+        None => Ok(1),
+        Some(0) => Err(AppError::InvalidQueryParam(
+            "step must be a positive integer".to_string(),
+        )),
+        Some(n) => Ok(n),
+    }
+}
+
+/// M3: retention-window headers — X-Timeline-Coverage (max_points x
+/// interval, seconds) lets clients clamp selectable time ranges honestly;
+/// X-Timeline-Interval is the point spacing needed to pick a step.
+fn timeline_headers() -> [(HeaderName, String); 2] {
+    let timeline = &crate::metrics::aggregator::TIMELINE;
+    [
+        (
+            HeaderName::from_static("x-timeline-coverage"),
+            timeline.coverage_secs().to_string(),
+        ),
+        (
+            HeaderName::from_static("x-timeline-interval"),
+            timeline.sample_interval_secs().to_string(),
+        ),
+    ]
+}
+
+pub async fn timeline_handler(
+    Query(query): Query<TimelineQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let step = parse_step(&query)?;
+    let snapshots: Vec<_> = crate::metrics::aggregator::TIMELINE
+        .all_snapshots()
+        .await
+        .into_iter()
+        .map(|mut snap| {
+            snap.entries = crate::metrics::aggregator::downsample_entries(snap.entries, step);
+            snap
+        })
+        .collect();
+    Ok((timeline_headers(), Json(json!({ "snapshots": snapshots }))))
+}
+
+async fn timeline_json(model_name: &str, version: &str, step: usize) -> impl IntoResponse {
     let entries = crate::metrics::aggregator::TIMELINE.get_timeline(model_name, version).await;
-    Json(json!({
-        "model": model_name,
-        "version": version,
-        "entries": entries,
-    }))
+    let entries = crate::metrics::aggregator::downsample_entries(entries, step);
+    (
+        timeline_headers(),
+        Json(json!({
+            "model": model_name,
+            "version": version,
+            "entries": entries,
+        })),
+    )
 }
 
 /// Bare timeline = the active version (§4.4; the old default was the literal
@@ -154,21 +204,25 @@ async fn timeline_json(model_name: &str, version: &str) -> Json<Value> {
 pub async fn timeline_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-) -> Result<Json<Value>, AppError> {
+    Query(query): Query<TimelineQuery>,
+) -> Result<impl IntoResponse, AppError> {
     crate::validation::validate_identifier(&model_name)?;
+    let step = parse_step(&query)?;
     let version = state.registry.get_active_version(&model_name).ok_or_else(|| {
         AppError::ModelNotFound(format!("{} has no active version", model_name))
     })?;
-    Ok(timeline_json(&model_name, &version).await)
+    Ok(timeline_json(&model_name, &version, step).await)
 }
 
 /// Versioned timeline = the explicit version (§4.4).
 pub async fn timeline_model_version_handler(
     Path((model_name, version)): Path<(String, String)>,
-) -> Result<Json<Value>, AppError> {
+    Query(query): Query<TimelineQuery>,
+) -> Result<impl IntoResponse, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    Ok(timeline_json(&model_name, &version).await)
+    let step = parse_step(&query)?;
+    Ok(timeline_json(&model_name, &version, step).await)
 }
 
 // ===== Alerts =====
