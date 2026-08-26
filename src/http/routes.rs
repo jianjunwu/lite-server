@@ -176,8 +176,9 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/versions", delete(delete_versions_handler))
         // Admin: activate version
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
-        // Admin: model version config read (M1; PATCH arrives in M2)
-        .route("/v2/models/:model_name/versions/:version/config", get(model_version_config_handler))
+        // Admin: model version config read (M1) and merge-patch write (M2)
+        .route("/v2/models/:model_name/versions/:version/config",
+            get(model_version_config_handler).patch(model_version_config_patch_handler))
         // Admin: weighted/canary routing weights (§4.3)
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())
