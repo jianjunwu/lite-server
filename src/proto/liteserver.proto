@@ -372,6 +372,9 @@ service Admin {
   // M2: model version config write — mirrors
   // PATCH /v2/models/:m/versions/:v/config. Additive-only.
   rpc UpdateModelConfig(UpdateModelConfigRequest) returns (UpdateModelConfigResponse);
+  // M5: server config read with source labels — mirrors
+  // GET /v2/server/config. Additive-only.
+  rpc GetServerConfig(GetServerConfigRequest) returns (GetServerConfigResponse);
 }
 
 // --- GetInfo (mirrors GET /info) ---
@@ -681,4 +684,12 @@ message UpdateModelConfigResponse {
   bool reloaded = 3;
   optional string etag = 4;              // new content etag after write; current etag for dry_run
   repeated string warnings = 5;          // unknown keys, not-applied hints, validation detail
+}
+
+// --- GetServerConfig (mirrors GET /v2/server/config, M5) ---
+message GetServerConfigRequest {}
+message GetServerConfigResponse {
+  string config_json = 1;              // redacted effective Config tree, JSON-encoded
+  map<string, string> sources = 2;     // leaf dot path → cli | file | default (approximate, see plan §3.6)
+  repeated string redacted = 3;        // dot-joined redacted paths
 }

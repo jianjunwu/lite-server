@@ -515,5 +515,63 @@
       "policies": "Policies",
       "advanced": "Advanced (unrecognized keys)"
     }
+  },
+  "instance": {
+    "detail": {
+      "online": "online",
+      "offline": "offline",
+      "modelsLoaded_zero": "no models loaded",
+      "modelsLoaded_one": "{{count}} model loaded",
+      "modelsLoaded_other": "{{count}} models loaded",
+      "notFound": "This instance is not registered (or hidden for your account).",
+      "unreachable": "Instance unreachable — showing the last known state.",
+      "tabs": {
+        "overview": "Overview",
+        "config": "Configuration"
+      },
+      "stats": {
+        "version": "Version",
+        "modelsLoaded": "Models loaded",
+        "rss": "Process RSS",
+        "cpu": "CPU",
+        "activeStreams": "Active streams"
+      },
+      "probes": {
+        "title": "Health probes"
+      },
+      "models": {
+        "title": "Models",
+        "empty": "No models loaded"
+      }
+    },
+    "config": {
+      "searchPlaceholder": "Filter by field path…",
+      "empty": "No configuration fields match the filter.",
+      "unsupported": "Not available on this instance (unreachable or predates this feature).",
+      "noMatch": "No fields match \"{{query}}\".",
+      "source": {
+        "cli": "CLI",
+        "file": "file",
+        "default": "default"
+      },
+      "groups": {
+        "server": "Server (HTTP)",
+        "grpc": "gRPC",
+        "metrics": "Metrics",
+        "alerts": "Alerts",
+        "access_control": "Access control",
+        "openai_compact": "OpenAI compact (/v1)",
+        "features": "Features",
+        "model_defaults": "Model defaults",
+        "tunables": "Server tunables",
+        "orchestration": "Orchestration",
+        "model_repository": "Model repository",
+        "rate_limit": "Rate limit",
+        "logging": "Logging",
+        "telemetry": "Telemetry",
+        "callbacks": "Callbacks",
+        "advanced": "Advanced (unrecognized sections)"
+      }
+    }
   }
 }

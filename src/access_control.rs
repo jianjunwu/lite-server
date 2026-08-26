@@ -541,6 +541,8 @@ mod tests {
         assert_eq!(classify_http_path("/metrics"), EndpointClass::Admin);
         assert_eq!(classify_http_path("/info"), EndpointClass::Admin);
         assert_eq!(classify_http_path("/v2/models/m/ready"), EndpointClass::Admin);
+        // M5: instance config read — admin class (fail-closed when unconfigured).
+        assert_eq!(classify_http_path("/v2/server/config"), EndpointClass::Admin);
     }
 
     // AUDIT (P0): bare `POST /v2/models/:m/reload` is a registered state-changing

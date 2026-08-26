@@ -4,7 +4,7 @@ import { PlusOutlined } from '@ant-design/icons';
 import { QRCodeSVG } from 'qrcode.react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, Link } from 'react-router-dom';
 import { bffFetch, setAdminKey } from '../api/client';
 import { auditApi, authApi, grantsApi, modelGrantsApi, invitesApi, sessionsApi, type AuditEntry, type InviteInfo, type SessionInfo } from '../api/auth';
 import { useInstances } from '../api/hooks';
@@ -113,7 +113,14 @@ function InstancesTab() {
         pagination={false}
         columns={[
           { title: 'ID', dataIndex: 'id', width: 130, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
-          { title: t('settings.instances.name'), dataIndex: 'name', ellipsis: true },
+          {
+            title: t('settings.instances.name'),
+            dataIndex: 'name',
+            ellipsis: true,
+            render: (v: string, i: InstanceInfo) => (
+              <Link to={`/instances/${encodeURIComponent(i.id)}?i=${encodeURIComponent(i.id)}`}>{v}</Link>
+            ),
+          },
           { title: 'URL', dataIndex: 'base_url', ellipsis: true, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
           {
             title: t('settings.instances.adminKey'),

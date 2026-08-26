@@ -22,6 +22,20 @@ const REDACTED: &str = "***";
 /// so clients can still show "N keys configured" without seeing the keys.
 const REDACTED_SUBTREES: &[&str] = &["policies.auth.keys"];
 
+/// Server config secrets (M5): the literal secret leaf of every
+/// `EndpointControl::Key` cell, plus telemetry OTLP auth headers (a
+/// header→token map, redacted wholesale). The env-var NAME (`value_env`) and
+/// file PATH (`value_file`) variants are not secrets and stay visible.
+const SERVER_REDACTED_SUBTREES: &[&str] = &[
+    "access_control.admin.http.value",
+    "access_control.admin.grpc.value",
+    "access_control.inference.http.value",
+    "access_control.inference.grpc.value",
+    "access_control.health.value",
+    "openai_compact.auth.value",
+    "telemetry.otlp_headers",
+];
+
 /// Leaf keys whose scalar value is redacted at any depth (*_key / *_secret,
 /// case-insensitive).
 fn is_secret_leaf(key: &str) -> bool {
@@ -36,9 +50,29 @@ fn redact_subtree(value: &Value) -> Value {
     }
 }
 
+/// True for null / empty object / empty array — a subtree that carries no
+/// secret. Redacting it to "***" would falsely imply a configured secret
+/// (and flip its source label to "file").
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        _ => false,
+    }
+}
+
 /// Walk the tree in place, redacting secrets and recording each redacted
-/// path (dot-joined; array elements as `path[i]`).
-fn redact_tree(path: &str, value: &mut Value, redacted: &mut Vec<String>) {
+/// path (dot-joined; array elements as `path[i]`). `subtrees` lists
+/// dot-joined paths replaced wholesale (see [`REDACTED_SUBTREES`] /
+/// [`SERVER_REDACTED_SUBTREES`]); `*_key` / `*_secret` scalar leaves are
+/// always redacted.
+pub(crate) fn redact_tree(
+    path: &str,
+    value: &mut Value,
+    redacted: &mut Vec<String>,
+    subtrees: &[&str],
+) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
@@ -47,7 +81,7 @@ fn redact_tree(path: &str, value: &mut Value, redacted: &mut Vec<String>) {
                 } else {
                     format!("{path}.{key}")
                 };
-                if REDACTED_SUBTREES.contains(&child_path.as_str()) {
+                if subtrees.contains(&child_path.as_str()) && !is_empty_value(child) {
                     *child = redact_subtree(child);
                     redacted.push(child_path);
                     continue;
@@ -57,12 +91,12 @@ fn redact_tree(path: &str, value: &mut Value, redacted: &mut Vec<String>) {
                     redacted.push(child_path);
                     continue;
                 }
-                redact_tree(&child_path, child, redacted);
+                redact_tree(&child_path, child, redacted, subtrees);
             }
         }
         Value::Array(items) => {
             for (i, item) in items.iter_mut().enumerate() {
-                redact_tree(&format!("{path}[{i}]"), item, redacted);
+                redact_tree(&format!("{path}[{i}]"), item, redacted, subtrees);
             }
         }
         _ => {}
@@ -104,7 +138,7 @@ pub async fn model_version_config_json(
     };
 
     let mut redacted = Vec::new();
-    redact_tree("", &mut config, &mut redacted);
+    redact_tree("", &mut config, &mut redacted, REDACTED_SUBTREES);
 
     Ok(json!({
         "model": model_name,
@@ -127,6 +161,75 @@ pub async fn model_version_config_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
     Ok(Json(model_version_config_json(&state, &model_name, &version).await?))
+}
+
+// ===== M5: server (instance) config read — plan §3.6 =====
+
+/// Per-leaf source attribution. Deliberately approximate (plan §3.6): a leaf
+/// whose path the CLI override structure sets is "cli"; of the rest, a leaf
+/// equal to the built-in `Config::default()` reads as "default" and anything
+/// else as "file". A value explicitly written into the file that happens to
+/// equal the default is therefore labeled "default" — full provenance
+/// tracking is not worth the framework for a read-only view.
+fn attribute_sources(
+    path: &str,
+    effective: &Value,
+    default: &Value,
+    cli: &std::collections::BTreeSet<String>,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    if let Value::Object(map) = effective {
+        for (key, child) in map {
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            let fallback = Value::Null;
+            let default_child = default.get(key).unwrap_or(&fallback);
+            attribute_sources(&child_path, child, default_child, cli, out);
+        }
+        return;
+    }
+    // Leaves (scalars, arrays, nulls) compare wholesale.
+    let source = if cli.contains(path) {
+        "cli"
+    } else if effective == default {
+        "default"
+    } else {
+        "file"
+    };
+    out.insert(path.to_string(), source.to_string());
+}
+
+/// Shared core for the HTTP handler and the gRPC GetServerConfig RPC.
+///
+/// Sources are attributed on the REDACTED tree so every row the client
+/// renders has an exact `sources` entry; a redacted secret never equals the
+/// default tree's null/empty placeholder, so configured secrets read "file".
+pub fn server_config_json(state: &AppState) -> Result<Value, AppError> {
+    let mut config = serde_json::to_value(&state.config)
+        .map_err(|e| AppError::Internal(format!("config serialize: {e}")))?;
+    let mut redacted = Vec::new();
+    redact_tree("", &mut config, &mut redacted, SERVER_REDACTED_SUBTREES);
+
+    let default = serde_json::to_value(crate::config::Config::default())
+        .map_err(|e| AppError::Internal(format!("default config serialize: {e}")))?;
+    let cli = state.cli_overrides.overridden_paths();
+    let mut sources = std::collections::BTreeMap::new();
+    attribute_sources("", &config, &default, &cli, &mut sources);
+
+    Ok(json!({
+        "config": config,
+        "sources": sources,
+        "redacted": redacted,
+    }))
+}
+
+pub async fn server_config_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(server_config_json(&state)?))
 }
 
 // ===== M2: PATCH (write) — plan §3.3 =====
@@ -554,7 +657,7 @@ mod tests {
     fn redacts_auth_keys_subtree_preserving_count() {
         let mut v = json!({"policies": {"auth": {"keys": ["k1", "k2", "k3"]}}});
         let mut redacted = Vec::new();
-        redact_tree("", &mut v, &mut redacted);
+        redact_tree("", &mut v, &mut redacted, REDACTED_SUBTREES);
         assert_eq!(v["policies"]["auth"]["keys"], json!(["***", "***", "***"]));
         assert_eq!(redacted, vec!["policies.auth.keys"]);
     }
@@ -568,7 +671,7 @@ mod tests {
             "normal_key_like": {"key_size": 4}
         });
         let mut redacted = Vec::new();
-        redact_tree("", &mut v, &mut redacted);
+        redact_tree("", &mut v, &mut redacted, REDACTED_SUBTREES);
         assert_eq!(v["api_key"], json!("***"));
         assert_eq!(v["nested"]["client_secret"], json!("***"));
         assert_eq!(v["nested"]["API_KEY"], json!("***"));
@@ -581,11 +684,32 @@ mod tests {
     }
 
     #[test]
+    fn empty_redacted_subtrees_are_left_visible() {
+        // An unset/empty secret container must not collapse to "***" — that
+        // would falsely imply a configured secret.
+        let mut v = json!({
+            "telemetry": {"otlp_headers": {}},
+            "access_control": {"health": null},
+            "policies": {"auth": {"keys": []}}
+        });
+        let mut redacted = Vec::new();
+        redact_tree("", &mut v, &mut redacted, SERVER_REDACTED_SUBTREES);
+        assert_eq!(v["telemetry"]["otlp_headers"], json!({}));
+        assert_eq!(v["access_control"]["health"], Value::Null);
+        assert!(redacted.is_empty());
+
+        let mut redacted = Vec::new();
+        redact_tree("", &mut v, &mut redacted, REDACTED_SUBTREES);
+        assert_eq!(v["policies"]["auth"]["keys"], json!([]));
+        assert!(redacted.is_empty());
+    }
+
+    #[test]
     fn leaves_normal_values_untouched() {
         let mut v = json!({"max_batch_size": 16, "accelerator": "cuda", "devices": [0, 1]});
         let original = v.clone();
         let mut redacted = Vec::new();
-        redact_tree("", &mut v, &mut redacted);
+        redact_tree("", &mut v, &mut redacted, REDACTED_SUBTREES);
         assert_eq!(v, original);
         assert!(redacted.is_empty());
     }
@@ -1141,5 +1265,140 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ConfigPatchError::App(AppError::ModelNotFound(_))));
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== M5: server config read =====
+
+    fn test_state_with(config: Config, cli: crate::config::CliOverrides) -> Arc<AppState> {
+        // No disk access in the M5 core — a non-existent repo path is fine.
+        let repo = PathBuf::from("/nonexistent-m5-repo");
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            inference_queue.clone(),
+            "warn".to_string(),
+            callback_runner.clone(),
+        ));
+        let mut state = AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            config,
+            repo,
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        );
+        state.cli_overrides = cli;
+        Arc::new(state)
+    }
+
+    #[test]
+    fn server_config_marks_cli_file_and_default_sources() {
+        let mut config = Config::default();
+        // Differs from the built-in default with no CLI override → "file".
+        config.metrics.timeline_max_points = 1440;
+        let cli = crate::config::CliOverrides {
+            // Equals the default value but forced via CLI → still "cli".
+            port: Some(8000),
+            no_grpc: true,
+            ..Default::default()
+        };
+        let state = test_state_with(config, cli);
+
+        let out = server_config_json(&state).unwrap();
+        let sources = out["sources"].as_object().unwrap();
+        let src = |p: &str| sources.get(p).and_then(|v| v.as_str());
+        assert_eq!(src("server.http_port"), Some("cli"));
+        assert_eq!(src("grpc.enabled"), Some("cli"));
+        assert_eq!(src("metrics.timeline_max_points"), Some("file"));
+        assert_eq!(src("server.host"), Some("default"));
+        assert_eq!(src("logging.level"), Some("default"));
+    }
+
+    #[test]
+    fn server_config_cli_beats_file_for_same_field() {
+        // Both file and CLI set the port; the CLI value wins in the effective
+        // config and the source must read "cli".
+        let mut config = Config::default();
+        config.server.http_port = 9000;
+        let cli = crate::config::CliOverrides {
+            port: Some(9000),
+            ..Default::default()
+        };
+        let state = test_state_with(config, cli);
+        let out = server_config_json(&state).unwrap();
+        assert_eq!(out["config"]["server"]["http_port"], json!(9000));
+        assert_eq!(
+            out["sources"]["server.http_port"],
+            json!("cli")
+        );
+    }
+
+    #[test]
+    fn server_config_redacts_access_control_and_otlp_secrets() {
+        use crate::config::{EndpointControl, ProtocolControl};
+        let mut config = Config::default();
+        let key_cell = || EndpointControl::Key {
+            key: "x-api-key".to_string(),
+            value: Some("topsecret".to_string()),
+            value_env: Some("ADMIN_KEY_ENV".to_string()),
+            value_file: None,
+        };
+        config.access_control.admin = ProtocolControl {
+            http: Some(key_cell()),
+            grpc: None,
+        };
+        config.openai_compact.auth = Some(key_cell());
+        config
+            .telemetry
+            .otlp_headers
+            .insert("Authorization".to_string(), "Bearer tok".to_string());
+        let state = test_state_with(config, crate::config::CliOverrides::default());
+
+        let out = server_config_json(&state).unwrap();
+        assert_eq!(out["config"]["access_control"]["admin"]["http"]["value"], json!("***"));
+        assert_eq!(out["config"]["openai_compact"]["auth"]["value"], json!("***"));
+        assert_eq!(out["config"]["telemetry"]["otlp_headers"], json!("***"));
+        // Non-secret companions stay visible.
+        assert_eq!(
+            out["config"]["access_control"]["admin"]["http"]["value_env"],
+            json!("ADMIN_KEY_ENV")
+        );
+        assert!(!out.to_string().contains("topsecret"));
+        assert!(!out.to_string().contains("Bearer tok"));
+        let redacted: Vec<&str> = out["redacted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(redacted.contains(&"access_control.admin.http.value"));
+        assert!(redacted.contains(&"openai_compact.auth.value"));
+        assert!(redacted.contains(&"telemetry.otlp_headers"));
+        // Redacted rows still carry a source entry (attributed post-redaction).
+        assert_eq!(
+            out["sources"]["access_control.admin.http.value"],
+            json!("file")
+        );
+    }
+
+    #[test]
+    fn server_config_serializes_full_tree_with_sources_for_every_leaf() {
+        let state = test_state_with(Config::default(), crate::config::CliOverrides::default());
+        let out = server_config_json(&state).unwrap();
+        // Sanity: the effective tree carries the known top-level sections and
+        // every leaf path has a source label.
+        for section in ["server", "grpc", "metrics", "alerts", "access_control", "features"] {
+            assert!(out["config"].get(section).is_some(), "missing section {section}");
+        }
+        let sources = out["sources"].as_object().unwrap();
+        assert!(sources.len() > 50, "expected per-leaf sources, got {}", sources.len());
+        let non_default: Vec<_> = sources.iter().filter(|(_, s)| s.as_str() != Some("default")).collect();
+        assert!(non_default.is_empty(), "non-default sources: {non_default:?}");
+        assert!(out["redacted"].as_array().unwrap().is_empty());
     }
 }
