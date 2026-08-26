@@ -103,6 +103,13 @@ pub struct WorkerManager {
     // RN-14: per-stream chunk channel depth for newly constructed worker
     // stream channels (server.stream_channel_size).
     stream_channel_size: usize,
+    // H3: content-hash ledger of recent config-PATCH writes (path →
+    // (etag, when)). The PATCH's atomic rename echoes back through the
+    // file watcher; the watcher consumes a matching entry to recognize
+    // the event as control-plane-originated and leave the PATCH mode's
+    // reload decision alone (write_only = no reload, apply_reload =
+    // already reloaded, rollback = restored). TTL-pruned on insert.
+    config_write_ledger: DashMap<PathBuf, (String, std::time::Instant)>,
 }
 
 struct WorkerProcess {
@@ -158,7 +165,33 @@ impl WorkerManager {
             // RN-14: default matches ServerConfig; the production path
             // overrides via with_stream_channel_size.
             stream_channel_size: 64,
+            config_write_ledger: DashMap::new(),
         }
+    }
+
+    /// H3: upper bound on how long a control-plane write entry stays in the
+    /// ledger. Only the watcher's debounce window after the write needs the
+    /// suppression; the TTL just keeps the map bounded.
+    const CONFIG_WRITE_LEDGER_TTL: Duration = Duration::from_secs(120);
+
+    /// H3: record a control-plane config write (config PATCH, or the file
+    /// rollback after a failed apply_reload) so the file watcher can
+    /// recognize its own echo of the atomic rename. `etag` is the content
+    /// hash of the bytes that were written.
+    pub(crate) fn note_config_write(&self, path: &std::path::Path, etag: String) {
+        self.config_write_ledger
+            .retain(|_, (_, at)| at.elapsed() < Self::CONFIG_WRITE_LEDGER_TTL);
+        self.config_write_ledger
+            .insert(path.to_path_buf(), (etag, std::time::Instant::now()));
+    }
+
+    /// H3: true (consuming the entry) when `path`'s current content etag
+    /// matches a recent control-plane write — i.e. the file event is the
+    /// watcher's own echo of a config PATCH, not a human edit.
+    pub(crate) fn take_config_write(&self, path: &std::path::Path, etag: &str) -> bool {
+        self.config_write_ledger
+            .remove_if(path, |_, (recorded, _)| recorded == etag)
+            .is_some()
     }
 
     /// P0 (D6): install the ensemble plan cache. Invalidated from the

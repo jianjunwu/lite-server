@@ -121,7 +121,7 @@ pub(crate) fn redact_tree(
 /// First 16 hex chars of the file content SHA-256 — changes iff the file
 /// content changes (mtime-only etags would miss same-size rewrites within
 /// the same second).
-fn content_etag(bytes: &[u8]) -> String {
+pub(crate) fn content_etag(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -618,6 +618,7 @@ pub(crate) async fn write_prepared(prepared: &PreparedPatch) -> Result<(), Confi
 /// Fold the reload outcome into the PATCH response. The write already
 /// happened; a failed reload rolls the file back to its pre-write bytes.
 pub(crate) async fn finish_apply_reload(
+    worker_manager: &crate::worker::WorkerManager,
     prepared: PreparedPatch,
     reload: Result<bool, AppError>,
 ) -> Result<Value, ConfigPatchError> {
@@ -629,10 +630,19 @@ pub(crate) async fn finish_apply_reload(
         )),
         Err(e) => {
             match prepared.rollback().await {
-                Ok(()) => Err(ConfigPatchError::ReloadFailed {
-                    message: format!("{e}"),
-                    rolled_back: true,
-                }),
+                Ok(()) => {
+                    // H3: the rollback is itself a control-plane write —
+                    // record it so the watcher does not fire a reload for
+                    // the restored bytes. (A patch-created file rolls back
+                    // to absence; there is no content etag to record.)
+                    if let Some(bytes) = &prepared.original {
+                        worker_manager.note_config_write(&prepared.path, content_etag(bytes));
+                    }
+                    Err(ConfigPatchError::ReloadFailed {
+                        message: format!("{e}"),
+                        rolled_back: true,
+                    })
+                }
                 Err(rb) => Err(ConfigPatchError::ReloadFailed {
                     message: format!(
                         "{e}; rollback also failed: {rb} — config.yaml left in the patched state"
@@ -658,6 +668,12 @@ pub async fn model_version_config_patch(
         PrepareOutcome::Ready(p) => p,
     };
     write_prepared(&prepared).await?;
+    // H3: record the write so the file watcher recognizes the echo of this
+    // atomic rename as control-plane-originated; the reload decision belongs
+    // to this PATCH's mode, not to the watcher.
+    state
+        .worker_manager
+        .note_config_write(&prepared.path, prepared.new_etag.clone());
     if req.mode == ConfigPatchMode::WriteOnly {
         return Ok(prepared.response(
             false,
@@ -668,7 +684,7 @@ pub async fn model_version_config_patch(
         .worker_manager
         .reload_model(model_name, Some(version))
         .await;
-    finish_apply_reload(*prepared, reload).await
+    finish_apply_reload(&state.worker_manager, *prepared, reload).await
 }
 
 pub async fn model_version_config_patch_handler(
@@ -1243,9 +1259,13 @@ mod tests {
             PrepareOutcome::DryRun(_) => panic!("apply_reload never yields a dry-run report"),
         };
         write_prepared(&prepared).await.unwrap();
-        let err = finish_apply_reload(*prepared, Err(AppError::Config("worker refused".to_string())))
-            .await
-            .unwrap_err();
+        let err = finish_apply_reload(
+            &state.worker_manager,
+            *prepared,
+            Err(AppError::Config("worker refused".to_string())),
+        )
+        .await
+        .unwrap_err();
         match err {
             ConfigPatchError::ReloadFailed { message, .. } => {
                 assert!(message.contains("worker refused"));
@@ -1277,7 +1297,7 @@ mod tests {
             PrepareOutcome::DryRun(_) => panic!("apply_reload never yields a dry-run report"),
         };
         write_prepared(&prepared).await.unwrap();
-        let out = finish_apply_reload(*prepared, Ok(true)).await.unwrap();
+        let out = finish_apply_reload(&state.worker_manager, *prepared, Ok(true)).await.unwrap();
         assert_eq!(out["reloaded"], json!(true));
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1303,7 +1323,12 @@ mod tests {
         };
         write_prepared(&prepared).await.unwrap();
         assert!(read_file(&repo, "m", "1", "config.yaml").is_some());
-        let _ = finish_apply_reload(*prepared, Err(AppError::Internal("boom".to_string()))).await;
+        let _ = finish_apply_reload(
+            &state.worker_manager,
+            *prepared,
+            Err(AppError::Internal("boom".to_string())),
+        )
+        .await;
         assert!(read_file(&repo, "m", "1", "config.yaml").is_none());
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1652,9 +1677,13 @@ mod tests {
         // Make the rollback impossible: the version directory is gone.
         std::fs::remove_dir_all(repo.join("m").join("1")).unwrap();
 
-        let err = finish_apply_reload(*prepared, Err(AppError::Config("worker refused".to_string())))
-            .await
-            .unwrap_err();
+        let err = finish_apply_reload(
+            &state.worker_manager,
+            *prepared,
+            Err(AppError::Config("worker refused".to_string())),
+        )
+        .await
+        .unwrap_err();
         match err {
             ConfigPatchError::ReloadFailed { message, rolled_back } => {
                 assert!(
@@ -1678,6 +1707,7 @@ mod tests {
     /// returned in plaintext by GET /config.
     #[tokio::test]
     async fn warmup_sample_headers_are_redacted() {
+
         let repo = temp_repo("redact-warmup");
         write_config(
             &repo,
@@ -1692,6 +1722,88 @@ mod tests {
             !out.to_string().contains("topsecret-token"),
             "warmup Authorization header must not be served in plaintext: {out}"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== H3: control-plane write ledger (watcher suppression) =====
+
+    /// H3: a PATCH write must be recorded in the worker manager's
+    /// control-plane write ledger (content-hash keyed), so the file watcher
+    /// can recognize its own echo of the atomic rename and leave the PATCH
+    /// mode's reload decision alone.
+    #[tokio::test]
+    async fn write_only_patch_records_control_plane_write() {
+        let repo = temp_repo("h3-ledger-write");
+        write_config(&repo, "m", "1", "max_batch_size: 16\n");
+        let state = test_state(repo.clone());
+
+        model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &patch_req(json!({"max_batch_size": 32}), ConfigPatchMode::WriteOnly),
+        )
+        .await
+        .unwrap();
+
+        let path = repo.join("m").join("1").join("config.yaml");
+        let etag = content_etag(&std::fs::read(&path).unwrap());
+        assert!(
+            state.worker_manager.take_config_write(&path, &etag),
+            "the PATCH's write must be recorded for watcher suppression"
+        );
+        // Consumed on match — a second lookup does not match.
+        assert!(!state.worker_manager.take_config_write(&path, &etag));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// H3: the rollback after a failed apply_reload is itself a
+    /// control-plane write — the watcher must not fire a reload for the
+    /// restored bytes either.
+    #[tokio::test]
+    async fn rollback_write_is_recorded_for_watcher_suppression() {
+        let repo = temp_repo("h3-ledger-rollback");
+        write_config(&repo, "m", "1", "max_batch_size: 16\n");
+        let state = test_state(repo.clone());
+        let original_etag = content_etag(b"max_batch_size: 16\n");
+
+        let prepared = match prepare_config_patch(
+            &state,
+            "m",
+            "1",
+            &patch_req(json!({"max_batch_size": 32}), ConfigPatchMode::ApplyReload),
+        )
+        .await
+        .unwrap()
+        {
+            PrepareOutcome::Ready(p) => p,
+            PrepareOutcome::DryRun(_) => panic!("apply_reload never yields a dry-run report"),
+        };
+        write_prepared(&prepared).await.unwrap();
+        let err = finish_apply_reload(
+            &state.worker_manager,
+            *prepared,
+            Err(AppError::Config("worker refused".to_string())),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigPatchError::ReloadFailed {
+                rolled_back: true,
+                ..
+            }
+        ));
+
+        let path = repo.join("m").join("1").join("config.yaml");
+        assert!(
+            state
+                .worker_manager
+                .take_config_write(&path, &original_etag),
+            "the rollback write must be recorded for watcher suppression"
+        );
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
