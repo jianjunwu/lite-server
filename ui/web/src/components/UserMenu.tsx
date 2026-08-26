@@ -4,12 +4,13 @@ import { UserOutlined, KeyOutlined, LogoutOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../context/AuthContext';
 import { authApi } from '../api/auth';
-import { STATUS_COLORS } from '../theme';
 
+// Role tags are identity markers, not alerts — keep them off the status
+// hues (red/amber mean "something is wrong" everywhere else).
 const ROLE_COLORS: Record<string, string> = {
-  admin: '#DC2626',
-  operator: '#D97706',
-  viewer: STATUS_COLORS.ready,
+  admin: '#6E6E73',
+  operator: '#0071E3',
+  viewer: '#8E8E93',
 };
 
 export function UserMenu() {

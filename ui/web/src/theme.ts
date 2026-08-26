@@ -28,6 +28,9 @@ export function getThemeConfig(dark: boolean): ThemeConfig {
         headerBg: dark ? '#000000' : '#FFFFFF',
         siderBg: dark ? '#000000' : '#FFFFFF',
         bodyBg: dark ? '#000000' : '#FFFFFF',
+        // The stock trigger bar is antd navy; blend it into the sider.
+        triggerBg: dark ? '#000000' : '#FFFFFF',
+        triggerColor: dark ? 'rgba(255,255,255,0.65)' : 'rgba(0,0,0,0.45)',
       },
       Card: {
         borderRadiusLG: 24,
