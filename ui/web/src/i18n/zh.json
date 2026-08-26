@@ -445,5 +445,21 @@
   "versions": {
     "ofTraffic": "{{weight}}% 流量",
     "loadedSince": "已加载 {{age}}"
+  },
+  "modelConfig": {
+    "title": "配置",
+    "noFile": "该版本没有 config.yaml",
+    "empty": "配置文件为空",
+    "unsupported": "不可用(实例不可达或实例版本过旧)",
+    "groups": {
+      "batching": "批处理",
+      "resources": "资源与设备",
+      "queue": "队列与超时",
+      "lifecycle": "生命周期与回收",
+      "resilience": "重试与弹出",
+      "health": "健康检查",
+      "policies": "策略",
+      "advanced": "高级(未识别键)"
+    }
   }
 }

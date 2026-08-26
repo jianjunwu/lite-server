@@ -1,10 +1,12 @@
-import { Card, Descriptions, Empty } from 'antd';
+import { Card, Descriptions, Empty, Typography } from 'antd';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
 import { useMergedVersions, useModelHealth, useModelReady, useTimeline } from '../api/hooks';
+import { useModelConfig } from '../api/config';
+import { ConfigForm } from '../components/config/ConfigForm';
 import { StatusBadge } from '../components/StatusBadge';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
@@ -33,6 +35,7 @@ export function VersionDetailPage() {
   const readyQuery = useModelReady(instanceId, name, version, isLoaded);
   const healthQuery = useModelHealth(instanceId, name, version, isLoaded);
   const timelineQuery = useTimeline(instanceId, name, version, 5_000, isLoaded);
+  const configQuery = useModelConfig(instanceId, name, version);
 
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
 
@@ -100,6 +103,18 @@ export function VersionDetailPage() {
             ) : null}
           </Descriptions.Item>
         </Descriptions>
+      </Card>
+
+      {/* M1: version config read view — visible for unloaded versions too
+          (review the file before loading). */}
+      <Card size="small" title={t('modelConfig.title')} loading={configQuery.isLoading}>
+        {configQuery.isError ? (
+          <Typography.Text type="secondary">{t('modelConfig.unsupported')}</Typography.Text>
+        ) : (
+          configQuery.data && (
+            <ConfigForm config={configQuery.data.config} hasFile={configQuery.data.has_file} />
+          )
+        )}
       </Card>
 
       {isLoaded ? (

@@ -188,6 +188,17 @@ def test_should_deny_single_model_get_when_whitelist_active(ctx):
     assert res.json()["reason"] == "model_denied"
 
 
+def test_should_gate_version_config_read_like_other_model_reads(ctx):
+    # M1: GET /v2/models/{m}/versions/{v}/config is a model-scoped read —
+    # the whitelist decides by the model segment, same as /ready.
+    ctx["store"].set_model_grant("op1", "dev", "alpha", "viewer")
+    client = ctx["client"]
+    login(client, "op1", "op-pass-1234")
+    res = client.get("/api/i/dev/v2/models/beta/versions/1/config")
+    assert res.status_code == 403
+    assert res.json()["reason"] == "model_denied"
+
+
 # ---- management API ----
 
 def test_should_manage_model_grants_via_api_as_admin(ctx):

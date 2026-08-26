@@ -450,5 +450,21 @@
   "versions": {
     "ofTraffic": "{{weight}}% of traffic",
     "loadedSince": "loaded {{age}} ago"
+  },
+  "modelConfig": {
+    "title": "Configuration",
+    "noFile": "This version has no config.yaml",
+    "empty": "The config file is empty",
+    "unsupported": "Not available (instance unreachable or predates this feature)",
+    "groups": {
+      "batching": "Batching",
+      "resources": "Resources & devices",
+      "queue": "Queue & timeouts",
+      "lifecycle": "Lifecycle & recycle",
+      "resilience": "Retries & ejection",
+      "health": "Health checks",
+      "policies": "Policies",
+      "advanced": "Advanced (unrecognized keys)"
+    }
   }
 }

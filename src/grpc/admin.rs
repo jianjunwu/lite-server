@@ -1098,6 +1098,35 @@ impl Admin for GrpcAdminService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn get_model_config(
+        &self,
+        req: Request<pb::GetModelConfigRequest>,
+    ) -> Result<Response<pb::GetModelConfigResponse>, Status> {
+        let r = req.get_ref();
+        crate::validation::validate_identifier(&r.model_name).map_err(to_status)?;
+        crate::validation::validate_version(&r.version).map_err(to_status)?;
+        // Shared core with the HTTP handler — same redaction and etag.
+        let out = crate::http::handlers::config::model_version_config_json(
+            &self.app_state,
+            &r.model_name,
+            &r.version,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::GetModelConfigResponse {
+            model: r.model_name.clone(),
+            version: r.version.clone(),
+            config_json: out["config"].to_string(),
+            has_file: out["has_file"].as_bool().unwrap_or(false),
+            redacted: out["redacted"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            etag: out["etag"].as_str().map(String::from),
+            loaded_at: out["loaded_at"].as_u64(),
+        }))
+    }
+
     async fn list_files(
         &self,
         req: Request<pb::ListFilesRequest>,
@@ -2933,5 +2962,57 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound, "download_model: {err}");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== GetModelConfig (M1) =====
+
+    #[tokio::test]
+    async fn get_model_config_returns_redacted_tree_and_etag() {
+        let repo = unique_repo("get-model-config");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("config.yaml"),
+            "max_batch_size: 8\npolicies:\n  auth:\n    keys: [alpha, beta]\n",
+        )
+        .await
+        .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .get_model_config(Request::new(pb::GetModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.has_file);
+        assert_eq!(resp.etag.as_deref().map(str::len), Some(16));
+        assert_eq!(resp.redacted, vec!["policies.auth.keys".to_string()]);
+        let config: serde_json::Value = serde_json::from_str(&resp.config_json).unwrap();
+        assert_eq!(config["max_batch_size"], serde_json::json!(8));
+        assert_eq!(
+            config["policies"]["auth"]["keys"],
+            serde_json::json!(["***", "***"])
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn get_model_config_unknown_version_is_not_found() {
+        let svc = build_admin_service_with_repo(
+            Arc::new(ModelRegistry::new()),
+            unique_repo("get-model-config-404"),
+        );
+        let err = svc
+            .get_model_config(Request::new(pb::GetModelConfigRequest {
+                model_name: "ghost".to_string(),
+                version: "9".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

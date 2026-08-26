@@ -366,6 +366,9 @@ service Admin {
   rpc UploadModel(stream UploadModelRequest) returns (UploadModelResponse);
   rpc DownloadModel(DownloadModelRequest) returns (stream DownloadModelChunk);
   rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  // M1 (admin-enhancement plan): model version config read — mirrors
+  // GET /v2/models/:m/versions/:v/config. Additive-only.
+  rpc GetModelConfig(GetModelConfigRequest) returns (GetModelConfigResponse);
 }
 
 // --- GetInfo (mirrors GET /info) ---
@@ -643,4 +646,19 @@ message FileEntry {
   // Epoch seconds; absent when unreadable (HTTP JSON emits null there).
   optional uint64 modified = 3;
   bool is_dir = 4;
+}
+
+// --- GetModelConfig (mirrors GET /v2/models/:m/versions/:v/config, M1) ---
+message GetModelConfigRequest {
+  string model_name = 1;
+  string version = 2;
+}
+message GetModelConfigResponse {
+  string model = 1;
+  string version = 2;
+  string config_json = 3;                // redacted file tree, JSON-encoded
+  bool has_file = 4;                     // false when the version has no config.yaml
+  repeated string redacted = 5;          // dot-joined redacted paths
+  optional string etag = 6;              // content SHA-256 (16 hex); absent without file
+  optional uint64 loaded_at = 7;         // epoch seconds; absent when not loaded
 }
