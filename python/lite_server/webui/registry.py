@@ -33,10 +33,14 @@ def _error(exc: Exception) -> JSONResponse:
 
 
 async def _probe(client: httpx.AsyncClient, base_url: str) -> bool:
-    """Reachability probe: GET {base_url}/info with a short timeout."""
+    """Reachability probe: GET {base_url}/info with a short timeout.
+
+    Any HTTP response counts as reachable: a 401/403 means the instance is
+    alive behind an auth gate (access_control classifies /info as admin),
+    not down. Only transport errors mean unreachable."""
     try:
-        res = await client.get(f"{base_url}/info", timeout=2.0)
-        return 200 <= res.status_code < 300
+        await client.get(f"{base_url}/info", timeout=2.0)
+        return True
     except httpx.HTTPError:
         return False
 

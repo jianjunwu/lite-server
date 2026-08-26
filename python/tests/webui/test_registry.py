@@ -1,6 +1,8 @@
 """Port of ui/server/test/instances-crud.test.ts."""
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from lite_server.webui.app import build_app
 from lite_server.webui.config import InstanceStore
@@ -103,3 +105,33 @@ def test_should_probe_reachability_when_requested_and_reject_unreachable_with_42
     assert res.json()["error"] == "instance_unreachable"
     # Not saved.
     assert "dead" not in open(file, encoding="utf-8").read()
+
+
+def test_should_probe_treat_auth_gated_instance_as_reachable(tmp_path, client_factory):
+    """A 401 from /info means the server is alive behind an auth gate
+    (access_control classifies /info as admin), not unreachable."""
+
+    class Gated(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"error":{"type":"authentication_error"}}'
+            self.send_response(401)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Gated)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        file = seed(tmp_path)
+        client = client_factory(build_app(InstanceStore(file, {})))
+        res = client.post("/api/instances?probe=true",
+                          json={"id": "gated", "name": "Gated", "base_url": base_url})
+        assert res.status_code == 201
+        assert "gated" in open(file, encoding="utf-8").read()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
