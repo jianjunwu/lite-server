@@ -20,6 +20,10 @@ const MAX_MODEL_ROWS = 6;
 // Asymmetric card rhythm (plan §4.1): wide/narrow alternating pairs.
 const CARD_SPANS = [14, 10, 10, 14];
 
+// Poll healthy instances briskly; back off when one is down so a dead
+// backend does not spam a failed request every 10s.
+const pollMs = (query: { state: { status: string } }) => (query.state.status === 'error' ? 30_000 : 10_000);
+
 export function OverviewPage() {
   const { t } = useTranslation();
   const neutrals = useNeutrals();
@@ -31,7 +35,7 @@ export function OverviewPage() {
       queryKey: [i.id, 'health'],
       queryFn: () => apiFetch<HealthSummary>(i.id, '/health'),
       retry: 0,
-      refetchInterval: 10_000,
+      refetchInterval: pollMs,
     })),
   });
   const infoQueries = useQueries({
@@ -46,7 +50,7 @@ export function OverviewPage() {
       queryKey: [i.id, 'timeline'],
       queryFn: () => apiFetch<TimelineAllResponse>(i.id, '/metrics/timeline'),
       retry: 0,
-      refetchInterval: 10_000,
+      refetchInterval: pollMs,
     })),
   });
   const alertsQueries = useQueries({
@@ -54,7 +58,7 @@ export function OverviewPage() {
       queryKey: [i.id, 'alerts'],
       queryFn: () => apiFetch<AlertsResponse>(i.id, '/metrics/alerts'),
       retry: 0,
-      refetchInterval: 10_000,
+      refetchInterval: pollMs,
     })),
   });
 
@@ -121,23 +125,30 @@ export function OverviewPage() {
 
   const degraded = totalVersions - statusCounts.ready;
   const checking = totalVersions === 0 && healthQueries.some((q) => q.isLoading);
+  // When every instance is down the version counts are unknown, not zero —
+  // the hero must say so instead of claiming "All 0 versions ready".
+  const allDown = !checking && instances.length > 0 && unreachable === instances.length;
 
   // The hero statement IS the monitoring conclusion (plan §3): quiet good
   // news when all is well, colored when something needs attention.
   const tone = checking
     ? 'ink'
-    : statusCounts.error > 0
+    : allDown
       ? 'error'
-      : degraded > 0
-        ? 'warning'
-        : 'ink';
+      : statusCounts.error > 0
+        ? 'error'
+        : degraded > 0
+          ? 'warning'
+          : 'ink';
   const statement = checking
     ? t('overview.stmtChecking')
-    : statusCounts.error > 0
-      ? t('overview.stmtDown', { count: statusCounts.error })
-      : degraded > 0
-        ? t('overview.stmtAttention', { count: degraded })
-        : t('overview.stmtAllReady', { versions: totalVersions });
+    : allDown
+      ? t('overview.stmtUnreachable')
+      : statusCounts.error > 0
+        ? t('overview.stmtDown', { count: statusCounts.error })
+        : degraded > 0
+          ? t('overview.stmtAttention', { count: degraded })
+          : t('overview.stmtAllReady', { versions: totalVersions });
   const subline = [
     t('overview.acrossInstances', { count: instances.length }),
     unreachable > 0 ? t('overview.unreachableCount', { count: unreachable }) : null,
@@ -188,6 +199,7 @@ export function OverviewPage() {
       <PageHero
         eyebrow={t('overview.title')}
         live
+        liveState={allDown ? 'offline' : 'live'}
         statement={statement}
         tone={tone}
         subline={subline}

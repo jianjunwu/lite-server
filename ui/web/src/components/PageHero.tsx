@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
 import { STATUS_COLORS, TYPE } from '../theme';
 import { SPACE, revealStyle } from '../tokens';
 import { useNeutrals } from '../context/ThemeModeContext';
@@ -17,6 +18,8 @@ interface PageHeroProps {
   extra?: ReactNode;
   /** Show a live indicator next to the eyebrow. */
   live?: boolean;
+  /** State of the live indicator; 'offline' grays it out when nothing is reachable. */
+  liveState?: 'live' | 'offline';
 }
 
 /**
@@ -24,9 +27,11 @@ interface PageHeroProps {
  * The statement is generated from real-time data — quiet good news when
  * all is well, colored when something needs attention (plan §3).
  */
-export function PageHero({ eyebrow, statement, tone = 'ink', subline, extra, live }: PageHeroProps) {
+export function PageHero({ eyebrow, statement, tone = 'ink', subline, extra, live, liveState = 'live' }: PageHeroProps) {
+  const { t } = useTranslation();
   const neutrals = useNeutrals();
   const color = tone === 'ink' ? neutrals.textPrimary : STATUS_COLORS[tone];
+  const offline = liveState === 'offline';
   return (
     <div className="reveal" style={{ marginBottom: SPACE[8] }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: SPACE[2], marginBottom: SPACE[3] }}>
@@ -45,9 +50,16 @@ export function PageHero({ eyebrow, statement, tone = 'ink', subline, extra, liv
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[1] }}>
             <span
               aria-hidden
-              style={{ width: 6, height: 6, borderRadius: '50%', background: STATUS_COLORS.ready }}
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: offline ? neutrals.textMuted : STATUS_COLORS.ready,
+              }}
             />
-            <span style={{ fontSize: TYPE.eyebrow, color: neutrals.textMuted }}>live</span>
+            <span style={{ fontSize: TYPE.eyebrow, color: neutrals.textMuted }}>
+              {offline ? t('common.offline') : t('common.live')}
+            </span>
           </span>
         )}
       </div>

@@ -29,7 +29,9 @@
     "back": "Back",
     "noInstanceAccess": "No access to this instance",
     "noInstanceAccessBody": "It is hidden for your account or does not exist. Pick another instance above.",
-    "ageAgo": "{{age}} ago"
+    "ageAgo": "{{age}} ago",
+    "live": "live",
+    "offline": "offline"
   },
   "overview": {
     "title": "Overview",
@@ -44,6 +46,7 @@
     "loadedModels": "Loaded models",
     "allReady": "All {{versions}} versions ready across {{instances}} instances",
     "stmtChecking": "Checking fleet status…",
+    "stmtUnreachable": "All instances unreachable",
     "stmtAllReady": "All {{versions}} versions ready",
     "stmtAttention_one": "{{count}} version needs attention",
     "stmtAttention_other": "{{count}} versions need attention",

@@ -29,7 +29,9 @@
     "back": "返回",
     "noInstanceAccess": "无权访问该实例",
     "noInstanceAccessBody": "该实例对你的账号不可见或不存在，请在上方选择其他实例。",
-    "ageAgo": "{{age}}前"
+    "ageAgo": "{{age}}前",
+    "live": "实时",
+    "offline": "离线"
   },
   "overview": {
     "title": "概览",
@@ -44,6 +46,7 @@
     "loadedModels": "已加载模型",
     "allReady": "全部 {{versions}} 个版本就绪（{{instances}} 个实例）",
     "stmtChecking": "正在检查集群状态…",
+    "stmtUnreachable": "所有实例不可达",
     "stmtAllReady": "{{versions}} 个版本全部就绪",
     "stmtAttention": "{{count}} 个版本需要关注",
     "stmtDown": "{{count}} 个版本故障",

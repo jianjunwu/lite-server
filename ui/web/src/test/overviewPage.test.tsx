@@ -73,3 +73,41 @@ describe('OverviewPage instance model rows', () => {
     expect(name.style.flex).toBe('0 0 180px');
   });
 });
+
+describe('OverviewPage hero when every instance is unreachable', () => {
+  function stubAllDown() {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } }),
+        ),
+      ),
+    );
+  }
+
+  function renderPage() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={['/overview?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <OverviewPage />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  it('should_state_unreachable_instead_of_claiming_zero_versions_ready', async () => {
+    stubAllDown();
+    renderPage();
+    expect(await screen.findByText('All instances unreachable')).toBeTruthy();
+    expect(screen.queryByText(/versions ready/)).toBeNull();
+  });
+
+  it('should_show_an_offline_indicator_instead_of_a_green_live_dot', async () => {
+    stubAllDown();
+    renderPage();
+    expect(await screen.findByText('offline')).toBeTruthy();
+    expect(screen.queryByText('live')).toBeNull();
+  });
+});
