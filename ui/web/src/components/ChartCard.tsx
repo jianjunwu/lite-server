@@ -7,6 +7,8 @@ interface ChartCardProps {
   loading: boolean;
   error: Error | null;
   isEmpty: boolean;
+  /** Empty-state text override (default: common.empty). */
+  emptyText?: ReactNode;
   onRetry?: () => void;
   extra?: ReactNode;
   children: ReactNode;
@@ -14,7 +16,7 @@ interface ChartCardProps {
 }
 
 /** Unified three-state wrapper: loading skeleton / empty / error-with-retry. */
-export function ChartCard({ title, loading, error, isEmpty, onRetry, extra, children, height = 240 }: ChartCardProps) {
+export function ChartCard({ title, loading, error, isEmpty, emptyText, onRetry, extra, children, height = 240 }: ChartCardProps) {
   const { t } = useTranslation();
   let body: ReactNode;
   if (loading) {
@@ -29,7 +31,7 @@ export function ChartCard({ title, loading, error, isEmpty, onRetry, extra, chil
       />
     );
   } else if (isEmpty) {
-    body = <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.empty')} />;
+    body = <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyText ?? t('common.empty')} />;
   } else {
     body = children;
   }

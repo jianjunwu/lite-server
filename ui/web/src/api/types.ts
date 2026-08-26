@@ -108,6 +108,19 @@ export interface TimelineEntry {
   queue_depth: number;
   active_workers: number;
   active_streams: number;
+  // M3 extension fields — optional: instances older than the schema omit
+  // them entirely (UI shows "unsupported"); tokens_per_s is null until the
+  // model reports tokens via the worker callback channel.
+  in_flight?: number;
+  worker_saturation?: number;
+  ttft_p99_ms?: number;
+  tbt_p99_ms?: number;
+  stream_bytes_per_s?: number;
+  tokens_per_s?: number | null;
+  rss_mb?: number;
+  cpu_percent?: number;
+  retries_per_s?: number;
+  ejections_per_s?: number;
 }
 
 export interface TimelineSnapshot {

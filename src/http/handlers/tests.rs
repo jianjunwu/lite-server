@@ -469,6 +469,80 @@ mod version_routing_tests {
         assert_eq!(json["version"], "2", "bare timeline must default to the active version");
     }
 
+    // ===== M3: step downsampling + coverage headers =====
+
+    async fn get(app: Router, uri: &str) -> axum::response::Response {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn timeline_step_zero_is_rejected() {
+        let app = Router::new().route("/metrics/timeline", axum::routing::get(timeline_handler));
+        let resp = get(app, "/metrics/timeline?step=0").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "step=0 must be rejected");
+    }
+
+    #[tokio::test]
+    async fn timeline_versioned_step_zero_is_rejected() {
+        let app = Router::new().route(
+            "/metrics/timeline/:model_name/versions/:version",
+            axum::routing::get(timeline_model_version_handler),
+        );
+        let resp = get(app, "/metrics/timeline/m/versions/1?step=0").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timeline_reports_coverage_and_downsamples() {
+        use crate::metrics::aggregator::TIMELINE;
+        crate::metrics::prometheus::register_metrics().ok();
+        // One sample is enough: the assertions are count-relative.
+        TIMELINE.sample("m3_step", "1").await;
+        let raw_count = TIMELINE.get_timeline("m3_step", "1").await.len();
+        assert!(raw_count >= 1);
+
+        let app = Router::new().route("/metrics/timeline", axum::routing::get(timeline_handler));
+
+        // Coverage headers describe the retention window.
+        let resp = get(app.clone(), "/metrics/timeline").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-timeline-coverage").unwrap(),
+            &TIMELINE.coverage_secs().to_string(),
+        );
+        assert_eq!(
+            resp.headers().get("x-timeline-interval").unwrap(),
+            &TIMELINE.sample_interval_secs().to_string(),
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let full = json["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["model"] == "m3_step")
+            .unwrap();
+        assert_eq!(full["entries"].as_array().unwrap().len(), raw_count);
+
+        // A step beyond the point count keeps exactly the latest point.
+        let resp = get(app, "/metrics/timeline?step=100000").await;
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let sampled = json["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["model"] == "m3_step")
+            .unwrap();
+        let entries = sampled["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "oversized step must keep the latest point");
+        assert_eq!(entries[0]["timestamp"], full["entries"].as_array().unwrap().last().unwrap()["timestamp"]);
+
+        TIMELINE.remove("m3_step", "1").await;
+    }
+
     // ===== §4.5: multi-version health =====
 
     #[tokio::test]

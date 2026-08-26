@@ -71,6 +71,17 @@ function errorMessage(body: unknown, status: number): string {
 
 /** Fetch against the BFF; throws ApiError carrying the upstream x-request-id. */
 export async function apiFetch<T>(instanceId: string, path: string, init?: RequestInit): Promise<T> {
+  const { data } = await apiFetchWithHeaders<T>(instanceId, path, init);
+  return data;
+}
+
+/** Same as apiFetch but also exposes the response headers (e.g. the
+ * X-Timeline-* retention metadata). */
+export async function apiFetchWithHeaders<T>(
+  instanceId: string,
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; headers: Headers }> {
   const headers = new Headers(init?.headers);
   headers.set('x-requested-with', 'lite-ui');
   const key = getAdminKey(instanceId);
@@ -88,7 +99,7 @@ export async function apiFetch<T>(instanceId: string, path: string, init?: Reque
     const message = errorMessage(body, res.status);
     throw new ApiError(res.status, res.headers.get('x-request-id'), body, message);
   }
-  return res.json() as Promise<T>;
+  return { data: (await res.json()) as T, headers: res.headers };
 }
 
 /** Fetch against the BFF itself (not an instance). */
