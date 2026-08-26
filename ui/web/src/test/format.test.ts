@@ -35,8 +35,12 @@ describe('formatMs', () => {
 });
 
 describe('formatAge', () => {
-  it('should_format_minutes_and_seconds', () => {
-    expect(formatAge(1000, 1000 + 182)).toBe('3m2s');
+  it('should_round_to_the_largest_unit_only', () => {
+    // "36m8s" reads like a countdown; a quiet "36m" is enough for a table.
+    expect(formatAge(1000, 1000 + 182)).toBe('3m');
+    expect(formatAge(1000, 1000 + 45)).toBe('45s');
+    expect(formatAge(1000, 1000 + 7300)).toBe('2h');
+    expect(formatAge(1000, 1000 + 3 * 86400 + 7200)).toBe('3d');
   });
   it('should_return_dash_for_null', () => {
     expect(formatAge(null)).toBe('-');

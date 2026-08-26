@@ -25,14 +25,15 @@ export function formatMs(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
-/** Unix seconds -> "3m2s ago"-style relative duration. */
+/** Unix seconds -> rounded single-unit age ("3m", "2h", "3d"). Wrap with
+ * i18n (`common.ageAgo`) at the call site for display. */
 export function formatAge(unixSecs: number | null | undefined, nowSecs = Date.now() / 1000): string {
   if (unixSecs == null) return '-';
   const delta = Math.max(0, nowSecs - unixSecs);
   if (delta < 60) return `${Math.floor(delta)}s`;
-  if (delta < 3600) return `${Math.floor(delta / 60)}m${Math.floor(delta % 60)}s`;
-  if (delta < 86400) return `${Math.floor(delta / 3600)}h${Math.floor((delta % 3600) / 60)}m`;
-  return `${Math.floor(delta / 86400)}d${Math.floor((delta % 86400) / 3600)}h`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h`;
+  return `${Math.floor(delta / 86400)}d`;
 }
 
 export function formatTime(unixSecs: number): string {

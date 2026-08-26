@@ -86,7 +86,7 @@ export function VersionDetailPage() {
               </Descriptions.Item>
               <Descriptions.Item label={t('common.weight')}>{info?.weight ?? '-'}</Descriptions.Item>
               <Descriptions.Item label={t('common.loadedAt')}>
-                {info?.loaded_at ? formatAge(info.loaded_at) : '-'}
+                {info?.loaded_at ? t('common.ageAgo', { age: formatAge(info.loaded_at) }) : '-'}
               </Descriptions.Item>
             </>
           )}

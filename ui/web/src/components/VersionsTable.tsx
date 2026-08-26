@@ -1,9 +1,8 @@
 import { Table, type TableProps } from 'antd';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import type { VersionInfo } from '../api/types';
 import { StatusBadge } from './StatusBadge';
-import { TrafficRiver } from './TrafficRiver';
 import { VersionActions } from './VersionActions';
 import { formatAge } from './format';
 import { useNeutrals } from '../context/ThemeModeContext';
@@ -19,11 +18,10 @@ interface VersionsTableProps {
 }
 
 /** Shared versions table — used by the Models page expand row and the model
- * detail Versions tab. The traffic river spans all versions, so it renders
- * once as the table's title strip, not as a per-row column. */
+ * detail Versions tab. The traffic river lives at page level (card body /
+ * detail hero), once per view, not inside this table. */
 export function VersionsTable({ model, versions, loading, ops }: VersionsTableProps) {
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const neutrals = useNeutrals();
   const ilink = useInstanceLink();
 
@@ -74,7 +72,7 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
       title: t('common.loadedAt'),
       dataIndex: 'loaded_at',
       width: 100,
-      render: (ts: number | null) => <span style={dataTextStyle}>{ts ? formatAge(ts) : '-'}</span>,
+      render: (ts: number | null) => <span style={dataTextStyle}>{ts ? t('common.ageAgo', { age: formatAge(ts) }) : '-'}</span>,
     },
   ];
 
@@ -93,16 +91,6 @@ export function VersionsTable({ model, versions, loading, ops }: VersionsTablePr
       loading={loading}
       dataSource={versions}
       pagination={false}
-      title={() =>
-        versions.length > 0 ? (
-          <TrafficRiver
-            versions={versions}
-            model={model}
-            editable={ops}
-            onSelect={(v) => navigate(ilink(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(v)}`))}
-          />
-        ) : null
-      }
       columns={columns}
     />
   );

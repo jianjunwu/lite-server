@@ -271,7 +271,7 @@ export function OverviewPage() {
                           <div key={m.name} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                             <Link
                               to={`/models/${encodeURIComponent(m.name)}?i=${encodeURIComponent(inst.id)}`}
-                              style={{ flex: '0 0 40%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                              style={{ flex: '0 0 180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
                             >
                               {m.name}
                             </Link>
