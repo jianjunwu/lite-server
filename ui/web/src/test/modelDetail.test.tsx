@@ -34,12 +34,18 @@ const mockHealth: { data: { total_workers: number; workers: never[] } | undefine
   data: undefined,
   isLoading: false,
 };
+const mockTimeline: {
+  data: { model: string; version: string; entries: Record<string, unknown>[] } | undefined;
+  isLoading: boolean;
+  error: Error | null;
+  refetch: () => void;
+} = { data: undefined, isLoading: false, error: null, refetch: vi.fn() };
 
 vi.mock('../api/hooks', () => ({
   useMergedModels: () => mockModelsList,
   useMergedVersions: () => mockMerged,
   useModelHealth: () => mockHealth,
-  useTimeline: () => ({ data: undefined, isLoading: false, error: null, refetch: vi.fn() }),
+  useTimeline: () => mockTimeline,
 }));
 
 vi.mock('../api/download', () => ({ downloadModelPackage: vi.fn() }));
@@ -68,15 +74,16 @@ vi.mock('../context/ThemeModeContext', () => ({
   useChartColors: () => ['#4F46E5'],
 }));
 
-function renderPage(model = 'ghost') {
+function renderPage(model = 'ghost', fetchImpl?: (url: string) => Response) {
   vi.stubGlobal(
     'fetch',
-    vi.fn(() =>
+    vi.fn((input: RequestInfo | URL) =>
       Promise.resolve(
-        new Response(JSON.stringify({ error: 'not found' }), {
-          status: 404,
-          headers: { 'content-type': 'application/json' },
-        }),
+        fetchImpl?.(String(input)) ??
+          new Response(JSON.stringify({ error: 'not found' }), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          }),
       ),
     ),
   );
@@ -96,12 +103,16 @@ function renderPage(model = 'ghost') {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  localStorage.clear();
   mockMerged.versions = [];
   mockMerged.activeVersion = null;
   mockMerged.isLoading = false;
   mockMerged.inRepo = true;
   mockMerged.hasLoaded = false;
   mockHealth.data = undefined;
+  mockTimeline.data = undefined;
+  mockTimeline.isLoading = false;
+  mockTimeline.error = null;
 });
 
 const loadedVersionRow = (version: string, weight: number, active: boolean) => ({
@@ -277,5 +288,136 @@ describe('ModelDetailPage unloaded model', () => {
     expect(screen.queryByRole('button', { name: /4 workers/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /1\/1 ready/i })).toBeNull();
     expect(screen.queryByRole('link', { name: /1 · 100%/ })).toBeNull();
+  });
+});
+
+/** One loaded echo v1 at 100% traffic — the baseline for the live-data suites. */
+function loadEcho() {
+  mockMerged.versions = [loadedVersionRow('1', 100, true)];
+  mockMerged.activeVersion = '1';
+  mockMerged.hasLoaded = true;
+}
+
+function timelineWith(entry: Record<string, unknown>) {
+  mockTimeline.data = { model: 'echo', version: '1', entries: [entry] };
+}
+
+const chartTitles = () =>
+  [...document.querySelectorAll('.ant-card-head-title')].map((el) => el.textContent);
+
+describe('ModelDetailPage KPI strip', () => {
+  it('should_show_current_qps_p99_queue_and_workers_from_the_latest_timeline_point', () => {
+    loadEcho();
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 3 });
+    renderPage('echo');
+    expect(screen.getByText('Current QPS')).toBeTruthy();
+    expect(screen.getByText('1.2')).toBeTruthy();
+    expect(screen.getByText('Current p99')).toBeTruthy();
+    expect(screen.getByText('1.8ms')).toBeTruthy();
+    expect(screen.getByText('3')).toBeTruthy();
+    expect(screen.getAllByText('1/1').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should_render_dashes_when_no_timeline_data_is_available', () => {
+    loadEcho();
+    renderPage('echo');
+    expect(screen.getByText('Current QPS')).toBeTruthy();
+    expect(screen.getAllByText('-').length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('ModelDetailPage metrics tab', () => {
+  it('should_render_six_default_metric_charts', () => {
+    loadEcho();
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5 });
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    expect(chartTitles()).toEqual([
+      'QPS',
+      'P99 latency',
+      'TTFT p99',
+      'Queue depth',
+      'In-flight',
+      'Worker saturation',
+    ]);
+  });
+
+  it('should_mark_a_chart_unsupported_when_the_instance_omits_that_field', () => {
+    loadEcho();
+    // Pre-M3 schema: no ttft_p99_ms at all → the card explains instead of faking zeros.
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1 });
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    expect(screen.getByText('This instance version does not report this metric')).toBeTruthy();
+  });
+
+  it('should_let_the_user_add_and_remove_charts_and_persist_the_selection', async () => {
+    loadEcho();
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5, cpu_percent: 0.4 });
+    const { unmount } = renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(await screen.findByText('CPU'));
+    expect(chartTitles()).toContain('CPU');
+    expect(localStorage.getItem('lite-ui-model-metrics-v1')).toContain('cpu_percent');
+    unmount();
+
+    // The selection survives a remount.
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    expect(chartTitles()).toContain('CPU');
+  });
+
+  it('should_restore_the_default_six_on_reset', async () => {
+    loadEcho();
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5, cpu_percent: 0.4 });
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(await screen.findByText('CPU'));
+    expect(chartTitles()).toContain('CPU');
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(chartTitles()).toHaveLength(6);
+    expect(chartTitles()).not.toContain('CPU');
+  });
+});
+
+describe('ModelDetailPage compare tab', () => {
+  const compareFetch = (body: unknown) => (url: string) =>
+    url.includes('/compare')
+      ? new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+      : new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } });
+
+  it('should_render_a_structured_table_instead_of_raw_json', async () => {
+    loadEcho();
+    // The compare query fires on page mount, so the stub must precede render.
+    renderPage('echo', compareFetch({
+      model: 'echo',
+      versions: [
+        { version: '1', avg_qps: 0.07, avg_p99_ms: 0.7, avg_queue_depth: 0, avg_active_workers: 2, sample_count: 30 },
+      ],
+    }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
+    expect(await screen.findByRole('link', { name: '1' })).toBeTruthy();
+    expect(screen.getByText('Avg QPS')).toBeTruthy();
+    expect(screen.getByText('0.07')).toBeTruthy();
+    expect(screen.getByText('30')).toBeTruthy();
+  });
+
+  it('should_show_an_empty_state_when_there_are_no_samples_yet', async () => {
+    loadEcho();
+    renderPage('echo', compareFetch({ model: 'echo', versions: [] }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
+    expect(await screen.findByText(/no comparison data/i)).toBeTruthy();
+  });
+});
+
+describe('ModelDetailPage traffic strip', () => {
+  it('should_explain_the_drag_interaction_when_editable', () => {
+    mockMerged.versions = [loadedVersionRow('v1', 70, false), loadedVersionRow('v2', 30, true)];
+    mockMerged.activeVersion = 'v2';
+    mockMerged.hasLoaded = true;
+    renderPage('echo');
+    expect(screen.getByText(/drag a divider to shift weight/i)).toBeTruthy();
   });
 });
