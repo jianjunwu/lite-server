@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -48,10 +50,19 @@ class ArtifactCache:
             if stored_path.exists():
                 return stored_path
 
-        # Cache miss or stale: extract
-        cached_path.mkdir(parents=True, exist_ok=True)
-        unpacker = ModelUnpacker(artifact_path)
-        unpacker.unpack(cached_path, prepend_name=False)
+        # Cache miss or stale: extract into a fresh temp dir, then swap it
+        # into place — re-extracting into the same directory would mix files
+        # left over from a previous artifact with the new ones.
+        tmp_path = self.cache_dir / f".{model_name}.tmp-{uuid.uuid4().hex}"
+        try:
+            tmp_path.mkdir(parents=True)
+            unpacker = ModelUnpacker(artifact_path)
+            unpacker.unpack(tmp_path, prepend_name=False)
+            shutil.rmtree(cached_path, ignore_errors=True)
+            tmp_path.rename(cached_path)
+        except BaseException:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+            raise
 
         self._index[cache_key] = str(cached_path)
         self._save_index()

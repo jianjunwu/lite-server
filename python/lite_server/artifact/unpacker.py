@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional, Tuple
 
 from lite_server import _json
@@ -20,6 +20,24 @@ class ArtifactCorruptedError(ValueError):
 
 class SignatureInvalidError(ValueError):
     """Raised when signature verification fails."""
+
+
+def _safe_out_path(extract_dir: Path, rel_path: str) -> Path:
+    """Resolve a manifest-declared relative path inside extract_dir.
+
+    The manifest ships inside the artifact, so its file paths are
+    attacker-controlled input: reject anything that could escape the
+    target directory (absolute paths, ``..`` components, backslashes).
+    """
+    rel = PurePosixPath(rel_path)
+    if (rel.is_absolute() or not rel_path or "\\" in rel_path
+            or any(part in ("", ".", "..") for part in rel.parts)):
+        raise ArtifactCorruptedError(f"Unsafe file path in manifest: {rel_path!r}")
+    out_path = extract_dir / rel_path
+    resolved_dir = extract_dir.resolve()
+    if not out_path.resolve().is_relative_to(resolved_dir):
+        raise ArtifactCorruptedError(f"Unsafe file path in manifest: {rel_path!r}")
+    return out_path
 
 
 class ModelUnpacker:
@@ -152,7 +170,7 @@ class ModelUnpacker:
 
                 # Single pass: stream-read, hash, and write
                 h = hashlib.sha256()
-                out_path = extract_dir / rel_path
+                out_path = _safe_out_path(extract_dir, rel_path)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(out_path, "wb") as dst:
                     while chunk := src.read(65536):

@@ -120,7 +120,12 @@ def filter_list_response(store, inst_id: str, user: dict, tail: str, payload):
         if not isinstance(rows, list):
             continue
         if model_key is None:
-            payload[field] = [r for r in rows if not isinstance(r, str) or granted(r)]
+            # String rows shaped "name/version" (the instance's /info
+            # loaded_models); grants are keyed by bare model name.
+            payload[field] = [
+                r for r in rows
+                if not isinstance(r, str) or granted(r.split("/", 1)[0])
+            ]
         else:
             payload[field] = [
                 r for r in rows

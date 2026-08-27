@@ -560,3 +560,55 @@ class TestArtifactCache:
 
         assert not cache._index
         assert not path1.exists()
+
+
+class TestUnpackAndValidatePathSafety:
+    """Audit: manifest-controlled ``rel_path`` must never escape the target dir."""
+
+    def test_rel_path_with_dotdot_does_not_escape_target_dir(self, tmp_path):
+        content = b"pwned"
+        artifact = tmp_path / "evil.lma"
+        target = tmp_path / "target"
+        target.mkdir()
+        manifest = {
+            "manifest_version": "1.0",
+            "name": "m",
+            "version": "1",
+            "files": {
+                "../escaped.txt": {"size": len(content),
+                                   "sha256": hashlib.sha256(content).hexdigest()},
+            },
+        }
+        with zipfile.ZipFile(artifact, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
+            zf.writestr("../escaped.txt", content)
+
+        unpacker = ModelUnpacker(artifact)
+        with pytest.raises(ArtifactCorruptedError):
+            unpacker.unpack_and_validate(target, prepend_name=False)
+
+        assert not (tmp_path / "escaped.txt").exists(), \
+            "a crafted manifest must not write outside the target directory"
+
+
+class TestArtifactCacheAudit:
+    """Audit: cache re-extraction must not serve stale files from a previous artifact."""
+
+    def test_reextract_into_same_dir_does_not_mix_stale_files(self, tmp_path):
+        import os as _os
+
+        cache = ArtifactCache(tmp_path / "cache")
+        a = tmp_path / "a.lma"
+        with zipfile.ZipFile(a, "w") as zf:
+            zf.writestr("a.txt", "A")
+        b = tmp_path / "b.lma"
+        with zipfile.ZipFile(b, "w") as zf:
+            zf.writestr("b.txt", "B")
+        _os.utime(b, (b.stat().st_atime, b.stat().st_mtime + 5))
+
+        cache.get_or_unpack(a, "m")
+        cache.get_or_unpack(b, "m")
+
+        extracted = sorted(p.name for p in (tmp_path / "cache" / "m").iterdir())
+        assert extracted == ["b.txt"], \
+            "the cache dir must not serve files from a previous artifact"

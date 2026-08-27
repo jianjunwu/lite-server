@@ -785,11 +785,17 @@ impl PriorityReceiver {
 
 /// Parse the request's scheduling priority from its `x-lite-priority` header
 /// (default 0). Consumed here in B1; P8-1 only defined the field.
+///
+/// The header is client-controlled, so positive values are clamped to 0: a
+/// client may only *de*prioritize itself, never preempt default-priority
+/// traffic (an unbounded range would be a deterministic starvation
+/// primitive). Positive slots stay reserved for server-internal scheduling.
 fn item_priority(item: &QueueItem) -> i32 {
     item.meta
         .as_ref()
         .and_then(|m| m.headers.get("x-lite-priority"))
         .and_then(|v| v.parse::<i32>().ok())
+        .map(|p| p.min(0))
         .unwrap_or(0)
 }
 
@@ -5701,7 +5707,10 @@ mod tests {
 
     #[test]
     fn b1_item_priority_reads_header_default_zero() {
-        assert_eq!(item_priority(&b1_item("x", Some(7))), 7);
+        // Client-controlled positive values clamp to 0 (self-deprioritize
+        // only); negative values pass through; absent header defaults to 0.
+        assert_eq!(item_priority(&b1_item("x", Some(7))), 0);
+        assert_eq!(item_priority(&b1_item("x", Some(-3))), -3);
         assert_eq!(item_priority(&b1_item("x", None)), 0);
     }
 
@@ -6369,5 +6378,27 @@ mod tests {
             Some(pb::response::Payload::Single(s)) => assert_eq!(s.status_code, 503),
             other => panic!("expected Single, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_client_priority_header_cannot_preempt_default_traffic() {
+        // x-lite-priority is parsed straight from the request header with no
+        // clamp (item_priority) — a client sending i32::MAX claims the top
+        // scheduling slot ahead of every default-priority (0) request, a
+        // deterministic starvation primitive. The documented ordering is
+        // Triton-style; the defect is the unbounded, client-controlled range.
+        let (tx, rx) = priority_channel(8);
+        let low = hint_item("default", meta_with_headers(&[]));
+        let high = hint_item("max-priority", meta_with_headers(&[("x-lite-priority", "2147483647")]));
+        let low_p = item_priority(&low);
+        let high_p = item_priority(&high);
+        tx.try_send(low, low_p).unwrap();
+        tx.try_send(high, high_p).unwrap();
+
+        let first = rx.recv().await.expect("two items enqueued");
+        assert_eq!(
+            first.uid, "default",
+            "a request header must not preempt default-priority traffic"
+        );
     }
 }

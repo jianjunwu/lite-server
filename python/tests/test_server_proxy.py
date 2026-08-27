@@ -19,6 +19,7 @@ class _Handler(BaseHTTPRequestHandler):
     metrics_text = ""
     metrics_status = 200
     requests: list = []
+    raw_models: bytes | None = None
 
     @classmethod
     def reset(cls):
@@ -39,6 +40,7 @@ class _Handler(BaseHTTPRequestHandler):
         )
         cls.metrics_status = 200
         cls.requests = []
+        cls.raw_models = None
 
     def _json(self, code: int, payload):
         data = json.dumps(payload).encode()
@@ -50,7 +52,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requests.append(("GET", self.path, None))
-        if self.path == "/v2/models":
+        if self.path == "/v2/models" and type(self).raw_models is not None:
+            data = type(self).raw_models
+            self.send_response(type(self).models_status)
+            self.send_header("content-type", "text/html")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/v2/models":
             self._json(type(self).models_status, {"models": type(self).models})
         elif self.path == "/metrics":
             data = type(self).metrics_text.encode()
@@ -203,3 +212,14 @@ class TestAdminStubs:
         srv = ServerProxy.for_model(base_url, "pets", "1")
         with pytest.raises(NotImplementedError):
             srv.unload_model("m")
+
+
+class TestRegistryProxyAudit:
+    """Audit: a 2xx non-JSON body must surface as ServerProxyError, not a raw
+    JSON decode error (the documented error contract)."""
+
+    def test_non_json_200_raises_server_proxy_error(self, base_url):
+        _Handler.raw_models = b"<html>gateway error</html>"
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        with pytest.raises(ServerProxyError):
+            srv.registry.list_loaded()

@@ -310,13 +310,16 @@ impl ModelRegistry {
             })
             .map(|(v, mv)| (v, mv.weight))
             .collect();
-        let total: u32 = candidates.iter().map(|(_, w)| w).sum();
+        // u64 accumulator: u32 weights from operator config can sum past
+        // u32::MAX (debug panic / release wrap) on as few as two versions.
+        let total: u64 = candidates.iter().map(|(_, w)| u64::from(*w)).sum();
         if total == 0 {
             return None;
         }
         use rand::Rng;
         let mut roll = rand::thread_rng().gen_range(0..total);
         for (v, w) in candidates {
+            let w = u64::from(w);
             if roll < w {
                 return Some(v.clone());
             }
@@ -1545,5 +1548,30 @@ mod tests {
             "deleted version must not leave a dead weight key: {weights:?}"
         );
         assert_eq!(weights.get("2"), Some(&40));
+    }
+
+    #[test]
+    fn test_routing_pick_with_large_weights_does_not_overflow() {
+        // u32 weight sum: two versions at 3e9 each overflow the `total`
+        // accumulator (debug builds panic, release wraps to garbage). Weights
+        // come from operator config, so this is config-error territory — but
+        // the pick must not panic or misdistribute.
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 3_000_000_000u32), ("2".into(), 3_000_000_000u32)]),
+        )
+        .unwrap();
+        for _ in 0..50 {
+            assert!(
+                reg.routing_pick("m1").is_some(),
+                "weighted pick must not panic on a large weight sum"
+            );
+        }
     }
 }

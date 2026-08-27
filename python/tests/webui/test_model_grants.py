@@ -315,7 +315,7 @@ def test_should_filter_info_loaded_models_when_whitelist_active(ctx):
     res = client.get("/api/i/dev/info")
     body = res.json()
     assert body["version"] == "0.1.0"
-    assert body["loaded_models"] == ["alpha"]
+    assert body["loaded_models"] == ["alpha/1"]
 
 
 def test_should_filter_drift_entries_when_whitelist_active(ctx):
@@ -334,7 +334,7 @@ def test_should_not_filter_observability_when_whitelist_inactive(ctx):
     res = client.get("/api/i/dev/metrics/timeline")
     assert {s["model"] for s in res.json()["snapshots"]} == {"alpha", "beta"}
     res = client.get("/api/i/dev/info")
-    assert res.json()["loaded_models"] == ["alpha", "beta"]
+    assert res.json()["loaded_models"] == ["alpha/1", "beta/1"]
 
 
 def test_should_not_filter_observability_for_admin(ctx):

@@ -52,7 +52,15 @@ def _request_json(url: str, *, payload: Any = None, timeout: float) -> Any:
         req.add_header("content-type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _json.loads(resp.read())
+            body = resp.read()
+            try:
+                return _json.loads(body)
+            except ValueError as e:
+                raise ServerProxyError(
+                    f"server returned a non-JSON 2xx body for {url}: "
+                    f"{body[:200]!r}",
+                    status_code=resp.status,
+                ) from e
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:500]
         raise ServerProxyError(

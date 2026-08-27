@@ -156,6 +156,12 @@ def utcnow() -> str:
 class AuthDB:
     def __init__(self, path: str, *, legacy_auth_path: str | None = None):
         self._lock = threading.RLock()
+        # Create the database file with owner-only permissions BEFORE SQLite
+        # opens it: the WAL/SHM sidecars inherit the main file's mode at
+        # creation time, and a post-hoc chmod races with their creation (and
+        # can never catch a -wal recreated after a clean-shutdown checkpoint).
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.close(fd)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -165,7 +171,12 @@ class AuthDB:
             self._migrate()
             if legacy_auth_path is not None:
                 self._import_legacy_yaml(legacy_auth_path)
-        os.chmod(path, 0o600)
+        # Defensive: cover databases created by older versions whose files
+        # (and sidecars) are already on disk with a wider mode.
+        for suffix in ("", "-wal", "-shm"):
+            p = path + suffix
+            if os.path.exists(p):
+                os.chmod(p, 0o600)
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:

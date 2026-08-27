@@ -191,8 +191,10 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if self.path == "/info":
+            # Same shape as the real instance (src/http/handlers/health.rs):
+            # loaded_models rows are "name/version" strings.
             payload = json.dumps({"server": "lite-server", "version": "0.1.0",
-                                  "loaded_models": ["alpha", "beta"]}).encode()
+                                  "loaded_models": ["alpha/1", "beta/1"]}).encode()
             self._send_json(payload)
             return
         if self.path == "/v2/repository/drift":

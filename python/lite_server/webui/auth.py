@@ -219,16 +219,24 @@ class UserStore:
         existing = self.get(username)
         if existing is None:
             raise AuthError("not_found", f'unknown user "{username}"')
+        # Validate everything before any write, then apply all changes in one
+        # transaction: a rejected password must not leave a committed role.
+        role = None
         if patch.get("role") is not None:
             role = self._validate_role(patch["role"])
             if existing.role == "admin" and role != "admin" and self._admin_count() <= 1:
                 raise AuthError("forbidden", "cannot demote the last admin")
-            self._db.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+        password_hash = None
         if patch.get("password") is not None:
-            self._db.execute(
-                "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE username = ?",
-                (_hash(self._validate_password(patch["password"])), username),
-            )
+            password_hash = _hash(self._validate_password(patch["password"]))
+        with self._db.transaction() as conn:
+            if role is not None:
+                conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+            if password_hash is not None:
+                conn.execute(
+                    "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE username = ?",
+                    (password_hash, username),
+                )
         return public_user(self.get(username))
 
     def set_password(self, username: str, password: str) -> None:

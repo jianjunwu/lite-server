@@ -16,6 +16,10 @@ pub enum AcquireResult {
     Rejected { retry_after_secs: u64 },
 }
 
+/// Ceiling for the Retry-After computed from a token-bucket wait: a
+/// misconfigured (subnormal) rate makes the raw wait saturate u64.
+const MAX_RETRY_AFTER_SECS: u64 = 86_400;
+
 pub struct TokenBucket {
     rate: f64,        // tokens per second
     capacity: f64,
@@ -121,9 +125,13 @@ impl RateLimiter {
             b.tokens -= 1.0;
             AcquireResult::Allowed
         } else {
+            // A positive-but-subnormal rpm makes rate effectively zero, so
+            // the raw wait is astronomically large (or infinite on a full
+            // underflow) and `as u64` would saturate to u64::MAX. Clamp to a
+            // bounded Retry-After: fail closed, but sanely.
             let wait = (1.0 - b.tokens) / b.rate;
             AcquireResult::Rejected {
-                retry_after_secs: wait.ceil().max(1.0) as u64,
+                retry_after_secs: wait.ceil().max(1.0).min(MAX_RETRY_AFTER_SECS as f64) as u64,
             }
         }
     }
@@ -298,3 +306,26 @@ mod tests {
         }
     }
 }
+
+    #[test]
+    fn test_subnormal_positive_rpm_rejects_with_sane_retry_after() {
+        // A positive-but-subnormal rpm (e.g. "1e-320" parsed from config)
+        // passes the C1 guard (rpm <= 0.0) but makes the refill rate
+        // effectively zero — the raw wait then saturates `as u64`, so every
+        // client gets Retry-After: u64::MAX (~584 billion years) and the
+        // bucket rejects forever. (1e-320, not 1e-330: the latter underflows
+        // to 0.0 already at literal-parse time and never reaches the bucket.)
+        let limiter = RateLimiter::default();
+        let first = limiter.acquire("subnormal", 1e-320, 1.0);
+        assert!(matches!(first, AcquireResult::Allowed), "burst token must pass");
+
+        match limiter.acquire("subnormal", 1e-320, 1.0) {
+            AcquireResult::Rejected { retry_after_secs } => {
+                assert!(
+                    retry_after_secs < 1_000_000,
+                    "subnormal rpm must fail closed with a sane Retry-After, got {retry_after_secs}"
+                );
+            }
+            AcquireResult::Allowed => panic!("a 0.0-refill bucket must reject after the burst"),
+        }
+    }
