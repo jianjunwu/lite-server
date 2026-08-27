@@ -3,11 +3,18 @@
     "groupMonitor": "监控",
     "groupTools": "工具",
     "overview": "概览",
+    "instances": "实例",
     "models": "模型",
     "metrics": "指标",
     "alerts": "告警",
     "playground": "Playground",
     "settings": "设置"
+  },
+  "instances": {
+    "subtitle": "{{count}} 个实例",
+    "empty": "尚未配置实例",
+    "emptyHint": "添加第一个 lite-server 后端，开始监控你的模型服务。",
+    "counts": "{{models}} 模型 · {{versions}} 版本 · {{workers}} Worker"
   },
   "common": {
     "appName": "lite-server",

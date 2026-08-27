@@ -3,11 +3,18 @@
     "groupMonitor": "Monitor",
     "groupTools": "Tools",
     "overview": "Overview",
+    "instances": "Instances",
     "models": "Models",
     "metrics": "Metrics",
     "alerts": "Alerts",
     "playground": "Playground",
     "settings": "Settings"
+  },
+  "instances": {
+    "subtitle": "{{count}} instances",
+    "empty": "No instances configured",
+    "emptyHint": "Add your first lite-server backend to start monitoring.",
+    "counts": "{{models}} models · {{versions}} versions · {{workers}} workers"
   },
   "common": {
     "appName": "lite-server",

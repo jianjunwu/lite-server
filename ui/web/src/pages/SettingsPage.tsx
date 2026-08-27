@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { App, Button, Card, Checkbox, Divider, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, Typography } from 'antd';
+import { App, Button, Card, Divider, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, Typography } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { QRCodeSVG } from 'qrcode.react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -10,16 +10,9 @@ import { auditApi, authApi, grantsApi, modelGrantsApi, invitesApi, sessionsApi, 
 import { useInstances } from '../api/hooks';
 import { useAuth } from '../context/AuthContext';
 import type { InstanceInfo } from '../api/types';
+import { InstanceForm } from '../components/InstanceForm';
 import { PageHeader } from '../components/PageHeader';
 import { MONO_FONT, STATUS_COLORS, dataTextStyle, TYPE } from '../theme';
-
-interface InstanceFormValues {
-  id: string;
-  name: string;
-  base_url: string;
-  admin_key?: string;
-  probe?: boolean;
-}
 
 function InstancesTab() {
   const { t } = useTranslation();
@@ -29,62 +22,8 @@ function InstancesTab() {
   const instancesQuery = useInstances();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editing, setEditing] = useState<InstanceInfo | null>(null);
-  const [form] = Form.useForm<InstanceFormValues>();
-  const [busy, setBusy] = useState(false);
 
   const instances = instancesQuery.data?.instances ?? [];
-
-  const openCreate = () => {
-    setEditing(null);
-    form.resetFields();
-    setDrawerOpen(true);
-  };
-
-  const openEdit = (inst: InstanceInfo) => {
-    setEditing(inst);
-    form.setFieldsValue({ id: inst.id, name: inst.name, base_url: inst.base_url, admin_key: '', probe: false });
-    setDrawerOpen(true);
-  };
-
-  const submit = async (values: InstanceFormValues) => {
-    setBusy(true);
-    try {
-      if (editing) {
-        const patch: Record<string, unknown> = { name: values.name, base_url: values.base_url };
-        // Empty key field on edit = keep the stored key; explicit space-free
-        // non-empty value replaces it.
-        if (values.admin_key && values.admin_key.trim().length > 0) {
-          patch.admin_key = values.admin_key.trim();
-        }
-        await bffFetch(`/api/instances/${encodeURIComponent(editing.id)}`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(patch),
-        });
-        message.success(t('settings.instances.updated'));
-      } else {
-        const probe = values.probe ? '?probe=true' : '';
-        await bffFetch(`/api/instances${probe}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            id: values.id.trim(),
-            name: values.name.trim(),
-            base_url: values.base_url.trim(),
-            ...(values.admin_key?.trim() ? { admin_key: values.admin_key.trim() } : {}),
-          }),
-        });
-        message.success(t('settings.instances.created'));
-      }
-      await queryClient.invalidateQueries({ queryKey: ['bff', 'instances'] });
-      setDrawerOpen(false);
-      form.resetFields();
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const remove = async (inst: InstanceInfo) => {
     try {
@@ -100,7 +39,7 @@ function InstancesTab() {
     <>
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
         {can('admin') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); setDrawerOpen(true); }}>
             {t('settings.instances.add')}
           </Button>
         )}
@@ -137,7 +76,7 @@ function InstancesTab() {
                 <Typography.Text type="secondary" style={{ fontSize: TYPE.secondary }}>env · readonly</Typography.Text>
               ) : can('admin') ? (
                 <span>
-                  <Button type="text" size="small" onClick={() => openEdit(i)}>
+                  <Button type="text" size="small" onClick={() => { setEditing(i); setDrawerOpen(true); }}>
                     {t('settings.instances.edit')}
                   </Button>
                   <Popconfirm title={t('settings.instances.deleteConfirm', { id: i.id })} onConfirm={() => remove(i)}>
@@ -151,57 +90,12 @@ function InstancesTab() {
         ]}
       />
 
-      <Drawer
-        title={editing ? t('settings.instances.editTitle', { id: editing.id }) : t('settings.instances.addTitle')}
+      <InstanceForm
         open={drawerOpen}
+        editing={editing}
         onClose={() => setDrawerOpen(false)}
-        width={380}
-      >
-        <Form form={form} layout="vertical" onFinish={submit} initialValues={{ probe: true }}>
-          <Form.Item
-            name="id"
-            label="ID"
-            rules={[
-              { required: true, message: t('settings.instances.idRequired') },
-              { pattern: /^[a-z0-9][a-z0-9-]*$/, message: t('settings.instances.idPattern') },
-            ]}
-          >
-            <Input disabled={editing !== null} style={{ fontFamily: MONO_FONT }} placeholder="prod-gpu" />
-          </Form.Item>
-          <Form.Item
-            name="name"
-            label={t('settings.instances.name')}
-            rules={[{ required: true, message: t('settings.instances.nameRequired') }]}
-          >
-            <Input placeholder="Prod GPU cluster" />
-          </Form.Item>
-          <Form.Item
-            name="base_url"
-            label="URL"
-            rules={[
-              { required: true, message: t('settings.instances.urlRequired') },
-              { type: 'url', message: t('settings.instances.urlInvalid') },
-            ]}
-          >
-            <Input style={{ fontFamily: MONO_FONT }} placeholder="http://10.0.0.11:8000" />
-          </Form.Item>
-          <Form.Item
-            name="admin_key"
-            label={t('settings.instances.adminKey')}
-            extra={editing ? t('settings.instances.adminKeyKeepHint') : t('settings.instances.adminKeyHint')}
-          >
-            <Input.Password style={{ fontFamily: MONO_FONT }} autoComplete="new-password" />
-          </Form.Item>
-          {!editing && (
-            <Form.Item name="probe" valuePropName="checked">
-              <Checkbox>{t('settings.instances.probe')}</Checkbox>
-            </Form.Item>
-          )}
-          <Button type="primary" htmlType="submit" block loading={busy}>
-            {editing ? t('settings.instances.save') : t('settings.instances.add')}
-          </Button>
-        </Form>
-      </Drawer>
+        onSaved={() => queryClient.invalidateQueries({ queryKey: ['bff', 'instances'] })}
+      />
     </>
   );
 }

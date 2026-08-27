@@ -10,6 +10,7 @@ import { RegisterPage } from './pages/RegisterPage';
 // Route-level code splitting: each page (and its share of echarts/antd)
 // loads on demand instead of inflating the entry bundle.
 const OverviewPage = lazy(() => import('./pages/OverviewPage').then((m) => ({ default: m.OverviewPage })));
+const InstancesPage = lazy(() => import('./pages/InstancesPage').then((m) => ({ default: m.InstancesPage })));
 const ModelsPage = lazy(() => import('./pages/ModelsPage').then((m) => ({ default: m.ModelsPage })));
 const ModelDetailPage = lazy(() => import('./pages/ModelDetailPage').then((m) => ({ default: m.ModelDetailPage })));
 const VersionDetailPage = lazy(() => import('./pages/VersionDetailPage').then((m) => ({ default: m.VersionDetailPage })));
@@ -48,6 +49,7 @@ export function App() {
         >
           <Route index element={<Navigate to="/overview" replace />} />
           <Route path="/overview" element={<Lazy><OverviewPage /></Lazy>} />
+          <Route path="/instances" element={<Lazy><InstancesPage /></Lazy>} />
           <Route path="/models" element={<Lazy><ModelsPage /></Lazy>} />
           <Route path="/models/:name" element={<Lazy><ModelDetailPage /></Lazy>} />
           <Route path="/models/:name/versions/:version" element={<Lazy><VersionDetailPage /></Lazy>} />

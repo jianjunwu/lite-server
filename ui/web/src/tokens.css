@@ -120,13 +120,16 @@ body {
 }
 
 /* Utility actions revealed on card hover; keyboard focus reveals them too. */
-.model-card .hover-only {
+.model-card .hover-only,
+.instance-card .hover-only {
   opacity: 0;
   transition: opacity var(--duration-interact) var(--ease-out);
 }
 
 .model-card:hover .hover-only,
-.model-card .hover-only:focus-visible {
+.model-card .hover-only:focus-visible,
+.instance-card:hover .hover-only,
+.instance-card .hover-only:focus-visible {
   opacity: 1;
 }
 
@@ -208,7 +211,8 @@ body {
   .river-seg,
   .chevron,
   .chip,
-  .model-card .hover-only {
+  .model-card .hover-only,
+  .instance-card .hover-only {
     transition: none;
   }
 
