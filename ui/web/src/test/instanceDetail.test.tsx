@@ -154,6 +154,34 @@ describe('InstanceDetailPage overview timeline', () => {
     expect(screen.getByText('12.3')).toBeTruthy();
   });
 
+  it('should_render_one_l1_card_per_model_when_v2_models_has_multiple_version_rows', () => {
+    // /v2/models returns one row per (model, version); the L1 grid is one
+    // card per model (plan §3.2).
+    mockModels = {
+      models: [
+        { name: 'echo', version: 'v1', status: 'ready', model_type: 'Echo', workers: 2 },
+        { name: 'echo', version: 'v2', status: 'ready', model_type: 'Echo', workers: 1 },
+      ],
+    };
+    mockHealth = {
+      status: 'ready',
+      models: [
+        {
+          name: 'echo',
+          active_version: 'v2',
+          versions: [
+            { version: 'v1', status: 'ready', workers: 2 },
+            { version: 'v2', status: 'ready', workers: 1 },
+          ],
+        },
+      ],
+    };
+    renderPage();
+    // Exactly one L1 card, enriched from health (3 workers across versions).
+    expect(screen.getAllByText('echo').length).toBe(1);
+    expect(screen.getByText(/2 versions · 3 workers/)).toBeTruthy();
+  });
+
   it('should_render_l1_model_entry_cards_with_health_derived_counts', () => {
     mockModels = {
       models: [{ name: 'echo', version: 'v1', status: 'ready', model_type: 'Echo', workers: 2 }],

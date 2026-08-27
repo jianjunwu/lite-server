@@ -224,12 +224,16 @@ export function InstanceDetailPage() {
 
   const models: ModelListItem[] = modelsQuery.data?.models ?? [];
 
+  // /v2/models returns one row per (model, version); the L1 grid is one
+  // card per model (plan §3.2), so dedupe by name.
+  const uniqueModels = [...new Map(models.map((m) => [m.name, m])).values()];
+
   // L1 model entry cards (plan §3.2): the /v2/models row carries name,
   // loaded version, status, type and total workers; health adds the version
   // count and active version. Ready/total worker split lives on the version
   // layer (VersionInfo), not at instance level.
   const healthModels = healthQuery.data?.models ?? [];
-  const modelEntries = models.map((m) => {
+  const modelEntries = uniqueModels.map((m) => {
     const h = healthModels.find((hm) => hm.name === m.name);
     return {
       name: m.name,
@@ -376,7 +380,7 @@ export function InstanceDetailPage() {
       <UploadDrawer
         open={uploadOpen}
         onClose={() => setUploadOpen(false)}
-        existingModels={models.map((m) => m.name)}
+        existingModels={uniqueModels.map((m) => m.name)}
       />
     </div>
   );

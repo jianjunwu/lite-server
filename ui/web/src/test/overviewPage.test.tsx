@@ -76,6 +76,109 @@ describe('OverviewPage scale group and instance cards', () => {
     expect(screen.getByText('Workers')).toBeTruthy();
   });
 
+  it('should_show_fleet_p99_from_the_latest_timeline_point_instead_of_dash', async () => {
+    stubInstanceApis();
+    // Override the empty timeline stub: latest entry carries p99_ms > 0.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        let body: unknown = {};
+        if (url.endsWith('/health')) {
+          body = {
+            models: [
+              {
+                name: 'echo',
+                active_version: '1',
+                versions: [{ version: '1', status: 'ready', workers: 1, loaded_at: 1, last_failure: null }],
+              },
+            ],
+          };
+        } else if (url.endsWith('/info')) {
+          body = { version: '0.8.12' };
+        } else if (url.includes('/metrics/timeline')) {
+          body = {
+            snapshots: [
+              {
+                model: 'echo',
+                version: '1',
+                entries: [{ timestamp: 100, qps: 0, p99_ms: 1.3 }],
+              },
+            ],
+          };
+        } else if (url.includes('/metrics/alerts')) {
+          body = { alerts: [] };
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }),
+        );
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={['/overview?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <OverviewPage />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('1.3ms')).toBeTruthy();
+    expect(screen.queryByText('-')).toBeNull();
+  });
+
+  it('should_update_fleet_p99_when_a_poll_returns_a_higher_latest_value', async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        let body: unknown = {};
+        if (url.endsWith('/health')) {
+          body = {
+            models: [
+              {
+                name: 'echo',
+                active_version: '1',
+                versions: [{ version: '1', status: 'ready', workers: 1, loaded_at: 1, last_failure: null }],
+              },
+            ],
+          };
+        } else if (url.endsWith('/info')) {
+          body = { version: '0.8.12' };
+        } else if (url.includes('/metrics/timeline')) {
+          calls += 1;
+          body = {
+            snapshots: [
+              {
+                model: 'echo',
+                version: '1',
+                entries: [{ timestamp: 100 + calls, qps: 0, p99_ms: calls === 1 ? 0 : 1.3 }],
+              },
+            ],
+          };
+        } else if (url.includes('/metrics/alerts')) {
+          body = { alerts: [] };
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }),
+        );
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={['/overview?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <OverviewPage />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    // First poll: p99 0 -> dash.
+    await waitFor(() => expect(screen.getAllByText('-').length).toBeGreaterThanOrEqual(1));
+    // Second poll (refetchInterval 10s): p99 1.3 -> the StatNum must update.
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 15000 });
+    await waitFor(() => expect(screen.getByText('1.3ms')).toBeTruthy(), { timeout: 2000 });
+  }, 25000);
+
   it('should_render_l0_instance_cards_that_link_into_the_instance_detail', async () => {
     stubInstanceApis();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

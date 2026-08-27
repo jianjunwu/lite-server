@@ -47,3 +47,6 @@ python/lite_server/webui/static/
 
 # Demo recording intermediates (re-record anytime via record.py)
 tools/record-demo/out/
+
+# Playwright MCP session artifacts (snapshots/screenshots/console logs)
+.playwright-mcp/
