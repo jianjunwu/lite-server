@@ -593,7 +593,7 @@
       "stats": {
         "version": "版本",
         "modelsLoaded": "已加载模型",
-        "rss": "进程 RSS",
+        "rss": "Worker RSS",
         "cpu": "CPU",
         "activeStreams": "活跃流"
       },
@@ -602,7 +602,8 @@
       },
       "models": {
         "title": "模型",
-        "empty": "暂无已加载模型"
+        "empty": "暂无已加载模型",
+        "counts": "{{versions}} 版本 · {{workers}} Worker"
       }
     },
     "config": {

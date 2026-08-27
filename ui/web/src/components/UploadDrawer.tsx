@@ -144,6 +144,9 @@ export function UploadDrawer({ open, onClose, existingModels, model }: UploadDra
       >
         <Form.Item name="model" label={t('upload.model')} rules={[{ required: true }]}>
           <AutoComplete
+            // Preset model (model detail "upload new version") locks the
+            // field: the target model is fixed, only the version is new.
+            disabled={model !== undefined}
             options={existingModels.map((m) => ({ value: m }))}
             placeholder={t('upload.modelPlaceholder')}
             style={{ fontFamily: MONO_FONT }}

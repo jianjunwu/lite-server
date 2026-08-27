@@ -1,17 +1,21 @@
 import { useMemo, useState } from 'react';
-import { Alert, Button, Card, Collapse, Empty, Input, Table, Tabs, Tag, Typography } from 'antd';
-import { DashboardOutlined, ReloadOutlined, SearchOutlined, SettingOutlined, TableOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Col, Collapse, Empty, Input, Row, Tabs, Tag, Typography } from 'antd';
+import { DashboardOutlined, ReloadOutlined, SearchOutlined, SettingOutlined, TableOutlined, UploadOutlined } from '@ant-design/icons';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ApiError, apiFetch } from '../api/client';
-import { useInstances, useModels, useServerInfo, useTimelineAll } from '../api/hooks';
+import { useHealthSummary, useInstances, useModels, useServerInfo, useTimelineAll } from '../api/hooks';
 import { useServerConfig } from '../api/config';
+import { roleAtLeast } from '../api/auth';
+import { useAuth } from '../context/AuthContext';
 import type { ModelListItem } from '../api/types';
 import { PageHeader } from '../components/PageHeader';
 import { AcceleratorPanel } from '../components/AcceleratorPanel';
+import { ModelGlyph } from '../components/ModelGlyph';
 import { StatNum } from '../components/StatNum';
 import { StatusBadge } from '../components/StatusBadge';
+import { UploadDrawer } from '../components/UploadDrawer';
 import { groupServerConfig, sourceTagColor } from '../components/config/serverConfigSchema';
 import { useNeutrals } from '../context/ThemeModeContext';
 import { MONO_FONT, TYPE, dataTextStyle } from '../theme';
@@ -145,12 +149,22 @@ export function InstanceDetailPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { user } = useAuth();
+  const neutrals = useNeutrals();
   const [tab, setTab] = useState('overview');
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   const instancesQuery = useInstances();
   const instance = (instancesQuery.data?.instances ?? []).find((i) => i.id === id);
+  // Uploads are operator-gated on the effective role of THIS instance
+  // (the ?i= current instance may differ from the :id detail).
+  const canUpload = roleAtLeast(
+    instance?.effective_role ?? user?.role ?? 'viewer',
+    'operator',
+  );
   const infoQuery = useServerInfo(id);
   const modelsQuery = useModels(id);
+  const healthQuery = useHealthSummary(id);
   const timelineQuery = useTimelineAll(id, 5_000, LATEST_POINT_STEP);
   const livez = useProbe(id, 'livez');
   const readyz = useProbe(id, 'readyz');
@@ -162,8 +176,11 @@ export function InstanceDetailPage() {
     { name: 'startupz' as const, query: startupz },
   ];
 
-  // Last timeline point per snapshot: RSS/CPU are process-level (any defined
-  // value), active streams aggregate across models.
+  // Last timeline point per snapshot: rss_mb is per model/version (summed
+  // over the version's live workers), so the instance-level number is the
+  // cross-version sum of latest points; cpu_percent is process-level (one
+  // value per tick — any defined point is the same value); active streams
+  // aggregate across models.
   const lastPoints = useMemo(
     () =>
       (timelineQuery.data?.snapshots ?? [])
@@ -171,7 +188,8 @@ export function InstanceDetailPage() {
         .filter((p) => p !== undefined),
     [timelineQuery.data],
   );
-  const rssMb = lastPoints.map((p) => p.rss_mb).find((v) => v != null);
+  const anyRss = lastPoints.some((p) => p.rss_mb != null);
+  const rssMb = anyRss ? lastPoints.reduce((sum, p) => sum + (p.rss_mb ?? 0), 0) : undefined;
   const cpuPercent = lastPoints.map((p) => p.cpu_percent).find((v) => v != null);
   const activeStreams =
     lastPoints.length > 0
@@ -206,6 +224,23 @@ export function InstanceDetailPage() {
 
   const models: ModelListItem[] = modelsQuery.data?.models ?? [];
 
+  // L1 model entry cards (plan §3.2): the /v2/models row carries name,
+  // loaded version, status, type and total workers; health adds the version
+  // count and active version. Ready/total worker split lives on the version
+  // layer (VersionInfo), not at instance level.
+  const healthModels = healthQuery.data?.models ?? [];
+  const modelEntries = models.map((m) => {
+    const h = healthModels.find((hm) => hm.name === m.name);
+    return {
+      name: m.name,
+      modelType: m.model_type,
+      status: m.status,
+      activeVersion: h?.active_version ?? m.version,
+      versionCount: h ? h.versions.length : 1,
+      workerCount: h ? h.versions.reduce((sum, v) => sum + v.workers, 0) : m.workers,
+    };
+  });
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
@@ -213,13 +248,20 @@ export function InstanceDetailPage() {
         title={instance?.name ?? id}
         subtitle={statement}
         extra={
-          <Button
-            size="small"
-            icon={<ReloadOutlined />}
-            onClick={() => queryClient.invalidateQueries({ queryKey: [id] })}
-          >
-            {t('common.refresh')}
-          </Button>
+          <span style={{ display: 'inline-flex', gap: SPACE[2] }}>
+            {canUpload && (
+              <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
+                {t('upload.title')}
+              </Button>
+            )}
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={() => queryClient.invalidateQueries({ queryKey: [id] })}
+            >
+              {t('common.refresh')}
+            </Button>
+          </span>
         }
       />
 
@@ -282,46 +324,36 @@ export function InstanceDetailPage() {
                   </div>
                 </Card>
 
-                <Card size="small" title={t('instance.detail.models.title')}>
-                  <Table<ModelListItem>
-                    size="small"
-                    rowKey={(r) => `${r.name}/${r.version}`}
-                    loading={modelsQuery.isLoading}
-                    dataSource={models}
-                    pagination={false}
-                    locale={{ emptyText: t('instance.detail.models.empty') }}
-                    onRow={(r) => ({
-                      style: { cursor: 'pointer' },
-                      onClick: () =>
-                        navigate(`/models/${encodeURIComponent(r.name)}?i=${encodeURIComponent(id)}`),
-                    })}
-                    columns={[
-                      {
-                        title: t('models.name'),
-                        dataIndex: 'name',
-                        render: (v: string) => <span style={dataTextStyle}>{v}</span>,
-                      },
-                      {
-                        title: t('common.version'),
-                        dataIndex: 'version',
-                        width: 120,
-                        render: (v: string) => <span style={dataTextStyle}>{v}</span>,
-                      },
-                      {
-                        title: t('common.status'),
-                        dataIndex: 'status',
-                        width: 140,
-                        render: (v: string) => <StatusBadge status={v} />,
-                      },
-                      {
-                        title: t('common.workers'),
-                        dataIndex: 'workers',
-                        width: 100,
-                        align: 'right',
-                        render: (v: number) => <span style={dataTextStyle}>{v}</span>,
-                      },
-                    ]}
-                  />
+                <Card size="small" title={t('instance.detail.models.title')} loading={modelsQuery.isLoading}>
+                  {modelEntries.length === 0 ? (
+                    <Empty description={t('instance.detail.models.empty')} />
+                  ) : (
+                    <Row gutter={[SPACE[4], SPACE[4]]}>
+                      {modelEntries.map((m) => (
+                        <Col xs={24} sm={12} xl={8} key={m.name}>
+                          <Link to={`/models/${encodeURIComponent(m.name)}?i=${encodeURIComponent(id)}`}>
+                            <Card size="small" className="lift" hoverable>
+                              <div style={{ display: 'flex', gap: SPACE[3], alignItems: 'center', minWidth: 0 }}>
+                                <ModelGlyph name={m.name} type={m.modelType} />
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: SPACE[2] }}>
+                                    <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      {m.name}
+                                    </span>
+                                    <StatusBadge status={m.status} />
+                                  </div>
+                                  <div style={{ fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
+                                    <span style={dataTextStyle}>{m.activeVersion}</span>
+                                    <span> · {t('instance.detail.models.counts', { versions: m.versionCount, workers: m.workerCount })}</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </Card>
+                          </Link>
+                        </Col>
+                      ))}
+                    </Row>
+                  )}
                 </Card>
               </div>
             ),
@@ -339,6 +371,12 @@ export function InstanceDetailPage() {
             children: <AcceleratorPanel instanceId={id} active={tab === 'accelerator'} />,
           },
         ]}
+      />
+
+      <UploadDrawer
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        existingModels={models.map((m) => m.name)}
       />
     </div>
   );

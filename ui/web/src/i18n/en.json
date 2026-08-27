@@ -598,7 +598,7 @@
       "stats": {
         "version": "Version",
         "modelsLoaded": "Models loaded",
-        "rss": "Process RSS",
+        "rss": "Worker RSS",
         "cpu": "CPU",
         "activeStreams": "Active streams"
       },
@@ -607,7 +607,8 @@
       },
       "models": {
         "title": "Models",
-        "empty": "No models loaded"
+        "empty": "No models loaded",
+        "counts": "{{versions}} versions · {{workers}} workers"
       }
     },
     "config": {
