@@ -305,7 +305,14 @@ pub enum ConfigPatchError {
     Invalid { message: String, warnings: Vec<String> },
     /// The reload after a successful write failed; carries whether the file
     /// rollback actually succeeded so the response never claims otherwise.
-    ReloadFailed { message: String, rolled_back: bool },
+    /// `restored` reports whether the version was brought back up with the
+    /// previous config (H2 service recovery) — a false here means the model
+    /// is NOT serving and needs manual intervention.
+    ReloadFailed {
+        message: String,
+        rolled_back: bool,
+        restored: bool,
+    },
 }
 
 /// RFC 7386 JSON merge-patch: objects merge recursively, null deletes a key,
@@ -638,9 +645,36 @@ pub(crate) async fn finish_apply_reload(
                     if let Some(bytes) = &prepared.original {
                         worker_manager.note_config_write(&prepared.path, content_etag(bytes));
                     }
+                    // H2 (service recovery): the failed reload left the
+                    // version Failed with no workers. The file is back to
+                    // the pre-patch bytes, so a recovering reload brings the
+                    // version back up with the previous config — Rust- and
+                    // Python-side consistent (workers read config.yaml from
+                    // disk at startup, which is why the restore must run
+                    // AFTER the rollback, not inside the first reload).
+                    let restored = match worker_manager
+                        .reload_model(&prepared.model, Some(&prepared.version))
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(re) => {
+                            tracing::error!(
+                                model = %prepared.model, version = %prepared.version,
+                                error = %re,
+                                "service restore after config rollback failed; \
+                                 the version is not serving"
+                            );
+                            false
+                        }
+                    };
                     Err(ConfigPatchError::ReloadFailed {
-                        message: format!("{e}"),
+                        message: if restored {
+                            format!("{e}; service restored with the previous config")
+                        } else {
+                            format!("{e}; service restore failed — the version is not serving")
+                        },
                         rolled_back: true,
+                        restored,
                     })
                 }
                 Err(rb) => Err(ConfigPatchError::ReloadFailed {
@@ -648,6 +682,7 @@ pub(crate) async fn finish_apply_reload(
                         "{e}; rollback also failed: {rb} — config.yaml left in the patched state"
                     ),
                     rolled_back: false,
+                    restored: false,
                 }),
             }
         }
@@ -682,7 +717,7 @@ pub async fn model_version_config_patch(
     }
     let reload = state
         .worker_manager
-        .reload_model(model_name, Some(version))
+        .reload_model_without_recovery(model_name, Some(version))
         .await;
     finish_apply_reload(&state.worker_manager, *prepared, reload).await
 }
@@ -736,7 +771,11 @@ pub async fn model_version_config_patch_handler(
             })),
         )
             .into_response()),
-        Err(ConfigPatchError::ReloadFailed { message, rolled_back }) => Ok((
+        Err(ConfigPatchError::ReloadFailed {
+            message,
+            rolled_back,
+            restored,
+        }) => Ok((
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": {
@@ -750,6 +789,7 @@ pub async fn model_version_config_patch_handler(
                     "param": Value::Null,
                 },
                 "rolled_back": rolled_back,
+                "restored": restored,
             })),
         )
             .into_response()),
@@ -1685,7 +1725,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            ConfigPatchError::ReloadFailed { message, rolled_back } => {
+            ConfigPatchError::ReloadFailed { message, rolled_back, .. } => {
                 assert!(
                     !rolled_back,
                     "rolled_back must be false when the rollback itself failed"
@@ -1804,6 +1844,103 @@ mod tests {
             "the rollback write must be recorded for watcher suppression"
         );
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// H2 (service recovery): an apply_reload PATCH whose reload fails at
+    /// RUNTIME (valid merged config, but the warmup sample file does not
+    /// exist) must not leave the model unserving — the file is rolled back
+    /// AND the version is brought back up with the previous config. A bare
+    /// file rollback leaves the version Failed with no workers until manual
+    /// intervention.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_reload_failure_restores_service_with_previous_config() {
+        let repo = temp_repo("h2-restore");
+        let dir = repo.join("m").join("1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        let good = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
+        std::fs::write(dir.join("config.yaml"), good).unwrap();
+
+        let state = test_state(repo.clone());
+        let config = crate::config::load_model_config(&dir.join("config.yaml")).unwrap();
+        state
+            .worker_manager
+            .load_model("m", "1", &config)
+            .await
+            .unwrap();
+
+        // Patch in a warmup policy whose sample file does not exist — the
+        // merged config is valid, but the reload fails after the old
+        // workers are already gone.
+        let err = model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &patch_req(
+                json!({"policies": {"warmup": {"enabled": true, "samples": [{"input_ref": "warmup/missing.json"}]}}}),
+                ConfigPatchMode::ApplyReload,
+            ),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ConfigPatchError::ReloadFailed {
+                message,
+                rolled_back,
+                ..
+            } => {
+                assert!(rolled_back, "the file must be rolled back");
+                assert!(
+                    message.contains("service restored"),
+                    "the response must report the service restore, got: {message}"
+                );
+            }
+            other => panic!("expected reload failure, got {other:?}"),
+        }
+
+        // The file is back to the pre-write bytes…
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some(good)
+        );
+        // …and the version is SERVING again with the previous config — not
+        // left Failed with no workers.
+        let mv = state
+            .registry
+            .get("m", Some("1"))
+            .expect("H2: the version must be restored, not left Failed/removed");
+        assert_eq!(
+            mv.status,
+            crate::registry::types::VersionStatus::Ready,
+            "H2: the version must be back to Ready after a failed apply_reload"
+        );
+        assert!(
+            mv.config.policies.warmup.is_none(),
+            "H2: the restored version must run the PREVIOUS config (no warmup)"
+        );
+
+        let _ = state.worker_manager.unload_model("m", Some("1")).await;
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
