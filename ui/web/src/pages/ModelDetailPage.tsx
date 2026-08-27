@@ -5,23 +5,23 @@ import {
   TableOutlined,
 } from '@ant-design/icons';
 import { useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
 import { useInstanceName, useMergedModels, useMergedVersions, useTimeline, useTimelineAll } from '../api/hooks';
-import type { TimelineEntry, VersionInfo } from '../api/types';
+import type { TimelineEntry } from '../api/types';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { ModelAccessPanel } from '../components/ModelAccessPanel';
 import { ModelGlyph } from '../components/ModelGlyph';
 import { StatusBadge, statusKind } from '../components/StatusBadge';
 import { StatNum } from '../components/StatNum';
-import { VersionActions } from '../components/VersionActions';
+import { VersionCard } from '../components/VersionCard';
 import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
-import { TrafficRiver, versionColor } from '../components/TrafficRiver';
+import { TrafficRiver } from '../components/TrafficRiver';
 import { RoutingEditor } from '../components/RoutingEditor';
 import { useLifecycleOp } from '../components/useLifecycleOp';
 import { buildTimelineOption, fieldState, type MetricKey } from '../components/timelineChart';
@@ -76,69 +76,6 @@ function loadMetricSelection(): MetricKey[] {
     // Corrupt payload → fall through to defaults.
   }
   return DEFAULT_METRICS;
-}
-
-/** Version card: the unit of the versions tab. Weight bar gives the
- * traffic comparison at a glance; the whole card drills down to the
- * version detail page. */
-function VersionCard({
-  model,
-  version,
-  colorIndex,
-  latest,
-  ops,
-}: {
-  model: string;
-  version: VersionInfo;
-  /** Index among loaded versions — matches the TrafficRiver palette. */
-  colorIndex: number;
-  latest?: TimelineEntry;
-  ops: boolean;
-}) {
-  const { t } = useTranslation();
-  const neutrals = useNeutrals();
-  const ilink = useInstanceLink();
-  const navigate = useNavigate();
-  const barColor = colorIndex >= 0 ? versionColor(colorIndex) : neutrals.textSecondary;
-  const detailUrl = ilink(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version.version)}`);
-  return (
-    <Card
-      size="small"
-      hoverable
-      onClick={() => navigate(detailUrl)}
-      styles={{ body: { display: 'flex', flexDirection: 'column', gap: SPACE[2] } }}
-    >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: SPACE[3] }}>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[2] }}>
-          <Link to={detailUrl} style={{ ...dataTextStyle, fontWeight: 600 }} onClick={(e) => e.stopPropagation()}>
-            {version.version}
-          </Link>
-          {version.active && (
-            <span style={{ color: barColor, fontSize: TYPE.secondary }}>●</span>
-          )}
-        </span>
-        <StatusBadge status={version.status} text={version.status === 'unloaded' ? t('models.unloaded') : undefined} />
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: SPACE[2] }}>
-        <div style={{ flex: 1, height: 6, borderRadius: 3, background: neutrals.textSecondary + '33', overflow: 'hidden' }}>
-          <div style={{ width: `${Math.max(0, Math.min(100, version.weight))}%`, height: '100%', background: barColor }} />
-        </div>
-        <span style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>{version.weight}%</span>
-      </div>
-      <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
-        Worker {version.workers.ready}/{version.workers.total}
-        {' · '}
-        {latest ? `${formatNumber(latest.qps)} QPS` : '-'}
-        {' · '}
-        {latest && latest.p99_ms > 0 ? `${formatMs(latest.p99_ms)} p99` : '-'}
-      </span>
-      {ops && (
-        <div onClick={(e) => e.stopPropagation()}>
-          <VersionActions model={model} version={version} />
-        </div>
-      )}
-    </Card>
-  );
 }
 
 export function ModelDetailPage() {

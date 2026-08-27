@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Button, Card, Checkbox, Dropdown, Empty, Input, Modal, Popconfirm, Segmented, Tooltip, Typography } from 'antd';
+import { Button, Card, Checkbox, Col, Dropdown, Empty, Input, Modal, Popconfirm, Row, Segmented, Tooltip, Typography } from 'antd';
 import {
   AimOutlined,
   ApiOutlined,
@@ -17,17 +17,19 @@ import { App } from 'antd';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { useInstanceName, useMergedModels, useMergedVersions } from '../api/hooks';
+import { useInstanceName, useMergedModels, useMergedVersions, useTimelineAll } from '../api/hooks';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import type { MergedModel, MergedModelStatus } from '../api/merge';
+import type { TimelineEntry } from '../api/types';
 import { StatusBadge } from '../components/StatusBadge';
-import { VersionsTable } from '../components/VersionsTable';
+import { VersionCard } from '../components/VersionCard';
 import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
 import { TrafficRiver } from '../components/TrafficRiver';
 import { UploadDrawer } from '../components/UploadDrawer';
 import { ModelGlyph } from '../components/ModelGlyph';
 import { lifecycleKey, useLifecycleOp } from '../components/useLifecycleOp';
+import { formatMs, formatNumber } from '../components/format';
 import { dataTextStyle, MONO_FONT, STATUS_COLORS, TYPE } from '../theme';
 import { SPACE } from '../tokens';
 import { useNeutrals } from '../context/ThemeModeContext';
@@ -142,7 +144,16 @@ function DeleteModelAction({ model }: { model: MergedModel }) {
  * table behind a disclosure so the list stays scannable. The whole card
  * navigates to the detail page; nested controls keep their own behavior.
  */
-function ModelCard({ model, order }: { model: MergedModel; order: number }) {
+function ModelCard({
+  model,
+  order,
+  latestByVersion,
+}: {
+  model: MergedModel;
+  order: number;
+  /** Latest timeline point per version, fanned out from the page-level poll. */
+  latestByVersion: Record<string, TimelineEntry>;
+}) {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { instanceId } = useInstance();
@@ -157,6 +168,26 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
   const active = loaded.find((v) => v.active);
   const workersReady = loaded.reduce((sum, v) => sum + v.workers.ready, 0);
   const workersTotal = loaded.reduce((sum, v) => sum + v.workers.total, 0);
+
+  // L2 live chips (plan §4): QPS/queue/RSS/streams summed across the model's
+  // versions, p99 maxed — same sumField/maxField policy as MetricsPage.
+  const live = useMemo(() => {
+    const entries = Object.values(latestByVersion);
+    if (entries.length === 0) return undefined;
+    let qps = 0;
+    let p99 = 0;
+    let queue = 0;
+    let streams = 0;
+    let rss: number | undefined;
+    for (const p of entries) {
+      qps += p.qps;
+      queue += p.queue_depth;
+      streams += p.active_streams;
+      if (p.rss_mb != null) rss = (rss ?? 0) + p.rss_mb;
+      p99 = Math.max(p99, p.p99_ms);
+    }
+    return { qps, p99, queue, streams, rss };
+  }, [latestByVersion]);
   const statement = !merged.hasLoaded
     ? t('models.stmtUnloaded')
     : active
@@ -227,6 +258,20 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
           </div>
         )}
 
+        {live && (
+          <div className="no-card-nav" style={{ display: 'flex', gap: SPACE[2], flexWrap: 'wrap', marginTop: SPACE[3], marginLeft: GLYPH_OFFSET }}>
+            <span className="chip" style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>{formatNumber(live.qps)} QPS</span>
+            <span className="chip" style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>
+              {live.p99 > 0 ? formatMs(live.p99) : '-'} p99
+            </span>
+            <span className="chip" style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>{formatNumber(live.queue)} queue</span>
+            <span className="chip" style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>
+              {live.rss != null ? `${Math.round(live.rss)} MB` : '-'} RSS
+            </span>
+            <span className="chip" style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>{live.streams} streams</span>
+          </div>
+        )}
+
         <div
           style={{
             display: 'flex',
@@ -279,12 +324,19 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
 
         {expanded && (
           <div className="expand-in no-card-nav" style={{ marginTop: SPACE[3] }}>
-            <VersionsTable
-              model={model.name}
-              versions={merged.versions}
-              loading={merged.isLoading}
-              ops={can('operator')}
-            />
+            <Row gutter={[SPACE[3], SPACE[3]]}>
+              {merged.versions.map((v) => (
+                <Col xs={24} md={12} xl={8} key={v.version}>
+                  <VersionCard
+                    model={model.name}
+                    version={v}
+                    colorIndex={loaded.findIndex((lv) => lv.version === v.version)}
+                    latest={latestByVersion[v.version]}
+                    ops={can('operator')}
+                  />
+                </Col>
+              ))}
+            </Row>
           </div>
         )}
       </Card>
@@ -301,6 +353,18 @@ export function ModelsPage() {
   const merged = useMergedModels(instanceId);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState<'all' | MergedModelStatus>('all');
+
+  // One page-level timeline poll feeds the L2 chips and the expanded
+  // version-card grid (plan §8) — no per-card timeline requests.
+  const timelineQuery = useTimelineAll(instanceId, 10_000);
+  const latestByModel = useMemo(() => {
+    const map: Record<string, Record<string, TimelineEntry>> = {};
+    for (const s of timelineQuery.data?.snapshots ?? []) {
+      const entry = s.entries[s.entries.length - 1];
+      if (entry) (map[s.model] ??= {})[s.version] = entry;
+    }
+    return map;
+  }, [timelineQuery.data]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { all: merged.data.length };
@@ -366,7 +430,9 @@ export function ModelsPage() {
           </Empty>
         </Card>
       ) : (
-        rows.map((m, idx) => <ModelCard key={m.name} model={m} order={idx + 1} />)
+        rows.map((m, idx) => (
+          <ModelCard key={m.name} model={m} order={idx + 1} latestByVersion={latestByModel[m.name] ?? {}} />
+        ))
       )}
       <UploadDrawer open={uploadOpen} onClose={() => setUploadOpen(false)} existingModels={modelNames} />
     </>

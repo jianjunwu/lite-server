@@ -14,6 +14,7 @@ const mockList: { data: MergedModel[]; isLoading: boolean; repoUnavailable: bool
   repoUnavailable: false,
 };
 const mockVersions: Record<string, MergedVersionsResult> = {};
+let mockTimelineSnapshots: { model: string; version: string; entries: unknown[] }[] = [];
 
 vi.mock('../api/hooks', () => ({
   useMergedModels: () => mockList,
@@ -25,6 +26,7 @@ vi.mock('../api/hooks', () => ({
       inRepo: true,
       hasLoaded: false,
     },
+  useTimelineAll: () => ({ data: { snapshots: mockTimelineSnapshots }, isLoading: false }),
   useInstanceName: () => 'Prod',
 }));
 
@@ -90,6 +92,7 @@ afterEach(() => {
   mockList.data = [];
   mockCanInstance = true;
   runLifecycle.mockClear();
+  mockTimelineSnapshots = [];
   for (const k of Object.keys(mockVersions)) delete mockVersions[k];
 });
 
@@ -181,7 +184,7 @@ describe('ModelsPage repository view', () => {
     expect((init as RequestInit).method).toBe('DELETE');
   });
 
-  it('should_collapse_the_versions_table_until_the_disclosure_is_opened', async () => {
+  it('should_collapse_the_version_cards_until_the_disclosure_is_opened', async () => {
     mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
     mockVersions['ghost'] = {
       versions: [
@@ -204,9 +207,8 @@ describe('ModelsPage repository view', () => {
     // Collapsed by default: the card stays a summary until asked.
     expect(screen.queryByRole('link', { name: '1' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /show versions/i }));
-    // Expanded in place: repo versions with per-version Load actions.
+    // Expanded in place: shared VersionCard per repo version.
     expect(await screen.findByRole('link', { name: '1' })).toBeTruthy();
-    expect((await screen.findAllByRole('button', { name: 'Load' })).length).toBeGreaterThan(0);
   });
 
   it('should_render_a_glyph_labelled_with_the_model_type', () => {
@@ -278,5 +280,39 @@ describe('ModelsPage repository view', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Load' }));
     fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
     await waitFor(() => expect(runLifecycle).toHaveBeenCalledWith('load', 'ghost', '1'));
+  });
+});
+
+describe('ModelsPage live chips', () => {
+  it('should_aggregate_latest_points_into_per_model_chips', () => {
+    mockList.data = [model({ name: 'echo', status: 'ready' })];
+    mockVersions['echo'] = {
+      versions: [
+        { version: 'v1', status: 'ready', active: true, weight: 50, workers: { ready: 1, total: 1 }, loaded_at: 1, loaded: true },
+        { version: 'v2', status: 'ready', active: false, weight: 50, workers: { ready: 1, total: 1 }, loaded_at: 1, loaded: true },
+      ],
+      activeVersion: 'v1',
+      isLoading: false,
+      inRepo: true,
+      hasLoaded: true,
+    };
+    // One page-level poll fans out to every card (plan §8).
+    mockTimelineSnapshots = [
+      { model: 'echo', version: 'v1', entries: [{ timestamp: 1, qps: 10, p99_ms: 100, queue_depth: 2, active_workers: 1, active_streams: 3, rss_mb: 100 }] },
+      { model: 'echo', version: 'v2', entries: [{ timestamp: 1, qps: 20, p99_ms: 200, queue_depth: 4, active_workers: 1, active_streams: 5, rss_mb: 50 }] },
+    ];
+    renderPage();
+    // QPS/queue/RSS/streams summed across versions, p99 maxed.
+    expect(screen.getByText('30 QPS')).toBeTruthy();
+    expect(screen.getByText('200.0ms p99')).toBeTruthy();
+    expect(screen.getByText('6 queue')).toBeTruthy();
+    expect(screen.getByText('150 MB RSS')).toBeTruthy();
+    expect(screen.getByText('8 streams')).toBeTruthy();
+  });
+
+  it('should_hide_the_chip_row_when_the_model_has_no_timeline_data', () => {
+    mockList.data = [model({ name: 'ghost', status: 'unloaded', workers: 0 })];
+    renderPage();
+    expect(screen.queryByText(/QPS$/)).toBeNull();
   });
 });
