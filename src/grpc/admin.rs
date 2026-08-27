@@ -1098,6 +1098,130 @@ impl Admin for GrpcAdminService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn get_model_config(
+        &self,
+        req: Request<pb::GetModelConfigRequest>,
+    ) -> Result<Response<pb::GetModelConfigResponse>, Status> {
+        let r = req.get_ref();
+        crate::validation::validate_identifier(&r.model_name).map_err(to_status)?;
+        crate::validation::validate_version(&r.version).map_err(to_status)?;
+        // Shared core with the HTTP handler — same redaction and etag.
+        let out = crate::http::handlers::config::model_version_config_json(
+            &self.app_state,
+            &r.model_name,
+            &r.version,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::GetModelConfigResponse {
+            model: r.model_name.clone(),
+            version: r.version.clone(),
+            config_json: out["config"].to_string(),
+            has_file: out["has_file"].as_bool().unwrap_or(false),
+            redacted: out["redacted"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            etag: out["etag"].as_str().map(String::from),
+            loaded_at: out["loaded_at"].as_u64(),
+        }))
+    }
+
+    async fn update_model_config(
+        &self,
+        req: Request<pb::UpdateModelConfigRequest>,
+    ) -> Result<Response<pb::UpdateModelConfigResponse>, Status> {
+        use crate::http::handlers::config::{
+            ConfigPatchError, ConfigPatchMode, ConfigPatchRequest,
+        };
+        let cx = req.extensions().get::<RequestContext>().cloned();
+        let r = req.into_inner();
+        crate::validation::validate_identifier(&r.model_name).map_err(to_status)?;
+        crate::validation::validate_version(&r.version).map_err(to_status)?;
+        let patch: serde_json::Value = serde_json::from_str(&r.patch_json)
+            .map_err(|e| Status::invalid_argument(format!("patch_json is not valid JSON: {e}")))?;
+        let mode = match r.mode.as_str() {
+            "" | "apply_reload" => ConfigPatchMode::ApplyReload,
+            "write_only" => ConfigPatchMode::WriteOnly,
+            "dry_run" => ConfigPatchMode::DryRun,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown mode `{other}` (apply_reload | write_only | dry_run)"
+                )))
+            }
+        };
+        let preq = ConfigPatchRequest {
+            patch,
+            if_match: r.if_match,
+            force: r.force,
+            mode,
+        };
+        // Shared core with the HTTP handler — same merge/validate/write/
+        // reload-rollback semantics.
+        let out = crate::http::handlers::config::model_version_config_patch(
+            &self.app_state,
+            &r.model_name,
+            &r.version,
+            &preq,
+        )
+        .await
+        .map_err(|e| match e {
+            ConfigPatchError::App(e) => to_status(e),
+            ConfigPatchError::Conflict { .. } => Status::failed_precondition(
+                "config.yaml changed since the provided etag; re-read and retry, or set force",
+            ),
+            ConfigPatchError::Invalid { message, .. } => Status::invalid_argument(message),
+            ConfigPatchError::ReloadFailed { message, rolled_back, .. } => Status::internal(
+                if rolled_back {
+                    format!("reload failed: {message}; config.yaml rolled back to the previous content")
+                } else {
+                    format!("reload failed: {message}")
+                },
+            ),
+        })?;
+        self.audit(
+            &cx,
+            "config_update",
+            &r.model_name,
+            Some(&r.version),
+            &format!("mode={} reloaded={}", r.mode, out["reloaded"]),
+        );
+        Ok(Response::new(pb::UpdateModelConfigResponse {
+            valid: out["valid"].as_bool().unwrap_or(false),
+            written: out["written"].as_bool().unwrap_or(false),
+            reloaded: out["reloaded"].as_bool().unwrap_or(false),
+            etag: out["etag"].as_str().map(String::from),
+            warnings: out["warnings"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+        }))
+    }
+
+    async fn get_server_config(
+        &self,
+        _req: Request<pb::GetServerConfigRequest>,
+    ) -> Result<Response<pb::GetServerConfigResponse>, Status> {
+        // Shared core with the HTTP handler — same redaction and sources.
+        let out = crate::http::handlers::config::server_config_json(&self.app_state)
+            .map_err(to_status)?;
+        Ok(Response::new(pb::GetServerConfigResponse {
+            config_json: out["config"].to_string(),
+            sources: out["sources"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            redacted: out["redacted"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+        }))
+    }
+
     async fn list_files(
         &self,
         req: Request<pb::ListFilesRequest>,
@@ -1123,8 +1247,7 @@ impl Admin for GrpcAdminService {
                 })
                 .collect(),
         }))
-    }
-}
+    }}
 
 #[cfg(test)]
 mod tests {
@@ -1660,6 +1783,7 @@ mod tests {
                 tls: None,
                 config,
                 has_hot_reload: Arc::new(AtomicBool::new(false)),
+                cli_overrides: crate::config::CliOverrides::default(),
             },
             shutdown_rx,
         ));
@@ -2933,5 +3057,250 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound, "download_model: {err}");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== GetModelConfig (M1) =====
+
+    #[tokio::test]
+    async fn get_model_config_returns_redacted_tree_and_etag() {
+        let repo = unique_repo("get-model-config");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("config.yaml"),
+            "max_batch_size: 8\npolicies:\n  auth:\n    keys: [alpha, beta]\n",
+        )
+        .await
+        .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .get_model_config(Request::new(pb::GetModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.has_file);
+        assert_eq!(resp.etag.as_deref().map(str::len), Some(16));
+        assert_eq!(resp.redacted, vec!["policies.auth.keys".to_string()]);
+        let config: serde_json::Value = serde_json::from_str(&resp.config_json).unwrap();
+        assert_eq!(config["max_batch_size"], serde_json::json!(8));
+        assert_eq!(
+            config["policies"]["auth"]["keys"],
+            serde_json::json!(["***", "***"])
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn get_model_config_unknown_version_is_not_found() {
+        let svc = build_admin_service_with_repo(
+            Arc::new(ModelRegistry::new()),
+            unique_repo("get-model-config-404"),
+        );
+        let err = svc
+            .get_model_config(Request::new(pb::GetModelConfigRequest {
+                model_name: "ghost".to_string(),
+                version: "9".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // ===== GetServerConfig (M5) =====
+
+    #[tokio::test]
+    async fn get_server_config_returns_tree_sources_and_redaction() {
+        use crate::config::{EndpointControl, ProtocolControl};
+        let mut config = Config::default();
+        config.metrics.timeline_max_points = 1440;
+        config.access_control.admin = ProtocolControl {
+            http: Some(EndpointControl::Key {
+                key: "x-api-key".to_string(),
+                value: Some("topsecret".to_string()),
+                value_env: None,
+                value_file: None,
+            }),
+            grpc: None,
+        };
+        let svc = build_admin_service_with_config(
+            Arc::new(ModelRegistry::new()),
+            std::env::temp_dir(),
+            config,
+        );
+
+        let resp = svc
+            .get_server_config(Request::new(pb::GetServerConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let tree: serde_json::Value = serde_json::from_str(&resp.config_json).unwrap();
+        assert_eq!(tree["metrics"]["timeline_max_points"], serde_json::json!(1440));
+        // Secret redacted; source labels still attached per leaf.
+        assert_eq!(
+            tree["access_control"]["admin"]["http"]["value"],
+            serde_json::json!("***")
+        );
+        assert!(!resp.config_json.contains("topsecret"));
+        assert_eq!(
+            resp.sources.get("metrics.timeline_max_points").map(String::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            resp.sources.get("server.http_port").map(String::as_str),
+            Some("default")
+        );
+        assert!(resp
+            .redacted
+            .contains(&"access_control.admin.http.value".to_string()));
+    }
+
+    // ===== UpdateModelConfig (M2) =====
+
+    #[tokio::test]
+    async fn update_model_config_write_only_writes_and_returns_etag() {
+        let repo = unique_repo("update-model-config");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("config.yaml"), "max_batch_size: 8\n")
+            .await
+            .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .update_model_config(Request::new(pb::UpdateModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+                patch_json: r#"{"max_batch_size": 32}"#.to_string(),
+                if_match: None,
+                force: false,
+                mode: "write_only".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.valid);
+        assert!(resp.written);
+        assert!(!resp.reloaded);
+        assert_eq!(resp.etag.as_deref().map(str::len), Some(16));
+
+        let written = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        assert!(written.contains("max_batch_size: 32"));
+        // Backup holds the pre-write bytes.
+        let bak = tokio::fs::read_to_string(dir.join("config.yaml.bak")).await.unwrap();
+        assert_eq!(bak, "max_batch_size: 8\n");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn update_model_config_dry_run_does_not_write() {
+        let repo = unique_repo("update-model-config-dry");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("config.yaml"), "max_batch_size: 8\n")
+            .await
+            .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .update_model_config(Request::new(pb::UpdateModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+                patch_json: r#"{"max_batch_size": "oops"}"#.to_string(),
+                if_match: None,
+                force: false,
+                mode: "dry_run".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.valid);
+        assert!(!resp.written);
+        assert!(!resp.warnings.is_empty());
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        assert_eq!(on_disk, "max_batch_size: 8\n");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn update_model_config_stale_etag_is_failed_precondition() {
+        let repo = unique_repo("update-model-config-409");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("config.yaml"), "max_batch_size: 8\n")
+            .await
+            .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let err = svc
+            .update_model_config(Request::new(pb::UpdateModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+                patch_json: r#"{"max_batch_size": 32}"#.to_string(),
+                if_match: Some("0000000000000000".to_string()),
+                force: false,
+                mode: "write_only".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        assert_eq!(on_disk, "max_batch_size: 8\n");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn update_model_config_invalid_merge_is_invalid_argument() {
+        let repo = unique_repo("update-model-config-400");
+        let dir = repo.join("cfg_m").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("config.yaml"), "max_batch_size: 8\n")
+            .await
+            .unwrap();
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let err = svc
+            .update_model_config(Request::new(pb::UpdateModelConfigRequest {
+                model_name: "cfg_m".to_string(),
+                version: "1".to_string(),
+                patch_json: r#"{"max_batch_size": "oops"}"#.to_string(),
+                if_match: None,
+                force: false,
+                mode: "write_only".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        assert_eq!(on_disk, "max_batch_size: 8\n");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn update_model_config_unknown_version_is_not_found() {
+        let svc = build_admin_service_with_repo(
+            Arc::new(ModelRegistry::new()),
+            unique_repo("update-model-config-404"),
+        );
+        let err = svc
+            .update_model_config(Request::new(pb::UpdateModelConfigRequest {
+                model_name: "ghost".to_string(),
+                version: "9".to_string(),
+                patch_json: r#"{"max_batch_size": 1}"#.to_string(),
+                if_match: None,
+                force: false,
+                mode: "".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

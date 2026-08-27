@@ -208,3 +208,23 @@ def test_should_audit_grant_changes(ctx):
     assert entries[0]["actor"] == "admin"
     assert entries[0]["target"] == "op1"
     assert entries[0]["detail"] == {"instance_id": "prod", "role": "viewer"}
+
+
+# ---- M5: instance config read (GET /v2/server/config) ----
+
+def test_should_let_viewer_read_server_config(ctx):
+    # No model segment in the path, so the model whitelist never engages;
+    # any role with instance access reads the effective server config.
+    client = ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    res = client.get("/api/i/dev/v2/server/config")
+    assert res.status_code == 200
+
+
+def test_should_deny_server_config_when_grant_is_none(ctx):
+    ctx["store"].set_instance_grant("viewer1", "dev", "none")
+    client = ctx["client"]
+    login(client, "viewer1", "viewer-pass-1")
+    res = client.get("/api/i/dev/v2/server/config")
+    assert res.status_code == 403
+    assert res.json()["reason"] == "instance_denied"

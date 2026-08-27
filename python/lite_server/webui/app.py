@@ -47,6 +47,7 @@ class _SpaFiles(StaticFiles):
 async def _lifespan(app: FastAPI):
     yield
     await app.state.http.aclose()
+    await app.state.http_long.aclose()
     await app.state.http_stream.aclose()
     # Checkpoint/close the auth SQLite (WAL) on clean shutdown. Tolerant: a
     # broken store must not turn shutdown into an error.
@@ -59,14 +60,22 @@ async def _lifespan(app: FastAPI):
 
 
 def build_app(registry, *, web_dist=None, user_store=None, auth_enabled: bool = True,
-              unary_timeout: float = 60.0, stream_max_connections: int = 500) -> FastAPI:
+              unary_timeout: float = 60.0, config_patch_timeout: float = 600.0,
+              stream_max_connections: int = 500) -> FastAPI:
     app = FastAPI(lifespan=_lifespan)
     app.state.registry = registry
     # trust_env=False: instance forwarding must not honor system/env proxy
     # settings (the Node BFF's undici client does not either).
-    # Two clients: bounded for unary calls, unbounded read for SSE streams.
+    # Three clients: bounded for unary calls, long-timeout for config PATCH,
+    # unbounded read for SSE streams and file transfers.
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(unary_timeout, connect=10.0), trust_env=False
+    )
+    # Config PATCH waits for a synchronous reload_model on the instance,
+    # which is minute-scale for large models; bounding it by unary_timeout
+    # would misreport a successful write+reload as 502 instance_unreachable.
+    app.state.http_long = httpx.AsyncClient(
+        timeout=httpx.Timeout(config_patch_timeout, connect=10.0), trust_env=False
     )
     # Each SSE stream or file transfer pins one upstream connection for its
     # lifetime, so the pool must cover the expected concurrent transfer load

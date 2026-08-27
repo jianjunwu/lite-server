@@ -136,7 +136,41 @@
     "stmtWaiting": "Waiting for metrics…",
     "currentQps": "Current QPS",
     "currentP99": "Current p99",
-    "currentQueue": "Queue depth"
+    "currentQueue": "Queue depth",
+    "range5m": "5 min",
+    "range15m": "15 min",
+    "range1h": "1 hour",
+    "rangeAll": "All",
+    "rangeDisabledHint": "Range exceeds the instance retention window — raise metrics.timeline_max_points on the instance",
+    "groupThroughput": "Throughput",
+    "groupLatency": "Latency",
+    "groupQueue": "Queue & concurrency",
+    "groupResources": "Resources",
+    "groupHealth": "Health",
+    "groupAccelerator": "Accelerator",
+    "tokensPerS": "Tokens/s",
+    "streamBytesPerS": "Stream bytes/s",
+    "ttftP99": "TTFT p99",
+    "tbtP99": "TBT p99",
+    "inFlight": "In-flight",
+    "activeStreams": "Active streams",
+    "saturation": "Worker saturation",
+    "rss": "Worker RSS",
+    "cpu": "CPU",
+    "retriesPerS": "Retries/s",
+    "ejectionsPerS": "Ejections/s",
+    "unsupported": "This instance version does not report this metric",
+    "notReported": "The model has not reported token metrics"
+  },
+  "accelerator": {
+    "devices": "Devices",
+    "utilization": "Utilization",
+    "memory": "Memory",
+    "temperature": "Temperature",
+    "updated": "Last report",
+    "empty": "The model has not reported accelerator metrics",
+    "emptyHint": "Report from model code via lit_api.report_accelerator_metrics(...) — see docs/observability.md",
+    "unsupported": "This instance does not support accelerator metrics (old version or features.accelerator_metrics off)"
   },
   "alerts": {
     "title": "Alerts",
@@ -450,5 +484,106 @@
   "versions": {
     "ofTraffic": "{{weight}}% of traffic",
     "loadedSince": "loaded {{age}} ago"
+  },
+  "modelConfig": {
+    "title": "Configuration",
+    "noFile": "This version has no config.yaml",
+    "empty": "The config file is empty",
+    "unsupported": "Not available (instance unreachable or predates this feature)",
+    "edit": "Edit",
+    "save": "Save",
+    "cancel": "Cancel",
+    "readOnly": "Read-only",
+    "discardTitle": "Discard changes?",
+    "discardBody": "Your unsaved edits will be lost.",
+    "diffTitle": "Confirm config changes",
+    "diffChanges": "{{count}} changed line block(s)",
+    "saved": "Config saved and reloaded",
+    "savedWriteOnly": "Config written to disk",
+    "dryRunValid": "Merged config is valid",
+    "dryRunInvalid": "Merged config is invalid",
+    "conflictTitle": "Config changed externally",
+    "conflictBody": "config.yaml was modified since you started editing.",
+    "forceOverwrite": "Force overwrite",
+    "conflictViewLatest": "View latest",
+    "reloadFailedTitle": "Reload failed",
+    "rolledBack": "config.yaml was rolled back to its previous content.",
+    "jsonInvalid": "Invalid JSON",
+    "dangerWarning": "Dangerous field — a wrong value can break worker startup",
+    "redactedSkipped": "Redacted secret fields are not editable and were left untouched: {{keys}}",
+    "mode": {
+      "applyReload": "Save and reload",
+      "writeOnly": "Write file only",
+      "dryRun": "Validate only (dry run)"
+    },
+    "groups": {
+      "batching": "Batching",
+      "resources": "Resources & devices",
+      "queue": "Queue & timeouts",
+      "lifecycle": "Lifecycle & recycle",
+      "resilience": "Retries & ejection",
+      "health": "Health checks",
+      "policies": "Policies",
+      "advanced": "Advanced (unrecognized keys)"
+    }
+  },
+  "instance": {
+    "detail": {
+      "online": "online",
+      "offline": "offline",
+      "modelsLoaded_zero": "no models loaded",
+      "modelsLoaded_one": "{{count}} model loaded",
+      "modelsLoaded_other": "{{count}} models loaded",
+      "notFound": "This instance is not registered (or hidden for your account).",
+      "unreachable": "Instance unreachable — showing the last known state.",
+      "tabs": {
+        "overview": "Overview",
+        "config": "Configuration",
+        "accelerator": "Accelerator"
+      },
+      "stats": {
+        "version": "Version",
+        "modelsLoaded": "Models loaded",
+        "rss": "Process RSS",
+        "cpu": "CPU",
+        "activeStreams": "Active streams"
+      },
+      "probes": {
+        "title": "Health probes"
+      },
+      "models": {
+        "title": "Models",
+        "empty": "No models loaded"
+      }
+    },
+    "config": {
+      "searchPlaceholder": "Filter by field path…",
+      "empty": "No configuration fields match the filter.",
+      "unsupported": "Not available on this instance (unreachable or predates this feature).",
+      "noMatch": "No fields match \"{{query}}\".",
+      "source": {
+        "cli": "CLI",
+        "file": "file",
+        "default": "default"
+      },
+      "groups": {
+        "server": "Server (HTTP)",
+        "grpc": "gRPC",
+        "metrics": "Metrics",
+        "alerts": "Alerts",
+        "access_control": "Access control",
+        "openai_compact": "OpenAI compact (/v1)",
+        "features": "Features",
+        "model_defaults": "Model defaults",
+        "tunables": "Server tunables",
+        "orchestration": "Orchestration",
+        "model_repository": "Model repository",
+        "rate_limit": "Rate limit",
+        "logging": "Logging",
+        "telemetry": "Telemetry",
+        "callbacks": "Callbacks",
+        "advanced": "Advanced (unrecognized sections)"
+      }
+    }
   }
 }

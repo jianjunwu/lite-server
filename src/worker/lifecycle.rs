@@ -1881,6 +1881,37 @@ impl WorkerManager {
         model_name: &str,
         version: Option<&str>,
     ) -> Result<bool, AppError> {
+        self.reload_model_inner(model_name, version, true).await
+    }
+
+    /// H2: config-PATCH apply_reload variant WITHOUT the internal restore.
+    /// The PATCH layer owns the config.yaml rollback; restoring here would
+    /// spawn workers against the still-patched file (the Python worker reads
+    /// config.yaml from disk at startup), so the caller rolls the file back
+    /// first and then re-reloads through [`Self::reload_model`] (recovering)
+    /// to converge Rust- and Python-side state on the previous config.
+    pub(crate) async fn reload_model_without_recovery(
+        &self,
+        model_name: &str,
+        version: Option<&str>,
+    ) -> Result<bool, AppError> {
+        self.reload_model_inner(model_name, version, false).await
+    }
+
+    /// H2 (service recovery): reload = validate-then-swap from disk, then
+    /// unload + load. A load failure AFTER the unload leaves the version
+    /// Failed with no workers — the model stops serving until someone
+    /// reloads manually. With `recover`, a post-unload load failure
+    /// triggers a best-effort restore: the version is brought back up with
+    /// the config it was running before the reload (snapshotted from the
+    /// registry below). The original error is still returned — the reload
+    /// DID fail; the restore only recovers service.
+    async fn reload_model_inner(
+        &self,
+        model_name: &str,
+        version: Option<&str>,
+        recover: bool,
+    ) -> Result<bool, AppError> {
         let v = match version {
             Some(v) => v.to_string(),
             None => match self.registry.get_active_version(model_name) {
@@ -1889,9 +1920,15 @@ impl WorkerManager {
             },
         };
 
-        if self.registry.get(model_name, Some(&v)).is_none() {
+        // Snapshot the running config and the active pointer BEFORE the
+        // unload — the unload drops the registry entry, and the restore
+        // needs exactly the config that was serving.
+        let Some(mv) = self.registry.get(model_name, Some(&v)) else {
             return Ok(false);
-        }
+        };
+        let old_config = mv.config.clone();
+        let was_active =
+            self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
 
         // Batch 0 (profile prerequisite): validate-then-swap — re-read
         // config.yaml from disk and apply model_defaults; any failure returns
@@ -1913,16 +1950,60 @@ impl WorkerManager {
             .validate()
             .map_err(|e| AppError::Config(e.to_string()))?;
 
-        let was_active =
-            self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
-
         info!("Reloading {} version {}", model_name, v);
         self.unload_version(model_name, &v).await?;
 
         // Small delay to ensure cleanup
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        self.load_model(model_name, &v, &config).await?;
+        if let Err(e) = self.load_model(model_name, &v, &config).await {
+            if !recover {
+                return Err(e);
+            }
+            // H2: restore service with the previous config (best-effort).
+            // load_model left the registry entry Failed — remove it so the
+            // restore load is not rejected as a duplicate.
+            warn!(
+                model = %model_name, version = %v, error = %e,
+                "reload failed after unload; restoring version with previous config"
+            );
+            let _ = self.registry.remove(model_name, &v);
+            match self.load_model(model_name, &v, &old_config).await {
+                Ok(()) => {
+                    // Same rule as the success path: only a version that was
+                    // active before the reload gets the pointer back — a
+                    // restored standby must not steal it (§4.3).
+                    if was_active {
+                        let _ = self.registry.activate_version(model_name, &v);
+                    }
+                    crate::metrics::prometheus::record_model_reload_restore(
+                        model_name,
+                        &v,
+                        crate::metrics::prometheus::ReloadRestoreStatus::Restored,
+                    );
+                    info!(
+                        model = %model_name, version = %v,
+                        "version restored with previous config after failed reload"
+                    );
+                }
+                Err(re) => {
+                    crate::metrics::prometheus::record_model_reload_restore(
+                        model_name,
+                        &v,
+                        crate::metrics::prometheus::ReloadRestoreStatus::Failed,
+                    );
+                    error!(
+                        model = %model_name, version = %v, error = %re,
+                        "restore with previous config also failed; version stays Failed"
+                    );
+                    return Err(AppError::Internal(format!(
+                        "{e}; restore with previous config also failed: {re}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+
         // Restore the active pointer only if this version was active before
         // the reload — auto-recycling a standby version must not steal the
         // pointer from the serving version (§4.3).
@@ -4923,5 +5004,223 @@ class TestAPI(LitAPI):
             "L5: warmup-failed workers still alive: {alive:?} — load_model \
              spawned them before warmup and never reaped them on failure"
         );
+    }
+
+    // ===== H2: reload failure restores the version with the previous config =====
+
+    /// Minimal LitAPI model whose setup is instant — the reload-recovery
+    /// tests spawn real workers, so setup must stay trivial.
+    const H2_MODEL_PY: &str = r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    /// Good on-disk config: Rust-valid and runnable on cpu.
+    const H2_GOOD_CONFIG: &str =
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
+
+    /// Rust-valid config that passes `ModelConfig::validate` but fails at
+    /// load RUNTIME: the warmup sample file does not exist, so the warmup
+    /// fails after the workers spawned (the deterministic post-unload
+    /// failure lever, same shape as failed_load_deregisters_custom_metric_families).
+    const H2_BROKEN_CONFIG: &str = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\npolicies:\n  warmup:\n    enabled: true\n    samples:\n      - input_ref: \"warmup/missing.json\"\n";
+
+    fn h2_repo(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-h2-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.py"), H2_MODEL_PY).unwrap();
+        std::fs::write(model_dir.join("config.yaml"), H2_GOOD_CONFIG).unwrap();
+        (repo, model_dir)
+    }
+
+    fn h2_worker_manager(
+        repo: std::path::PathBuf,
+        registry: Arc<ModelRegistry>,
+    ) -> Arc<WorkerManager> {
+        Arc::new(WorkerManager::new(
+            registry,
+            repo,
+            Arc::new(InferenceQueue::new()),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ))
+    }
+
+    /// H2: a reload whose post-unload load fails (valid config, runtime
+    /// failure) must not leave the model unserving — the version is brought
+    /// back up with the config it was running before the reload, and the
+    /// original error is still returned to the caller.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_failure_restores_version_with_previous_config() {
+        let tag = "reloadrec";
+        let (repo, model_dir) = h2_repo(tag);
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = h2_worker_manager(repo.clone(), registry.clone());
+
+        let config = crate::config::load_model_config(&model_dir.join("config.yaml")).unwrap();
+        wm.load_model(tag, "1", &config).await.unwrap();
+        registry.activate_version(tag, "1").unwrap();
+
+        // Break the on-disk config: valid, but the warmup sample is missing.
+        std::fs::write(model_dir.join("config.yaml"), H2_BROKEN_CONFIG).unwrap();
+
+        let result = wm.reload_model(tag, Some("1")).await;
+        assert!(
+            result.is_err(),
+            "the reload must still report the failure to the caller"
+        );
+
+        // H2: service was restored with the previous config.
+        let mv = registry
+            .get(tag, Some("1"))
+            .expect("H2: the version must be restored, not left Failed/removed");
+        assert_eq!(
+            mv.status,
+            VersionStatus::Ready,
+            "H2: the version must be back to Ready after a failed reload"
+        );
+        assert!(
+            mv.config.policies.warmup.is_none(),
+            "H2: the restored version must run the PREVIOUS config (no warmup)"
+        );
+        assert_eq!(
+            registry.get_active_version(tag).as_deref(),
+            Some("1"),
+            "H2: the active pointer must be restored"
+        );
+        let key = model_version_key(tag, "1");
+        assert!(
+            !wm.workers.read().await.get(&key).unwrap_or(&vec![]).is_empty(),
+            "H2: the restored version must have live workers"
+        );
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_RELOAD_RESTORE_TOTAL
+                .with_label_values(&[tag, "1", "restored"])
+                .get(),
+            1.0,
+            "H2: the successful restore must be counted"
+        );
+
+        let _ = wm.unload_model(tag, Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// H2 boundary: when the on-disk CODE is also broken (setup raises), the
+    /// restore with the previous config fails too — the version stays Failed
+    /// and the error names both failures. No resurrection loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_recovery_failure_leaves_version_failed() {
+        let tag = "recfail";
+        let (repo, model_dir) = h2_repo(tag);
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = h2_worker_manager(repo.clone(), registry.clone());
+
+        let config = crate::config::load_model_config(&model_dir.join("config.yaml")).unwrap();
+        wm.load_model(tag, "1", &config).await.unwrap();
+
+        // Break the code (setup raises → every spawn fails) and touch the
+        // config so the reload re-reads it.
+        std::fs::write(
+            model_dir.join("model.py"),
+            "from lite_server import LitAPI\n\n\nclass TestAPI(LitAPI):\n    def setup(self, device):\n        raise RuntimeError(\"broken by test\")\n",
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("config.yaml"), H2_BROKEN_CONFIG).unwrap();
+
+        let err = wm
+            .reload_model(tag, Some("1"))
+            .await
+            .expect_err("a reload against broken code must fail");
+        assert!(
+            format!("{err}").contains("restore with previous config also failed"),
+            "the error must name the failed restore attempt, got: {err}"
+        );
+        assert_eq!(
+            registry.get(tag, Some("1")).map(|mv| mv.status),
+            Some(VersionStatus::Failed),
+            "the version must stay Failed when the restore also fails"
+        );
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_RELOAD_RESTORE_TOTAL
+                .with_label_values(&[tag, "1", "failed"])
+                .get(),
+            1.0,
+            "H2: the failed restore must be counted"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// H2: restoring a failed reload of a STANDBY version must not steal the
+    /// active pointer from the serving version (§4.3, same rule as the
+    /// success path). v1 is an ensemble (no workers — keeps the test fast);
+    /// v2 is the reloaded LitAPI version.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_recovery_preserves_active_pointer_of_serving_version() {
+        let tag = "stdby";
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-h2-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+
+        // v1: valid ensemble plan (loads with no workers).
+        let v1_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&v1_dir).unwrap();
+        std::fs::write(
+            v1_dir.join("config.yaml"),
+            "ensemble:\n  output: \"$a.output\"\n  steps:\n    - name: a\n      model: sub\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n",
+        )
+        .unwrap();
+
+        // v2: real LitAPI worker.
+        let v2_dir = repo.join(tag).join("2");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        std::fs::write(v2_dir.join("model.py"), H2_MODEL_PY).unwrap();
+        std::fs::write(v2_dir.join("config.yaml"), H2_GOOD_CONFIG).unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = h2_worker_manager(repo.clone(), registry.clone());
+
+        wm.load_model(tag, "1", &ModelConfig::default()).await.unwrap();
+        let config2 = crate::config::load_model_config(&v2_dir.join("config.yaml")).unwrap();
+        wm.load_model(tag, "2", &config2).await.unwrap();
+        registry.activate_version(tag, "1").unwrap();
+
+        // Break v2's on-disk config and reload the standby version.
+        std::fs::write(v2_dir.join("config.yaml"), H2_BROKEN_CONFIG).unwrap();
+        let result = wm.reload_model(tag, Some("2")).await;
+        assert!(result.is_err(), "the standby reload must report the failure");
+
+        assert_eq!(
+            registry.get(tag, Some("2")).map(|mv| mv.status),
+            Some(VersionStatus::Ready),
+            "H2: the standby version must be restored to Ready"
+        );
+        assert_eq!(
+            registry.get_active_version(tag).as_deref(),
+            Some("1"),
+            "H2: restoring a standby version must not steal the active pointer"
+        );
+
+        let _ = wm.unload_model(tag, Some("2")).await;
+        let _ = wm.unload_model(tag, Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

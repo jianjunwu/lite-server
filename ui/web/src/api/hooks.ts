@@ -1,8 +1,9 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ApiError, apiFetch, bffFetch } from './client';
+import { ApiError, apiFetch, apiFetchWithHeaders, bffFetch } from './client';
 import { mergeModelList, mergeVersionList, type MergedModel, type MergedVersions } from './merge';
 import type {
+  AcceleratorReading,
   AlertsResponse,
   HealthSummary,
   InstanceInfo,
@@ -156,10 +157,31 @@ export function useModelHealth(instanceId: string | null, model: string, version
   });
 }
 
-export function useTimelineAll(instanceId: string | null, refetchInterval: number | false = 5_000) {
+export interface TimelineAllResult extends TimelineAllResponse {
+  /** X-Timeline-Coverage header: retention window in seconds. Undefined on
+   * instances older than the M3 schema. */
+  coverageSeconds?: number;
+  /** X-Timeline-Interval header: timeline point spacing in seconds. */
+  intervalSeconds?: number;
+}
+
+function positiveHeader(headers: Headers, name: string): number | undefined {
+  const v = Number(headers.get(name));
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+export function useTimelineAll(instanceId: string | null, refetchInterval: number | false = 5_000, step?: number) {
   return useQuery({
-    queryKey: [instanceId, 'timeline'],
-    queryFn: () => apiFetch<TimelineAllResponse>(instanceId!, '/metrics/timeline'),
+    queryKey: [instanceId, 'timeline', step ?? null],
+    queryFn: async (): Promise<TimelineAllResult> => {
+      const path = step && step > 1 ? `/metrics/timeline?step=${step}` : '/metrics/timeline';
+      const { data, headers } = await apiFetchWithHeaders<TimelineAllResponse>(instanceId!, path);
+      return {
+        ...data,
+        coverageSeconds: positiveHeader(headers, 'x-timeline-coverage'),
+        intervalSeconds: positiveHeader(headers, 'x-timeline-interval'),
+      };
+    },
     enabled: instanceId !== null,
     refetchInterval,
   });
@@ -182,6 +204,24 @@ export function useAlerts(instanceId: string | null, refetchInterval: number | f
     queryKey: [instanceId, 'alerts'],
     queryFn: () => apiFetch<AlertsResponse>(instanceId!, '/metrics/alerts'),
     enabled: instanceId !== null,
+    refetchInterval,
+  });
+}
+
+/** M4: per-device accelerator readings. `null` data on 404 — the instance
+ * predates the endpoint or runs with features.accelerator_metrics off. */
+export function useAcceleratorMetrics(instanceId: string | null, refetchInterval: number | false = 10_000, active = true) {
+  return useQuery({
+    queryKey: [instanceId, 'accelerator'],
+    queryFn: async (): Promise<AcceleratorReading[] | null> => {
+      try {
+        return await apiFetch<AcceleratorReading[]>(instanceId!, '/metrics/accelerator');
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) return null;
+        throw err;
+      }
+    },
+    enabled: instanceId !== null && active,
     refetchInterval,
   });
 }

@@ -737,6 +737,13 @@ pub struct FeaturesConfig {
     /// `streaming && websocket_streaming && decoupled` for WS). Default true.
     pub decoupled: bool,
     pub streaming_metrics: bool,
+    /// M4: vendor-neutral accelerator metrics — mount GET /metrics/accelerator
+    /// and record worker-reported readings into the
+    /// `lite_server_accelerator_*` families. Default true: the families are
+    /// server-fixed with cardinality-capped labels (unlike the worker-named
+    /// custom_metrics, which stays opt-in) and there is no background sampler
+    /// (unlike timeline) — zero cost until a model reports.
+    pub accelerator_metrics: bool,
     /// P5-2 (蓝图 §4.4, D16): 允许 `x-lite-version` pin 绕过权重路由（HTTP 与
     /// gRPC 双侧门控一致）。默认 false（breaking）——生产上 pin 可绕过灰度
     /// 权重，仅灰度/调试环境显式开启。
@@ -757,6 +764,7 @@ impl Default for FeaturesConfig {
             http_bidi: true,
             decoupled: true,
             streaming_metrics: true,
+            accelerator_metrics: true,
             canary_override: false,
         }
     }
@@ -1634,6 +1642,20 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     Ok(config)
 }
 
+/// Validate a would-be config.yaml without touching the filesystem (M2 PATCH
+/// dry-run / pre-write gate): the same serde parse, env expansion and warmup
+/// sentinel as [`load_model_config`], plus the duration/range gate the reload
+/// chain applies after model_defaults.
+pub fn validate_model_config_yaml(content: &str) -> anyhow::Result<ModelConfig> {
+    let mut config: ModelConfig = serde_yaml::from_str(content)?;
+    expand_policy_env_vars(&mut config)?;
+    if let Some(w) = &config.policies.warmup {
+        w.validate()?;
+    }
+    config.validate()?;
+    Ok(config)
+}
+
 /// Expand `${VAR}` entries in `policies.auth.keys` from the environment.
 /// Fail-closed: an unset variable is a load error, never an empty key.
 fn expand_policy_env_vars(config: &mut ModelConfig) -> anyhow::Result<()> {
@@ -1684,6 +1706,57 @@ pub struct CliOverrides {
     pub shutdown_stream_grace_ms: Option<u32>,
     /// Per-model tunables overridden via CLI flags.
     pub tunables: ModelTunables,
+}
+
+impl CliOverrides {
+    /// Dot-paths (into the serialized `Config` tree) that this override set
+    /// explicitly forces. Drives the M5 `/v2/server/config` source labels:
+    /// these paths read as "cli" regardless of file/default content.
+    pub fn overridden_paths(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        if self.port.is_some() { out.insert("server.http_port".to_string()); }
+        if self.host.is_some() { out.insert("server.host".to_string()); }
+        if self.model_repo.is_some() { out.insert("model_repository.path".to_string()); }
+        if self.threads.is_some() { out.insert("server.threads".to_string()); }
+        if self.timeout.is_some() { out.insert("server.timeout".to_string()); }
+        if self.log_level.is_some() { out.insert("logging.level".to_string()); }
+        if self.log_info_output.is_some() { out.insert("logging.info_output".to_string()); }
+        if self.log_error_output.is_some() { out.insert("logging.error_output".to_string()); }
+        if self.log_rotation.is_some() { out.insert("logging.rotation".to_string()); }
+        if self.grpc_port.is_some() { out.insert("server.grpc_port".to_string()); }
+        if self.metrics_port.is_some() { out.insert("server.metrics_port".to_string()); }
+        if self.no_grpc { out.insert("grpc.enabled".to_string()); }
+        if self.no_metrics { out.insert("metrics.enabled".to_string()); }
+        if self.no_streaming_metrics { out.insert("features.streaming_metrics".to_string()); }
+        if self.graceful_timeout.is_some() { out.insert("server.graceful_timeout".to_string()); }
+        if self.keepalive_timeout.is_some() { out.insert("server.keepalive_timeout".to_string()); }
+        if self.shutdown_stream_grace_ms.is_some() { out.insert("server.shutdown_stream_grace_ms".to_string()); }
+        let t = &self.tunables;
+        let mut tunable = |name: &str, set: bool| {
+            if set { out.insert(format!("model_defaults.{name}")); }
+        };
+        tunable("max_queue_size", t.max_queue_size.is_some());
+        tunable("max_requests", t.max_requests.is_some());
+        tunable("max_requests_jitter", t.max_requests_jitter.is_some());
+        tunable("recycle_max_percent", t.recycle_max_percent.is_some());
+        tunable("count_streams_toward_max_requests", t.count_streams_toward_max_requests.is_some());
+        tunable("recycle_stream_drain_timeout_secs", t.recycle_stream_drain_timeout_secs.is_some());
+        tunable("max_concurrent_streams", t.max_concurrent_streams.is_some());
+        tunable("recycle_stream_grace_ms", t.recycle_stream_grace_ms.is_some());
+        tunable("request_timeout", t.request_timeout.is_some());
+        tunable("health_check_interval", t.health_check_interval.is_some());
+        tunable("ejection_error_threshold", t.ejection_error_threshold.is_some());
+        tunable("ejection_timeout", t.ejection_timeout.is_some());
+        tunable("ejection_max_percent", t.ejection_max_percent.is_some());
+        tunable("ejection_max_timeout", t.ejection_max_timeout.is_some());
+        tunable("max_retries", t.max_retries.is_some());
+        tunable("startup_timeout", t.startup_timeout.is_some());
+        tunable("health_check_timeout", t.health_check_timeout.is_some());
+        tunable("health_check_kill_threshold", t.health_check_kill_threshold.is_some());
+        tunable("worker_kill_timeout", t.worker_kill_timeout.is_some());
+        tunable("hook_http_timeout", t.hook_http_timeout.is_some());
+        out
+    }
 }
 
 impl Config {
@@ -2706,6 +2779,64 @@ mod tests {
     }
 
     // --- Model defaults ---
+
+    #[test]
+    fn overridden_paths_empty_by_default() {
+        assert!(CliOverrides::default().overridden_paths().is_empty());
+    }
+
+    #[test]
+    fn overridden_paths_cover_every_override_kind() {
+        let overrides = CliOverrides {
+            port: Some(9090),
+            host: Some("127.0.0.1".to_string()),
+            model_repo: Some("/repo".to_string()),
+            threads: Some(4),
+            timeout: Some(10.0),
+            log_level: Some("debug".to_string()),
+            log_info_output: Some("/tmp/i.log".to_string()),
+            log_error_output: Some("/tmp/e.log".to_string()),
+            log_rotation: Some("daily".to_string()),
+            grpc_port: Some(9001),
+            metrics_port: Some(9002),
+            no_grpc: true,
+            no_metrics: true,
+            no_streaming_metrics: true,
+            graceful_timeout: Some(5.0),
+            keepalive_timeout: Some(2.0),
+            shutdown_stream_grace_ms: Some(100),
+            tunables: ModelTunables {
+                max_queue_size: Some(500),
+                request_timeout: Some(60.0),
+                ..Default::default()
+            },
+        };
+        let paths = overrides.overridden_paths();
+        for expected in [
+            "server.http_port",
+            "server.host",
+            "model_repository.path",
+            "server.threads",
+            "server.timeout",
+            "logging.level",
+            "logging.info_output",
+            "logging.error_output",
+            "logging.rotation",
+            "server.grpc_port",
+            "server.metrics_port",
+            "grpc.enabled",
+            "metrics.enabled",
+            "features.streaming_metrics",
+            "server.graceful_timeout",
+            "server.keepalive_timeout",
+            "server.shutdown_stream_grace_ms",
+            "model_defaults.max_queue_size",
+            "model_defaults.request_timeout",
+        ] {
+            assert!(paths.contains(expected), "missing cli path {expected}");
+        }
+        assert_eq!(paths.len(), 19);
+    }
 
     #[test]
     fn test_model_defaults_none_by_default() {

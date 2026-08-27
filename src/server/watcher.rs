@@ -143,6 +143,45 @@ pub(super) async fn process_watch_events(
     // event batch — otherwise it grows monotonically with version churn.
     last_reload.retain(|(m, v), _| registry.get(m, Some(v)).is_some());
 
+    // H3: a config.yaml event whose on-disk content matches a recent config
+    // PATCH write is the echo of the PATCH's own atomic rename (or its
+    // rollback). The reload decision belongs to the PATCH mode — write_only
+    // promised NO reload and apply_reload already ran one — so the watcher
+    // drops the config.yaml path from the trigger set. Matching is keyed on
+    // the content hash: the debounce delay makes any time-window heuristic
+    // unreliable, while a hash mismatch (a human edit after the PATCH)
+    // correctly falls through to the normal reload below.
+    let keys: Vec<(String, String)> = models_to_reload.iter().cloned().collect();
+    for key in keys {
+        let config_path = repo_path.join(&key.0).join(&key.1).join("config.yaml");
+        let has_config_event = trigger_files
+            .get(&key)
+            .map(|files| files.contains(&config_path))
+            .unwrap_or(false);
+        if !has_config_event {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&config_path).await else {
+            continue;
+        };
+        if !worker_manager.take_config_write(
+            &config_path,
+            &crate::http::handlers::config::content_etag(&bytes),
+        ) {
+            continue;
+        }
+        debug!(
+            "Hot reload: skipping {} version {} config.yaml echo of a control-plane write",
+            key.0, key.1
+        );
+        let files = trigger_files.get_mut(&key).expect("checked above");
+        files.retain(|f| *f != config_path);
+        if files.is_empty() {
+            trigger_files.remove(&key);
+            models_to_reload.remove(&key);
+        }
+    }
+
     // Reload changed models (with per-model/version cooldown)
     let cooldown = Duration::from_secs_f32(server_tunables.hot_reload_cooldown_secs);
     for (name, version) in models_to_reload {
@@ -1295,5 +1334,225 @@ class TestAPI(LitAPI):
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ===== H3: config PATCH writes must not echo back as watcher reloads =====
+    //
+    // A config.yaml PATCH carries its own reload semantics (write_only = no
+    // reload; apply_reload = the PATCH itself reloaded). Its atomic rename
+    // still produces a file event; the watcher must recognize the echo as
+    // control-plane-originated (the on-disk content hash matches a recorded
+    // PATCH write) and leave the PATCH's mode decision alone.
+
+    fn hot_reload_config(max_batch_size: i64) -> String {
+        // hot_reload_patterns cleared: the default ["*.py"] gate would keep
+        // config.yaml events from ever reaching the reload path.
+        format!(
+            "hot_reload: true\nhot_reload_patterns: []\nmax_batch_size: {max_batch_size}\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n"
+        )
+    }
+
+    const H3_MODEL_PY: &str = r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    def on_file_changed(self, changed_files):
+        return {"handled": True}
+"#;
+
+    fn h3_app_state(
+        repo: PathBuf,
+        wm: Arc<WorkerManager>,
+        registry: Arc<ModelRegistry>,
+    ) -> Arc<crate::http::state::AppState> {
+        Arc::new(crate::http::state::AppState::new(
+            registry,
+            wm,
+            Arc::new(InferenceQueue::new()),
+            crate::config::Config::default(),
+            repo,
+            Arc::new(CallbackRunner::new()),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    fn h3_patch_req(
+        max_batch_size: i64,
+        mode: crate::http::handlers::config::ConfigPatchMode,
+    ) -> crate::http::handlers::config::ConfigPatchRequest {
+        crate::http::handlers::config::ConfigPatchRequest {
+            patch: serde_json::json!({"max_batch_size": max_batch_size}),
+            if_match: None,
+            force: false,
+            mode,
+        }
+    }
+
+    async fn h3_load_version(
+        tmp: &std::path::Path,
+        max_batch_size: i64,
+    ) -> (
+        Arc<ModelRegistry>,
+        Arc<WorkerManager>,
+        Arc<crate::http::state::AppState>,
+    ) {
+        let version_dir = tmp.join("m").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        tokio::fs::write(
+            version_dir.join("config.yaml"),
+            hot_reload_config(max_batch_size),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(version_dir.join("model.py"), H3_MODEL_PY)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = build_test_worker_manager(tmp.to_path_buf(), registry.clone());
+        let state = h3_app_state(tmp.to_path_buf(), wm.clone(), registry.clone());
+        let config = crate::config::load_model_config(&version_dir.join("config.yaml")).unwrap();
+        wm.load_model("m", "1", &config).await.unwrap();
+        (registry, wm, state)
+    }
+
+    async fn h3_fire_config_event(
+        tmp: &PathBuf,
+        wm: Arc<WorkerManager>,
+        registry: Arc<ModelRegistry>,
+        last_reload: &mut std::collections::HashMap<(String, String), Instant>,
+    ) {
+        let flag = AtomicBool::new(true);
+        process_watch_events(
+            vec![(tmp.join("m").join("1").join("config.yaml"), WatchEventKind::Modify)],
+            tmp.clone(),
+            wm,
+            registry,
+            last_reload,
+            &crate::config::ServerTunables::default(),
+            &flag,
+            &None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_only_patch_write_is_not_reloaded_by_watcher() {
+        let tmp = test_repo_dir("h3-write-only");
+        let (registry, wm, state) = h3_load_version(&tmp, 1).await;
+
+        crate::http::handlers::config::model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &h3_patch_req(4, crate::http::handlers::config::ConfigPatchMode::WriteOnly),
+        )
+        .await
+        .unwrap();
+
+        let mut last_reload = std::collections::HashMap::new();
+        h3_fire_config_event(&tmp, wm.clone(), registry.clone(), &mut last_reload).await;
+
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            1,
+            "write_only contract broken: the watcher reloaded the PATCH's own write"
+        );
+        assert!(
+            last_reload.is_empty(),
+            "write_only: the watcher must not fire a reload for a control-plane write"
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn apply_reload_patch_write_does_not_retrigger_watcher_reload() {
+        let tmp = test_repo_dir("h3-apply-reload");
+        let (registry, wm, state) = h3_load_version(&tmp, 1).await;
+
+        let out = crate::http::handlers::config::model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &h3_patch_req(
+                4,
+                crate::http::handlers::config::ConfigPatchMode::ApplyReload,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["reloaded"], serde_json::json!(true));
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            4,
+            "sanity: apply_reload reloaded"
+        );
+
+        // The PATCH's rename now echoes through the watcher. The PATCH
+        // already ran the reload; the watcher must not restart the workers
+        // a second time (observable: no cooldown entry is recorded).
+        let mut last_reload = std::collections::HashMap::new();
+        h3_fire_config_event(&tmp, wm.clone(), registry.clone(), &mut last_reload).await;
+
+        assert!(
+            last_reload.is_empty(),
+            "apply_reload: the watcher must not fire a second reload for the PATCH's own write"
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn human_edit_after_write_only_patch_still_hot_reloads() {
+        let tmp = test_repo_dir("h3-human-edit");
+        let (registry, wm, state) = h3_load_version(&tmp, 1).await;
+
+        crate::http::handlers::config::model_version_config_patch(
+            &state,
+            "m",
+            "1",
+            &h3_patch_req(4, crate::http::handlers::config::ConfigPatchMode::WriteOnly),
+        )
+        .await
+        .unwrap();
+
+        // A human edit after the PATCH changes the content again — the
+        // watcher must reload as usual (suppression keys on the content
+        // hash, not on a time window).
+        tokio::fs::write(
+            tmp.join("m").join("1").join("config.yaml"),
+            hot_reload_config(7),
+        )
+        .await
+        .unwrap();
+
+        let mut last_reload = std::collections::HashMap::new();
+        h3_fire_config_event(&tmp, wm.clone(), registry.clone(), &mut last_reload).await;
+
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            7,
+            "a human edit after a PATCH must still hot-reload"
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

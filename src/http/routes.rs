@@ -176,6 +176,13 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/versions", delete(delete_versions_handler))
         // Admin: activate version
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
+        // Admin: model version config read (M1) and merge-patch write (M2)
+        .route("/v2/models/:model_name/versions/:version/config",
+            get(model_version_config_handler).patch(model_version_config_patch_handler))
+        // Admin: effective server config read with source labels (M5). No
+        // model segment → access_log_target None → classify_http_path Admin
+        // (fail-closed to loopback when access_control is unconfigured).
+        .route("/v2/server/config", get(server_config_handler))
         // Admin: weighted/canary routing weights (§4.3)
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())
@@ -197,6 +204,9 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     }
     if features.alerts {
         router = router.route("/metrics/alerts", get(alerts_handler));
+    }
+    if features.accelerator_metrics {
+        router = router.route("/metrics/accelerator", get(accelerator_handler));
     }
     if features.version_compare {
         router = router.route("/v2/models/:model_name/compare", get(compare_versions_handler));

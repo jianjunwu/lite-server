@@ -422,6 +422,8 @@ pub struct HttpServerOptions {
     pub has_hot_reload: Arc<AtomicBool>,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub tls: Option<Arc<crate::tls::TlsConfigStore>>,
+    /// M5: CLI overrides captured at startup (server config source labels).
+    pub cli_overrides: crate::config::CliOverrides,
 }
 
 pub async fn start_http_server(
@@ -439,12 +441,14 @@ pub async fn start_http_server(
         has_hot_reload,
         rate_limiter,
         tls,
+        cli_overrides,
     } = options;
     let repo_path = PathBuf::from(&config.model_repository.path);
     // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
     let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);
     state.shutdown_state = shutdown_state.clone();
     state.draining = draining.clone();
+    state.cli_overrides = cli_overrides;
     let state_admission = state.admission.clone();
 
     // P7-1: resolve endpoint-class access control (value_env/value_file read

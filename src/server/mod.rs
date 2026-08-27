@@ -100,6 +100,9 @@ pub struct LiteServer {
     worker_manager: Arc<WorkerManager>,
     inference_queue: Arc<InferenceQueue>,
     callback_runner: Arc<CallbackRunner>,
+    /// M5: CLI overrides captured at startup, forwarded to the HTTP/gRPC
+    /// AppState for `/v2/server/config` source labels.
+    cli_overrides: crate::config::CliOverrides,
 }
 
 /// Lenient semver parse for version directory names (§4.2): tolerates a
@@ -196,7 +199,15 @@ impl LiteServer {
             worker_manager,
             inference_queue,
             callback_runner,
+            cli_overrides: crate::config::CliOverrides::default(),
         }
+    }
+
+    /// M5: record the CLI overrides so `/v2/server/config` can label the
+    /// fields they forced as "cli".
+    pub fn with_cli_overrides(mut self, overrides: crate::config::CliOverrides) -> Self {
+        self.cli_overrides = overrides;
+        self
     }
 
     /// Loopback HTTP base URL handed to workers as --server-http so @route
@@ -423,6 +434,7 @@ impl LiteServer {
                 has_hot_reload: has_hot_reload_for_http,
                 rate_limiter: rate_limiter.clone(),
                 tls: http_tls.clone(),
+                cli_overrides: self.cli_overrides.clone(),
             },
             http_shutdown_rx,
         ));
@@ -470,6 +482,7 @@ impl LiteServer {
                     tls: grpc_tls.clone(),
                     config: self.config.clone(),
                     has_hot_reload: has_hot_reload.clone(),
+                    cli_overrides: self.cli_overrides.clone(),
                 },
                 grpc_shutdown_rx,
             )))
@@ -499,6 +512,9 @@ impl LiteServer {
             self.config.metrics.p99_window_max_samples,
             self.config.metrics.p99_window_max_age_secs,
         );
+        // M4: gate the accelerator record path on the feature toggle (route
+        // mounting is gated in routes.rs).
+        crate::metrics::accelerator::set_enabled(self.config.features.accelerator_metrics);
         let timeline_enabled = self.config.features.timeline;
         let timeline_sample_interval = self.config.metrics.timeline_sample_interval_secs.max(1);
         let registry_for_timeline = self.registry.clone();
@@ -510,9 +526,9 @@ impl LiteServer {
             loop {
                 tick.tick().await;
                 let models = registry_for_timeline.list_loaded_keys();
-                for (name, version) in models {
-                    crate::metrics::aggregator::TIMELINE.sample(&name, &version).await;
-                }
+                // M2/L1: one tick-level gather/refresh/CPU window shared by
+                // all loaded keys, instead of per-key repetition.
+                crate::metrics::aggregator::TIMELINE.sample_tick(&models).await;
             }
         });
 

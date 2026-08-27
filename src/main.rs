@@ -223,7 +223,7 @@ fn main() {
             };
 
             // CLI overrides
-            cfg.apply_overrides(&CliOverrides {
+            let cli_overrides = CliOverrides {
                 port,
                 host,
                 model_repo,
@@ -264,7 +264,8 @@ fn main() {
                     worker_kill_timeout,
                     hook_http_timeout,
                 },
-            });
+            };
+            cfg.apply_overrides(&cli_overrides);
 
             // Validate after CLI overrides so a negative --<tunable> fails fast
             // with a clear message instead of panicking at model load.
@@ -313,7 +314,7 @@ fn main() {
 
             // Build tokio runtime with configured thread count（已在上方
             // telemetry init 前构建——OTLP exporter 构造需要 reactor 上下文）。
-            let server = LiteServer::new(cfg);
+            let server = LiteServer::new(cfg).with_cli_overrides(cli_overrides);
             if let Err(e) = rt.block_on(server.run(None)) {
                 error!("Server error: {}", e);
                 std::process::exit(1);

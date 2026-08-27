@@ -108,6 +108,19 @@ export interface TimelineEntry {
   queue_depth: number;
   active_workers: number;
   active_streams: number;
+  // M3 extension fields — optional: instances older than the schema omit
+  // them entirely (UI shows "unsupported"); tokens_per_s is null until the
+  // model reports tokens via the worker callback channel.
+  in_flight?: number;
+  worker_saturation?: number;
+  ttft_p99_ms?: number;
+  tbt_p99_ms?: number;
+  stream_bytes_per_s?: number;
+  tokens_per_s?: number | null;
+  rss_mb?: number;
+  cpu_percent?: number;
+  retries_per_s?: number;
+  ejections_per_s?: number;
 }
 
 export interface TimelineSnapshot {
@@ -133,4 +146,18 @@ export interface AlertItem {
 
 export interface AlertsResponse {
   alerts: AlertItem[];
+}
+
+/** M4: latest worker-reported accelerator reading per device
+ * (GET /metrics/accelerator). Value fields are null when the model did not
+ * report that field; the array itself is empty until any model reports. */
+export interface AcceleratorReading {
+  device: string;
+  accel: string;
+  utilization_percent: number | null;
+  memory_used_bytes: number | null;
+  memory_total_bytes: number | null;
+  temperature_celsius: number | null;
+  /** Epoch seconds of the last report carrying this device. */
+  updated_at: number;
 }

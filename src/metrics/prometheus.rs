@@ -64,6 +64,18 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
+    // H2: reload-failure service recovery. Fires only when a reload's
+    // post-unload load failed and the lifecycle layer attempted a restore
+    // with the previous config; the status label is the closed
+    // ReloadRestoreStatus enum (§6.5 #10).
+    pub static ref MODEL_RELOAD_RESTORE_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_model_reload_restore_total",
+            "Reload-failure restores with the previous config, by outcome"
+        ),
+        &["model", "version", "status"]
+    ).unwrap();
+
     pub static ref VERSION_SWITCHES_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
             "liteserver_version_switches_total",
@@ -512,6 +524,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(QUEUE_DEPTH.clone()))?;
     REGISTRY.register(Box::new(MODEL_LOAD_TOTAL.clone()))?;
     REGISTRY.register(Box::new(MODEL_WARMUP_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(MODEL_RELOAD_RESTORE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(MODEL_WARMUP_DURATION.clone()))?;
     REGISTRY.register(Box::new(VERSION_SWITCHES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(ACTIVE_WORKERS.clone()))?;
@@ -569,6 +582,10 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKERS_RSS_BYTES.clone()))?;
     INFO.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1.0);
     REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
+    // M4: vendor-neutral accelerator families (fixed names, device+accel
+    // labels; empty until a worker reports — registration is ungated, the
+    // record path is gated on features.accelerator_metrics).
+    crate::metrics::accelerator::register(&REGISTRY)?;
     Ok(())
 }
 
@@ -1034,6 +1051,33 @@ pub fn record_model_warmup(model: &str, version: &str, secs: f64, status: Warmup
         .inc();
 }
 
+/// H2: outcome of a reload-failure restore with the previous config — the
+/// closed status label set of `liteserver_model_reload_restore_total`
+/// (§6.5 #10: label values are closed enums).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadRestoreStatus {
+    /// The version came back up with the previous config (service restored).
+    Restored,
+    /// The restore also failed — the version stays Failed, not serving.
+    Failed,
+}
+
+impl ReloadRestoreStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ReloadRestoreStatus::Restored => "restored",
+            ReloadRestoreStatus::Failed => "failed",
+        }
+    }
+}
+
+/// H2: record one restore attempt's terminal outcome.
+pub fn record_model_reload_restore(model: &str, version: &str, status: ReloadRestoreStatus) {
+    MODEL_RELOAD_RESTORE_TOTAL
+        .with_label_values(&[model, version, status.as_str()])
+        .inc();
+}
+
 pub fn record_model_unload(model: &str, version: &str) {
     MODEL_LOAD_TOTAL.with_label_values(&[model, version, "unload", "success"]).inc();
 }
@@ -1202,6 +1246,7 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     }
     purge!(MODEL_WARMUP_TOTAL, "liteserver_model_warmup_total", ["model", "version", "status"]);
     purge!(MODEL_WARMUP_DURATION, "liteserver_model_warmup_duration_seconds", ["model", "version"]);
+    purge!(MODEL_RELOAD_RESTORE_TOTAL, "liteserver_model_reload_restore_total", ["model", "version", "status"]);
     // B16: routing history ages out for the unloaded version — purge
     // VERSION_SWITCHES_TOTAL series whose from OR to names it (the standard
     // purge's model+version filter can't match its label shape). Series
@@ -1543,6 +1588,12 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
                 c
             });
             counter.with_label_values(&[model, version]).inc_by(m.tokens_generated as f64);
+        }
+        // M4: device-scoped accelerator readings ride the same piggyback
+        // channel but are NOT (model, version) tagged — the neutral families
+        // key on (device, accel) only.
+        if !m.accelerator.is_empty() {
+            crate::metrics::accelerator::record_readings(&m.accelerator);
         }
         // Pre-registered custom metrics (numeric ID path)
         record_custom_metrics(model, version, &m.gauges, &m.counters, &m.histograms);
@@ -2001,6 +2052,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
         let m = Some(&metrics);
 
@@ -2049,6 +2101,7 @@ mod tests {
             gauges: vec![MetricValue { id: 0, value: 99.5 }],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
         record_worker_metrics("rwmc_model", "1", Some(&metrics));
 
@@ -2084,6 +2137,7 @@ mod tests {
                 gauges: vec![],
                 counters: vec![],
                 histograms: vec![],
+                accelerator: vec![],
             }),
         );
         // Pre-registered custom family path (worker-local gauge ordinal 0).
@@ -2540,6 +2594,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
 
         // Must NOT panic — the poisoned lock is recovered via into_inner().
@@ -2567,6 +2622,7 @@ mod tests {
             gauges: vec![],
             counters: vec![],
             histograms: vec![],
+            accelerator: vec![],
         };
 
         let model = "b1_single_m";
@@ -2996,6 +3052,10 @@ mod tests {
         record_worker_inference(model, version, 0, 3);
         record_stream_rejected(model, version, "4xx", 0.001, "concurrency_limit");
         inc_health_check(model, version, "ok");
+        // H2: the reload-restore counter is a per-version family and must be
+        // covered by the purge (seeded here so the leftover check below
+        // proves it).
+        record_model_reload_restore(model, version, ReloadRestoreStatus::Restored);
         // MODEL_LOAD_TOTAL is the lifecycle event log — it must SURVIVE the
         // cleanup (operators query it after unload).
         record_model_load(model, version, true);
@@ -3036,6 +3096,49 @@ mod tests {
             1.0,
             "neighbor version must be untouched"
         );
+    }
+
+    /// H2: the reload-restore counter records both outcomes under the closed
+    /// status label set (§6.5 #10) and is aged out by remove_version_metrics
+    /// like every other per-version family.
+    #[test]
+    fn reload_restore_counter_records_by_outcome_and_is_purged() {
+        let _ = register_metrics();
+        let model = "h2_metric_m";
+        let version = "1";
+        record_model_reload_restore(model, version, ReloadRestoreStatus::Restored);
+        record_model_reload_restore(model, version, ReloadRestoreStatus::Failed);
+
+        assert_eq!(
+            MODEL_RELOAD_RESTORE_TOTAL
+                .with_label_values(&[model, version, "restored"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            MODEL_RELOAD_RESTORE_TOTAL
+                .with_label_values(&[model, version, "failed"])
+                .get(),
+            1.0
+        );
+
+        remove_version_metrics(model, version);
+        let leftover = REGISTRY
+            .gather()
+            .iter()
+            .find(|mf| mf.get_name() == "liteserver_model_reload_restore_total")
+            .map(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .filter(|m| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == "model" && l.get_value() == model)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "restore series must be purged on unload");
     }
 
     // ===== Round2 B3: info + process metrics =====

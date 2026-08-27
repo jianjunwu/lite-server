@@ -359,6 +359,8 @@ pub mod files;
 pub use files::*;
 pub mod upload_sessions;
 pub use upload_sessions::*;
+pub mod config;
+pub use config::*;
 
 #[cfg(test)]
 mod tests;

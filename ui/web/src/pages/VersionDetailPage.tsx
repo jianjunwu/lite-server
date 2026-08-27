@@ -1,10 +1,13 @@
-import { Card, Descriptions, Empty } from 'antd';
+import { Card, Descriptions, Empty, Typography } from 'antd';
+import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
 import { useMergedVersions, useModelHealth, useModelReady, useTimeline } from '../api/hooks';
+import { useModelConfig } from '../api/config';
+import { ConfigEditor } from '../components/config/ConfigEditor';
 import { StatusBadge } from '../components/StatusBadge';
 import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
@@ -33,6 +36,9 @@ export function VersionDetailPage() {
   const readyQuery = useModelReady(instanceId, name, version, isLoaded);
   const healthQuery = useModelHealth(instanceId, name, version, isLoaded);
   const timelineQuery = useTimeline(instanceId, name, version, 5_000, isLoaded);
+  // M2: editing pauses the config poll so a refresh can't clobber the draft.
+  const [configEditing, setConfigEditing] = useState(false);
+  const configQuery = useModelConfig(instanceId, name, version, { pausePolling: configEditing });
 
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
 
@@ -100,6 +106,25 @@ export function VersionDetailPage() {
             ) : null}
           </Descriptions.Item>
         </Descriptions>
+      </Card>
+
+      {/* M1/M2: version config view + edit — visible for unloaded versions
+          too (review the file before loading). */}
+      <Card size="small" title={t('modelConfig.title')} loading={configQuery.isLoading}>
+        {configQuery.isError ? (
+          <Typography.Text type="secondary">{t('modelConfig.unsupported')}</Typography.Text>
+        ) : (
+          configQuery.data &&
+          instanceId && (
+            <ConfigEditor
+              instanceId={instanceId}
+              model={name}
+              version={version}
+              data={configQuery.data}
+              onEditingChange={setConfigEditing}
+            />
+          )
+        )}
       </Card>
 
       {isLoaded ? (

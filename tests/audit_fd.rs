@@ -492,6 +492,7 @@ mod fd_c {
             has_hot_reload: Arc::new(AtomicBool::new(false)),
             rate_limiter: Arc::new(RateLimiter::default()),
             tls: None,
+            cli_overrides: lite_server::config::CliOverrides::default(),
         };
         let handle = tokio::spawn(async move {
             let _ = start_http_server(options, shutdown_rx).await;

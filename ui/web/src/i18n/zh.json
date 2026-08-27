@@ -132,7 +132,41 @@
     "stmtWaiting": "等待指标数据…",
     "currentQps": "当前 QPS",
     "currentP99": "当前 p99",
-    "currentQueue": "队列深度"
+    "currentQueue": "队列深度",
+    "range5m": "5 分钟",
+    "range15m": "15 分钟",
+    "range1h": "1 小时",
+    "rangeAll": "全部",
+    "rangeDisabledHint": "时间范围超出实例保留窗口——请调大实例的 metrics.timeline_max_points",
+    "groupThroughput": "吞吐",
+    "groupLatency": "延迟",
+    "groupQueue": "队列与并发",
+    "groupResources": "资源",
+    "groupHealth": "健康",
+    "groupAccelerator": "加速器",
+    "tokensPerS": "Tokens/s",
+    "streamBytesPerS": "流字节/s",
+    "ttftP99": "TTFT p99",
+    "tbtP99": "TBT p99",
+    "inFlight": "在途请求",
+    "activeStreams": "活跃流",
+    "saturation": "Worker 饱和度",
+    "rss": "Worker RSS",
+    "cpu": "CPU",
+    "retriesPerS": "重试/s",
+    "ejectionsPerS": "弹出/s",
+    "unsupported": "该实例版本不支持此指标",
+    "notReported": "模型未上报 token 指标"
+  },
+  "accelerator": {
+    "devices": "设备数",
+    "utilization": "利用率",
+    "memory": "显存",
+    "temperature": "温度",
+    "updated": "最近上报",
+    "empty": "模型未上报加速器指标",
+    "emptyHint": "在模型代码中调用 lit_api.report_accelerator_metrics(...) 上报——见 docs/observability.md",
+    "unsupported": "该实例不支持加速器指标(版本过旧或 features.accelerator_metrics 未开启)"
   },
   "alerts": {
     "title": "告警",
@@ -445,5 +479,106 @@
   "versions": {
     "ofTraffic": "{{weight}}% 流量",
     "loadedSince": "已加载 {{age}}"
+  },
+  "modelConfig": {
+    "title": "配置",
+    "noFile": "该版本没有 config.yaml",
+    "empty": "配置文件为空",
+    "unsupported": "不可用(实例不可达或实例版本过旧)",
+    "edit": "编辑",
+    "save": "保存",
+    "cancel": "取消",
+    "readOnly": "只读",
+    "discardTitle": "放弃修改?",
+    "discardBody": "未保存的编辑将丢失。",
+    "diffTitle": "确认配置变更",
+    "diffChanges": "{{count}} 处变更行块",
+    "saved": "配置已保存并重新加载",
+    "savedWriteOnly": "配置已写入磁盘",
+    "dryRunValid": "合并后的配置有效",
+    "dryRunInvalid": "合并后的配置无效",
+    "conflictTitle": "配置已被外部修改",
+    "conflictBody": "config.yaml 在你编辑期间被修改。",
+    "forceOverwrite": "强制覆盖",
+    "conflictViewLatest": "查看最新",
+    "reloadFailedTitle": "重新加载失败",
+    "rolledBack": "config.yaml 已回滚至修改前内容。",
+    "jsonInvalid": "JSON 格式无效",
+    "dangerWarning": "危险字段 —— 错误取值可能导致 worker 无法启动",
+    "redactedSkipped": "脱敏的密钥字段不可编辑,已保持原样:{{keys}}",
+    "mode": {
+      "applyReload": "保存并重新加载",
+      "writeOnly": "仅写入文件",
+      "dryRun": "仅校验(dry run)"
+    },
+    "groups": {
+      "batching": "批处理",
+      "resources": "资源与设备",
+      "queue": "队列与超时",
+      "lifecycle": "生命周期与回收",
+      "resilience": "重试与弹出",
+      "health": "健康检查",
+      "policies": "策略",
+      "advanced": "高级(未识别键)"
+    }
+  },
+  "instance": {
+    "detail": {
+      "online": "在线",
+      "offline": "离线",
+      "modelsLoaded_zero": "未加载模型",
+      "modelsLoaded_one": "已加载 {{count}} 个模型",
+      "modelsLoaded_other": "已加载 {{count}} 个模型",
+      "notFound": "该实例未注册(或对你的账号不可见)。",
+      "unreachable": "实例不可达 —— 展示最近一次已知状态。",
+      "tabs": {
+        "overview": "概览",
+        "config": "配置",
+        "accelerator": "加速器"
+      },
+      "stats": {
+        "version": "版本",
+        "modelsLoaded": "已加载模型",
+        "rss": "进程 RSS",
+        "cpu": "CPU",
+        "activeStreams": "活跃流"
+      },
+      "probes": {
+        "title": "健康探针"
+      },
+      "models": {
+        "title": "模型",
+        "empty": "暂无已加载模型"
+      }
+    },
+    "config": {
+      "searchPlaceholder": "按字段路径过滤…",
+      "empty": "没有匹配的配置字段。",
+      "unsupported": "该实例不支持此功能(不可达或版本过旧)。",
+      "noMatch": "没有匹配「{{query}}」的字段。",
+      "source": {
+        "cli": "CLI",
+        "file": "文件",
+        "default": "默认"
+      },
+      "groups": {
+        "server": "Server (HTTP)",
+        "grpc": "gRPC",
+        "metrics": "指标",
+        "alerts": "告警",
+        "access_control": "访问控制",
+        "openai_compact": "OpenAI 兼容 (/v1)",
+        "features": "特性开关",
+        "model_defaults": "模型默认参数",
+        "tunables": "服务器调节项",
+        "orchestration": "编排",
+        "model_repository": "模型仓库",
+        "rate_limit": "限流",
+        "logging": "日志",
+        "telemetry": "遥测",
+        "callbacks": "回调",
+        "advanced": "高级(未识别节)"
+      }
+    }
   }
 }

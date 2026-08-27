@@ -17,6 +17,10 @@ pub struct AppState {
     pub worker_manager: Arc<WorkerManager>,
     pub inference_queue: Arc<InferenceQueue>,
     pub config: Config,
+    /// M5: CLI overrides captured at startup. Drives `/v2/server/config`
+    /// source labels ("cli"); empty when constructed by tests or the embedded
+    /// (non-CLI) entry point. Injected post-`new` like `shutdown_state`.
+    pub cli_overrides: crate::config::CliOverrides,
     pub repo_path: PathBuf,
     pub alert_engine: Arc<AlertEngine>,
     pub shutdown_state: Arc<ShutdownState>,
@@ -69,6 +73,7 @@ impl AppState {
             worker_manager,
             inference_queue,
             config,
+            cli_overrides: crate::config::CliOverrides::default(),
             repo_path,
             alert_engine: Arc::new(AlertEngine::new(alert_thresholds)),
             shutdown_state: Arc::new(ShutdownState::new()),

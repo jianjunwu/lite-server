@@ -128,6 +128,10 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if self.path == "/v2/models/m/versions/1/config" and self.command in ("GET", "PATCH"):
+            # Config PATCH waits for a synchronous model reload on the
+            # instance, which can far exceed the unary read timeout.
+            time.sleep(1)
         if self.path.endswith(("/upload", "/download")):
             # Simulates a long upload-finalize / download-pack before the
             # response headers arrive (bounded by the transfer timeout, not

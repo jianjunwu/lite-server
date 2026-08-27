@@ -104,6 +104,7 @@ mod tests {
                     tls: None,
                     config,
                     has_hot_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    cli_overrides: crate::config::CliOverrides::default(),
                 },
                 rx,
             )

@@ -584,6 +584,8 @@ pub struct GrpcServerOptions {
     pub tls: Option<Arc<crate::tls::TlsConfigStore>>,
     pub config: crate::config::Config,
     pub has_hot_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// M5: CLI overrides captured at startup (server config source labels).
+    pub cli_overrides: crate::config::CliOverrides,
 }
 
 /// Start the gRPC server.
@@ -606,6 +608,7 @@ pub async fn start_grpc_server(
         tls,
         config,
         has_hot_reload,
+        cli_overrides,
     } = options;
     // P-ENSEMBLE-GRPC (蓝图 §4.1): build an AppState so the unary infer handler
     // can dispatch ensemble models through execute_ensemble (ensemble models have
@@ -624,6 +627,7 @@ pub async fn start_grpc_server(
         rate_limiter.clone(),
     );
     app_state.shutdown_state = shutdown_state.clone();
+    app_state.cli_overrides = cli_overrides;
     let app_state = Arc::new(app_state);
 
     // P7-1 (蓝图 §4.2): endpoint-class access control — value_env/value_file

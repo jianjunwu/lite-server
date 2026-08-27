@@ -163,6 +163,9 @@ features:
   streaming_metrics: true      # 流式生命周期指标族（liteserver_stream*/streaming_*）。
                                # 门控边界与豁免指标见 observability.md「Streaming metrics」节。
                                # 与 metrics.enabled 相互独立——后者控制独立监听器，本开关控制记录哪些序列。
+  accelerator_metrics: true    # 厂商中性加速器指标族（lite_server_accelerator_*，device/accel 标签）
+                               # + GET /metrics/accelerator。记录路径与路由同开关；模型经
+                               # lit_api.report_accelerator_metrics 上报前零开销。
 
 model_defaults:                # CLI 级别默认值，应用于所有模型
   max_queue_size: null         # 覆盖所有模型的 max_queue_size

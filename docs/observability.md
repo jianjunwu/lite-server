@@ -218,6 +218,63 @@ Records go to the dedicated log target `lite_server::audit` at `info` level
 RUST_LOG=lite_server::audit=info
 ```
 
+### Timeline endpoint
+
+`GET /metrics/timeline` (all loaded versions), `GET /metrics/timeline/{model}`
+(active version), and `GET /metrics/timeline/{model}/versions/{version}`
+return the in-memory ring buffer sampled every
+`metrics.timeline_sample_interval_secs` (default 10s) with up to
+`metrics.timeline_max_points` (default 30) points per model/version. Sampling
+reads the existing Prometheus registry only — no extra recording points.
+
+Each entry carries:
+
+| Field | Source | Notes |
+|---|---|---|
+| `timestamp` | sample time | Unix seconds. |
+| `qps` | `liteserver_requests_total` delta | All status families. |
+| `p99_ms` | in-process latency window | Sliding window (`p99_window_*` knobs). |
+| `queue_depth` | `liteserver_queue_depth` | |
+| `active_workers` | `liteserver_active_workers` | |
+| `active_streams` | `liteserver_streaming_connections` | Summed across `protocol`; 0 while `features.streaming_metrics` is off. |
+| `in_flight` | `liteserver_in_flight_requests` | Queued + processing. |
+| `worker_saturation` | `liteserver_worker_saturation` | Hottest worker's concurrent batches. |
+| `ttft_p99_ms` | `liteserver_streaming_ttft_seconds` | Bucket-interpolated, merged across `protocol`. Process-lifetime histogram, **not** a sliding window; 0 without streaming traffic. |
+| `tbt_p99_ms` | `liteserver_streaming_tbt_seconds` | Same derivation as `ttft_p99_ms`. |
+| `stream_bytes_per_s` | `liteserver_stream_output_bytes_total` delta | Summed across `stream_kind`, rated over the sample window. |
+| `tokens_per_s` | `lite_server_tokens_generated_total` delta | `null` until the model reports tokens via the worker callback channel. |
+| `rss_mb` | `liteserver_workers_resident_memory_bytes` | Live-worker RSS sum for the version, MiB. |
+| `cpu_percent` | `liteserver_process_cpu_seconds_total` delta | Process-wide, cumulative across cores — may exceed 100. The sampler refreshes process metrics itself, so no scraper is required. |
+| `retries_per_s` | `liteserver_retries_total` delta | Rated over the sample window. |
+| `ejections_per_s` | `liteserver_worker_ejections_total` delta | Rated over the sample window. |
+
+Instances older than this schema omit the new fields entirely; clients must
+treat absent fields as "not supported by this instance version".
+
+**Downsampling**: `?step=N` (integer ≥ 1) keeps every Nth point anchored at
+the latest sample, so the freshest point is always included. `step=0` is
+rejected with 400. Example: with a 24h window (1440 points), `?step=5`
+returns ~288 points covering the full window.
+
+**Response headers**:
+
+| Header | Meaning |
+|---|---|
+| `X-Timeline-Coverage` | Retention window in seconds (`timeline_max_points` × `timeline_sample_interval_secs`) — the longest range a client can honestly display. |
+| `X-Timeline-Interval` | Point spacing in seconds; clients use it to convert a desired time range into a `step`. |
+
+**Retention window**: the defaults (30 × 10s = 5 minutes) suit live
+debugging. For a 24h window at 1-minute resolution:
+
+```yaml
+metrics:
+  timeline_max_points: 1440        # 24h at 60s spacing
+  timeline_sample_interval_secs: 60
+```
+
+Memory cost is bounded by `timeline_max_points` × loaded versions; the ring
+is per model/version and reaped on unload.
+
 ### `tokens_generated` semantics
 
 Python workers report `tokens_generated` in the Done-frame `Metrics` —
@@ -233,6 +290,47 @@ prefill's TTFT口径 differs from the Rust-side TTFT (two conflicting numbers),
 and decode includes downstream backpressure (ZMQ HWM blocking inflates the
 worker-side window). Both move to the tokenizer follow-up item together with
 exact token counting.
+
+### Accelerator metrics (vendor-neutral)
+
+Added in the M4 admin-enhancement round. The core links **no vendor SDK** —
+model code reads its own stack (pynvml, torch.mlu, torch_npu, …) and reports
+through the same worker `Metrics` piggyback channel as `tokens_generated`,
+via `lit_api.report_accelerator_metrics(device, accel, ...)` (all value
+fields optional; omitted fields stay absent). Readings are device-scoped,
+latest-per-device: the worker buffers one reading per `(device, accel)` pair
+and attaches it to the next response's `Metrics.accelerator`, so an idle
+model simply reports nothing until traffic resumes.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `lite_server_accelerator_utilization_percent` | `device, accel` | Compute utilization 0-100. |
+| `lite_server_accelerator_memory_used_bytes` | `device, accel` | Device memory in use. |
+| `lite_server_accelerator_memory_total_bytes` | `device, accel` | Device memory capacity. |
+| `lite_server_accelerator_temperature_celsius` | `device, accel` | Device temperature. |
+
+Label whitelist: `device` (slot id, e.g. `"0"`/`"cuda:0"`) and `accel`
+(vendor tag: `cuda`/`mlu`/`npu`/…, bounded in practice) are admitted for
+these families only; both values are length-capped (64 chars) and the
+distinct `(device, accel)` pair count is capped at 64 — pairs beyond the cap
+are dropped (one-shot warning), never created as series. Because the
+families carry no `model`/`version` labels they are not part of the
+version-unload purge (a device may be shared by several versions); the pair
+cap is the bounding mechanism.
+
+`GET /metrics/accelerator` (feature `features.accelerator_metrics`, default
+on — fixed families with capped labels and no background sampler, unlike the
+opt-in worker-named `custom_metrics`) returns the latest reading per device
+as a JSON array:
+`[{device, accel, utilization_percent, memory_used_bytes, memory_total_bytes, temperature_celsius, updated_at}]`.
+Unreported fields are `null`; `updated_at` (epoch seconds) exposes
+staleness. With no reports the array is empty (`[]`) — clients should show a
+"model has not reported" empty state, not an error. With the feature off the
+route is unmounted (404).
+
+`kv_cache_utilization` is deliberately untouched: device memory is **not** a
+KV-cache proxy, and the GIE gauge stays NaN until a model reports KV
+utilization explicitly.
 
 ## OpenTelemetry
 
