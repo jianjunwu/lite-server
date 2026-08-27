@@ -112,8 +112,12 @@ describe('SettingsPage instance grants', () => {
     fireEvent.click(await screen.findByRole('tab', { name: 'Users' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Access' }));
     // The drawer lists each visible instance with a role select (first
-    // combobox; the model-access section adds more below).
-    const [combobox] = await screen.findAllByRole('combobox');
+    // combobox; the model-access section adds more below). The instances
+    // query is cold here — instance management lives on /instances now, so
+    // the per-row role selects render a beat after the model-instance
+    // select; wait for them instead of grabbing the first match.
+    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2));
+    const [combobox] = screen.getAllByRole('combobox');
     fireEvent.mouseDown(combobox);
     fireEvent.click(await screen.findByText('operator', { selector: '.ant-select-item-option *' }));
     await waitFor(() =>
