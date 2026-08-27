@@ -1,32 +1,27 @@
-import { Card, Col, Empty, Row, Select, Table, Tabs, Typography, Button, Input, Modal } from 'antd';
+import { Card, Col, Empty, Row, Select, Tabs, Button, Input, Modal } from 'antd';
 import {
-  ClusterOutlined,
-  DiffOutlined,
   LineChartOutlined,
   SafetyOutlined,
   TableOutlined,
 } from '@ant-design/icons';
-import { useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { apiFetch } from '../api/client';
-import { useMergedModels, useMergedVersions, useModelHealth, useTimeline } from '../api/hooks';
-import type { ModelCompare, TimelineEntry } from '../api/types';
-import { WorkerMatrix } from '../components/WorkerMatrix';
+import { useMergedModels, useMergedVersions, useTimeline, useTimelineAll } from '../api/hooks';
+import type { TimelineEntry, VersionInfo } from '../api/types';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { ModelAccessPanel } from '../components/ModelAccessPanel';
 import { ModelGlyph } from '../components/ModelGlyph';
 import { StatusBadge, statusKind } from '../components/StatusBadge';
 import { StatNum } from '../components/StatNum';
-import { VersionsTable } from '../components/VersionsTable';
+import { VersionActions } from '../components/VersionActions';
 import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
-import { TrafficRiver } from '../components/TrafficRiver';
+import { TrafficRiver, versionColor } from '../components/TrafficRiver';
 import { RoutingEditor } from '../components/RoutingEditor';
 import { useLifecycleOp } from '../components/useLifecycleOp';
 import { buildTimelineOption, fieldState, type MetricKey } from '../components/timelineChart';
@@ -83,11 +78,67 @@ function loadMetricSelection(): MetricKey[] {
   return DEFAULT_METRICS;
 }
 
-/** Compact average for the compare table: keeps up to 3 decimals so small
- * rates (0.07 qps) don't round away. */
-function formatAvg(v: number): string {
-  if (!Number.isFinite(v)) return '-';
-  return Number.isInteger(v) ? String(v) : String(+v.toFixed(3));
+/** Version card: the unit of the versions tab. Weight bar gives the
+ * traffic comparison at a glance; the whole card drills down to the
+ * version detail page. */
+function VersionCard({
+  model,
+  version,
+  colorIndex,
+  latest,
+  ops,
+}: {
+  model: string;
+  version: VersionInfo;
+  /** Index among loaded versions — matches the TrafficRiver palette. */
+  colorIndex: number;
+  latest?: TimelineEntry;
+  ops: boolean;
+}) {
+  const { t } = useTranslation();
+  const neutrals = useNeutrals();
+  const ilink = useInstanceLink();
+  const navigate = useNavigate();
+  const barColor = colorIndex >= 0 ? versionColor(colorIndex) : neutrals.textSecondary;
+  const detailUrl = ilink(`/models/${encodeURIComponent(model)}/versions/${encodeURIComponent(version.version)}`);
+  return (
+    <Card
+      size="small"
+      hoverable
+      onClick={() => navigate(detailUrl)}
+      styles={{ body: { display: 'flex', flexDirection: 'column', gap: SPACE[2] } }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: SPACE[3] }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[2] }}>
+          <Link to={detailUrl} style={{ ...dataTextStyle, fontWeight: 600 }} onClick={(e) => e.stopPropagation()}>
+            {version.version}
+          </Link>
+          {version.active && (
+            <span style={{ color: barColor, fontSize: TYPE.secondary }}>●</span>
+          )}
+        </span>
+        <StatusBadge status={version.status} text={version.status === 'unloaded' ? t('models.unloaded') : undefined} />
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: SPACE[2] }}>
+        <div style={{ flex: 1, height: 6, borderRadius: 3, background: neutrals.textSecondary + '33', overflow: 'hidden' }}>
+          <div style={{ width: `${Math.max(0, Math.min(100, version.weight))}%`, height: '100%', background: barColor }} />
+        </div>
+        <span style={{ ...dataTextStyle, fontSize: TYPE.secondary }}>{version.weight}%</span>
+      </div>
+      <span style={{ ...dataTextStyle, fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
+        Worker {version.workers.ready}/{version.workers.total}
+        {' · '}
+        {latest ? `${formatNumber(latest.qps)} QPS` : '-'}
+        {' · '}
+        {latest && latest.p99_ms > 0 ? `${formatMs(latest.p99_ms)} p99` : '-'}
+      </span>
+      {ops && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <VersionActions model={model} version={version} />
+        </div>
+      )}
+    </Card>
+  );
 }
 
 export function ModelDetailPage() {
@@ -100,7 +151,7 @@ export function ModelDetailPage() {
   const [editingRouting, setEditingRouting] = useState(false);
   const [loadOpen, setLoadOpen] = useState(false);
   const [loadVersion, setLoadVersion] = useState('');
-  const [tab, setTab] = useState('versions');
+  const [tab, setTab] = useState('metrics');
   const [selectedMetrics, setSelectedMetrics] = useState<MetricKey[]>(loadMetricSelection);
   const { runLifecycle } = useLifecycleOp();
 
@@ -111,16 +162,21 @@ export function ModelDetailPage() {
   const modelType = modelsList.data.find((m) => m.name === name)?.modelType ?? 'unknown';
   const versions = merged.versions;
   const unloadedVersions = versions.filter((v) => !v.loaded).map((v) => v.version);
-  const healthQuery = useModelHealth(instanceId, name, undefined, merged.hasLoaded);
   const timelineQuery = useTimeline(instanceId, name, undefined, 5_000, merged.hasLoaded);
-  const compareQuery = useQuery({
-    queryKey: [instanceId, 'compare', name],
-    queryFn: () => apiFetch<ModelCompare>(instanceId!, `/v2/models/${encodeURIComponent(name)}/compare`),
-    enabled: instanceId !== null && merged.hasLoaded,
-    retry: 0,
-  });
+  const timelineAllQuery = useTimelineAll(instanceId, merged.hasLoaded ? 5_000 : false);
 
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
+  // Latest point per version — drives the version cards' current QPS/P99.
+  const latestByVersion = useMemo(() => {
+    const map = new Map<string, TimelineEntry>();
+    (timelineAllQuery.data?.snapshots ?? [])
+      .filter((s) => s.model === name)
+      .forEach((s) => {
+        const entry = s.entries[s.entries.length - 1];
+        if (entry) map.set(s.version, entry);
+      });
+    return map;
+  }, [timelineAllQuery.data, name]);
 
   const changeMetrics = (keys: MetricKey[]) => {
     const next = keys.length > 0 ? keys : DEFAULT_METRICS;
@@ -268,34 +324,37 @@ export function ModelDetailPage() {
             key: 'versions',
             label: tabLabel(<TableOutlined aria-hidden />, t('models.tabs.versions')),
             children: (
-              <Card
-                size="small"
-                extra={
-                  can('operator') && !editingRouting && merged.hasLoaded ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[3] }}>
+                {can('operator') && !editingRouting && merged.hasLoaded && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                     <Button size="small" onClick={() => setEditingRouting(true)}>
                       {t('routing.edit')}
                     </Button>
-                  ) : undefined
-                }
-              >
-                <VersionsTable model={name} versions={versions} loading={merged.isLoading} ops={can('operator')} />
+                  </div>
+                )}
+                <Row gutter={[SPACE[3], SPACE[3]]}>
+                  {versions.map((v) => (
+                    <Col xs={24} md={12} xl={8} key={v.version}>
+                      <VersionCard
+                        model={name}
+                        version={v}
+                        colorIndex={loadedVersions.findIndex((lv) => lv.version === v.version)}
+                        latest={latestByVersion.get(v.version)}
+                        ops={can('operator')}
+                      />
+                    </Col>
+                  ))}
+                </Row>
                 {editingRouting && (
-                  <RoutingEditor model={name} versions={versions.filter((v) => v.loaded)} onClose={() => setEditingRouting(false)} />
+                  <Card size="small">
+                    <RoutingEditor
+                      model={name}
+                      versions={versions.filter((v) => v.loaded)}
+                      onClose={() => setEditingRouting(false)}
+                    />
+                  </Card>
                 )}
-              </Card>
-            ),
-          },
-          {
-            key: 'workers',
-            label: tabLabel(<ClusterOutlined aria-hidden />, t('models.tabs.workers')),
-            children: (
-              <Card size="small" loading={merged.hasLoaded && healthQuery.isLoading}>
-                {merged.hasLoaded ? (
-                  healthQuery.data && <WorkerMatrix workers={healthQuery.data.workers} />
-                ) : (
-                  loadFirstHint
-                )}
-              </Card>
+              </div>
             ),
           },
           {
@@ -354,48 +413,6 @@ export function ModelDetailPage() {
               </div>
             ) : (
               <Card size="small">{loadFirstHint}</Card>
-            ),
-          },
-          {
-            key: 'compare',
-            label: tabLabel(<DiffOutlined aria-hidden />, t('models.tabs.compare')),
-            children: (
-              <Card size="small" loading={merged.hasLoaded && compareQuery.isLoading}>
-                {!merged.hasLoaded ? (
-                  loadFirstHint
-                ) : compareQuery.isError ? (
-                  <Typography.Text type="secondary">{compareQuery.error.message}</Typography.Text>
-                ) : (compareQuery.data?.versions.length ?? 0) === 0 ? (
-                  <Empty description={t('models.compareEmpty')} />
-                ) : (
-                  <Table
-                    size="small"
-                    rowKey="version"
-                    pagination={false}
-                    dataSource={compareQuery.data!.versions}
-                    columns={[
-                      {
-                        title: t('models.activeVersion'),
-                        dataIndex: 'version',
-                        render: (v: string) => (
-                          <Link to={ilink(`/models/${encodeURIComponent(name)}/versions/${encodeURIComponent(v)}`)}>
-                            {v}
-                          </Link>
-                        ),
-                      },
-                      { title: t('models.compareAvgQps'), dataIndex: 'avg_qps', render: formatAvg },
-                      {
-                        title: t('models.compareAvgP99'),
-                        dataIndex: 'avg_p99_ms',
-                        render: (v: number) => formatMs(v),
-                      },
-                      { title: t('models.compareAvgQueue'), dataIndex: 'avg_queue_depth', render: formatAvg },
-                      { title: t('models.compareAvgWorkers'), dataIndex: 'avg_active_workers', render: formatAvg },
-                      { title: t('models.compareSamples'), dataIndex: 'sample_count' },
-                    ]}
-                  />
-                )}
-              </Card>
             ),
           },
           // Per-model whitelist management — instance admins only.

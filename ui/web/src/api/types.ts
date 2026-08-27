@@ -133,22 +133,6 @@ export interface TimelineAllResponse {
   snapshots: TimelineSnapshot[];
 }
 
-/** GET /v2/models/{name}/compare — per-version timeline averages
- * (features.version_compare). */
-export interface ModelCompareRow {
-  version: string;
-  avg_qps: number;
-  avg_p99_ms: number;
-  avg_queue_depth: number;
-  avg_active_workers: number;
-  sample_count: number;
-}
-
-export interface ModelCompare {
-  model: string;
-  versions: ModelCompareRow[];
-}
-
 export interface AlertItem {
   model: string;
   version: string;

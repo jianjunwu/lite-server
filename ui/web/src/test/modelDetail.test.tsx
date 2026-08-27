@@ -40,12 +40,18 @@ const mockTimeline: {
   error: Error | null;
   refetch: () => void;
 } = { data: undefined, isLoading: false, error: null, refetch: vi.fn() };
+const mockTimelineAll: {
+  data: { snapshots: { model: string; version: string; entries: Record<string, unknown>[] }[] } | undefined;
+  isLoading: boolean;
+  error: Error | null;
+} = { data: undefined, isLoading: false, error: null };
 
 vi.mock('../api/hooks', () => ({
   useMergedModels: () => mockModelsList,
   useMergedVersions: () => mockMerged,
   useModelHealth: () => mockHealth,
   useTimeline: () => mockTimeline,
+  useTimelineAll: () => mockTimelineAll,
 }));
 
 vi.mock('../api/download', () => ({ downloadModelPackage: vi.fn() }));
@@ -94,6 +100,7 @@ function renderPage(model = 'ghost', fetchImpl?: (url: string) => Response) {
         <AntdApp>
           <Routes>
             <Route path="/models/:name" element={<ModelDetailPage />} />
+            <Route path="/models/:name/versions/:version" element={<div>version detail probe</div>} />
           </Routes>
         </AntdApp>
       </QueryClientProvider>
@@ -113,6 +120,9 @@ afterEach(() => {
   mockTimeline.data = undefined;
   mockTimeline.isLoading = false;
   mockTimeline.error = null;
+  mockTimelineAll.data = undefined;
+  mockTimelineAll.isLoading = false;
+  mockTimelineAll.error = null;
 });
 
 const loadedVersionRow = (version: string, weight: number, active: boolean) => ({
@@ -176,10 +186,11 @@ describe('ModelDetailPage unloaded model', () => {
     renderPage();
     // Header marks the model unloaded, no error UI.
     expect(screen.getAllByText('Unloaded').length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: 'Load' })).toBeTruthy();
-    // Runtime tabs degrade to a quiet "load first" hint (panes render lazily).
-    fireEvent.click(screen.getByRole('tab', { name: 'Workers' }));
+    // The default metrics tab degrades to a quiet "load first" hint.
     expect(screen.getAllByText(/available after loading/i).length).toBeGreaterThan(0);
+    // Per-version load action lives on the version card (panes render lazily).
+    fireEvent.click(screen.getByRole('tab', { name: 'Versions' }));
+    expect(screen.getByRole('button', { name: 'Load' })).toBeTruthy();
   });
 
   it('should_render_breadcrumb_back_to_models_with_instance_param', () => {
@@ -382,36 +393,6 @@ describe('ModelDetailPage metrics tab', () => {
   });
 });
 
-describe('ModelDetailPage compare tab', () => {
-  const compareFetch = (body: unknown) => (url: string) =>
-    url.includes('/compare')
-      ? new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
-      : new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } });
-
-  it('should_render_a_structured_table_instead_of_raw_json', async () => {
-    loadEcho();
-    // The compare query fires on page mount, so the stub must precede render.
-    renderPage('echo', compareFetch({
-      model: 'echo',
-      versions: [
-        { version: '1', avg_qps: 0.07, avg_p99_ms: 0.7, avg_queue_depth: 0, avg_active_workers: 2, sample_count: 30 },
-      ],
-    }));
-    fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
-    expect(await screen.findByRole('link', { name: '1' })).toBeTruthy();
-    expect(screen.getByText('Avg QPS')).toBeTruthy();
-    expect(screen.getByText('0.07')).toBeTruthy();
-    expect(screen.getByText('30')).toBeTruthy();
-  });
-
-  it('should_show_an_empty_state_when_there_are_no_samples_yet', async () => {
-    loadEcho();
-    renderPage('echo', compareFetch({ model: 'echo', versions: [] }));
-    fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
-    expect(await screen.findByText(/no comparison data/i)).toBeTruthy();
-  });
-});
-
 describe('ModelDetailPage traffic strip', () => {
   it('should_explain_the_drag_interaction_when_editable', () => {
     mockMerged.versions = [loadedVersionRow('v1', 70, false), loadedVersionRow('v2', 30, true)];
@@ -419,5 +400,54 @@ describe('ModelDetailPage traffic strip', () => {
     mockMerged.hasLoaded = true;
     renderPage('echo');
     expect(screen.getByText(/drag a divider to shift weight/i)).toBeTruthy();
+  });
+});
+
+describe('ModelDetailPage information architecture', () => {
+  it('should_default_to_the_metrics_tab_and_drop_the_workers_and_compare_tabs', () => {
+    loadEcho();
+    renderPage('echo');
+    const active = document.querySelector('.ant-tabs-tab-active');
+    expect(active?.textContent).toBe('Metrics');
+    expect(screen.getByRole('tab', { name: 'Versions' })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: 'Access' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Workers' })).toBeNull();
+    expect(screen.queryByRole('tab', { name: 'Compare' })).toBeNull();
+  });
+});
+
+describe('ModelDetailPage version cards', () => {
+  function twoVersionsWithMetrics() {
+    mockMerged.versions = [loadedVersionRow('v1', 70, false), loadedVersionRow('v2', 30, true)];
+    mockMerged.activeVersion = 'v2';
+    mockMerged.hasLoaded = true;
+    // Model-level KPI stream kept distinct so card values can't collide with it.
+    mockTimeline.data = { model: 'echo', version: 'v2', entries: [{ qps: 9.9, p99_ms: 0.1, queue_depth: 0 }] };
+    mockTimelineAll.data = {
+      snapshots: [
+        { model: 'echo', version: 'v1', entries: [{ qps: 0.3, p99_ms: 2.1 }] },
+        { model: 'echo', version: 'v2', entries: [{ qps: 1.2, p99_ms: 1.8 }] },
+      ],
+    };
+  }
+
+  it('should_render_a_card_per_version_with_weight_and_current_metrics', () => {
+    twoVersionsWithMetrics();
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Versions' }));
+    expect(screen.getByText('70%')).toBeTruthy();
+    expect(screen.getByText('30%')).toBeTruthy();
+    expect(screen.getByText(/0\.3 QPS/)).toBeTruthy();
+    expect(screen.getByText(/2\.1ms p99/)).toBeTruthy();
+    expect(screen.getByText(/1\.2 QPS/)).toBeTruthy();
+    expect(screen.getByText(/1\.8ms p99/)).toBeTruthy();
+  });
+
+  it('should_link_each_card_to_its_version_detail_page', () => {
+    twoVersionsWithMetrics();
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Versions' }));
+    const link = screen.getByRole('link', { name: 'v2' });
+    expect(link.getAttribute('href')).toBe('/models/echo/versions/v2?i=prod');
   });
 });

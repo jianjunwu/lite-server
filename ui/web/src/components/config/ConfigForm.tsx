@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { Collapse, Empty, Input, InputNumber, Switch, Typography } from 'antd';
-import { WarningOutlined } from '@ant-design/icons';
+import { Collapse, Empty, Input, InputNumber, Select, Switch, Tooltip, Typography } from 'antd';
+import { CloseOutlined, PlusOutlined, QuestionCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import { groupModelConfig, MODEL_CONFIG_GROUPS, type ConfigFieldMeta } from './modelConfigSchema';
+import { groupModelConfig, MODEL_CONFIG_GROUPS, type ConfigFieldMeta, type ConfigGroupMeta } from './modelConfigSchema';
 import { deepEqual } from './configDraft';
 import { MONO_FONT, STATUS_COLORS, TYPE, dataTextStyle } from '../../theme';
 import { SPACE } from '../../tokens';
@@ -56,11 +56,13 @@ function JsonField({
   onChange,
   onValidity,
   danger,
+  placeholder,
 }: {
   value: unknown;
   onChange: (v: unknown) => void;
   onValidity: (valid: boolean) => void;
   danger?: boolean;
+  placeholder?: string;
 }) {
   const { t } = useTranslation();
   const [text, setText] = useState(() =>
@@ -71,6 +73,7 @@ function JsonField({
     <div style={{ flex: 1, maxWidth: 420 }}>
       <Input.TextArea
         value={text}
+        placeholder={placeholder}
         autoSize={{ minRows: 1, maxRows: 10 }}
         style={{
           fontFamily: MONO_FONT,
@@ -105,21 +108,41 @@ function EditRow({
   meta,
   draftValue,
   originalValue,
+  removable,
   onChange,
   onValidity,
+  onRemove,
 }: {
   meta: ConfigFieldMeta;
   draftValue: unknown;
   originalValue: unknown;
+  /** Row pulled in via the add-field picker and still unset — offer a way
+   * to drop it again. */
+  removable?: boolean;
   onChange: (v: unknown) => void;
   onValidity: (valid: boolean) => void;
+  onRemove?: () => void;
 }) {
   const { t } = useTranslation();
   const kind = controlKind(meta, draftValue);
   const changed = !deepEqual(draftValue, originalValue);
   const danger = meta.danger === true && changed;
+  const unset = draftValue === undefined || draftValue === null;
+  const defaultHint =
+    unset && meta.defaultValue !== undefined
+      ? t('modelConfig.defaultPrefix', { value: formatValue(meta.defaultValue) })
+      : undefined;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[1] }}>
+    <div
+      data-changed={changed || undefined}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: SPACE[1],
+        borderLeft: changed ? `2px solid ${STATUS_COLORS.warning}` : '2px solid transparent',
+        paddingLeft: SPACE[2],
+      }}
+    >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: SPACE[4] }}>
         <span style={{ fontFamily: MONO_FONT, fontSize: TYPE.secondary }}>
           {meta.key}
@@ -129,10 +152,17 @@ function EditRow({
               ({meta.unit})
             </Typography.Text>
           )}
+          <Tooltip title={t(`modelConfig.fields.${meta.key}`)}>
+            <QuestionCircleOutlined
+              data-testid={`field-desc-${meta.key}`}
+              style={{ fontSize: 12, opacity: 0.45, marginLeft: 6 }}
+            />
+          </Tooltip>
         </span>
         {kind === 'number' && (
           <InputNumber
             value={typeof draftValue === 'number' ? draftValue : undefined}
+            placeholder={defaultHint}
             style={{ width: 160, borderColor: danger ? STATUS_COLORS.error : undefined }}
             onChange={(v) => onChange(v ?? undefined)}
           />
@@ -143,12 +173,18 @@ function EditRow({
         {kind === 'string' && (
           <Input
             value={typeof draftValue === 'string' ? draftValue : ''}
+            placeholder={defaultHint}
             style={{ width: 260, borderColor: danger ? STATUS_COLORS.error : undefined }}
             onChange={(e) => onChange(e.target.value === '' ? undefined : e.target.value)}
           />
         )}
         {kind === 'json' && (
-          <JsonField value={draftValue} onChange={onChange} onValidity={onValidity} danger={danger} />
+          <JsonField value={draftValue} onChange={onChange} onValidity={onValidity} danger={danger} placeholder={defaultHint} />
+        )}
+        {removable && (
+          <Tooltip title={t('modelConfig.cancel')}>
+            <CloseOutlined data-testid={`field-remove-${meta.key}`} style={{ fontSize: 12, opacity: 0.45 }} onClick={onRemove} />
+          </Tooltip>
         )}
       </div>
       {danger && (
@@ -186,10 +222,16 @@ export function ConfigForm({
   const { t } = useTranslation();
   // Per-field JSON validity (keyed by field key); aggregate reported upward.
   const validity = useRef(new Map<string, boolean>());
+  // Keys pulled in via the add-field picker but not yet given a value —
+  // they render as rows but never reach the patch until a value is entered.
+  const [addedKeys, setAddedKeys] = useState<Set<string>>(new Set());
   // An edit session's reports must not leak into the next one — a stale
   // `false` would lock the Save button even when every field is valid.
   useEffect(() => {
-    if (!editing) validity.current.clear();
+    if (!editing) {
+      validity.current.clear();
+      setAddedKeys(new Set());
+    }
   }, [editing]);
   if (!hasFile) return <Empty description={t('modelConfig.noFile')} />;
   if (!editing && Object.keys(config).length === 0) {
@@ -210,21 +252,55 @@ export function ConfigForm({
       meta={meta}
       draftValue={current[meta.key]}
       originalValue={config[meta.key]}
+      removable={addedKeys.has(meta.key) && current[meta.key] === undefined}
       onChange={(v) => onChange?.(meta.key, v)}
       onValidity={(valid) => reportValidity(meta.key, valid)}
+      onRemove={() =>
+        setAddedKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(meta.key);
+          return next;
+        })
+      }
     />
   );
 
+  /** Per-group picker of schema fields absent from the draft; choosing one
+   * opens an (unset) edit row for it. */
+  const addFieldPicker = (group: ConfigGroupMeta) => {
+    const unset = group.fields.filter((f) => !(f.key in current) && !addedKeys.has(f.key));
+    if (unset.length === 0) return null;
+    return (
+      <Select
+        size="small"
+        showSearch
+        value={null}
+        placeholder={
+          <span>
+            <PlusOutlined style={{ marginRight: 4 }} />
+            {t('modelConfig.addField')}
+          </span>
+        }
+        style={{ width: 260 }}
+        options={unset.map((f) => ({ value: f.key, label: f.key }))}
+        onChange={(key: string) => setAddedKeys((prev) => new Set(prev).add(key))}
+      />
+    );
+  };
+
   const items = editing
     ? [
-        // Edit mode shows every schema field (absent ones get empty controls
-        // so new keys can be added), then one JSON block for advanced keys.
+        // Set-first: only keys present in the config tree render as rows;
+        // the group's remaining schema fields are pulled in on demand.
         ...MODEL_CONFIG_GROUPS.map((meta) => ({
           key: meta.key,
           label: t(`modelConfig.groups.${meta.key}`),
           children: (
             <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[3] }}>
-              {meta.fields.map(editField)}
+              {meta.fields
+                .filter((f) => f.key in current || addedKeys.has(f.key))
+                .map(editField)}
+              {addFieldPicker(meta)}
             </div>
           ),
         })),
@@ -264,5 +340,7 @@ export function ConfigForm({
             ]
           : []),
       ];
-  return <Collapse ghost items={items} defaultActiveKey={items.map((i) => i.key)} />;
+  // Remount on mode switch: defaultActiveKey only applies at first mount,
+  // and panels added by the edit branch would otherwise stay collapsed.
+  return <Collapse key={editing ? 'edit' : 'view'} ghost items={items} defaultActiveKey={items.map((i) => i.key)} />;
 }

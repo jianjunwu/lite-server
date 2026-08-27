@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, App, Button, Space, Tag } from 'antd';
+import { Alert, App, Button, Tag } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -11,6 +11,9 @@ import {
 import { ApiError } from '../../api/client';
 import { withAdminKeyRetry } from '../../api/mutations';
 import { useCanInstance } from '../../context/useEffectiveRole';
+import { useNeutrals } from '../../context/ThemeModeContext';
+import { TYPE } from '../../theme';
+import { SPACE } from '../../tokens';
 import { ConfigForm } from './ConfigForm';
 import { ConfigDiffModal } from './ConfigDiffModal';
 import { buildPatch } from './configDraft';
@@ -37,6 +40,7 @@ export function ConfigEditor({
   const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
   const can = useCanInstance();
+  const neutrals = useNeutrals();
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Record<string, unknown>>({});
@@ -208,22 +212,11 @@ export function ConfigEditor({
 
   return (
     <div>
-      <Space style={{ marginBottom: 12 }}>
-        {editing ? (
-          <>
-            <Button
-              type="primary"
-              disabled={!dirty || !jsonValid}
-              onClick={() => setDiffOpen(true)}
-            >
-              {t('modelConfig.save')}
-            </Button>
-            <Button onClick={cancelEdit}>{t('modelConfig.cancel')}</Button>
-          </>
-        ) : (
+      {!editing && (
+        <div style={{ marginBottom: 12 }}>
           <Button onClick={enterEdit}>{t('modelConfig.edit')}</Button>
-        )}
-      </Space>
+        </div>
+      )}
       {editing && built.skipped.length > 0 && (
         <Alert
           type="warning"
@@ -243,6 +236,34 @@ export function ConfigEditor({
         onChange={handleChange}
         onValidityChange={setJsonValid}
       />
+      {editing && (
+        <div
+          style={{
+            position: 'sticky',
+            bottom: 0,
+            zIndex: 10,
+            display: 'flex',
+            alignItems: 'center',
+            gap: SPACE[3],
+            padding: `${SPACE[2]}px ${SPACE[3]}px`,
+            marginTop: 12,
+            background: neutrals.bgPage,
+            borderTop: `1px solid ${neutrals.border}`,
+          }}
+        >
+          <span style={{ flex: 1, fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
+            {t('modelConfig.unsavedCount', { count: Object.keys(built.patch).length })}
+          </span>
+          <Button onClick={cancelEdit}>{t('modelConfig.discard')}</Button>
+          <Button
+            type="primary"
+            disabled={!dirty || !jsonValid}
+            onClick={() => setDiffOpen(true)}
+          >
+            {t('modelConfig.save')}
+          </Button>
+        </div>
+      )}
       <ConfigDiffModal
         open={diffOpen}
         submitting={submitting}
