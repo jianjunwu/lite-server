@@ -386,6 +386,7 @@
       "totpResetAction": "Reset 2FA"
     },
     "instances": {
+      "entryHint": "Instance management lives on the Instances page: create, edit, monitor and remove your lite-server backends.",
       "manage": "Manage instances",
       "add": "Add instance",
       "addTitle": "Add instance",

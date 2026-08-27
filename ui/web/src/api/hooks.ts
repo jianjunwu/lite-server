@@ -25,6 +25,14 @@ export function useInstances() {
   });
 }
 
+/** Display name of the current instance for breadcrumbs (hierarchy plan
+ * §3.4): resolved from the BFF instance list by the ?i= pin. */
+export function useInstanceName(instanceId: string | null): string | null {
+  const { data } = useInstances();
+  if (!instanceId) return null;
+  return data?.instances.find((i) => i.id === instanceId)?.name ?? null;
+}
+
 export function useServerInfo(instanceId: string | null) {
   return useQuery({
     queryKey: [instanceId, 'info'],

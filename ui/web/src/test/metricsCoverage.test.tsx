@@ -32,6 +32,7 @@ vi.mock('../api/hooks', () => ({
     refetch: vi.fn(),
   }),
   useAcceleratorMetrics: () => ({ data: null }),
+  useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../context/InstanceContext', () => ({

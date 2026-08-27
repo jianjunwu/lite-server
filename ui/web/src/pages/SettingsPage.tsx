@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { App, Button, Card, Divider, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, Typography } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { QRCodeSVG } from 'qrcode.react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams, Link } from 'react-router-dom';
 import { bffFetch, setAdminKey } from '../api/client';
@@ -10,93 +10,21 @@ import { auditApi, authApi, grantsApi, modelGrantsApi, invitesApi, sessionsApi, 
 import { useInstances } from '../api/hooks';
 import { useAuth } from '../context/AuthContext';
 import type { InstanceInfo } from '../api/types';
-import { InstanceForm } from '../components/InstanceForm';
 import { PageHeader } from '../components/PageHeader';
 import { MONO_FONT, STATUS_COLORS, dataTextStyle, TYPE } from '../theme';
 
+/** Instance management moved to /instances (hierarchy plan §6); this tab is
+ * an entry card so the form is not maintained twice. The tab slot stays to
+ * keep old /settings?tab=instances bookmarks working. */
 function InstancesTab() {
   const { t } = useTranslation();
-  const { message } = App.useApp();
-  const { can } = useAuth();
-  const queryClient = useQueryClient();
-  const instancesQuery = useInstances();
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [editing, setEditing] = useState<InstanceInfo | null>(null);
-
-  const instances = instancesQuery.data?.instances ?? [];
-
-  const remove = async (inst: InstanceInfo) => {
-    try {
-      await bffFetch(`/api/instances/${encodeURIComponent(inst.id)}`, { method: 'DELETE' });
-      message.success(t('settings.instances.deleted'));
-      await queryClient.invalidateQueries({ queryKey: ['bff', 'instances'] });
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : String(err));
-    }
-  };
-
   return (
-    <>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
-        {can('admin') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); setDrawerOpen(true); }}>
-            {t('settings.instances.add')}
-          </Button>
-        )}
-      </div>
-      <Table<InstanceInfo>
-        size="small"
-        rowKey="id"
-        loading={instancesQuery.isLoading}
-        dataSource={instances}
-        pagination={false}
-        columns={[
-          { title: 'ID', dataIndex: 'id', width: 130, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
-          {
-            title: t('settings.instances.name'),
-            dataIndex: 'name',
-            ellipsis: true,
-            render: (v: string, i: InstanceInfo) => (
-              <Link to={`/instances/${encodeURIComponent(i.id)}?i=${encodeURIComponent(i.id)}`}>{v}</Link>
-            ),
-          },
-          { title: 'URL', dataIndex: 'base_url', ellipsis: true, render: (v: string) => <span style={dataTextStyle}>{v}</span> },
-          {
-            title: t('settings.instances.adminKey'),
-            width: 110,
-            render: (_: unknown, i: InstanceInfo) =>
-              i.has_admin_key ? <Tag color="#16A34A" style={{ border: 'none', color: '#fff' }}>server</Tag> : '-',
-          },
-          {
-            title: t('settings.instances.actions'),
-            width: 160,
-            align: 'right',
-            render: (_: unknown, i: InstanceInfo) =>
-              i.readonly ? (
-                <Typography.Text type="secondary" style={{ fontSize: TYPE.secondary }}>env · readonly</Typography.Text>
-              ) : can('admin') ? (
-                <span>
-                  <Button type="text" size="small" onClick={() => { setEditing(i); setDrawerOpen(true); }}>
-                    {t('settings.instances.edit')}
-                  </Button>
-                  <Popconfirm title={t('settings.instances.deleteConfirm', { id: i.id })} onConfirm={() => remove(i)}>
-                    <Button type="text" size="small" danger>
-                      {t('settings.instances.delete')}
-                    </Button>
-                  </Popconfirm>
-                </span>
-              ) : null,
-          },
-        ]}
-      />
-
-      <InstanceForm
-        open={drawerOpen}
-        editing={editing}
-        onClose={() => setDrawerOpen(false)}
-        onSaved={() => queryClient.invalidateQueries({ queryKey: ['bff', 'instances'] })}
-      />
-    </>
+    <Card size="small">
+      <Typography.Paragraph style={{ fontSize: TYPE.secondary }}>{t('settings.instances.entryHint')}</Typography.Paragraph>
+      <Link to="/instances">
+        <Button type="primary" icon={<PlusOutlined />}>{t('settings.instances.manage')}</Button>
+      </Link>
+    </Card>
   );
 }
 

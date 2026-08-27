@@ -32,6 +32,7 @@ vi.mock('../api/hooks', () => ({
   useModels: () => ({ data: { models: [] }, isLoading: false }),
   useTimelineAll: (...args: unknown[]) => timelineAllSpy(...args),
   useAcceleratorMetrics: (...args: unknown[]) => acceleratorSpy(...args),
+  useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../api/config', () => ({

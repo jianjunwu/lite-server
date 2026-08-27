@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { App as AntdApp } from 'antd';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -20,25 +20,10 @@ vi.mock('../context/AuthContext', async (importOriginal) => {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
-function installFetch(postResponse: Response) {
-  return vi.stubGlobal(
+function installFetch() {
+  vi.stubGlobal(
     'fetch',
-    vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const url = String(input);
-      if (url.startsWith('/api/instances') && init?.method === 'POST') {
-        return Promise.resolve(postResponse.clone());
-      }
-      if (url.startsWith('/api/instances')) {
-        return Promise.resolve(
-          json({
-            instances: [
-              { id: 'prod', name: 'Prod', base_url: 'http://p', has_admin_key: false, readonly: false },
-            ],
-          }),
-        );
-      }
-      return Promise.resolve(json({}));
-    }),
+    vi.fn(() => Promise.resolve(json({ instances: [] }))),
   );
 }
 
@@ -55,49 +40,23 @@ function renderSettings() {
   );
 }
 
-async function openAddDrawerAndSubmit() {
-  fireEvent.click(await screen.findByRole('button', { name: /Add instance$/ }));
-  const dialog = await screen.findByRole('dialog', { name: 'Add instance' });
-  fireEvent.change(screen.getByPlaceholderText('prod-gpu'), { target: { value: 'dev02' } });
-  fireEvent.change(screen.getByPlaceholderText('Prod GPU cluster'), { target: { value: 'Dead' } });
-  fireEvent.change(screen.getByPlaceholderText('http://10.0.0.11:8000'), {
-    target: { value: 'http://localhost:18001' },
-  });
-  fireEvent.click(screen.getByRole('button', { name: 'Add instance' }));
-  return dialog;
-}
-
 afterEach(() => vi.unstubAllGlobals());
 
-describe('SettingsPage add instance', () => {
-  it('should_show_the_server_error_reason_when_the_reachability_probe_rejects_the_add', async () => {
-    installFetch(json({ error: 'instance_unreachable', base_url: 'http://localhost:18001' }, 422));
+// Instance create/edit/delete flows live on /instances (shared InstanceForm)
+// and are covered by instancesPage.test.tsx; this tab is a compat entry card.
+describe('SettingsPage instances tab', () => {
+  it('should_offer_an_entry_card_linking_to_the_instances_page', async () => {
+    installFetch();
     renderSettings();
-    const dialog = await openAddDrawerAndSubmit();
-    // The toast explains why the add was rejected, and the drawer stays open
-    // so the user can fix the URL or uncheck the probe.
-    await waitFor(() =>
-      expect(document.querySelector('.ant-message')?.textContent).toContain('instance_unreachable'),
-    );
-    expect(dialog.isConnected).toBe(true);
+    const link = await screen.findByRole('link', { name: /Manage instances/ });
+    expect(link).toHaveAttribute('href', '/instances');
   });
 
-  it('should_close_the_drawer_and_refresh_the_list_on_success', async () => {
-    installFetch(
-      json(
-        {
-          instances: [
-            { id: 'prod', name: 'Prod', base_url: 'http://p', has_admin_key: false, readonly: false },
-            { id: 'dev02', name: 'Dead', base_url: 'http://localhost:18001', has_admin_key: false, readonly: false },
-          ],
-        },
-        201,
-      ),
-    );
+  it('should_explain_where_instance_management_moved', async () => {
+    installFetch();
     renderSettings();
-    await openAddDrawerAndSubmit();
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog', { name: 'Add instance' })).not.toBeInTheDocument(),
-    );
+    expect(
+      await screen.findByText(/Instance management lives on the Instances page/),
+    ).toBeTruthy();
   });
 });

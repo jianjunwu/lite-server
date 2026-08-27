@@ -52,6 +52,7 @@ vi.mock('../api/hooks', () => ({
   useModelHealth: () => mockHealth,
   useTimeline: () => mockTimeline,
   useTimelineAll: () => mockTimelineAll,
+  useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../api/download', () => ({ downloadModelPackage: vi.fn() }));

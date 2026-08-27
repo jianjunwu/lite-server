@@ -2,8 +2,7 @@ import { useEffect } from 'react';
 import { Alert, Button, Divider, Empty, Layout, Menu, Select, Space, Tag, Typography } from 'antd';
 import {
   DashboardOutlined,
-  AppstoreOutlined,
-  LineChartOutlined,
+  ClusterOutlined,
   AlertOutlined,
   CodeOutlined,
   SettingOutlined,
@@ -51,14 +50,15 @@ export function AppLayout() {
 
   const selectedKey = '/' + (location.pathname.split('/')[1] || 'overview');
 
+  // Hierarchy browse: /models has no sider entry — it is reached from the
+  // instance detail ("view all models"), the overview and global search.
   const menuItems = [
     {
       type: 'group' as const,
       label: t('nav.groupMonitor'),
       children: [
         { key: '/overview', icon: <DashboardOutlined />, label: <Link to={ilink('/overview')}>{t('nav.overview')}</Link> },
-        { key: '/models', icon: <AppstoreOutlined />, label: <Link to={ilink('/models')}>{t('nav.models')}</Link> },
-        { key: '/metrics', icon: <LineChartOutlined />, label: <Link to={ilink('/metrics')}>{t('nav.metrics')}</Link> },
+        { key: '/instances', icon: <ClusterOutlined />, label: <Link to={ilink('/instances')}>{t('nav.instances')}</Link> },
         { key: '/alerts', icon: <AlertOutlined />, label: <Link to={ilink('/alerts')}>{t('nav.alerts')}</Link> },
       ],
     },
@@ -130,7 +130,7 @@ export function AppLayout() {
                     size="small"
                     icon={<SettingOutlined />}
                     style={{ width: '100%', textAlign: 'left' }}
-                    onClick={() => navigate(ilink('/settings?tab=instances'))}
+                    onClick={() => navigate(ilink('/instances'))}
                   >
                     {t('settings.instances.manage')}
                   </Button>

@@ -10,6 +10,7 @@ vi.mock('../api/hooks', () => ({
     data: { instances: [{ id: 'prod', name: 'Prod', base_url: 'http://p' }] },
     isLoading: false,
   }),
+  useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../context/ThemeModeContext', () => ({

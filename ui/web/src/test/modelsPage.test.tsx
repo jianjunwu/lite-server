@@ -25,6 +25,7 @@ vi.mock('../api/hooks', () => ({
       inRepo: true,
       hasLoaded: false,
     },
+  useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../components/UploadDrawer', () => ({ UploadDrawer: () => null }));

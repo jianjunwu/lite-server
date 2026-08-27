@@ -84,11 +84,11 @@ async function openInstanceSelect() {
 }
 
 describe('AppLayout instance picker', () => {
-  it('should_navigate_to_instances_tab_from_manage_entry', async () => {
+  it('should_navigate_to_the_instances_page_from_manage_entry', async () => {
     renderLayout();
     await openInstanceSelect();
     fireEvent.click(await screen.findByRole('button', { name: /Manage instances/ }));
-    expect(screen.getByTestId('loc').textContent).toBe('/settings?tab=instances&i=echo-local');
+    expect(screen.getByTestId('loc').textContent).toBe('/instances?i=echo-local');
   });
 
   it('should_show_manage_entry_when_no_instances', async () => {
@@ -100,8 +100,15 @@ describe('AppLayout instance picker', () => {
 
   it('should_keep_the_instance_param_when_navigating_from_the_sider', async () => {
     renderLayout();
-    fireEvent.click(await screen.findByRole('link', { name: 'Models' }));
-    expect(screen.getByTestId('loc').textContent).toBe('/models?i=echo-local');
+    fireEvent.click(await screen.findByRole('link', { name: 'Instances' }));
+    expect(screen.getByTestId('loc').textContent).toBe('/instances?i=echo-local');
+  });
+
+  it('should_expose_instances_and_hide_models_and_metrics_in_the_sider', async () => {
+    renderLayout();
+    expect(await screen.findByRole('link', { name: 'Instances' })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'Models' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Metrics' })).toBeNull();
   });
 
   it('should_show_the_effective_role_tag_in_the_instance_picker', async () => {

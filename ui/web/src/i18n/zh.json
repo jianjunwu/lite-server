@@ -381,6 +381,7 @@
       "totpResetAction": "重置 2FA"
     },
     "instances": {
+      "entryHint": "实例管理已移至实例页：创建、编辑、监控与删除你的 lite-server 后端。",
       "manage": "管理实例",
       "add": "添加实例",
       "addTitle": "添加实例",

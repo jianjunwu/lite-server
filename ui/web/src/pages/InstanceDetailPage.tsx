@@ -183,7 +183,7 @@ export function InstanceDetailPage() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
         <PageHeader
           title={id}
-          breadcrumb={[{ title: t('nav.settings'), href: '/settings' }, { title: id }]}
+          breadcrumb={[{ title: t('nav.instances'), href: '/instances' }, { title: id }]}
         />
         <Card size="small">
           <Empty description={t('instance.detail.notFound')} />
@@ -209,11 +209,7 @@ export function InstanceDetailPage() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
-        breadcrumb={[
-          { title: t('nav.settings'), href: '/settings' },
-          { title: t('settings.tabs.instances'), href: '/settings?tab=instances' },
-          { title: instance?.name ?? id },
-        ]}
+        breadcrumb={[{ title: t('nav.instances'), href: '/instances' }, { title: instance?.name ?? id }]}
         title={instance?.name ?? id}
         subtitle={statement}
         extra={

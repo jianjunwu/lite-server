@@ -17,7 +17,7 @@ import { App } from 'antd';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { useMergedModels, useMergedVersions } from '../api/hooks';
+import { useInstanceName, useMergedModels, useMergedVersions } from '../api/hooks';
 import { modelOps, withAdminKeyRetry } from '../api/mutations';
 import type { MergedModel, MergedModelStatus } from '../api/merge';
 import { StatusBadge } from '../components/StatusBadge';
@@ -295,6 +295,8 @@ function ModelCard({ model, order }: { model: MergedModel; order: number }) {
 export function ModelsPage() {
   const { t } = useTranslation();
   const { instanceId } = useInstance();
+  const ilink = useInstanceLink();
+  const instName = useInstanceName(instanceId);
   const can = useCanInstance();
   const merged = useMergedModels(instanceId);
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -317,6 +319,14 @@ export function ModelsPage() {
       <PageHeader
         title={t('models.title')}
         subtitle={instanceId}
+        breadcrumb={
+          instanceId
+            ? [
+                { title: instName ?? instanceId, href: ilink(`/instances/${encodeURIComponent(instanceId)}`) },
+                { title: t('models.title') },
+              ]
+            : undefined
+        }
         extra={
           can('operator') ? (
             <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>

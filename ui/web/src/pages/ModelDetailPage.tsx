@@ -10,7 +10,7 @@ import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { useMergedModels, useMergedVersions, useTimeline, useTimelineAll } from '../api/hooks';
+import { useInstanceName, useMergedModels, useMergedVersions, useTimeline, useTimelineAll } from '../api/hooks';
 import type { TimelineEntry, VersionInfo } from '../api/types';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
@@ -147,6 +147,7 @@ export function ModelDetailPage() {
   const navigate = useNavigate();
   const { instanceId } = useInstance();
   const ilink = useInstanceLink();
+  const instName = useInstanceName(instanceId);
   const can = useCanInstance();
   const [editingRouting, setEditingRouting] = useState(false);
   const [loadOpen, setLoadOpen] = useState(false);
@@ -197,7 +198,15 @@ export function ModelDetailPage() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
         <PageHeader
           title={name}
-          breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
+          breadcrumb={
+            instanceId
+              ? [
+                  { title: instName ?? instanceId, href: ilink(`/instances/${encodeURIComponent(instanceId)}`) },
+                  { title: t('models.title'), href: ilink('/models') },
+                  { title: name },
+                ]
+              : undefined
+          }
         />
         <Card size="small">
           <Empty description={t('models.notFound')} />
@@ -232,7 +241,15 @@ export function ModelDetailPage() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
-        breadcrumb={[{ title: t('models.title'), href: ilink('/models') }, { title: name }]}
+        breadcrumb={
+          instanceId
+            ? [
+                { title: instName ?? instanceId, href: ilink(`/instances/${encodeURIComponent(instanceId)}`) },
+                { title: t('models.title'), href: ilink('/models') },
+                { title: name },
+              ]
+            : undefined
+        }
         title={
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[3] }}>
             <ModelGlyph name={name} type={modelType} size={SPACE[7]} />

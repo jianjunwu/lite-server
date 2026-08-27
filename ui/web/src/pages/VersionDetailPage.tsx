@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { useMergedVersions, useModelHealth, useModelReady, useTimeline } from '../api/hooks';
+import { useInstanceName, useMergedVersions, useModelHealth, useModelReady, useTimeline } from '../api/hooks';
 import { useModelConfig } from '../api/config';
 import { ConfigEditor } from '../components/config/ConfigEditor';
 import { StatusBadge } from '../components/StatusBadge';
@@ -26,6 +26,7 @@ export function VersionDetailPage() {
   const navigate = useNavigate();
   const { instanceId } = useInstance();
   const ilink = useInstanceLink();
+  const instName = useInstanceName(instanceId);
   const can = useCanInstance();
 
   const chartColors = useChartColors();
@@ -58,11 +59,16 @@ export function VersionDetailPage() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[5] }}>
       <PageHeader
-        breadcrumb={[
-          { title: t('models.title'), href: ilink('/models') },
-          { title: name, href: ilink(`/models/${encodeURIComponent(name)}`) },
-          { title: version },
-        ]}
+        breadcrumb={
+          instanceId
+            ? [
+                { title: instName ?? instanceId, href: ilink(`/instances/${encodeURIComponent(instanceId)}`) },
+                { title: t('models.title'), href: ilink('/models') },
+                { title: name, href: ilink(`/models/${encodeURIComponent(name)}`) },
+                { title: version },
+              ]
+            : undefined
+        }
         onBack={() => navigate(ilink(`/models/${encodeURIComponent(name)}`))}
         title={
           <span>
