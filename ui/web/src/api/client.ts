@@ -111,7 +111,7 @@ export async function bffFetch<T>(path: string, init?: RequestInit): Promise<T> 
   if (!res.ok) {
     const body = await parseErrorBody(res);
     notifyBffUnauthorized(res.status, body);
-    throw new ApiError(res.status, res.headers.get('x-request-id'), body, `HTTP ${res.status}`);
+    throw new ApiError(res.status, res.headers.get('x-request-id'), body, errorMessage(body, res.status));
   }
   return res.json() as Promise<T>;
 }

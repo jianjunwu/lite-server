@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, apiFetch, getAdminKey, setAdminKey } from '../api/client';
+import { ApiError, apiFetch, bffFetch, getAdminKey, setAdminKey } from '../api/client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -117,5 +117,30 @@ describe('apiFetch error messages', () => {
     });
     const err = (await apiFetch('prod', '/v2/models', { method: 'GET' }).catch((e) => e)) as ApiError;
     expect(err.message).toBe('forbidden');
+  });
+});
+
+describe('bffFetch', () => {
+  it('should_surface_the_server_error_reason_instead_of_a_bare_http_status', async () => {
+    mockFetch({
+      ok: false,
+      status: 422,
+      text: () =>
+        Promise.resolve(JSON.stringify({ error: 'instance_unreachable', base_url: 'http://localhost:18001' })),
+    });
+    const err = (await bffFetch('/api/instances?probe=true', { method: 'POST' }).catch((e) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(422);
+    expect(err.message).toBe('instance_unreachable');
+  });
+
+  it('should_fall_back_to_http_status_when_the_body_has_no_error', async () => {
+    mockFetch({
+      ok: false,
+      status: 500,
+      text: () => Promise.resolve('boom'),
+    });
+    const err = (await bffFetch('/api/x').catch((e) => e)) as ApiError;
+    expect(err.message).toBe('HTTP 500');
   });
 });
