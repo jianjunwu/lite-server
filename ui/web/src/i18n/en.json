@@ -73,8 +73,6 @@
     "modelType": "Type",
     "traffic": "Traffic",
     "trafficDragHint": "Drag a divider to shift weight, then Apply",
-    "selectMetrics": "Select metrics",
-    "resetMetrics": "Reset",
     "noModels": "No models in the repository yet",
     "detail": "Model detail",
     "versionDetail": "Version detail",
@@ -288,7 +286,8 @@
       "not_session_owner": "This upload session belongs to another user",
       "admin_required": "Admin permission required for this operation",
       "session_binding_mismatch": "Upload session does not match this model version"
-    }
+    },
+    "newVersion": "Upload new version"
   },
   "tasks": {
     "title": "Tasks",

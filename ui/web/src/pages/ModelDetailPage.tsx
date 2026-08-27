@@ -1,16 +1,17 @@
-import { Card, Col, Empty, Row, Select, Tabs, Button, Input, Modal } from 'antd';
+import { Button, Card, Col, Empty, Input, Modal, Row, Segmented, Select, Space, Tabs, Tooltip, Typography } from 'antd';
 import {
   LineChartOutlined,
   SafetyOutlined,
   TableOutlined,
+  UploadOutlined,
 } from '@ant-design/icons';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
 import { useInstanceLink } from '../context/useInstanceLink';
 import { useCanInstance } from '../context/useEffectiveRole';
-import { useInstanceName, useMergedModels, useMergedVersions, useTimeline, useTimelineAll } from '../api/hooks';
+import { useAlerts, useInstanceName, useMergedModels, useMergedVersions, useTimelineAll } from '../api/hooks';
 import type { TimelineEntry } from '../api/types';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
@@ -23,8 +24,19 @@ import { PageHeader } from '../components/PageHeader';
 import { Reveal } from '../components/PageHero';
 import { TrafficRiver } from '../components/TrafficRiver';
 import { RoutingEditor } from '../components/RoutingEditor';
+import { UploadDrawer } from '../components/UploadDrawer';
 import { useLifecycleOp } from '../components/useLifecycleOp';
-import { buildTimelineOption, fieldState, type MetricKey } from '../components/timelineChart';
+import { buildTimelineOption, fieldState, stepForRange, trimToRange, type ThresholdLine } from '../components/timelineChart';
+import {
+  METRIC_GROUP_ORDER,
+  METRIC_GROUPS,
+  RANGE_LABEL,
+  RANGE_SECONDS,
+  REFRESH_KEY,
+  loadRefresh,
+  type MetricGroupKey,
+  type RangeKey,
+} from '../components/metricsGroups';
 import { formatMs, formatNumber } from '../components/format';
 import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
 import { dataTextStyle, MONO_FONT, TYPE } from '../theme';
@@ -41,43 +53,6 @@ function tabLabel(icon: React.ReactNode, text: string) {
   );
 }
 
-/** Full model-level metric catalog (MetricKey in timelineChart.ts). Titles
- * reuse the MetricsPage i18n keys; MetricsPage keeps its own grouped copy. */
-const METRIC_CATALOG: { key: MetricKey; titleKey: string; yAxisName?: string }[] = [
-  { key: 'qps', titleKey: 'metrics.qps' },
-  { key: 'p99_ms', titleKey: 'metrics.p99', yAxisName: 'ms' },
-  { key: 'ttft_p99_ms', titleKey: 'metrics.ttftP99', yAxisName: 'ms' },
-  { key: 'tbt_p99_ms', titleKey: 'metrics.tbtP99', yAxisName: 'ms' },
-  { key: 'tokens_per_s', titleKey: 'metrics.tokensPerS' },
-  { key: 'stream_bytes_per_s', titleKey: 'metrics.streamBytesPerS' },
-  { key: 'queue_depth', titleKey: 'metrics.queueDepth' },
-  { key: 'in_flight', titleKey: 'metrics.inFlight' },
-  { key: 'active_streams', titleKey: 'metrics.activeStreams' },
-  { key: 'active_workers', titleKey: 'metrics.workers' },
-  { key: 'worker_saturation', titleKey: 'metrics.saturation' },
-  { key: 'rss_mb', titleKey: 'metrics.rss', yAxisName: 'MB' },
-  { key: 'cpu_percent', titleKey: 'metrics.cpu', yAxisName: '%' },
-  { key: 'retries_per_s', titleKey: 'metrics.retriesPerS' },
-  { key: 'ejections_per_s', titleKey: 'metrics.ejectionsPerS' },
-];
-
-const DEFAULT_METRICS: MetricKey[] = ['qps', 'p99_ms', 'ttft_p99_ms', 'queue_depth', 'in_flight', 'worker_saturation'];
-const METRICS_STORAGE_KEY = 'lite-ui-model-metrics-v1';
-const CATALOG_KEYS = new Set<string>(METRIC_CATALOG.map((m) => m.key));
-
-function loadMetricSelection(): MetricKey[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(METRICS_STORAGE_KEY) ?? '[]') as unknown;
-    if (Array.isArray(raw)) {
-      const valid = raw.filter((k): k is MetricKey => typeof k === 'string' && CATALOG_KEYS.has(k));
-      if (valid.length > 0) return valid;
-    }
-  } catch {
-    // Corrupt payload → fall through to defaults.
-  }
-  return DEFAULT_METRICS;
-}
-
 export function ModelDetailPage() {
   const { t } = useTranslation();
   const { name = '' } = useParams();
@@ -90,7 +65,14 @@ export function ModelDetailPage() {
   const [loadOpen, setLoadOpen] = useState(false);
   const [loadVersion, setLoadVersion] = useState('');
   const [tab, setTab] = useState('metrics');
-  const [selectedMetrics, setSelectedMetrics] = useState<MetricKey[]>(loadMetricSelection);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  // Metrics-tab controls (migrated from MetricsPage, plan §5): group tabs,
+  // time range with coverage negotiation, version overlay, refresh/pause.
+  const [group, setGroup] = useState<MetricGroupKey>('throughput');
+  const [range, setRange] = useState<RangeKey>('all');
+  const [refreshMs, setRefreshMs] = useState<number>(loadRefresh());
+  const [paused, setPaused] = useState(false);
+  const [selectedVersions, setSelectedVersions] = useState<string[]>([]);
   const { runLifecycle } = useLifecycleOp();
 
   const chartColors = useChartColors();
@@ -100,11 +82,37 @@ export function ModelDetailPage() {
   const modelType = modelsList.data.find((m) => m.name === name)?.modelType ?? 'unknown';
   const versions = merged.versions;
   const unloadedVersions = versions.filter((v) => !v.loaded).map((v) => v.version);
-  const timelineQuery = useTimeline(instanceId, name, undefined, 5_000, merged.hasLoaded);
-  const timelineAllQuery = useTimelineAll(instanceId, merged.hasLoaded ? 5_000 : false);
 
-  const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
-  // Latest point per version — drives the version cards' current QPS/P99.
+  const [coverageSeconds, setCoverageSeconds] = useState<number | undefined>(undefined);
+  const [intervalSeconds, setIntervalSeconds] = useState<number | undefined>(undefined);
+  const effectiveRange: RangeKey =
+    RANGE_SECONDS[range] != null && coverageSeconds != null && RANGE_SECONDS[range]! > coverageSeconds
+      ? 'all'
+      : range;
+  const step = useMemo(() => {
+    if (intervalSeconds == null) return undefined;
+    const seconds = RANGE_SECONDS[effectiveRange] ?? coverageSeconds;
+    if (seconds == null) return undefined;
+    return stepForRange(seconds, intervalSeconds);
+  }, [effectiveRange, coverageSeconds, intervalSeconds]);
+
+  // Single timelineAll poll feeds the KPI strip, the version cards and the
+  // metrics tab (plan §5) — the old model-level useTimeline is gone.
+  const timelineAllQuery = useTimelineAll(instanceId, merged.hasLoaded && !paused ? refreshMs : false, step);
+  const alertsQuery = useAlerts(instanceId, paused ? false : 10_000);
+
+  // Coverage arrives with the first response; a picked range that exceeds it
+  // falls back to 'all' (never disabled). Reset on instance change — a
+  // pre-M3 instance (no headers) must not inherit the previous coverage.
+  const dataCoverage = timelineAllQuery.data?.coverageSeconds;
+  const dataInterval = timelineAllQuery.data?.intervalSeconds;
+  useEffect(() => {
+    setCoverageSeconds(dataCoverage);
+    setIntervalSeconds(dataInterval);
+  }, [instanceId, dataCoverage, dataInterval]);
+
+  // Latest point per version — drives the version cards' current data and
+  // the KPI strip (sum/max across versions, plan §4).
   const latestByVersion = useMemo(() => {
     const map = new Map<string, TimelineEntry>();
     (timelineAllQuery.data?.snapshots ?? [])
@@ -116,11 +124,96 @@ export function ModelDetailPage() {
     return map;
   }, [timelineAllQuery.data, name]);
 
-  const changeMetrics = (keys: MetricKey[]) => {
-    const next = keys.length > 0 ? keys : DEFAULT_METRICS;
-    setSelectedMetrics(next);
-    localStorage.setItem(METRICS_STORAGE_KEY, JSON.stringify(next));
+  const kpi = useMemo(() => {
+    const entries = [...latestByVersion.values()];
+    let qps = 0;
+    let queue = 0;
+    let p99 = 0;
+    for (const p of entries) {
+      qps += p.qps;
+      queue += p.queue_depth;
+      p99 = Math.max(p99, p.p99_ms);
+    }
+    return { hasData: entries.length > 0, qps, queue, p99 };
+  }, [latestByVersion]);
+
+  // Metrics-tab series: per-version overlay trimmed to the range and
+  // filtered to the selected versions (default: all).
+  const versionNames = versions.map((v) => v.version);
+  const effectiveVersions = selectedVersions.length > 0 ? selectedVersions : versionNames;
+  const snapshots = useMemo(() => {
+    const trimmed = trimToRange(timelineAllQuery.data?.snapshots ?? [], RANGE_SECONDS[effectiveRange]);
+    return trimmed.filter((s) => s.model === name && effectiveVersions.includes(s.version));
+  }, [timelineAllQuery.data, name, effectiveVersions, effectiveRange]);
+
+  // Latest reading per visible version — drives the comparison statement.
+  const latest = useMemo(
+    () =>
+      snapshots
+        .map((s) => ({ version: s.version, entry: s.entries[s.entries.length - 1] }))
+        .filter((x): x is { version: string; entry: NonNullable<typeof x.entry> } => Boolean(x.entry)),
+    [snapshots],
+  );
+
+  const isEmpty = snapshots.every((s) => s.entries.length === 0);
+
+  // Comparison conclusion as a statement line inside the metrics tab
+  // (plan §5): "v1 answers 12ms faster than v2" — PageHero stays unique to
+  // the overview, so this is plain text, not a hero.
+  const metricsStatement = useMemo(() => {
+    if (latest.length === 0) return t('metrics.stmtWaiting');
+    if (latest.length >= 2) {
+      const sorted = [...latest].sort((a, b) => a.entry.p99_ms - b.entry.p99_ms);
+      const fast = sorted[0];
+      const slow = sorted[sorted.length - 1];
+      const diff = slow.entry.p99_ms - fast.entry.p99_ms;
+      if (diff > 0) {
+        return t('metrics.stmtFaster', {
+          fast: fast.version,
+          slow: slow.version,
+          ms: formatMs(diff),
+        });
+      }
+    }
+    const first = latest[0];
+    return t('metrics.stmtServing', {
+      version: first.version,
+      qps: formatNumber(first.entry.qps),
+      p99: formatMs(first.entry.p99_ms),
+    });
+  }, [latest, t]);
+
+  // Alert threshold lines for the p99/queue charts (plan §5 — migrated).
+  const thresholdsFor = (rule: 'p99_ms' | 'queue_depth'): ThresholdLine[] => {
+    const seen = new Map<string, ThresholdLine>();
+    (alertsQuery.data?.alerts ?? [])
+      .filter((a) => a.rule === rule && a.model === name)
+      .forEach((a) => {
+        seen.set(`${a.severity}:${a.threshold}`, {
+          value: a.threshold,
+          label: `${t(a.severity === 'critical' ? 'metrics.criticalThreshold' : 'metrics.warningThreshold')} ${a.threshold}`,
+          severity: a.severity,
+        });
+      });
+    return [...seen.values()];
   };
+
+  const rangeOptions = (Object.keys(RANGE_SECONDS) as RangeKey[]).map((rk) => {
+    const seconds = RANGE_SECONDS[rk];
+    const disabled = seconds != null && coverageSeconds != null && seconds > coverageSeconds;
+    const text = t(RANGE_LABEL[rk]);
+    return {
+      value: rk,
+      disabled,
+      label: disabled ? (
+        <Tooltip title={t('metrics.rangeDisabledHint')}>
+          <span>{text}</span>
+        </Tooltip>
+      ) : (
+        text
+      ),
+    };
+  });
 
   const submitLoad = async () => {
     if (!loadVersion.trim()) return;
@@ -160,9 +253,6 @@ export function ModelDetailPage() {
   // one version, so its total undercounts multi-version models.
   const workerTotal = loadedVersions.reduce((sum, v) => sum + v.workers.total, 0);
   const readyWorkers = loadedVersions.reduce((sum, v) => sum + v.workers.ready, 0);
-  // Latest timeline point drives the KPI strip under the header.
-  const latestEntry: TimelineEntry | undefined =
-    timelineQuery.data?.entries[timelineQuery.data.entries.length - 1];
   // Hero-layer statement under the title (plan §4.3), composed from atomic
   // plural-aware parts ("1 of 1 version ready · v2 active · 2 workers").
   const statement = !merged.hasLoaded
@@ -207,28 +297,37 @@ export function ModelDetailPage() {
         }
         subtitle={statement}
         extra={
-          can('operator') && (unloadedVersions.length > 0 || !merged.inRepo) ? (
-            <Button size="small" onClick={() => setLoadOpen(true)}>
-              {t('ops.loadVersion')}
-            </Button>
-          ) : undefined
+          <span style={{ display: 'inline-flex', gap: SPACE[2] }}>
+            {can('operator') && (
+              <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadOpen(true)}>
+                {t('upload.newVersion')}
+              </Button>
+            )}
+            {can('operator') && (unloadedVersions.length > 0 || !merged.inRepo) ? (
+              <Button size="small" onClick={() => setLoadOpen(true)}>
+                {t('ops.loadVersion')}
+              </Button>
+            ) : undefined}
+          </span>
         }
       />
 
       {merged.hasLoaded && (
         <Reveal order={1}>
           <div style={{ display: 'flex', gap: SPACE[5], flexWrap: 'wrap' }}>
+            {/* KPI strip = latest points summed across versions, p99 maxed
+                (plan §4 — same 口径 as the version cards). */}
             <StatNum
               label={t('metrics.currentQps')}
-              value={latestEntry ? formatNumber(latestEntry.qps) : '-'}
+              value={kpi.hasData ? formatNumber(kpi.qps) : '-'}
             />
             <StatNum
               label={t('metrics.currentP99')}
-              value={latestEntry && latestEntry.p99_ms > 0 ? formatMs(latestEntry.p99_ms) : '-'}
+              value={kpi.hasData && kpi.p99 > 0 ? formatMs(kpi.p99) : '-'}
             />
             <StatNum
               label={t('metrics.currentQueue')}
-              value={latestEntry ? formatNumber(latestEntry.queue_depth) : '-'}
+              value={kpi.hasData ? formatNumber(kpi.queue) : '-'}
             />
             <StatNum label={t('metrics.workers')} value={`${readyWorkers}/${workerTotal}`} />
           </div>
@@ -316,25 +415,60 @@ export function ModelDetailPage() {
             label: tabLabel(<LineChartOutlined aria-hidden />, t('models.tabs.metrics')),
             children: merged.hasLoaded ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div style={{ display: 'flex', gap: SPACE[3], alignItems: 'center' }}>
-                  <Select
-                    mode="multiple"
-                    style={{ flex: 1, minWidth: 280 }}
-                    maxTagCount="responsive"
-                    placeholder={t('models.selectMetrics')}
-                    value={selectedMetrics}
-                    onChange={(keys) => changeMetrics(keys as MetricKey[])}
-                    options={METRIC_CATALOG.map((m) => ({ value: m.key, label: t(m.titleKey) }))}
-                    // All 15 options inside the virtual-scroll window.
-                    listHeight={480}
-                  />
-                  <Button size="small" onClick={() => changeMetrics(DEFAULT_METRICS)}>
-                    {t('models.resetMetrics')}
-                  </Button>
-                </div>
+                {/* Comparison conclusion (plan §5): "v1 answers 12ms faster
+                    than v2" as a statement line, not a hero — the model
+                    detail header already owns the page title. */}
+                <Typography.Text style={{ fontSize: TYPE.lead, color: neutrals.textSecondary }}>
+                  {metricsStatement}
+                </Typography.Text>
+                <Card size="small" style={{ width: 'fit-content', maxWidth: '100%' }}>
+                  <Space wrap size="middle">
+                    <Segmented
+                      value={effectiveRange}
+                      onChange={(v) => setRange(v as RangeKey)}
+                      options={rangeOptions}
+                    />
+                    <Select
+                      mode="multiple"
+                      style={{ minWidth: 240 }}
+                      placeholder={t('metrics.versionsOverlay')}
+                      value={effectiveVersions}
+                      onChange={setSelectedVersions}
+                      options={versionNames.map((v) => ({ value: v, label: v }))}
+                      maxTagCount={4}
+                    />
+                    <Select
+                      style={{ width: 130 }}
+                      value={paused ? 0 : refreshMs}
+                      onChange={(v) => {
+                        if (v === 0) {
+                          setPaused(true);
+                        } else {
+                          setPaused(false);
+                          setRefreshMs(v);
+                          localStorage.setItem(REFRESH_KEY, String(v));
+                        }
+                      }}
+                      options={[
+                        { value: 2000, label: t('metrics.every2s') },
+                        { value: 5000, label: t('metrics.every5s') },
+                        { value: 10000, label: t('metrics.every10s') },
+                        { value: 30000, label: t('metrics.every30s') },
+                        { value: 0, label: t('metrics.pause') },
+                      ]}
+                    />
+                  </Space>
+                </Card>
+                <Tabs
+                  activeKey={group}
+                  onChange={(k) => setGroup(k as MetricGroupKey)}
+                  items={METRIC_GROUP_ORDER.map((g) => ({
+                    key: g,
+                    label: t(`metrics.group${g.charAt(0).toUpperCase()}${g.slice(1)}`),
+                  }))}
+                />
                 <Row gutter={[SPACE[5], SPACE[5]]}>
-                  {METRIC_CATALOG.filter((m) => selectedMetrics.includes(m.key)).map((c) => {
-                    const isEmpty = snapshots.every((s) => s.entries.length === 0);
+                  {METRIC_GROUPS[group].map((c) => {
                     const state = isEmpty ? ('ok' as const) : fieldState(snapshots, c.key);
                     const emptyText =
                       state === 'unsupported'
@@ -346,15 +480,16 @@ export function ModelDetailPage() {
                       <Col xs={24} xl={12} key={c.key}>
                         <ChartCard
                           title={t(c.titleKey)}
-                          loading={timelineQuery.isLoading}
-                          error={timelineQuery.error}
+                          loading={timelineAllQuery.isLoading}
+                          error={timelineAllQuery.error}
                           isEmpty={isEmpty || state !== 'ok'}
                           emptyText={emptyText}
-                          onRetry={() => timelineQuery.refetch()}
+                          onRetry={() => timelineAllQuery.refetch()}
                         >
                           <EChart
                             option={buildTimelineOption(snapshots, c.key, {
                               yAxisName: c.yAxisName,
+                              thresholds: c.rule ? thresholdsFor(c.rule) : undefined,
                               palette: chartColors,
                             })}
                             group={`model-${name}`}
@@ -384,6 +519,13 @@ export function ModelDetailPage() {
               ]
             : []),
         ]}
+      />
+
+      <UploadDrawer
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        existingModels={modelsList.data.map((m) => m.name)}
+        model={name}
       />
 
       <Modal

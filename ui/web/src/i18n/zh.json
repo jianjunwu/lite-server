@@ -69,8 +69,6 @@
     "modelType": "类型",
     "traffic": "流量",
     "trafficDragHint": "拖拽分界调整权重,然后应用",
-    "selectMetrics": "选择指标",
-    "resetMetrics": "重置",
     "noModels": "仓库中还没有模型",
     "detail": "模型详情",
     "versionDetail": "版本详情",
@@ -283,7 +281,8 @@
       "not_session_owner": "该上传会话属于其他用户",
       "admin_required": "该操作需要管理员权限",
       "session_binding_mismatch": "上传会话与该模型版本不匹配"
-    }
+    },
+    "newVersion": "上传新版本"
   },
   "tasks": {
     "title": "任务",

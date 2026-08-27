@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App as AntdApp } from 'antd';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -34,29 +34,41 @@ const mockHealth: { data: { total_workers: number; workers: never[] } | undefine
   data: undefined,
   isLoading: false,
 };
-const mockTimeline: {
-  data: { model: string; version: string; entries: Record<string, unknown>[] } | undefined;
-  isLoading: boolean;
-  error: Error | null;
-  refetch: () => void;
-} = { data: undefined, isLoading: false, error: null, refetch: vi.fn() };
 const mockTimelineAll: {
-  data: { snapshots: { model: string; version: string; entries: Record<string, unknown>[] }[] } | undefined;
+  data: {
+    snapshots: { model: string; version: string; entries: Record<string, unknown>[] }[];
+    coverageSeconds?: number;
+    intervalSeconds?: number;
+  } | undefined;
   isLoading: boolean;
   error: Error | null;
 } = { data: undefined, isLoading: false, error: null };
+let mockAlerts: { alerts: { model: string; rule: string; severity: string; threshold: number }[] } = { alerts: [] };
 
 vi.mock('../api/hooks', () => ({
   useMergedModels: () => mockModelsList,
   useMergedVersions: () => mockMerged,
   useModelHealth: () => mockHealth,
-  useTimeline: () => mockTimeline,
   useTimelineAll: () => mockTimelineAll,
+  useAlerts: () => ({ data: mockAlerts }),
   useInstanceName: () => 'Prod',
 }));
 
 vi.mock('../api/download', () => ({ downloadModelPackage: vi.fn() }));
-vi.mock('../components/EChart', () => ({ EChart: () => null }));
+const echartOptions = vi.hoisted(() => vi.fn());
+vi.mock('../components/EChart', () => ({
+  EChart: (props: { option: unknown }) => {
+    echartOptions(props.option);
+    return null;
+  },
+}));
+const uploadProps = vi.hoisted(() => vi.fn());
+vi.mock('../components/UploadDrawer', () => ({
+  UploadDrawer: (props: { open: boolean; model?: string }) => {
+    uploadProps(props);
+    return props.open ? <div>upload-drawer-mock</div> : null;
+  },
+}));
 
 vi.mock('../context/InstanceContext', () => ({
   useInstance: () => ({ instanceId: 'prod', setInstanceId: vi.fn() }),
@@ -118,12 +130,12 @@ afterEach(() => {
   mockMerged.inRepo = true;
   mockMerged.hasLoaded = false;
   mockHealth.data = undefined;
-  mockTimeline.data = undefined;
-  mockTimeline.isLoading = false;
-  mockTimeline.error = null;
   mockTimelineAll.data = undefined;
   mockTimelineAll.isLoading = false;
   mockTimelineAll.error = null;
+  mockAlerts = { alerts: [] };
+  echartOptions.mockClear();
+  uploadProps.mockClear();
 });
 
 const loadedVersionRow = (version: string, weight: number, active: boolean) => ({
@@ -311,7 +323,7 @@ function loadEcho() {
 }
 
 function timelineWith(entry: Record<string, unknown>) {
-  mockTimeline.data = { model: 'echo', version: '1', entries: [entry] };
+  mockTimelineAll.data = { snapshots: [{ model: 'echo', version: '1', entries: [entry] }] };
 }
 
 const chartTitles = () =>
@@ -339,58 +351,98 @@ describe('ModelDetailPage KPI strip', () => {
 });
 
 describe('ModelDetailPage metrics tab', () => {
-  it('should_render_six_default_metric_charts', () => {
+  it('should_render_the_throughput_group_by_default', () => {
     loadEcho();
     timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5 });
     renderPage('echo');
     fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
-    expect(chartTitles()).toEqual([
-      'QPS',
-      'P99 latency',
-      'TTFT p99',
-      'Queue depth',
-      'In-flight',
-      'Worker saturation',
-    ]);
+    expect(chartTitles()).toEqual(['QPS', 'Tokens/s', 'Stream bytes/s']);
+  });
+
+  it('should_expose_group_tabs_range_and_refresh_controls', () => {
+    loadEcho();
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    for (const g of ['Throughput', 'Latency', 'Queue & concurrency', 'Resources', 'Health']) {
+      expect(screen.getByRole('tab', { name: g })).toBeTruthy();
+    }
+    expect(screen.getByText('5 min')).toBeTruthy();
+    // Range segmented + version overlay + refresh selects.
+    expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2);
   });
 
   it('should_mark_a_chart_unsupported_when_the_instance_omits_that_field', () => {
     loadEcho();
-    // Pre-M3 schema: no ttft_p99_ms at all → the card explains instead of faking zeros.
-    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1 });
+    // Pre-M3 schema: no ttft/tbt at all → the card explains instead of
+    // faking zeros; p99 is present and renders.
+    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0 });
     renderPage('echo');
     fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
-    expect(screen.getByText('This instance version does not report this metric')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'Latency' }));
+    expect(screen.getAllByText('This instance version does not report this metric')).toHaveLength(2);
   });
 
-  it('should_let_the_user_add_and_remove_charts_and_persist_the_selection', async () => {
+  it('should_not_offer_cpu_in_the_resources_group', () => {
     loadEcho();
-    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5, cpu_percent: 0.4 });
-    const { unmount } = renderPage('echo');
-    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
-    fireEvent.mouseDown(screen.getByRole('combobox'));
-    fireEvent.click(await screen.findByText('CPU'));
-    expect(chartTitles()).toContain('CPU');
-    expect(localStorage.getItem('lite-ui-model-metrics-v1')).toContain('cpu_percent');
-    unmount();
-
-    // The selection survives a remount.
+    timelineWith({ qps: 1.2 });
     renderPage('echo');
     fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
-    expect(chartTitles()).toContain('CPU');
+    fireEvent.click(screen.getByRole('tab', { name: 'Resources' }));
+    expect(chartTitles()).toEqual(['Active workers', 'Worker saturation', 'Worker RSS']);
+    expect(screen.queryByText('CPU')).toBeNull();
   });
 
-  it('should_restore_the_default_six_on_reset', async () => {
+  it('should_draw_alert_thresholds_on_the_p99_chart', () => {
     loadEcho();
-    timelineWith({ qps: 1.2, p99_ms: 1.8, queue_depth: 0, in_flight: 0, worker_saturation: 0.1, ttft_p99_ms: 0.5, cpu_percent: 0.4 });
+    timelineWith({ qps: 1.2, p99_ms: 1.8 });
+    mockAlerts = {
+      alerts: [{ model: 'echo', rule: 'p99_ms', severity: 'critical', threshold: 5 }],
+    };
     renderPage('echo');
     fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
-    fireEvent.mouseDown(screen.getByRole('combobox'));
-    fireEvent.click(await screen.findByText('CPU'));
-    expect(chartTitles()).toContain('CPU');
-    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
-    expect(chartTitles()).toHaveLength(6);
-    expect(chartTitles()).not.toContain('CPU');
+    fireEvent.click(screen.getByRole('tab', { name: 'Latency' }));
+    const serialized = JSON.stringify(echartOptions.mock.calls.map((c) => c[0]));
+    expect(serialized).toContain('critical threshold');
+    expect(serialized).toContain('5');
+  });
+
+  it('should_state_which_version_is_faster_in_the_comparison_line', () => {
+    mockMerged.versions = [loadedVersionRow('v1', 50, true), loadedVersionRow('v2', 50, false)];
+    mockMerged.activeVersion = 'v1';
+    mockMerged.hasLoaded = true;
+    mockTimelineAll.data = {
+      snapshots: [
+        { model: 'echo', version: 'v1', entries: [{ timestamp: 1, qps: 10, p99_ms: 100, queue_depth: 0 }] },
+        { model: 'echo', version: 'v2', entries: [{ timestamp: 1, qps: 10, p99_ms: 200, queue_depth: 0 }] },
+      ],
+    };
+    renderPage('echo');
+    expect(screen.getByText(/v1 is 100.0ms faster at p99 than v2/)).toBeTruthy();
+  });
+
+  it('should_disable_ranges_beyond_the_instances_retention_window', async () => {
+    loadEcho();
+    // M3 instance: 5-minute retention via X-Timeline-* headers.
+    mockTimelineAll.data = {
+      snapshots: [],
+      coverageSeconds: 300,
+      intervalSeconds: 10,
+    };
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('tab', { name: 'Metrics' }));
+    await waitFor(() => {
+      expect(document.querySelectorAll('.ant-segmented-item-disabled').length).toBe(2);
+    });
+  });
+
+  it('should_open_the_upload_drawer_with_the_model_preset', async () => {
+    loadEcho();
+    renderPage('echo');
+    fireEvent.click(screen.getByRole('button', { name: /Upload new version/ }));
+    expect(await screen.findByText('upload-drawer-mock')).toBeTruthy();
+    const lastCall = uploadProps.mock.calls.at(-1)?.[0];
+    expect(lastCall?.open).toBe(true);
+    expect(lastCall?.model).toBe('echo');
   });
 });
 
@@ -422,8 +474,8 @@ describe('ModelDetailPage version cards', () => {
     mockMerged.versions = [loadedVersionRow('v1', 70, false), loadedVersionRow('v2', 30, true)];
     mockMerged.activeVersion = 'v2';
     mockMerged.hasLoaded = true;
-    // Model-level KPI stream kept distinct so card values can't collide with it.
-    mockTimeline.data = { model: 'echo', version: 'v2', entries: [{ qps: 9.9, p99_ms: 0.1, queue_depth: 0 }] };
+    // Per-version streams drive the version cards; the KPI strip now derives
+    // from the same data (sum across versions).
     mockTimelineAll.data = {
       snapshots: [
         { model: 'echo', version: 'v1', entries: [{ qps: 0.3, p99_ms: 2.1 }] },
