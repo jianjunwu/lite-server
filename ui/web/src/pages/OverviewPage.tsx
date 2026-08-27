@@ -1,21 +1,19 @@
 import { useMemo } from 'react';
-import { Card, Col, Empty, Row, Skeleton, Typography } from 'antd';
+import { Col, Empty, Row, Typography } from 'antd';
 import { useQueries } from '@tanstack/react-query';
-import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api/client';
 import { useInstances } from '../api/hooks';
 import type { AlertsResponse, HealthSummary, ServerInfo, TimelineAllResponse } from '../api/types';
-import { StatusBadge, StatusDot, statusKind } from '../components/StatusBadge';
+import { statusKind } from '../components/StatusBadge';
+import { InstanceCard } from '../components/InstanceCard';
 import { EChart } from '../components/EChart';
 import { PageHero, Reveal } from '../components/PageHero';
 import { StatNum } from '../components/StatNum';
-import { STATUS_COLORS, TYPE, dataTextStyle } from '../theme';
+import { STATUS_COLORS, TYPE } from '../theme';
 import { SPACE } from '../tokens';
 import { useNeutrals } from '../context/ThemeModeContext';
 import { formatMs, formatNumber } from '../components/format';
-
-const MAX_MODEL_ROWS = 6;
 
 // Asymmetric card rhythm (plan §4.1): wide/narrow alternating pairs.
 const CARD_SPANS = [14, 10, 10, 14];
@@ -64,9 +62,11 @@ export function OverviewPage() {
 
   const loading = instancesQuery.isLoading;
 
-  const { statusCounts, totalVersions, fleetQps, fleetP99, sparkline, activeAlerts, unreachable } = useMemo(() => {
+  const { statusCounts, totalVersions, modelCount, workerCount, fleetQps, fleetP99, sparkline, activeAlerts, unreachable } = useMemo(() => {
     const counts: Record<string, number> = { ready: 0, loading: 0, warning: 0, error: 0, offline: 0 };
     let versions = 0;
+    let models = 0;
+    let workers = 0;
     let qps = 0;
     let p99 = 0;
     let alerts = 0;
@@ -75,12 +75,14 @@ export function OverviewPage() {
 
     healthQueries.forEach((q) => {
       if (q.isError) down += 1;
-      q.data?.models.forEach((m) =>
+      q.data?.models.forEach((m) => {
+        models += 1;
         m.versions.forEach((v) => {
           counts[statusKind(v.status)] += 1;
           versions += 1;
-        }),
-      );
+          workers += v.workers;
+        });
+      });
     });
     timelineQueries.forEach((q) => {
       q.data?.snapshots.forEach((s) => {
@@ -102,6 +104,8 @@ export function OverviewPage() {
     return {
       statusCounts: counts,
       totalVersions: versions,
+      modelCount: models,
+      workerCount: workers,
       fleetQps: qps,
       fleetP99: p99,
       sparkline: line,
@@ -216,6 +220,7 @@ export function OverviewPage() {
             marginBottom: SPACE[8],
           }}
         >
+          {/* Live group: hero numerals stay the focus (plan §3.1). */}
           <StatNum label={t('overview.fleetQps')} value={formatNumber(fleetQps)}>
             <EChart option={sparkOption} height={48} />
           </StatNum>
@@ -225,6 +230,15 @@ export function OverviewPage() {
             value={activeAlerts}
             tone={activeAlerts > 0 ? 'error' : 'ink'}
           />
+          <div
+            style={{ width: 1, alignSelf: 'stretch', background: neutrals.border, margin: `0 ${SPACE[2]}px` }}
+            aria-hidden
+          />
+          {/* Scale group: compact 32px numerals — fleet breadth, not live load. */}
+          <StatNum compact label={t('overview.instances')} value={instances.length} />
+          <StatNum compact label={t('overview.models')} value={modelCount} />
+          <StatNum compact label={t('overview.versions')} value={totalVersions} />
+          <StatNum compact label={t('overview.workers')} value={workerCount} />
           {degraded > 0 && totalVersions > 0 && (
             // Quiet rule: the donut only appears when there is something to say.
             <div style={{ width: 220 }}>
@@ -239,81 +253,18 @@ export function OverviewPage() {
           {t('overview.instances')}
         </Typography.Title>
         <Row gutter={[SPACE[5], SPACE[5]]}>
-          {instances.map((inst, idx) => {
-            const health = healthQueries[idx];
-            const info = infoQueries[idx];
-            const timeline = timelineQueries[idx];
-            const unreachableInst = health.isError;
-            const models = health.data?.models ?? [];
-            const snapshots = timeline.data?.snapshots ?? [];
-
-            return (
-              <Col xs={24} md={CARD_SPANS[idx % CARD_SPANS.length]} key={inst.id}>
-                <Card
-                  className="lift"
-                  title={
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE[2] }}>
-                      {inst.name}
-                      <Typography.Text type="secondary" style={{ fontSize: TYPE.eyebrow, fontWeight: 400 }}>
-                        {info.data?.version ?? ''}
-                      </Typography.Text>
-                    </span>
-                  }
-                  extra={
-                    unreachableInst ? (
-                      <StatusBadge status="offline" text={t('common.unreachable')} />
-                    ) : (
-                      <StatusBadge status={health.data?.status} />
-                    )
-                  }
-                >
-                  {health.isLoading ? (
-                    <Skeleton active paragraph={{ rows: 2 }} />
-                  ) : unreachableInst ? (
-                    <Typography.Text type="secondary" style={dataTextStyle}>{inst.base_url}</Typography.Text>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE[2] }}>
-                      {models.slice(0, MAX_MODEL_ROWS).map((m) => {
-                        const modelSnaps = snapshots.filter((s) => s.model === m.name);
-                        const latestP99 = Math.max(
-                          0,
-                          ...modelSnaps.map((s) => s.entries[s.entries.length - 1]?.p99_ms ?? 0),
-                        );
-                        return (
-                          <div key={m.name} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <Link
-                              to={`/models/${encodeURIComponent(m.name)}?i=${encodeURIComponent(inst.id)}`}
-                              style={{ flex: '0 0 180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                            >
-                              {m.name}
-                            </Link>
-                            <span style={{ display: 'inline-flex', gap: 4 }}>
-                              {m.versions.map((v) => (
-                                <StatusDot key={v.version} kind={statusKind(v.status)} size={7} />
-                              ))}
-                            </span>
-                            <span style={{ ...dataTextStyle, marginLeft: 'auto', fontSize: TYPE.secondary, color: neutrals.textSecondary }}>
-                              {latestP99 > 0 ? formatMs(latestP99) : '-'}
-                            </span>
-                          </div>
-                        );
-                      })}
-                      {models.length > MAX_MODEL_ROWS && (
-                        <Link to={`/models?i=${encodeURIComponent(inst.id)}`} style={{ fontSize: TYPE.secondary }}>
-                          +{models.length - MAX_MODEL_ROWS} more
-                        </Link>
-                      )}
-                      {models.length === 0 && (
-                        <Typography.Text type="secondary" style={{ fontSize: TYPE.secondary }}>
-                          {t('models.noModels')}
-                        </Typography.Text>
-                      )}
-                    </div>
-                  )}
-                </Card>
-              </Col>
-            );
-          })}
+          {instances.map((inst, idx) => (
+            <Col xs={24} md={CARD_SPANS[idx % CARD_SPANS.length]} key={inst.id}>
+              {/* L0 instance card — the whole card links into the detail. */}
+              <InstanceCard
+                inst={inst}
+                health={healthQueries[idx].data}
+                healthLoading={healthQueries[idx].isLoading}
+                unreachable={healthQueries[idx].isError}
+                info={infoQueries[idx].data}
+              />
+            </Col>
+          ))}
         </Row>
       </Reveal>
     </div>

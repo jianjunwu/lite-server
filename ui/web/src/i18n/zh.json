@@ -59,7 +59,9 @@
     "stmtDown": "{{count}} 个版本故障",
     "acrossInstances": "共 {{count}} 个实例",
     "unreachableCount": "{{count}} 个不可达",
-    "fleetP99": "P99 延迟"
+    "fleetP99": "P99 延迟",
+    "versions": "版本",
+    "workers": "Worker"
   },
   "models": {
     "title": "模型",

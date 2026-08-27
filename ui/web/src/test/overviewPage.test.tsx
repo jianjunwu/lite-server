@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import '../i18n';
@@ -56,8 +56,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('OverviewPage instance model rows', () => {
-  it('should_pin_status_dots_to_a_fixed_name_column_so_rows_align_at_any_card_width', async () => {
+describe('OverviewPage scale group and instance cards', () => {
+  it('should_show_the_scale_group_with_model_version_and_worker_totals', async () => {
     stubInstanceApis();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -67,10 +67,32 @@ describe('OverviewPage instance model rows', () => {
         </QueryClientProvider>
       </MemoryRouter>,
     );
-    const name = await screen.findByRole('link', { name: 'echo' });
-    // A percentage basis lets the dot cluster drift with card width; a fixed
-    // basis keeps dots right after names on every row.
-    expect(name.style.flex).toBe('0 0 180px');
+    // 1 instance · 1 model · 1 version · 1 worker (from the health payload).
+    // 'Instances' also titles the card section below the scale group.
+    await waitFor(() => expect(screen.getAllByText('Instances').length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(screen.getAllByText('1').length).toBeGreaterThanOrEqual(4));
+    expect(screen.getByText('Models')).toBeTruthy();
+    expect(screen.getByText('Versions')).toBeTruthy();
+    expect(screen.getByText('Workers')).toBeTruthy();
+  });
+
+  it('should_render_l0_instance_cards_that_link_into_the_instance_detail', async () => {
+    stubInstanceApis();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={['/overview?i=prod']}>
+        <QueryClientProvider client={queryClient}>
+          <OverviewPage />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    // L0 anatomy: name, server version, count row — no model rows.
+    expect(await screen.findByText('Prod')).toBeTruthy();
+    expect(await screen.findByText('0.8.12')).toBeTruthy();
+    expect(await screen.findByText('1 models · 1 versions · 1 workers')).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'echo' })).toBeNull();
+    const card = screen.getByText('Prod').closest('.ant-card') as HTMLElement;
+    expect(card.closest('a')).toHaveAttribute('href', '/instances/prod?i=prod');
   });
 });
 

@@ -63,7 +63,9 @@
     "acrossInstances_other": "Across {{count}} instances",
     "unreachableCount_one": "{{count}} unreachable",
     "unreachableCount_other": "{{count}} unreachable",
-    "fleetP99": "P99 latency"
+    "fleetP99": "P99 latency",
+    "versions": "Versions",
+    "workers": "Workers"
   },
   "models": {
     "title": "Models",

@@ -12,15 +12,18 @@ interface StatNumProps {
   /** Small unit or qualifier after the value (e.g. "ms"). */
   unit?: ReactNode;
   tone?: Tone;
+  /** 32px variant for scale numbers that must not compete with the hero
+   * numerals (overview scale group, plan §3.1). */
+  compact?: boolean;
   /** Optional content under the label (e.g. a sparkline). */
   children?: ReactNode;
 }
 
 /**
- * Data-zone big numeral: 64px tabular figure + short caption (plan §2.2).
- * No card chrome — whitespace does the grouping.
+ * Data-zone big numeral: 64px tabular figure + short caption (plan §2.2),
+ * or 32px when compact. No card chrome — whitespace does the grouping.
  */
-export function StatNum({ label, value, unit, tone = 'ink', children }: StatNumProps) {
+export function StatNum({ label, value, unit, tone = 'ink', compact = false, children }: StatNumProps) {
   const neutrals = useNeutrals();
   const color = tone === 'ink' ? neutrals.textPrimary : STATUS_COLORS[tone];
   return (
@@ -29,7 +32,7 @@ export function StatNum({ label, value, unit, tone = 'ink', children }: StatNumP
         <span
           style={{
             ...dataTextStyle,
-            fontSize: TYPE.dataNum,
+            fontSize: compact ? 32 : TYPE.dataNum,
             fontWeight: 600,
             letterSpacing: '-0.02em',
             lineHeight: 1,
