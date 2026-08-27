@@ -13,10 +13,12 @@ import { WorkerMatrix } from '../components/WorkerMatrix';
 import { ChartCard } from '../components/ChartCard';
 import { EChart } from '../components/EChart';
 import { PageHeader } from '../components/PageHeader';
+import { Reveal } from '../components/PageHero';
+import { StatNum } from '../components/StatNum';
 import { VersionActions } from '../components/VersionActions';
 import { buildTimelineOption } from '../components/timelineChart';
 import { useChartColors, useNeutrals } from '../context/ThemeModeContext';
-import { formatAge } from '../components/format';
+import { formatAge, formatMs, formatNumber } from '../components/format';
 import { dataTextStyle, TYPE } from '../theme';
 import { SPACE } from '../tokens';
 
@@ -42,6 +44,8 @@ export function VersionDetailPage() {
   const configQuery = useModelConfig(instanceId, name, version, { pausePolling: configEditing });
 
   const snapshots = timelineQuery.data ? [timelineQuery.data] : [];
+  // Latest timeline point drives the header StatNum row.
+  const latestEntry = timelineQuery.data?.entries[timelineQuery.data.entries.length - 1];
 
   // Hero-layer statement: weight · status · age (plan §4.3).
   const statement =
@@ -82,6 +86,30 @@ export function VersionDetailPage() {
         }
         subtitle={statement}
       />
+
+      {/* Version-layer StatNum row (plan §3.1/§4): current QPS/p99/worker
+          r/t/RSS/streams from this version's timeline latest point. */}
+      {isLoaded && (
+        <Reveal order={1}>
+          <div style={{ display: 'flex', gap: SPACE[5], flexWrap: 'wrap' }}>
+            <StatNum label={t('metrics.qps')} value={latestEntry ? formatNumber(latestEntry.qps) : '-'} />
+            <StatNum
+              label={t('metrics.p99')}
+              value={latestEntry && latestEntry.p99_ms > 0 ? formatMs(latestEntry.p99_ms) : '-'}
+            />
+            <StatNum label={t('common.workers')} value={info ? `${info.workers.ready}/${info.workers.total}` : '-'} />
+            <StatNum
+              label={t('metrics.rss')}
+              value={latestEntry && latestEntry.rss_mb != null ? Math.round(latestEntry.rss_mb) : '-'}
+              unit={latestEntry && latestEntry.rss_mb != null ? 'MB' : undefined}
+            />
+            <StatNum
+              label={t('metrics.activeStreams')}
+              value={latestEntry ? formatNumber(latestEntry.active_streams) : '-'}
+            />
+          </div>
+        </Reveal>
+      )}
 
       <Card size="small">
         <Descriptions size="small" column={{ xs: 1, md: 4 }}>
