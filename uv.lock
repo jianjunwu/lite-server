@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "miraserver"
-version = "0.8.12rc2"
+version = "0.8.12"
 source = { editable = "." }
 dependencies = [
     { name = "bcrypt" },
