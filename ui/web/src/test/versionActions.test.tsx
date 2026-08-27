@@ -109,10 +109,31 @@ describe('VersionActions unloaded version', () => {
     expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull();
   });
 
+  it('should_decorate_unloaded_actions_with_icons', () => {
+    renderActions(unloaded);
+    // Icons are aria-hidden; the accessible name stays the action text.
+    expect(screen.getByRole('button', { name: 'Download' }).querySelector('.anticon-download')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Load' }).querySelector('.anticon-rocket')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Delete' }).querySelector('.anticon-delete')).toBeTruthy();
+  });
+
   it('should_keep_runtime_ops_for_loaded_versions', () => {
     renderActions(version);
     expect(screen.getByRole('button', { name: 'Unload' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Load' })).toBeNull();
+  });
+
+  it('should_decorate_runtime_actions_with_icons', () => {
+    renderActions(version);
+    expect(screen.getByRole('button', { name: 'Download' }).querySelector('.anticon-download')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reload' }).querySelector('.anticon-reload')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Unload' }).querySelector('.anticon-stop')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Delete' }).querySelector('.anticon-delete')).toBeTruthy();
+  });
+
+  it('should_decorate_activate_with_the_aim_icon_on_inactive_versions', () => {
+    renderActions({ ...version, active: false });
+    expect(screen.getByRole('button', { name: 'Activate' }).querySelector('.anticon-aim')).toBeTruthy();
   });
 
   it('should_track_load_through_the_lifecycle_watcher', async () => {

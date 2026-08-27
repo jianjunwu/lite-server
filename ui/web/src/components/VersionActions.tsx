@@ -1,5 +1,13 @@
 import { useState } from 'react';
 import { App, Button, Checkbox, Input, Modal, Popconfirm, Space } from 'antd';
+import {
+  AimOutlined,
+  DeleteOutlined,
+  DownloadOutlined,
+  ReloadOutlined,
+  RocketOutlined,
+  StopOutlined,
+} from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useInstance } from '../context/InstanceContext';
@@ -113,18 +121,25 @@ export function VersionActions({ model, version }: VersionActionsProps) {
   if (version.loaded === false) {
     return (
       <Space size={4} wrap>
-        <Button type="text" size="small" disabled={busy} onClick={startDownload}>
+        <Button type="text" size="small" disabled={busy} onClick={startDownload} icon={<DownloadOutlined aria-hidden />}>
           {t('ops.download')}
         </Button>
         <Popconfirm
           title={t('ops.loadConfirm', { version: version.version })}
           onConfirm={() => runLifecycle('load', model, version.version)}
         >
-          <Button type="text" size="small" loading={lifecycleLoading('load')} disabled={busy}>
+          <Button type="text" size="small" loading={lifecycleLoading('load')} disabled={busy} icon={<RocketOutlined aria-hidden />}>
             {t('ops.load')}
           </Button>
         </Popconfirm>
-        <Button type="text" size="small" danger disabled={busy} onClick={() => setDeleteOpen(true)}>
+        <Button
+          type="text"
+          size="small"
+          danger
+          disabled={busy}
+          onClick={() => setDeleteOpen(true)}
+          icon={<DeleteOutlined aria-hidden />}
+        >
           {t('ops.delete')}
         </Button>
         <Modal
@@ -152,7 +167,7 @@ export function VersionActions({ model, version }: VersionActionsProps) {
 
   return (
     <Space size={4} wrap>
-      <Button type="text" size="small" disabled={busy} onClick={startDownload}>
+      <Button type="text" size="small" disabled={busy} onClick={startDownload} icon={<DownloadOutlined aria-hidden />}>
         {t('ops.download')}
       </Button>
 
@@ -160,19 +175,33 @@ export function VersionActions({ model, version }: VersionActionsProps) {
         title={t('ops.reloadConfirm', { version: version.version })}
         onConfirm={() => runLifecycle('reload', model, version.version)}
       >
-        <Button type="text" size="small" loading={lifecycleLoading('reload')} disabled={busy}>
+        <Button type="text" size="small" loading={lifecycleLoading('reload')} disabled={busy} icon={<ReloadOutlined aria-hidden />}>
           {t('ops.reload')}
         </Button>
       </Popconfirm>
 
       {!version.active && (
-        <Button type="text" size="small" loading={lifecycleLoading('activate')} disabled={busy} onClick={confirmActivate}>
+        <Button
+          type="text"
+          size="small"
+          loading={lifecycleLoading('activate')}
+          disabled={busy}
+          onClick={confirmActivate}
+          icon={<AimOutlined aria-hidden />}
+        >
           {t('ops.activate')}
         </Button>
       )}
 
       {version.active ? (
-        <Button type="text" size="small" loading={lifecycleLoading('unload')} disabled={busy} onClick={confirmUnloadActive}>
+        <Button
+          type="text"
+          size="small"
+          loading={lifecycleLoading('unload')}
+          disabled={busy}
+          onClick={confirmUnloadActive}
+          icon={<StopOutlined aria-hidden />}
+        >
           {t('ops.unload')}
         </Button>
       ) : (
@@ -180,13 +209,20 @@ export function VersionActions({ model, version }: VersionActionsProps) {
           title={t('ops.unloadConfirm', { version: version.version })}
           onConfirm={() => runLifecycle('unload', model, version.version)}
         >
-          <Button type="text" size="small" loading={lifecycleLoading('unload')} disabled={busy}>
+          <Button type="text" size="small" loading={lifecycleLoading('unload')} disabled={busy} icon={<StopOutlined aria-hidden />}>
             {t('ops.unload')}
           </Button>
         </Popconfirm>
       )}
 
-      <Button type="text" size="small" danger disabled={busy} onClick={() => setDeleteOpen(true)}>
+      <Button
+        type="text"
+        size="small"
+        danger
+        disabled={busy}
+        onClick={() => setDeleteOpen(true)}
+        icon={<DeleteOutlined aria-hidden />}
+      >
         {t('ops.delete')}
       </Button>
 
