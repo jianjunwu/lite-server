@@ -116,7 +116,9 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: req.data.clone(),
             sequence_id: req.sequence_id.clone(),
-            deadline_unix_ns: deadline.unix_ns,
+            // B1 (cluster A): only a client-specified deadline rides the
+            // stream meta — no server.timeout fallback truncation.
+            deadline_unix_ns: deadline.stream_meta_unix_ns(),
             ..Default::default()
         };
         // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified
@@ -158,6 +160,7 @@ impl GrpcService {
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,
+                deadline_client_specified: deadline.client_specified,
                 decoupled: false,
                 // E8-1 (D38): the dag selector rides the gRPC metadata.
                 dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)

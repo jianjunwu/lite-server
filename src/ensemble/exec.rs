@@ -167,6 +167,12 @@ pub(crate) fn execute_nested_ensemble_boxed(
 pub struct EnsembleExecOpts {
     pub client_ip: String,
     pub deadline_unix_ns: Option<i64>,
+    /// B1 (2026-08-28 audit, cluster A): true iff `deadline_unix_ns` came from
+    /// the client (`x-lite-timeout` / `grpc-timeout`). The pre-layer DAG
+    /// budget keeps using `deadline_unix_ns` unconditionally (unary fallback
+    /// semantics, decided 2026-08-28); a STREAMING step's E5 base is gated on
+    /// this flag so the server.timeout fallback never truncates a stream.
+    pub deadline_client_specified: bool,
     /// StreamOpen.decoupled passthrough (batch 0).
     pub decoupled: bool,
     /// E8-1 (batch 5, D38): the request's DAG-set name — extracted by each
@@ -376,6 +382,16 @@ pub(crate) async fn execute_ensemble_inner(
     // form plans pass through; unknown names 400 here.
     let plan = select_dag_set(&plan, opts.dag_selector.as_deref())?;
     let deadline_unix_ns = opts.deadline_unix_ns;
+    // B1 (cluster A, decided 2026-08-28): the streaming step's E5 deadline
+    // base is CLIENT-gated — the server.timeout fallback still bounds the
+    // pre-layers (unary semantics unchanged), but it must never truncate a
+    // stream. Every streaming path below (preflight / tail / chain, and the
+    // D19 quick-fail predicate inside execute_stream_step) takes this value.
+    let stream_deadline_unix_ns = if opts.deadline_client_specified {
+        deadline_unix_ns
+    } else {
+        None
+    };
     let tail_idx = plan.output_step;
 
     // MIMO (D31/R18): the single root-parsing point — the KServe envelope
@@ -447,7 +463,7 @@ pub(crate) async fn execute_ensemble_inner(
             None => None,
         };
         let mut stream = spawn_chain(
-            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
+            &state, &plan, chain, &context, request_id, &opts, stream_deadline_unix_ns, snapshot,
         )
         .await?;
         stream.permit = permit;
@@ -463,8 +479,10 @@ pub(crate) async fn execute_ensemble_inner(
     // so the TTFT critical path after the layers is just assemble + send.
     // The autoload path stays serial (preflight only when already ready).
     let preflight_fut = async {
+        // B8 (cluster C): the preflight meta's request_id is completed at
+        // the call site (`{parent}:{step}`, D20 non-chain format).
         tail_stream_preflight(
-            &state, &plan.steps[tail_idx], request_id, &opts, deadline_unix_ns, snapshot,
+            &state, &plan.steps[tail_idx], &format!("{}:{}", request_id, plan.steps[tail_idx].name), &opts, stream_deadline_unix_ns, snapshot,
         )
         .await
     };
@@ -495,7 +513,7 @@ pub(crate) async fn execute_ensemble_inner(
     };
     let mut stream = open_tail_stream(
         &state, &plan, tail_idx, tail_layer, &context, &absent_inputs,
-        request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
+        request_id, &opts, stream_deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
     ).await?;
     stream.permit = permit;
     Ok(EnsembleOutcome::Stream(stream))
@@ -735,7 +753,7 @@ async fn run_layers(
 #[allow(clippy::too_many_arguments)] // layer-engine plumbing: state+plan+ctx+ids ride together by design
 /// dropped, failures warn only); batch 2 replaces this function's body with
 /// the chain spawn without touching the caller seam.
-async fn open_tail_stream(
+pub(crate) async fn open_tail_stream(
     state: &Arc<AppState>,
     plan: &Arc<EnsemblePlan>,
     tail_idx: usize,
@@ -744,6 +762,9 @@ async fn open_tail_stream(
     absent_inputs: &HashSet<String>,
     request_id: &str,
     opts: &EnsembleExecOpts,
+    // B1 (cluster A): the CLIENT-gated deadline base for the streaming step
+    // (server.timeout fallback excluded); unary siblings read
+    // `opts.deadline_unix_ns` instead.
     deadline_unix_ns: Option<i64>,
     preflight: Option<TailPreflight>,
     snapshot: &Arc<VersionSnapshot>,
@@ -761,7 +782,11 @@ async fn open_tail_stream(
         .filter(|&i| i != tail_idx)
         .collect();
 
-    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns, preflight, snapshot);
+    // B8 (cluster C): the tail's complete request_id (`{parent}:{step}`,
+    // D20 non-chain format) is built HERE — execute_stream_step uses it
+    // verbatim (single suffix point per path).
+    let tail_request_id = format!("{}:{}", request_id, plan.steps[tail_idx].name);
+    let run_stream = execute_stream_step(state, plan, tail_idx, context, &tail_request_id, opts, deadline_unix_ns, preflight, snapshot);
     tokio::pin!(run_stream);
 
     if siblings.is_empty() {
@@ -807,11 +832,15 @@ async fn open_tail_stream(
             let plan_spawn = plan.clone();
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
+            let opts_deadline_unix_ns = opts.deadline_unix_ns;
             let snapshot = snapshot.clone();
             let ancestors = ancestors.to_vec();
             set.spawn(async move {
                 let name = step.name.clone();
-                execute_step(state, &plan_spawn, idx, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors).await
+                // Siblings are UNARY steps — they keep the ungated deadline
+                // (server.timeout fallback is established unary semantics,
+                // B1/cluster A); the gated param belongs to the stream step.
+                execute_step(state, &plan_spawn, idx, &step, &ctx, &request_id, &client_ip, opts_deadline_unix_ns, &snapshot, depth, &ancestors).await
                     .map(|v| (name.clone(), Ok(v)))
                     .unwrap_or_else(|e| (name.clone(), Err(e)))
             });
@@ -845,7 +874,7 @@ async fn open_tail_stream(
 /// sub-model was not ready at preflight time — the autoload path stays
 /// serial after the pre-layers (P7 constraint: never preflight a stream for
 /// a model still loading).
-struct TailPreflight {
+pub(crate) struct TailPreflight {
     meta: pb::RequestMeta,
     worker_id: usize,
     clients: Vec<Arc<crate::transport::zmq::WorkerZmqClient>>,
@@ -891,9 +920,11 @@ async fn tail_stream_preflight(
     }
     // E5 (batch 3): the preflight meta carries the STEP deadline — the same
     // min(parent, now + timeout_secs) formula the serial path would compute.
+    // B8 (cluster C): request_id arrives COMPLETE from the caller (the
+    // execute_ensemble_inner preflight call site suffixes `{parent}:{step}`).
     let preflight_deadline = step_effective_deadline(deadline_unix_ns, step.timeout_secs);
     let meta = build_step_meta(
-        &format!("{}:{}", request_id, step.name), &opts.client_ip, preflight_deadline, step_headers, bytes::Bytes::new(),
+        request_id, &opts.client_ip, preflight_deadline, step_headers, bytes::Bytes::new(),
     );
     let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
     let seq_registry = state.inference_queue.sequence_registry();
@@ -910,6 +941,21 @@ async fn tail_stream_preflight(
     Ok(Some(TailPreflight { meta, worker_id, clients }))
 }
 
+/// B7/O6 (cluster C): how a chain hop's forward ended — the consumer's next
+/// action differs per outcome (stop the chain on error, continue with the
+/// next chunk on done, unwind immediately on downstream close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardOutcome {
+    /// An Error frame terminated the chain (node failure or hop bound).
+    Error,
+    /// The sub-stream finished cleanly (Done frame / upstream channel close).
+    Done,
+    /// The downstream receiver is gone — the hop's worker was already
+    /// cancelled inside forward_stream; the consumer unwinds immediately
+    /// instead of opening a new sub-stream per remaining chunk (O6 churn).
+    DownstreamClosed,
+}
+
 /// §4.2: forward a worker stream into a downstream channel. Only Chunk
 /// frames pass through — a per-chunk sub-stream's Done is an intermediate
 /// milestone, NOT the chain's end (the tail hop synthesizes the final Done);
@@ -917,78 +963,126 @@ async fn tail_stream_preflight(
 /// failure cancels its worker and propagates upstream, D18). When the
 /// downstream closes (adapter disconnect / next hop exiting), send
 /// StreamCancel to THIS worker and end.
-/// D35: `deadline` is this hop's wall-clock cap (E5 timeout_secs, measured
-/// from the sub-stream open) — on expiry the hop emits an Error frame
-/// downstream, cancels its worker, and stops the chain.
-/// Returns `true` when the stream ended with an Error frame (chain stop).
+/// D35 × B7 (cluster C): BOTH directions carry the two-stage bound — recv
+/// via [`streaming::recv_chunk`], send via [`streaming::send_bounded`] —
+/// with `deadline` = this hop's wall-clock cap (min(client overall, open +
+/// timeout_secs), GAP-7) and `idle` = the always-on chunk idle budget. A
+/// stalled hop (silent upstream OR backpressured downstream) is reclaimed by
+/// THIS hop inside min(deadline, idle): an Error frame is try_send'd
+/// downstream (best-effort — a full channel means the peer already stalled;
+/// dropping matches the overflow-truncation philosophy) and the hop's worker
+/// is cancelled. No send blocks unbounded (P10 permits / inflight counts /
+/// the chain task tree all release along the error-terminated path).
 async fn forward_stream(
     mut rx: mpsc::Receiver<pb::StreamResponse>,
     tx: mpsc::Sender<pb::StreamResponse>,
     cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
     stream_id: String,
     deadline: Option<Instant>,
+    idle: Option<Duration>,
     step_name: &str,
-) -> bool {
+) -> ForwardOutcome {
     // m4: cumulative time this hop's downstream channel was FULL (the 64-slot
     // bound is backpressure, not a drop — saturation measures how long it held).
     let mut saturation_secs: f64 = 0.0;
+    // B7: locally-generated terminal Error frame — best-effort try_send (a
+    // full channel means the peer stalled; never block a dying hop on it).
+    let try_send_hop_error = |tx: &mpsc::Sender<pb::StreamResponse>, msg: String| {
+        let _ = tx.try_send(pb::StreamResponse {
+            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                message: msg,
+            })),
+            ..Default::default()
+        });
+    };
     loop {
-        let next = match deadline {
-            Some(d) => match tokio::time::timeout_at(tokio::time::Instant::from_std(d), rx.recv()).await {
-                Ok(v) => v,
-                Err(_) => {
-                    // D35: hop wall-clock cap expired mid-stream — Error
-                    // frame downstream + cancel this hop's worker (§4.4:
-                    // every mid-stream failure reaches the client as an
-                    // Error frame).
-                    let _ = tx.send(pb::StreamResponse {
-                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
-                            message: format!(
-                                "pipeline step '{step_name}' exceeded its timeout (D35)"
-                            ),
-                        })),
-                        ..Default::default()
-                    }).await;
-                    let _ = cancel_client
-                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
-                        .await;
-                    crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
-                        saturation_secs,
-                    );
-                    return true;
-                }
-            },
-            None => rx.recv().await,
+        let next = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+            Ok(v) => v,
+            Err(elapsed) => {
+                // D35: hop bound expired mid-stream — Error frame downstream
+                // + cancel this hop's worker (§4.4: every mid-stream failure
+                // reaches the client as an Error frame).
+                let msg = match elapsed {
+                    crate::streaming::RecvElapsed::Deadline => format!(
+                        "pipeline step '{step_name}' exceeded its timeout (D35)"
+                    ),
+                    crate::streaming::RecvElapsed::Idle => format!(
+                        "pipeline step '{step_name}' idle timeout"
+                    ),
+                };
+                try_send_hop_error(&tx, msg);
+                let _ = cancel_client
+                    .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                    .await;
+                crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                    saturation_secs,
+                );
+                return ForwardOutcome::Error;
+            }
         };
         let Some(chunk) = next else { break };
         match chunk.payload {
             Some(pb::stream_response::Payload::Chunk(_)) => {
                 let send_start = Instant::now();
-                let send_res = tx.send(chunk).await;
+                let outcome = crate::streaming::send_bounded(deadline, idle, tx.send(chunk)).await;
                 saturation_secs += send_start.elapsed().as_secs_f64();
-                if send_res.is_err() {
-                    let _ = cancel_client
-                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
-                        .await;
-                    crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
-                        saturation_secs,
-                    );
-                    return false;
+                match outcome {
+                    crate::streaming::SendOutcome::Sent(Ok(())) => {}
+                    crate::streaming::SendOutcome::Sent(Err(_)) => {
+                        let _ = cancel_client
+                            .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                            .await;
+                        crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                            saturation_secs,
+                        );
+                        return ForwardOutcome::DownstreamClosed;
+                    }
+                    crate::streaming::SendOutcome::Deadline => {
+                        // B7: the send must not escape the hop bound — a
+                        // backpressured downstream previously parked the hop
+                        // in an unbounded send, defeating the deadline.
+                        try_send_hop_error(&tx, format!(
+                            "pipeline step '{step_name}' exceeded its timeout (D35)"
+                        ));
+                        let _ = cancel_client
+                            .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                            .await;
+                        crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                            saturation_secs,
+                        );
+                        return ForwardOutcome::Error;
+                    }
+                    crate::streaming::SendOutcome::Idle => {
+                        try_send_hop_error(&tx, format!(
+                            "pipeline step '{step_name}' idle timeout"
+                        ));
+                        let _ = cancel_client
+                            .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                            .await;
+                        crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                            saturation_secs,
+                        );
+                        return ForwardOutcome::Error;
+                    }
                 }
             }
             Some(pb::stream_response::Payload::Error(_)) => {
                 // Propagate the failure downstream, then stop the chain.
-                let _ = tx.send(chunk).await;
+                // Bounded like the chunk path (B7): a stalled downstream
+                // must not pin a dying hop either.
+                let send_start = Instant::now();
+                let _ = crate::streaming::send_bounded(deadline, idle, tx.send(chunk)).await;
+                saturation_secs += send_start.elapsed().as_secs_f64();
                 crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
                     saturation_secs,
                 );
-                return true;
+                return ForwardOutcome::Error;
             }
             Some(pb::stream_response::Payload::Done(_)) => {
                 crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
                     saturation_secs,
                 );
-                return false;
+                return ForwardOutcome::Done;
             }
             _ => {}
         }
@@ -996,7 +1090,7 @@ async fn forward_stream(
     crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
         saturation_secs,
     );
-    false
+    ForwardOutcome::Done
 }
 
 /// §4.2 / C5: a pipeline chunk is spliced RAW into the downstream step's
@@ -1056,6 +1150,14 @@ pub(crate) async fn consume_stream_consumer(
     while let Some(chunk) = upstream.recv().await {
         match &chunk.payload {
             Some(pb::stream_response::Payload::Chunk(c)) => {
+                // O6 (cluster C): nobody consumes this chain anymore — unwind
+                // instead of opening another sub-stream for this chunk (the
+                // mid-sub-stream case is forward_stream's DownstreamClosed;
+                // the head stays cancel-able via cancel_chain, same as any
+                // consumer-side bail).
+                if downstream.is_closed() {
+                    return Ok(());
+                }
                 // Chunk → the previous step's value in a per-chunk context.
                 // P2 (batch 6): the chunk stays unparsed raw bytes (P-R2
                 // guarantees whole-reference-only consumption — the downstream
@@ -1122,18 +1224,28 @@ pub(crate) async fn consume_stream_consumer(
                         handles.push(handle);
                     }
                 }
-                // D35: the hop's wall-clock cap, measured from this
-                // sub-stream's open (E5 formula per streaming step on a
-                // chain) — enforced inside forward_stream.
-                let hop_deadline = step.timeout_secs.and_then(|t| {
-                    Instant::now().checked_add(Duration::try_from_secs_f64(t).ok()?)
-                });
-                let error_terminated = forward_stream(
+                // D35 × GAP-7 (cluster C): the hop's wall-clock cap =
+                // min(client overall [client-gated, cluster A], open +
+                // timeout_secs) — mid hops no longer see only timeout_secs;
+                // a tighter client overall deadline bounds every hop.
+                let hop_deadline = crate::deadline::min_instant(
+                    crate::deadline::to_instant(deadline_unix_ns),
+                    step.timeout_secs.and_then(|t| {
+                        Instant::now().checked_add(Duration::try_from_secs_f64(t).ok()?)
+                    }),
+                );
+                // B7 (cluster C): the hop's chunk idle budget — the same
+                // always-on two-stage reclaim the adapters run.
+                let hop_idle = crate::deadline::idle_budget(
+                    state.config.server.decoupled_idle_timeout_secs,
+                );
+                let outcome = forward_stream(
                     sub.chunk_rx,
                     downstream.clone(),
                     sub.cancel_client.clone(),
                     sub.stream_id.clone(),
                     hop_deadline,
+                    hop_idle,
                     &step.name,
                 )
                 .await;
@@ -1142,13 +1254,25 @@ pub(crate) async fn consume_stream_consumer(
                 // in-flight streams instead of accumulating O(chunks) over
                 // the chain's lifetime.
                 remove_chain_handle(chain_handles, &sub.stream_id);
-                if error_terminated {
-                    // A node failed: cancel its worker and stop consuming
-                    // upstream — the upstream sender drops with us (D18).
-                    let _ = sub.cancel_client
-                        .send_raw(crate::streaming::build_stream_cancel(sub.stream_id.clone()))
-                        .await;
-                    return Ok(());
+                match outcome {
+                    ForwardOutcome::Error => {
+                        // A node failed: cancel its worker and stop consuming
+                        // upstream — the upstream sender drops with us (D18).
+                        let _ = sub.cancel_client
+                            .send_raw(crate::streaming::build_stream_cancel(sub.stream_id.clone()))
+                            .await;
+                        return Ok(());
+                    }
+                    ForwardOutcome::DownstreamClosed => {
+                        // O6 (cluster C): the downstream is gone — this hop's
+                        // worker was already cancelled inside forward_stream
+                        // and the upstream unwinds along the D18 channel-close
+                        // chain. Do NOT open a new sub-stream per remaining
+                        // chunk (the churn burned a worker open + G4 permit +
+                        // inflight slot per chunk until the upstream ran dry).
+                        return Ok(());
+                    }
+                    ForwardOutcome::Done => {}
                 }
                 seq += 1;
             }
@@ -1255,8 +1379,11 @@ async fn spawn_chain(
     // Head: open the first worker stream from the pre-layer context
     // SYNCHRONOUSLY — build failures surface as real error codes before the
     // stream is returned (the chain consumers then run detached).
+    // B8 (cluster C): the head's request_id (`{parent}:{step}`) is completed
+    // at the call site — chain consumers then extend it per chunk
+    // (`{parent}:{step}:{seq}`).
     let head_stream = execute_stream_step(
-        state, plan, nodes[0], context, request_id, opts, deadline_unix_ns, None, snapshot,
+        state, plan, nodes[0], context, &format!("{}:{}", request_id, plan.steps[nodes[0]].name), opts, deadline_unix_ns, None, snapshot,
     )
     .await?;
     {
@@ -1561,6 +1688,21 @@ async fn execute_stream_step(
             // readiness (pick non-empty) with backoff. A pick failure is a
             // retryable state.
             ensure_sub_model_loaded(state, &step.model, &resolved_version).await?;
+            let mv = state.registry.get(&step.model, Some(&resolved_version))
+                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
+            // E1/D4: ensembles have no streaming form (zero workers) — a
+            // streaming step calling one is an unsupported combination, not a
+            // readiness problem. Fail fast BEFORE the D19 poll (B5,
+            // 2026-08-28 audit: the poll can never succeed for a workerless
+            // ensemble, so a check behind it was unreachable — every such
+            // request wasted a full backoff round and got the wrong status).
+            if mv.model_type == ModelType::Ensemble {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "streaming step '{}' calls ensemble model '{}' — ensembles have no \
+                     streaming form (D4)",
+                    step.name, step.model
+                )));
+            }
             let mut retries = 0;
             let max_retries = 30;
             let mut delay = Duration::from_millis(50);
@@ -1600,18 +1742,6 @@ async fn execute_stream_step(
                 retries += 1;
             }
 
-            let mv = state.registry.get(&step.model, Some(&resolved_version))
-                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
-            // E1/D4: ensembles have no streaming form (zero workers) — a
-            // streaming step calling one is an unsupported combination, not a
-            // readiness problem. Fail fast instead of exhausting the D19 poll.
-            if mv.model_type == ModelType::Ensemble {
-                return Err(AppError::InvalidRequestBody(format!(
-                    "streaming step '{}' calls ensemble model '{}' — ensembles have no \
-                     streaming form (D4)",
-                    step.name, step.model
-                )));
-            }
             let clients = state.worker_manager.get_zmq_clients(&step.model, &resolved_version).await
                 .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, resolved_version)))?;
 
@@ -1636,8 +1766,12 @@ async fn execute_stream_step(
             }
 
             // Streaming meta carries no payload — the body rides StreamOpen.data.
+            // B8 (cluster C): the request_id arrives COMPLETE from the caller
+            // (single suffix point — tail: `{parent}:{step}` at the
+            // open_tail_stream call site; chain: `{parent}:{step}:{seq}` in
+            // consume_stream_consumer) — this function never re-suffixes.
             let meta = build_step_meta(
-                &format!("{}:{}", request_id, step.name), &opts.client_ip, step_deadline, step_headers, bytes::Bytes::new(),
+                request_id, &opts.client_ip, step_deadline, step_headers, bytes::Bytes::new(),
             );
 
             let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
@@ -1792,14 +1926,18 @@ async fn open_stream_with_retry(
     AppError,
 > {
     let mut permit = permit;
-    // First-frame peek bound: the step budget remaining; with no deadline the
-    // idle budget (same escape hatch as the adapters' recv_chunk: 0 = none).
-    let peek_bound = crate::deadline::remaining(step_deadline).or_else(|| {
-        crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs)
-    });
     let mut attempt: u32 = 0;
     let mut backoff = Duration::from_millis(50);
     loop {
+        // B6 (cluster C, D35): the first-frame peek bound is recomputed PER
+        // ATTEMPT from the step deadline's CURRENT remaining budget — the
+        // send/peek/backoff of earlier attempts already consumed part of the
+        // window, so a per-entry bound would let the last attempt overshoot
+        // the step wall-clock cap. With no deadline the idle budget is the
+        // escape hatch (same as the adapters' recv_chunk: 0 = none).
+        let peek_bound = crate::deadline::remaining(step_deadline).or_else(|| {
+            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs)
+        });
         let stream_id = format!("stream-{}", Uuid::new_v4());
         let client = &clients[worker_id];
         let open_req = crate::streaming::build_stream_open(
@@ -2108,6 +2246,7 @@ mod audit_0822_tests {
         let opts = EnsembleExecOpts {
             client_ip: String::new(),
             deadline_unix_ns: None,
+            deadline_client_specified: false,
             decoupled: false,
             dag_selector: None,
         };
@@ -2135,6 +2274,267 @@ mod audit_0822_tests {
         assert!(
             frames.is_empty(),
             "capacity rejection leaked a worker stream open: {frames:?}"
+        );
+    }
+
+    /// /audit 举证(流式面,控制流维度):E1/D4 —— `stream: true` 的 step 指向
+    /// ensemble 子模型是「不支持的组合」,必须快速失败 400
+    /// (`InvalidRequestBody`,§4.4「组合不支持」行)。exec.rs:1608-1614 的 D4
+    /// 检查位于 D19 退避轮询(1567-1601)之后,而 ensemble 模型 workers 恒空
+    /// → `streaming_worker_ready`(1436)永远为 false → 轮询只能以 30 次重试
+    /// 耗尽(503 ModelNotReady)或 deadline 快速失败(504 InferenceTimeout)
+    /// 退出,D4 检查对其目标场景是死代码。客户端白等一轮退避还拿到错误的
+    /// 状态码归属。
+    #[tokio::test]
+    async fn test_audit_control_streaming_step_to_ensemble_must_fail_fast() {
+        let state = audit_state();
+        // Register the sub-model as an ENSEMBLE: registry-ready, zero workers.
+        state
+            .registry
+            .register(
+                "subens",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::Ensemble,
+                PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.mark_ready("subens", "1").unwrap();
+
+        let plan = single_stream_step_plan("subens");
+        let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+        // A short client deadline keeps the misrouted D19 poll quick (the
+        // fast-fail arm fires in ~300ms instead of 30 retries ≈ 15s).
+        let deadline_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+            + 300_000_000;
+        let opts = EnsembleExecOpts {
+            client_ip: String::new(),
+            deadline_unix_ns: Some(deadline_ns),
+            deadline_client_specified: true, // the test's short deadline stands in for a client one
+            decoupled: false,
+            dag_selector: None,
+        };
+        let snapshot = Arc::new(VersionSnapshot::default());
+        let res = execute_stream_step(
+            &state, &plan, 0, &ctx, "req-d4", &opts, Some(deadline_ns), None, &snapshot,
+        )
+        .await;
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "D4: a streaming step calling an ensemble model must fail fast, not open a stream"
+            ),
+        };
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "D4: a streaming step calling an ensemble model is an unsupported \
+             combination and must fail fast with 400 InvalidRequestBody; got \
+             {err:?} (the D19 readiness poll can never succeed for a workerless \
+             ensemble, so the fail-fast check behind it is unreachable)"
+        );
+    }
+
+    /// Register `model` v1 ready with one worker + ZMQ client and a DEFAULT
+    /// (uncapped) queue entry.
+    async fn register_uncapped_streaming_model(
+        state: &Arc<AppState>,
+        model: &str,
+        endpoint: String,
+    ) {
+        state
+            .registry
+            .register(
+                model,
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client.clone()])
+            .await;
+        state.inference_queue.register_model(
+            model,
+            "1",
+            &crate::config::ModelConfig::default(),
+            vec![],
+            vec![client],
+            Arc::new(crate::inference_queue::OutlierState::new(1)),
+            None,
+        );
+    }
+
+    /// Scripted PAIR worker: the first `error_opens` Open frames get an
+    /// immediate StreamError reply; later Open frames stay silent (the stream
+    /// never produces a first frame). Every observed Open is counted into
+    /// `open_count`.
+    fn spawn_error_then_silent_worker(
+        endpoint: String,
+        error_opens: u32,
+        open_count: Arc<std::sync::atomic::AtomicU32>,
+    ) -> std::thread::JoinHandle<()> {
+        use prost::Message;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            let mut opens: u32 = 0;
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
+                    continue;
+                }
+                opens += 1;
+                open_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if opens <= error_opens {
+                    let resp = pb::Response {
+                        payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                            stream_id: st.stream_id.clone(),
+                            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                message: "boom".to_string(),
+                            })),
+                        })),
+                        ..Default::default()
+                    };
+                    let _ = s.send(resp.encode_to_vec(), 0);
+                }
+                // opens > error_opens: stay silent (hang before the first frame).
+            }
+        })
+    }
+
+    /// /audit 举证(流式面,顺序/数据维度):D35 建流期 retry 的首帧 peek 超时
+    /// 预算 `peek_bound` 在 exec.rs:1797-1799 于循环外按「进入时的
+    /// step_deadline 余量」计算一次,之后每次重试都用同一个陈旧值。前几次
+    /// 尝试的 send/peek/退避已消耗预算,后续 peek 仍能等到「进入时刻 +
+    /// 原始余量」,建流窗口可显著越过 step_deadline(D35:retry 窗口 =
+    /// send_stream 至首个非 Error 帧,受 step 墙钟上限约束)。
+    ///
+    /// 场景:timeout_secs=1.5、retries=3;前 3 次建流立刻收到 Error 帧,
+    /// 退避 50+100+200ms;第 4 次建流 worker 沉默。正确行为:第 4 次 peek
+    /// 只剩「deadline − 已耗」的余量,函数在 ~1.5s 返回;当前行为:第 4 次
+    /// peek 仍等满进入时的 1500ms,~2.1s 才返回。open_count 看守排除
+    /// 「环境太慢导致第 4 次尝试根本没发生」的假通过。
+    #[tokio::test]
+    async fn test_audit_order_d35_retry_peek_must_recompute_remaining_budget() {
+        let state = audit_state();
+        let endpoint = format!(
+            "ipc://{}",
+            std::env::temp_dir()
+                .join(format!("lite-server-audit0822-peek-{}.sock", std::process::id()))
+                .display()
+        );
+        let open_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let _worker = spawn_error_then_silent_worker(endpoint.clone(), 3, open_count.clone());
+        register_uncapped_streaming_model(&state, "retrym", endpoint).await;
+
+        let mut plan = single_stream_step_plan("retrym");
+        plan.steps[0].timeout_secs = Some(1.5);
+        plan.steps[0].retries = 3;
+        let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+        let opts = EnsembleExecOpts {
+            client_ip: String::new(),
+            deadline_unix_ns: None,
+            deadline_client_specified: false,
+            decoupled: false,
+            dag_selector: None,
+        };
+        let snapshot = Arc::new(VersionSnapshot::default());
+        let start = std::time::Instant::now();
+        let _ = execute_stream_step(&state, &plan, 0, &ctx, "req-peek", &opts, None, None, &snapshot).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            open_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "the scenario requires 3 fast-Error attempts + 1 silent attempt; \
+             fewer opens means the environment was too slow, not the bug absent"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "D35: the build window (open + retries + first-frame peeks) must stay \
+             within the step wall-clock cap (1.5s); a stale per-entry peek bound \
+             let the last attempt overshoot to {elapsed:?}"
+        );
+    }
+
+    /// /audit 举证(流式面,资源/控制流维度):forward_stream 的跳级墙钟上限
+    /// (D35,exec.rs:936-960)只包裹 `rx.recv()`;chunk 分支的
+    /// `tx.send(chunk).await`(967)无界。下游 64 槽 channel 满且消费方停滞
+    /// 时,hop 阻塞在 send 里,deadline 永远无法触发:无 Error 帧、无 cancel,
+    /// 直到适配层 idle 回收兜底(`decoupled_idle_timeout_secs = 0` 时无限挂起,
+    /// P10 许可/链路任务树一并泄漏)。
+    ///
+    /// 场景:上游瞬间供给 100 个 chunk(> 下游 64 槽),下游 receiver 永不
+    /// 排空,hop deadline = 100ms。正确行为:deadline 触发,hop 以
+    /// error-terminated 结束;当前行为:forward_stream 永久阻塞在第 65 个
+    /// send 上。
+    #[tokio::test]
+    async fn test_audit_resource_forward_stream_send_must_not_escape_hop_deadline() {
+        let (up_tx, up_rx) = mpsc::channel(128);
+        let (down_tx, _down_rx) = mpsc::channel(64); // receiver never drained
+        let endpoint = format!(
+            "ipc://{}",
+            std::env::temp_dir()
+                .join(format!("lite-server-audit0822-fwd-{}.sock", std::process::id()))
+                .display()
+        );
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _worker = spawn_recording_worker(endpoint.clone(), seen_tx);
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+
+        let feeder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let frame = pb::StreamResponse {
+                    stream_id: "sid".to_string(),
+                    payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                        data: bytes::Bytes::from_static(b"{}"),
+                        is_final: false,
+                    })),
+                };
+                if up_tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let hop_deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            forward_stream(up_rx, down_tx, client, "sid".to_string(), Some(hop_deadline), None, "hop"),
+        )
+        .await;
+        feeder.abort();
+        let outcome = res.expect(
+            "D35: the hop wall-clock cap must fire even while the downstream send \
+             is backpressured; forward_stream hung past the 3s witness bound",
+        );
+        assert!(
+            matches!(outcome, ForwardOutcome::Error),
+            "a hop-deadline expiry must end the chain as error-terminated, got {outcome:?}"
         );
     }
 }

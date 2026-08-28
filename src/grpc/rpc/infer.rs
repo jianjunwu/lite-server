@@ -128,6 +128,7 @@ impl GrpcService {
                 let opts = crate::ensemble::EnsembleExecOpts {
                     client_ip: client_ip.clone(),
                     deadline_unix_ns: ensemble_deadline.unix_ns,
+                    deadline_client_specified: ensemble_deadline.client_specified,
                     decoupled: false,
                     dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
                         .map_err(|e| err(app_error_to_grpc_status(&e)))?,

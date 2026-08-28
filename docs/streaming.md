@@ -31,6 +31,14 @@ All four honor `x-sequence-id` (worker affinity), auth, rate limits, deadlines
 (`x-lite-timeout`), and the inference callbacks. The decoupled endpoints also
 honor `x-lite-worker-id` (direct pin).
 
+**Deadline semantics (two-stage bound):** a stream's OVERALL deadline
+activates only when the client explicitly specifies one (`x-lite-timeout` /
+`grpc-timeout`) — `server.timeout` never truncates a stream (it still bounds
+unary requests and pre-dispatch waits). The chunk-IDLE reclaim
+(`server.decoupled_idle_timeout_secs`) is always on, so a stuck stream is
+recovered instead of hanging unbounded. To bound memory for long streams,
+tune `decoupled_idle_timeout_secs` and `max_concurrent_streams`.
+
 `features.decoupled` defaults to `true`; setting it to `false` unmounts both
 decoupled routes at the router (404).
 

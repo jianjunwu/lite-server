@@ -132,7 +132,9 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: req.data.clone(),
             sequence_id: req.sequence_id.clone(),
-            deadline_unix_ns: deadline.unix_ns,
+            // B1 (cluster A): only a client-specified deadline rides the
+            // stream meta — no server.timeout fallback truncation.
+            deadline_unix_ns: deadline.stream_meta_unix_ns(),
             ..Default::default()
         };
         let stream_id = format!("grpc-decoupled-{}", Uuid::new_v4());

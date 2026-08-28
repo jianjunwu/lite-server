@@ -56,13 +56,14 @@ impl GrpcService {
         let deadline =
             crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
 
-        // Wait for first message (must be BidiOpen). Bound the wait by the
-        // resolved deadline (server.timeout and/or client grpc-timeout); when
-        // no deadline resolves, FD-5 falls back to the always-on decoupled
-        // idle budget so a connected-but-silent client cannot pin the handler
+        // Wait for first message (must be BidiOpen). Bound the wait by a
+        // CLIENT-specified deadline only (O7: aligned with the stream_deadline
+        // gating — the server.timeout fallback must not cut bidi either); with
+        // no client deadline, FD-5 falls back to the always-on decoupled idle
+        // budget so a connected-but-silent client cannot pin the handler
         // forever. Only when the operator disabled BOTH budgets does the wait
         // stay unbounded (documented P-DEADLINE semantics).
-        let first = match crate::deadline::to_instant(deadline.unix_ns) {
+        let first = match crate::deadline::to_instant(deadline.stream_meta_unix_ns()) {
             Some(instant) => match tokio::time::timeout_at(instant.into(), stream.message()).await {
                 Ok(res) => {
                     res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
@@ -194,7 +195,9 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: initial_data.clone(),
             sequence_id: sequence_id.clone(),
-            deadline_unix_ns: deadline.unix_ns,
+            // B1 (cluster A): only a client-specified deadline rides the
+            // stream meta — no server.timeout fallback truncation.
+            deadline_unix_ns: deadline.stream_meta_unix_ns(),
             ..Default::default()
         };
 
@@ -298,8 +301,22 @@ impl GrpcService {
                     // Half-close (transport input end) → trigger (D33).
                     Ok(Ok(None)) => break,
                     Err(_) => {
-                        return Err(err(Status::deadline_exceeded(
-                            "bidi aggregation timed out waiting for close",
+                        // B9 (cluster B): distinguish idle from deadline —
+                        // the idle arm goes through the canonical mapping
+                        // (IdleTimeout → DeadlineExceeded, same row as
+                        // InferenceTimeout) with error_code idle_timeout.
+                        let deadline_fired = agg_deadline
+                            .map(|d| d <= std::time::Instant::now())
+                            .unwrap_or(false);
+                        if deadline_fired {
+                            return Err(err(Status::deadline_exceeded(
+                                "bidi aggregation exceeded the overall deadline",
+                            )));
+                        }
+                        return Err(err(app_error_to_grpc_status(
+                            &crate::error::AppError::IdleTimeout(
+                                "bidi aggregation idle timeout waiting for close".to_string(),
+                            ),
                         )));
                     }
                 }
@@ -313,6 +330,7 @@ impl GrpcService {
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,
+                deadline_client_specified: deadline.client_specified,
                 decoupled: false,
                 // E8-1 (D38): the dag selector rides the gRPC metadata.
                 dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)

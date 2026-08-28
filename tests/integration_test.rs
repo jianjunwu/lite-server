@@ -2911,9 +2911,12 @@ async fn test_ws_first_frame_text_invalid_json_rejected() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
                 if body.get("error").is_some() {
+                    // §4.4 note ② (B3, 2026-08-28): early rejects send the
+                    // contractual {error:{code,message}} — the malformed-JSON
+                    // first frame maps to parse_error.
                     assert_eq!(
-                        body["error"], "invalid JSON",
-                        "Text first frame must keep the legacy rejection"
+                        body["error"]["code"], "parse_error",
+                        "Text first frame invalid JSON must reject with the contractual error object"
                     );
                     got_error = true;
                     break;
@@ -8421,12 +8424,14 @@ async fn test_h2_bidi_initial_data_empty_skips_validation() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// WS6 (P-DEADLINE bidi parity): a bidi stream whose client never sends the
-/// opening message must be recovered after `server.timeout`, instead of
-/// hanging the handler unbounded. The server's `bidi_stream` reads the first
-/// message bounded by the resolved deadline; with `server.timeout: 2.0` and no
-/// client `grpc-timeout`, the wait is bounded to ~2s and the RPC fails with
-/// `DeadlineExceeded`.
+/// WS6 (P-DEADLINE bidi parity, O7-aligned 2026-08-28): a bidi stream whose
+/// client never sends the opening message must be recovered instead of
+/// hanging the handler unbounded. The first-message wait is bounded by a
+/// CLIENT-specified deadline only (server.timeout must not cut bidi, same
+/// gating as stream_deadline); a silent client is reclaimed by the always-on
+/// decoupled idle budget (FD-5). With `decoupled_idle_timeout_secs: 2.0`,
+/// `server.timeout: 30.0` (must NOT fire) and no client `grpc-timeout`, the
+/// RPC fails with `DeadlineExceeded` at ~2s.
 #[tokio::test]
 #[serial]
 async fn test_grpc_bidi_first_message_timeout() {
@@ -8448,7 +8453,7 @@ async fn test_grpc_bidi_first_message_timeout() {
     std::fs::write(
         &server_yaml,
         format!(
-            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18215\n  log_level: warn\n  timeout: 2.0\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18215\n  log_level: warn\n  timeout: 30.0\n  decoupled_idle_timeout_secs: 2.0\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
             http_port = http_port,
             grpc_port = grpc_port,
             repo = repo.to_string_lossy()

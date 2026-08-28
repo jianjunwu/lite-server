@@ -530,6 +530,9 @@ pub(crate) async fn execute_step(
         let child_opts = EnsembleExecOpts {
             client_ip: client_ip.to_string(),
             deadline_unix_ns,
+            // Inert here: nested ensembles are unary-only (D4), and the flag
+            // only gates streaming steps.
+            deadline_client_specified: false,
             decoupled: false, // the child is unary-only (D4)
             dag_selector: None, // E8-1: nested ensembles are unary-only, no selector passthrough
         };

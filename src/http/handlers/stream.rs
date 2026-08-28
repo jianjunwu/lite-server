@@ -457,7 +457,9 @@ async fn sse_infer_impl(
     // (0.8.3 audit B4).
     span.record("body_bytes", payload_bytes.len() as i64);
     span.record("body_kind", body.kind());
-    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
+    // B1 (cluster A): only a client-specified deadline rides the stream meta
+    // — the server.timeout fallback must not truncate streams worker-side.
+    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.stream_meta_unix_ns()));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -499,6 +501,7 @@ async fn sse_infer_impl(
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
+            deadline_client_specified: deadline.client_specified,
             decoupled,
             dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };
@@ -831,6 +834,11 @@ async fn sse_infer_impl(
                     Some(pb::stream_response::Payload::Done(_)) => {
                         prometheus::StreamCloseReason::Done
                     }
+                    // B2 (cluster A): a worker-side deadline cut records
+                    // reason=deadline, not worker_error.
+                    Some(pb::stream_response::Payload::Error(ref e)) => {
+                        error_frame_close_reason(&e.message)
+                    }
                     _ => prometheus::StreamCloseReason::Error,
                 };
                 break;
@@ -1059,6 +1067,14 @@ async fn ws_send_error(
         | AppError::UnsupportedMediaType(_) => 1003,
         _ => 1011,
     };
+    // B9 (cluster B, §4.4): the close reason distinguishes deadline from
+    // idle — InferenceTimeout rides the literal "deadline" (its legacy
+    // error_code "timeout" collapsed the two); IdleTimeout's error_code is
+    // already "idle_timeout".
+    let reason: &str = match e {
+        AppError::InferenceTimeout(_) => "deadline",
+        _ => e.error_code(),
+    };
     let _ = sink
         .send(Message::Text(
             json!({"error": {"code": e.error_code(), "message": e.to_string()}}).to_string(),
@@ -1067,7 +1083,36 @@ async fn ws_send_error(
     let _ = sink
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
             code,
-            reason: e.error_code().to_string().into(),
+            reason: reason.to_string().into(),
+        })))
+        .await;
+}
+
+/// §4.4 note ② (B3, cluster B): a pre-dispatch early reject must honor the
+/// same close contract as [`ws_send_error`] — an `{error:{code,message}}`
+/// frame, then a coded Close — on the not-yet-split socket. Code attribution
+/// follows the early-reject semantics: client-class causes (unknown
+/// model/version, client silence, a Close/garbage first frame, auth /
+/// rate-limit / malformed JSON) close 1003; server-state causes (model not
+/// ready) close 1011.
+async fn ws_early_reject(socket: &mut WebSocket, e: &AppError) {
+    let code: u16 = match e {
+        AppError::ModelNotReady(_) => 1011,
+        _ => 1003,
+    };
+    let reason: &str = match e {
+        AppError::InferenceTimeout(_) => "deadline",
+        _ => e.error_code(),
+    };
+    let _ = socket
+        .send(Message::Text(
+            json!({"error": {"code": e.error_code(), "message": e.to_string()}}).to_string(),
+        ))
+        .await;
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: reason.to_string().into(),
         })))
         .await;
 }
@@ -1205,6 +1250,22 @@ fn is_stream_terminal(chunk: &pb::StreamResponse) -> bool {
     )
 }
 
+/// B2 (2026-08-28 audit, cluster A): classify a terminal Error frame's close
+/// reason by the worker's structured error_type — a worker-side cooperative
+/// deadline cut must record `Deadline` (gateway-side recv_chunk parity), not
+/// a generic worker error. `worker_recycling` deliberately keeps the generic
+/// `Error` reason — the dedicated `recycle_stream_evicted_total` metric
+/// already covers it (no new reason cardinality).
+fn error_frame_close_reason(message: &str) -> prometheus::StreamCloseReason {
+    let error_type = serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|v| v.get("error")?.get("type")?.as_str().map(String::from));
+    match error_type.as_deref() {
+        Some("deadline_exceeded") => prometheus::StreamCloseReason::Deadline,
+        _ => prometheus::StreamCloseReason::Error,
+    }
+}
+
 /// Detect a WS decoupled cancel-or-close control frame (D1):
 /// `{"type":"cancel"}` or `{"type":"close"}` — aliases in decoupled mode.
 fn is_cancel_or_close_frame(text: &str) -> bool {
@@ -1298,7 +1359,7 @@ async fn handle_ws_stream(
     let request_version_label = version.as_deref().unwrap_or("").to_string();
     let (resolved_version, pinned) = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
             // A2: 未解析的 (model, version) 用常量 label——其 series 永不随
             // unload 清除,原始 label 会被模型名枚举无限放大。
@@ -1310,7 +1371,8 @@ async fn handle_ws_stream(
                 ws_start.elapsed().as_secs_f64(),
                 "early_reject",
             );
-            let _ = socket.close().await;
+            // §4.4 note ② (B3): error JSON + coded close, never a bare close.
+            ws_early_reject(&mut socket, &e).await;
             return;
         }
     };
@@ -1324,7 +1386,11 @@ async fn handle_ws_stream(
             ws_start.elapsed().as_secs_f64(),
             "early_reject",
         );
-        let _ = socket.close().await;
+        ws_early_reject(
+            &mut socket,
+            &AppError::ModelNotReady(format!("{model_name} version {resolved_version}")),
+        )
+        .await;
         return;
     }
 
@@ -1335,18 +1401,19 @@ async fn handle_ws_stream(
         // Auth is checked before rate limiting (short-circuit), and each
         // failure reports its OWN reason — the handshake already upgraded to
         // 101 so there's no HTTP status to set; send an accurate error frame
-        // then close.
-        let auth_failed = enforce_auth(mv.policies.auth.as_ref(), &headers).is_err();
-        let rl_failed = !auth_failed
-            && enforce_rate_limit(
+        // then close (§4.4 note ②, B3).
+        let rejected = match enforce_auth(mv.policies.auth.as_ref(), &headers) {
+            Err(e) => Some(e),
+            Ok(()) => enforce_rate_limit(
                 &state,
                 mv.policies.rate_limit.as_ref(),
                 &model_name,
                 &cx.client_ip,
             )
             .await
-            .is_err();
-        if auth_failed || rl_failed {
+            .err(),
+        };
+        if let Some(e) = rejected {
             // 鉴权/限流 → 4xx。
             prometheus::record_stream_rejected(
                 &model_name,
@@ -1355,15 +1422,7 @@ async fn handle_ws_stream(
                 ws_start.elapsed().as_secs_f64(),
                 "early_reject",
             );
-            let reason = if auth_failed {
-                "unauthorized"
-            } else {
-                "rate limit exceeded"
-            };
-            let _ = socket
-                .send(Message::Text(json!({ "error": reason }).to_string()))
-                .await;
-            let _ = socket.close().await;
+            ws_early_reject(&mut socket, &e).await;
             return;
         }
     }
@@ -1383,7 +1442,7 @@ async fn handle_ws_stream(
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
                 Ok(r) => r,
                 Err(_) => {
-                    // 首帧超时 → 4xx。
+                    // 首帧超时 → 4xx(客户端沉默 = idle,B9)。
                     prometheus::record_stream_rejected(
                         &model_name,
                         &resolved_version,
@@ -1391,7 +1450,13 @@ async fn handle_ws_stream(
                         ws_start.elapsed().as_secs_f64(),
                         "early_reject",
                     );
-                    let _ = socket.close().await;
+                    ws_early_reject(
+                        &mut socket,
+                        &AppError::IdleTimeout(
+                            "no first frame within the budget (client silence)".to_string(),
+                        ),
+                    )
+                    .await;
                     return;
                 }
             },
@@ -1409,7 +1474,13 @@ async fn handle_ws_stream(
                     ws_start.elapsed().as_secs_f64(),
                     "early_reject",
                 );
-                let _ = socket.close().await;
+                ws_early_reject(
+                    &mut socket,
+                    &AppError::InvalidRequestBody(
+                        "first frame must be a Text or Binary data frame".to_string(),
+                    ),
+                )
+                .await;
                 return;
             }
         }
@@ -1419,7 +1490,7 @@ async fn handle_ws_stream(
     // Binary first frames skip validation entirely (E3, frame type wins).
     match &first_frame {
         FirstFrame::Json(text) => {
-            if serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes()).is_err() {
+            if let Err(e) = serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes()) {
                 // 非法 JSON → 4xx。
                 prometheus::record_stream_rejected(
                     &model_name,
@@ -1428,8 +1499,7 @@ async fn handle_ws_stream(
                     ws_start.elapsed().as_secs_f64(),
                     "early_reject",
                 );
-                let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
-                let _ = socket.close().await;
+                ws_early_reject(&mut socket, &AppError::Serialization(e)).await;
                 return;
             }
         }
@@ -1479,7 +1549,9 @@ async fn handle_ws_stream(
     };
     span.record("body_bytes", payload_bytes.len() as i64);
     span.record("body_kind", body_kind);
-    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
+    // B1 (cluster A): only a client-specified deadline rides the stream meta
+    // — the server.timeout fallback must not truncate streams worker-side.
+    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.stream_meta_unix_ns()));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -1586,20 +1658,26 @@ async fn handle_ws_stream(
             } else {
                 None
             };
+            // B4 (cluster B): the idle clock starts at the last DATA frame —
+            // Ping/Pong/Close control frames are transport liveness, not
+            // aggregation activity (h2 bidi.rs parity), so a keep-pinging
+            // client cannot pin the aggregation buffer past the idle budget.
+            let mut last_data_activity = std::time::Instant::now();
             loop {
                 // Two-stage bound (D17): chunk-idle ALWAYS on (reclaims an
                 // abandoned aggregating client), overall deadline since the
                 // first frame. The recv itself is timeout-wrapped — an idle
                 // check between blocking recvs would never fire. Per-recv
-                // bound = min(overall remaining, idle) — recv_chunk's
+                // bound = min(overall remaining, idle remaining) — recv_chunk's
                 // semantics; a client-specified deadline must NOT disable
                 // the always-on idle reclaim.
                 let now = std::time::Instant::now();
-                let bound = match (agg_deadline, agg_idle) {
-                    (Some(d), Some(idle)) => Some(d.saturating_duration_since(now).min(idle)),
+                let idle_remaining = agg_idle
+                    .map(|i| i.saturating_sub(last_data_activity.elapsed()));
+                let bound = match (agg_deadline, idle_remaining) {
+                    (Some(d), Some(i)) => Some(d.saturating_duration_since(now).min(i)),
                     (Some(d), None) => Some(d.saturating_duration_since(now)),
-                    (None, Some(idle)) => Some(idle),
-                    (None, None) => None,
+                    (None, i) => i,
                 };
                 let next = match bound {
                     Some(b) => tokio::time::timeout(b, ws_stream.next()).await,
@@ -1617,6 +1695,7 @@ async fn handle_ws_stream(
                             ws_send_error(&mut ws_sink, &e).await;
                             return;
                         }
+                        last_data_activity = std::time::Instant::now();
                     }
                     Ok(Some(Ok(Message::Binary(b)))) => {
                         if let Err(e) = aggregator.push(bytes::Bytes::from(b), false, ct.as_deref()) {
@@ -1624,12 +1703,13 @@ async fn handle_ws_stream(
                             ws_send_error(&mut ws_sink, &e).await;
                             return;
                         }
+                        last_data_activity = std::time::Instant::now();
                     }
                     // WS transport close / disconnect mid-aggregation →
                     // abandon the execution (§4.4: connection gone, no
                     // response object).
                     Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
-                    Ok(_) => {} // Ping/Pong ignored
+                    Ok(_) => {} // Ping/Pong ignored — NOT data activity (B4)
                     // Idle/deadline fired with no close trigger.
                     Err(_) => {
                         prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64(), "early_reject");
@@ -1638,15 +1718,18 @@ async fn handle_ws_stream(
                             .unwrap_or(false);
                         // §4.4: aggregation idle/deadline timeout closes
                         // with 1011 + {error:{code,message}} — route through
-                        // ws_send_error like every other error path.
-                        let e = AppError::InferenceTimeout(
-                            if deadline_fired {
-                                "bidi aggregation exceeded the overall deadline"
-                            } else {
-                                "bidi aggregation idle timeout"
-                            }
-                            .to_string(),
-                        );
+                        // ws_send_error like every other error path. B9:
+                        // idle constructs IdleTimeout so the close reason
+                        // (idle_timeout) is distinguishable from deadline.
+                        let e = if deadline_fired {
+                            AppError::InferenceTimeout(
+                                "bidi aggregation exceeded the overall deadline".to_string(),
+                            )
+                        } else {
+                            AppError::IdleTimeout(
+                                "bidi aggregation idle timeout".to_string(),
+                            )
+                        };
                         ws_send_error(&mut ws_sink, &e).await;
                         return;
                     }
@@ -1670,6 +1753,7 @@ async fn handle_ws_stream(
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
+            deadline_client_specified: deadline.client_specified,
             decoupled,
             dag_selector,
         };
@@ -2064,6 +2148,11 @@ async fn handle_ws_stream(
                 reason = match chunk.payload {
                     Some(pb::stream_response::Payload::Done(_)) => {
                         prometheus::StreamCloseReason::Done
+                    }
+                    // B2 (cluster A): a worker-side deadline cut records
+                    // reason=deadline, not worker_error.
+                    Some(pb::stream_response::Payload::Error(ref e)) => {
+                        error_frame_close_reason(&e.message)
                     }
                     _ => prometheus::StreamCloseReason::Error,
                 };
@@ -3386,6 +3475,32 @@ mod tests {
             is_stream_terminal(&error_chunk),
             "Error is a terminal frame (callback.rs) — \
              is_stream_terminal must return true so the WS loop breaks on Error"
+        );
+    }
+
+    /// B2 (2026-08-28 audit, cluster A): a worker-side cooperative deadline
+    /// cut (error_type=deadline_exceeded) must record close reason=deadline —
+    /// gateway-side recv_chunk parity — not worker_error. worker_recycling
+    /// keeps the generic Error reason (recycle_stream_evicted_total covers it).
+    #[test]
+    fn error_frame_close_reason_maps_deadline_exceeded_to_deadline() {
+        use crate::metrics::prometheus::StreamCloseReason;
+        let deadline_msg = r#"{"error":{"code":null,"message":"deadline exceeded","param":null,"type":"deadline_exceeded"}}"#;
+        assert_eq!(
+            error_frame_close_reason(deadline_msg),
+            StreamCloseReason::Deadline,
+            "worker deadline cut must record reason=deadline"
+        );
+        let recycling_msg = r#"{"error":{"message":"worker recycling","type":"worker_recycling"}}"#;
+        assert_eq!(
+            error_frame_close_reason(recycling_msg),
+            StreamCloseReason::Error,
+            "worker_recycling keeps the generic Error reason (no new reason cardinality)"
+        );
+        assert_eq!(
+            error_frame_close_reason("plain boom"),
+            StreamCloseReason::Error,
+            "unstructured error messages keep the generic Error reason"
         );
     }
 

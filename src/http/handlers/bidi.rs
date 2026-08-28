@@ -218,13 +218,14 @@ async fn h2_bidi_entry_impl(
     }
 
     // 4. Build RequestMeta from HTTP headers + initial_data bytes.
+    // B1 (cluster A): only a client-specified deadline rides the stream meta.
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let meta = build_request_meta(
         &headers,
         initial_data,
         "/predict",
         &cx,
-        deadline.unix_ns,
+        deadline.stream_meta_unix_ns(),
     );
 
     let stream_id = format!("http-bidi-{}", uuid::Uuid::new_v4());
@@ -311,7 +312,10 @@ async fn h2_bidi_entry_impl(
         loop {
             if let Some(idle) = agg_idle {
                 if last_activity.elapsed() > idle {
-                    return Err(AppError::InferenceTimeout(format!(
+                    // B9 (cluster B): idle reclaims construct IdleTimeout so
+                    // the wire error_code (idle_timeout) is distinguishable
+                    // from the overall deadline.
+                    return Err(AppError::IdleTimeout(format!(
                         "bidi aggregation idle timeout for {}",
                         model_name
                     )));
@@ -356,11 +360,18 @@ async fn h2_bidi_entry_impl(
                                 let deadline_fired = agg_deadline
                                     .map(|d| d <= std::time::Instant::now())
                                     .unwrap_or(false);
-                                return Err(AppError::InferenceTimeout(if deadline_fired {
-                                    "bidi aggregation exceeded the overall deadline".to_string()
+                                // B9 (cluster B): idle → IdleTimeout
+                                // (error_code idle_timeout); deadline keeps
+                                // InferenceTimeout.
+                                return Err(if deadline_fired {
+                                    AppError::InferenceTimeout(
+                                        "bidi aggregation exceeded the overall deadline".to_string()
+                                    )
                                 } else {
-                                    format!("bidi aggregation idle timeout for {}", model_name)
-                                }));
+                                    AppError::IdleTimeout(
+                                        format!("bidi aggregation idle timeout for {}", model_name)
+                                    )
+                                });
                             }
                         },
                         None => body_stream.next().await,
@@ -396,6 +407,7 @@ async fn h2_bidi_entry_impl(
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
+            deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };

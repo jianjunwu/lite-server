@@ -48,7 +48,7 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => 404,
         AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
         AppError::VersionAlreadyLoaded(_, _) => 409,
-        AppError::InferenceTimeout(_) => 504,
+        AppError::InferenceTimeout(_) | AppError::IdleTimeout(_) => 504,
         AppError::BadGateway(_) => 502,
         AppError::Validation(_)
         | AppError::Config(_)
@@ -87,6 +87,13 @@ pub(super) fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
         "service_unavailable" | "model_not_ready" => tonic::Code::Unavailable,
         // P9-1: a decoupled stream on a model without predict_decoupled.
         "not_implemented" => tonic::Code::FailedPrecondition,
+        // B2 (2026-08-28 audit, cluster A): a worker-side cooperative
+        // deadline cut must classify like the gateway-side deadline, not as
+        // an internal server fault (clients branch retries on the code; the
+        // metrics family derives from it too).
+        "deadline_exceeded" => tonic::Code::DeadlineExceeded,
+        // B2: a recycle-evicted stream is a retryable transient (Q3 parity).
+        "worker_recycling" => tonic::Code::Unavailable,
         _ => tonic::Code::Internal,
     }
 }
@@ -414,6 +421,35 @@ mod audit_tests {
             "parity 缺陷:HTTP QueueFull 响应恒挂 Retry-After(error.rs HTTP 侧),gRPC 直连 \
              queue-full 也经 with_retry_after 挂 retry-after;ensemble 子步骤 QueueFull 经 \
              app_error_to_grpc_status 丢失该 metadata,gRPC 客户端无法退避"
+        );
+    }
+
+    /// /audit 举证(流式面,数据假设维度):worker 在 `meta.deadline_unix_ns`
+    /// 到期时协作式截断流,发 `StreamError{error_type: "deadline_exceeded"}`
+    /// (python/lite_server/worker/streaming.py `_consume_stream` 的
+    /// deadline_cut 分支)。同一事件由 gateway 侧 recv_chunk 触发时产
+    /// `Status::deadline_exceeded` + `StreamCloseReason::Deadline`;由 worker
+    /// 侧触发时也必须同类——客户端按 code 做重试决策,指标 family 也由
+    /// `grpc_code_to_status_family(grpc_err.code())` 派生。当前映射表无此
+    /// 臂,落 `_ => Internal`:截断被误报为服务器故障(reason=worker_error)。
+    #[test]
+    fn test_audit_data_worker_deadline_cut_must_map_to_deadline_exceeded() {
+        assert_eq!(
+            super::error_type_to_grpc_code("deadline_exceeded"),
+            tonic::Code::DeadlineExceeded,
+            "worker-side deadline cut (error_type=deadline_exceeded) must classify like the \
+             gateway-side deadline (DeadlineExceeded), not as an internal server fault"
+        );
+    }
+
+    /// B2 (cluster A): a recycle eviction frame is a retryable transient —
+    /// Unavailable (Q3 parity), never an internal server fault.
+    #[test]
+    fn test_audit_data_worker_recycling_maps_to_unavailable() {
+        assert_eq!(
+            super::error_type_to_grpc_code("worker_recycling"),
+            tonic::Code::Unavailable,
+            "worker_recycling is a retryable transient eviction (Q3 parity), not Internal"
         );
     }
 }

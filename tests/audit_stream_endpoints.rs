@@ -11,6 +11,14 @@
 //!       (grpc/rpc/bidi.rs:477-486 vs §4.3/§4.4);
 //!   S5  h2 bidi 声明式模型多轮帧静默丢弃、无错误帧
 //!       (http/handlers/bidi.rs:229-241 vs §4.4「h2 同语义错误帧」)。
+//!   S6  WS 开流前早退(模型不存在/未就绪/首帧超时/首帧非法)静默关闭,
+//!       无错误 JSON、无 close code(stream.rs:1313/1327/1394/1412 vs
+//!       §4.4 注②「一律落 close frame(code + 错误 JSON)」);
+//!   S7  WS 聚合期 Ping/Pong 重置 idle 预算,周期 ping 使回收永不触发
+//!       (stream.rs:1589-1632 vs D17 聚合期 idle 约束);
+//!   S8  WS 聚合 idle/deadline 回收的 close reason 均坍缩为 "timeout",
+//!       不可区分(stream.rs:1642-1650 → error.rs:238 vs §4.4
+//!       reason=idle_timeout/deadline)。
 //! 真 server 子进程 + 模型夹具(与 tests/audit_ensemble_stream.rs 同构);
 //! 端口段 23100-23199。
 
@@ -803,5 +811,190 @@ async fn test_audit_h2_bidi_multi_round_error_frame() {
         "§4.4 (组合不支持/会话式多轮): h2 bidi must emit an error frame for \
          frames after the envelope trigger — currently they die silently with \
          the dropped body stream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S6: WS 开流前拒绝(model 不存在/未就绪/首帧超时/首帧非法)静默关闭
+//     (stream.rs:1313/1327/1394/1412 vs §4.4 注②「WS 一律落 close frame
+//     (code + 错误 JSON)」)。
+// ---------------------------------------------------------------------------
+
+/// §4.4 注②:WS 无 HTTP 状态码,所有拒绝必须落成 close frame(code +
+/// {error:{code,message}})。S2-S5 修复(2026-08-14)把 ensemble 路径全部接
+/// 上了 ws_send_error,但 handle_ws_stream 的四个开流前早退点(模型解析失
+/// 败 / 未就绪 / 首帧超时 / 首帧为 Close 或错误帧)仍是裸
+/// `socket.close().await` —— 客户端既拿不到错误 JSON 也拿不到 close code,
+/// 「模型不存在」与「网络抖动」无法区分。
+#[tokio::test]
+#[serial]
+async fn test_audit_ws_early_reject_must_send_error_json_and_coded_close() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _gp, _guard, _repo) = boot_minimal("", false, &["pre"]).await;
+    wait_ready_all(&base, &["pre"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    // "ghost" is not in the repo: resolve_version fails → early reject.
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ghost/stream");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+
+    let mut error_json: Option<Value> = None;
+    let mut close_frame: Option<Option<(u16, String)>> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(4), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    if v.get("error").is_some() {
+                        error_json = Some(v);
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_frame = Some(frame.map(|f| (u16::from(f.code), f.reason.to_string())));
+                break;
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+    }
+
+    let err = error_json.expect(
+        "§4.4 note ②: a WS early reject must send an {error:{code,message}} frame \
+         before closing — the client currently learns nothing about why it was rejected",
+    );
+    assert!(
+        err.get("error").and_then(|e| e.get("code")).is_some(),
+        "the error JSON must carry a machine-readable code, got: {err}"
+    );
+    let close = close_frame.expect("the server must close the socket after rejecting");
+    assert!(
+        close.is_some(),
+        "§4.4 note ②: the close frame must carry a contractual code + reason, \
+         got a bare codeless Close"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S7: WS 聚合期 Ping/Pong 重置 idle 预算(stream.rs:1589-1632 vs D17「聚合
+//     期受 idle 超时约束,防 N 连接 × max_request_body_bytes 钉死」)。
+// ---------------------------------------------------------------------------
+
+/// D17/§4.4:聚合期客户端沉寂超过 decoupled_idle_timeout_secs 必须被回收
+/// (close 1011)。聚合循环每轮从 `Instant::now()` 重算完整 idle 预算,而
+/// Ping/Pong 帧走 `Ok(_) => {}` 分支回到循环顶 —— 周期 ping 的客户端让
+/// idle 永远不可能触发,聚合缓冲(上限 max_request_body_bytes)被无限期
+/// 钉住,正是 D17 设计要防的「N 连接 = N 倍内存」形态。h2 端做对了:只有
+/// 完整 Data 帧才更新 last_activity(bidi.rs:331)。
+#[tokio::test]
+#[serial]
+async fn test_audit_ws_aggregation_ping_must_not_reset_idle_reclaim() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _gp, _guard, _repo) = boot_minimal(
+        "  decoupled_idle_timeout_secs: 1.0",
+        false,
+        &["pre", "tail_slow", "ens_ws_slow"],
+    )
+    .await;
+    wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut sink, mut stream) = ws.split();
+
+    // One data frame starts the aggregation (no close trigger follows).
+    sink.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+
+    // Keep pinging for 8s — well past the 1s aggregation idle budget. A
+    // correct server reclaims at ~1s regardless; the pinger keeps running
+    // so the post-stop idle fire cannot mask the defect.
+    let pinger = tokio::spawn(async move {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if sink.send(Message::Ping(Vec::new())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut close_code: Option<u16> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {} // chunks / pong / text
+            Err(_) => break,
+        }
+    }
+    pinger.abort();
+
+    assert_eq!(
+        close_code,
+        Some(1011),
+        "D17: aggregation idle reclaim must fire (close 1011) even while the \
+         client keeps the transport alive with pings — ping/pong is liveness, \
+         not aggregation activity"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S8: WS 聚合 idle/deadline 回收的 close reason 坍缩为 "timeout"
+//     (stream.rs:1642-1650 → ws_send_error:1070 → error.rs:238 vs §4.4
+//     「reason=deadline / reason=idle_timeout」)。
+// ---------------------------------------------------------------------------
+
+/// §4.4:聚合期 idle 超时的 close 契约是 1011 + reason=idle_timeout(与
+/// reason=deadline 可区分,客户端据此决策重试)。实现精心区分了两种消息
+/// 文本(stream.rs:1636-1648 的 deadline_fired 分支),但 CloseFrame 的
+/// reason 取 `e.error_code()`(ws_send_error:1070),InferenceTimeout 的
+/// code 恒为 "timeout"(error.rs:238)—— 两种超时在同一条连接上不可区分。
+#[tokio::test]
+#[serial]
+async fn test_audit_ws_aggregation_idle_close_reason_must_distinguish_idle() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _gp, _guard, _repo) = boot_minimal(
+        "  decoupled_idle_timeout_secs: 1.0",
+        false,
+        &["pre", "tail_slow", "ens_ws_slow"],
+    )
+    .await;
+    wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+
+    // One data frame, then silence → idle reclaim at ~1s.
+    ws.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+
+    let mut close_reason: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(6), ws.next()).await {
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_reason = frame.map(|f| f.reason.to_string());
+                break;
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        close_reason.as_deref(),
+        Some("idle_timeout"),
+        "§4.4: an aggregation idle reclaim must close with reason=idle_timeout \
+         (distinct from reason=deadline); both currently collapse to the \
+         generic error_code \"timeout\", got {close_reason:?}"
     );
 }

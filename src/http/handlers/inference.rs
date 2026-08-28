@@ -281,6 +281,7 @@ async fn do_infer(
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
+            deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector,
         };

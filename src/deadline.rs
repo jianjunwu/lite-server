@@ -44,6 +44,21 @@ impl ResolvedDeadline {
         unix_ns: None,
         client_specified: false,
     };
+
+    /// B1 (2026-08-28 audit, cluster A): the value written into a streaming
+    /// `StreamOpen.meta.deadline_unix_ns`. Only a CLIENT-specified deadline
+    /// reaches the worker — the `server.timeout` fallback must never
+    /// truncate a stream (the worker cuts at the meta value regardless of
+    /// its source, which silently overrode the 方案 C gateway gating). The
+    /// unary paths keep using `unix_ns` directly (fallback is the
+    /// established unary semantics).
+    pub fn stream_meta_unix_ns(&self) -> Option<i64> {
+        if self.client_specified {
+            self.unix_ns
+        } else {
+            None
+        }
+    }
 }
 
 fn now_unix_ns() -> i64 {
@@ -273,6 +288,17 @@ mod tests {
     #[test]
     fn remaining_none_when_no_deadline() {
         assert_eq!(remaining(None), None);
+    }
+
+    #[test]
+    fn stream_meta_unix_ns_gates_on_client_specified() {
+        // B1 (cluster A): the fallback value never reaches a stream meta.
+        let client = resolve_from_http(&hmap(&[("x-lite-timeout", "5")]), 30.0);
+        assert_eq!(client.stream_meta_unix_ns(), client.unix_ns);
+        let fallback = resolve_from_http(&hmap(&[]), 30.0);
+        assert!(fallback.unix_ns.is_some());
+        assert_eq!(fallback.stream_meta_unix_ns(), None);
+        assert_eq!(ResolvedDeadline::NONE.stream_meta_unix_ns(), None);
     }
 
     #[test]

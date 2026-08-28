@@ -24,6 +24,14 @@ pub enum AppError {
     #[error("inference timeout: {0}")]
     InferenceTimeout(String),
 
+    /// B9 (2026-08-28 audit, cluster B): an IDLE reclaim — no bytes moved
+    /// within the idle budget (distinct from InferenceTimeout, the overall
+    /// deadline). Same row as InferenceTimeout everywhere (HTTP 504 / gRPC
+    /// DeadlineExceeded); the dedicated error_code lets WS close reasons and
+    /// clients distinguish "silent too long" from "deadline hit".
+    #[error("idle timeout: {0}")]
+    IdleTimeout(String),
+
     #[error("queue full: {0}")]
     QueueFull(String),
 
@@ -161,6 +169,7 @@ impl AppError {
             AppError::VersionNotFound(_, _) => "model version not found",
             AppError::VersionAlreadyLoaded(_, _) => "model version already loaded",
             AppError::InferenceTimeout(_) => "inference timeout",
+            AppError::IdleTimeout(_) => "idle timeout",
             AppError::QueueFull(_) => "queue full",
             AppError::WorkerCrashed(_) => "service temporarily unavailable",
             AppError::BadGateway(_) => "bad gateway",
@@ -236,6 +245,7 @@ impl AppError {
             AppError::VersionNotFound(_, _) => "version_not_found",
             AppError::VersionAlreadyLoaded(_, _) => "version_already_loaded",
             AppError::InferenceTimeout(_) => "timeout",
+            AppError::IdleTimeout(_) => "idle_timeout",
             AppError::QueueFull(_) => "queue_full",
             AppError::WorkerCrashed(_) => "internal_error",
             AppError::BadGateway(_) => "bad_gateway",
@@ -288,6 +298,7 @@ impl AppError {
             AppError::VersionNotFound(_, _) => StatusCode::NOT_FOUND,
             AppError::VersionAlreadyLoaded(_, _) => StatusCode::CONFLICT,
             AppError::InferenceTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            AppError::IdleTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             AppError::QueueFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::WorkerCrashed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -380,6 +391,7 @@ impl AppError {
             AppError::VersionAlreadyLoaded(_, _) => "conflict_error",
             AppError::Conflict(_) => "conflict_error",
             AppError::InferenceTimeout(_) => "server_error",
+            AppError::IdleTimeout(_) => "server_error",
             AppError::QueueFull(_) => "queue_full",
             AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",
             AppError::WorkerCrashed(_) => "server_error",

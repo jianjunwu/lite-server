@@ -16,7 +16,11 @@ server:
   grpc_port: 8001              # gRPC server port
   metrics_port: 8002           # Prometheus metrics port
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
-  timeout: 30.0                # Global request timeout (seconds)
+  timeout: 30.0                # Global request timeout (seconds). Bounds unary requests and
+                               # pre-dispatch waits; it does NOT truncate streaming responses —
+                               # a stream's overall deadline activates only via a client-specified
+                               # x-lite-timeout / grpc-timeout. To govern long/idle streams use
+                               # decoupled_idle_timeout_secs and max_concurrent_streams instead.
   threads: null                # Tokio worker threads (null = auto = CPU cores)
   cache_registry: false        # Snapshot registry (strategy + active-version pins) to
                                # <repo>/.lite-server-registry.json on shutdown; restore on

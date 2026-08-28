@@ -2446,6 +2446,7 @@ fn e8_when_eval_semantics() {
     let opts = EnsembleExecOpts {
         client_ip: "127.0.0.1".into(),
         deadline_unix_ns: None,
+        deadline_client_specified: false,
         decoupled: false,
         dag_selector: Some("fast".into()),
     };
@@ -3725,6 +3726,7 @@ fn chain_consumer_harness_full(
     let opts = EnsembleExecOpts {
         client_ip: String::new(),
         deadline_unix_ns: None,
+        deadline_client_specified: false,
         decoupled: false,
         dag_selector: None,
     };
@@ -4187,5 +4189,283 @@ async fn cancel_chain_must_survive_a_poisoned_handle_list() {
     assert!(
         result.is_ok(),
         "cancel_chain panicked on a poisoned handle list — the worker-stream cancels were never sent"
+    );
+}
+
+/// PAIR worker: records the StreamOpen meta request_id, then replies one
+/// Chunk + Done so the sub-stream completes.
+fn spawn_request_id_recording_worker(
+    endpoint: String,
+    seen: std::sync::mpsc::Sender<String>,
+) -> std::thread::JoinHandle<()> {
+    use prost::Message;
+    std::thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let s = ctx.socket(zmq::PAIR).expect("worker socket");
+        s.connect(&endpoint).expect("worker connect");
+        let _ = s.set_rcvtimeo(8000);
+        while let Ok(bytes) = s.recv_bytes(0) {
+            let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            let Some(pb::stream_request::Action::Open(open)) = st.action else { continue };
+            let rid = open
+                .meta
+                .as_ref()
+                .map(|m| m.request_id.clone())
+                .unwrap_or_default();
+            let _ = seen.send(rid);
+            let mk = |payload| pb::Response {
+                payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                    stream_id: st.stream_id.clone(),
+                    payload: Some(payload),
+                })),
+                ..Default::default()
+            };
+            let _ = s.send(
+                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                    data: Bytes::from_static(b"{}"),
+                    is_final: false,
+                }))
+                .encode_to_vec(),
+                0,
+            );
+            let _ = s.send(
+                mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(),
+                0,
+            );
+        }
+    })
+}
+
+/// /audit 举证(流式面,数据假设维度):D20 裁定管道链上每 chunk 子调用的
+/// request_id = `{parent}:{step}:{chunk_seq}`。但 consume_stream_consumer
+/// (exec.rs:1086)先拼出 `{parent}:{step}:{seq}`,再传入
+/// execute_stream_step,后者(exec.rs:1640)又拼一次 `:{step}` ——
+/// worker 实际看到 `{parent}:{step}:{seq}:{step}`,与 D20 契约及非链路径
+/// 的 `{parent}:{step}` 格式均不一致,trace/日志按文档格式关联不上链上
+/// 子调用。
+#[tokio::test]
+async fn test_audit_data_chain_chunk_request_id_double_suffixes_step_name() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("reqid");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let _worker = spawn_request_id_recording_worker(endpoint.clone(), seen_tx);
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let h = chain_consumer_harness_with(state, plan);
+
+    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(h.up_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), h.run).await;
+
+    let rid = seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the worker must observe the per-chunk sub-stream's StreamOpen");
+    assert_eq!(
+        rid, "req-1:tail:0",
+        "D20: the per-chunk sub-call request_id must be {{parent}}:{{step}}:{{chunk_seq}}; \
+         the step name is suffixed twice (consumer + execute_stream_step)"
+    );
+}
+
+/// C4 guard (cluster C): after the request_id suffix responsibility moved to
+/// the callers, the NON-chain tail path must still produce `{parent}:{step}`
+/// (D20 / T4 format) — a regression here would drop the suffix entirely.
+#[tokio::test]
+async fn test_tail_stream_request_id_keeps_parent_step_format() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("tailrid");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let _worker = spawn_request_id_recording_worker(endpoint.clone(), seen_tx);
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    // Single streaming step "tail" as the DAG output — the open_tail_stream
+    // path (not the chain consumer).
+    let mut plan = chain_consumer_plan();
+    plan.steps.truncate(1);
+    plan.steps[0].name = "tail".to_string();
+    plan.steps[0].model = "ghost".to_string();
+    plan.steps[0].version = Some("1".to_string());
+    plan.layers = vec![vec![0]];
+    plan.output_step = 0;
+    plan.step_dep_keys = vec![Vec::new()];
+    let plan = Arc::new(plan);
+    let snapshot = Arc::new(VersionSnapshot::default());
+    let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+    let opts = EnsembleExecOpts {
+        client_ip: String::new(),
+        deadline_unix_ns: None,
+        deadline_client_specified: false,
+        decoupled: false,
+        dag_selector: None,
+    };
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        open_tail_stream(&state, &plan, 0, 0, &ctx, &std::collections::HashSet::new(), "req-9", &opts, None, None, &snapshot, 0, &[]),
+    )
+    .await
+    .expect("tail open must not hang")
+    .expect("tail stream must open");
+    drop(stream.chunk_rx);
+
+    let rid = seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the worker must observe the tail stream's StreamOpen");
+    assert_eq!(
+        rid, "req-9:tail",
+        "the non-chain tail request_id must stay {{parent}}:{{step}} after B8"
+    );
+}
+
+/// O6 (cluster C): once the downstream is gone the consumer must NOT open a
+/// new sub-stream per remaining chunk. Deterministic interlock: feed chunk 1
+/// only → the consumer opens sub-stream #1 and idles on upstream.recv; the
+/// test drains the forwarded chunk, CLOSES the downstream, then feeds more
+/// chunks — the consumer must unwind on the closed-downstream check without
+/// a second Open.
+#[tokio::test]
+async fn chain_consumer_downstream_close_stops_substream_churn() {
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("churn");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let _worker = spawn_request_id_recording_worker(endpoint.clone(), seen_tx);
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let h = chain_consumer_harness_with(state, plan);
+    let ConsumerHarness { up_tx, mut down_rx, run, .. } = h;
+
+    // The harness `run` is a cold future — drive it CONCURRENTLY with the
+    // feed/drain script (reading down_rx before polling run would deadlock).
+    let driver = async move {
+        up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+        // Sub-stream #1's chunk arrives; close the downstream behind it.
+        let _first = down_rx.recv().await.expect("sub-stream #1 must forward a chunk");
+        drop(down_rx);
+        // More upstream chunks arrive only now — with the churn defect each
+        // would open a fresh sub-stream.
+        for _ in 0..4 {
+            up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+        }
+        drop(up_tx);
+    };
+    let (res, _) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, driver) })
+        .await
+        .expect("the consumer must unwind promptly on downstream close");
+    res.expect("downstream close is a clean unwind, not an error");
+
+    let mut opens = 0u32;
+    while seen_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+        opens += 1;
+    }
+    assert_eq!(
+        opens, 1,
+        "O6: a dead downstream must stop the per-chunk sub-stream churn — \
+         exactly 1 Open (the in-flight one), got {opens}"
+    );
+}
+
+/// GAP-7 (cluster C): a mid hop's wall-clock cap is min(client overall,
+/// open + timeout_secs) — when the client overall deadline is TIGHTER than
+/// timeout_secs, the hop must fire on the client deadline (Error frame
+/// downstream + worker cancel), not sail on to timeout_secs.
+#[tokio::test]
+async fn chain_consumer_mid_hop_honors_client_overall_deadline() {
+    use prost::Message;
+    let state = chain_consumer_state();
+    let endpoint = chain_test_ipc_endpoint("gap7");
+    // Silent-after-open worker: records open/cancel actions, never replies —
+    // only the hop deadline can end the sub-stream.
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+    let ep = endpoint.clone();
+    std::thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let s = ctx.socket(zmq::PAIR).expect("worker socket");
+        s.connect(&ep).expect("worker connect");
+        let _ = s.set_rcvtimeo(8000);
+        while let Ok(bytes) = s.recv_bytes(0) {
+            let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            let action = match st.action {
+                Some(pb::stream_request::Action::Open(_)) => "open",
+                Some(pb::stream_request::Action::Cancel(_)) => "cancel",
+                _ => "other",
+            };
+            let _ = seen_tx.send(action.to_string());
+        }
+    });
+    register_streaming_model(&state, "ghost", endpoint).await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    plan.steps[1].timeout_secs = Some(30.0); // LOOSE — the client deadline must win
+    let plan = Arc::new(plan);
+    let (up_tx, up_rx) = tokio::sync::mpsc::channel(4);
+    let (down_tx, mut down_rx) = tokio::sync::mpsc::channel(4);
+    let handles = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let snapshot = Arc::new(VersionSnapshot::default());
+    let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+    // The client-gated overall deadline (cluster A): 300ms from now.
+    let client_deadline_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+        + 300_000_000;
+    let opts = EnsembleExecOpts {
+        client_ip: String::new(),
+        deadline_unix_ns: Some(client_deadline_ns),
+        deadline_client_specified: true,
+        decoupled: false,
+        dag_selector: None,
+    };
+    let state_run = state.clone();
+    let plan_run = plan.clone();
+    let handles_run = handles.clone();
+    let snapshot_run = snapshot.clone();
+    let run = tokio::spawn(async move {
+        consume_stream_consumer(
+            &state_run, &plan_run, 1, "pre", up_rx, down_tx, &ctx, "req-1", &opts,
+            Some(client_deadline_ns), &handles_run, None, true, &snapshot_run,
+        )
+        .await
+    });
+
+    up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(up_tx);
+
+    let start = std::time::Instant::now();
+    let mut saw_error = false;
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(3), down_rx.recv()).await {
+        if let Some(pb::stream_response::Payload::Error(e)) = frame.payload {
+            assert!(
+                e.message.contains("exceeded its timeout"),
+                "the hop deadline Error frame must name the timeout, got: {}",
+                e.message
+            );
+            saw_error = true;
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+    let _ = tokio::time::timeout(Duration::from_secs(3), run).await;
+
+    assert!(
+        saw_error,
+        "GAP-7: the mid hop must emit an Error frame when the client overall \
+         deadline fires (timeout_secs=30s must not mask it)"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the hop must fire near the 300ms client deadline, not the 30s step cap; elapsed {elapsed:?}"
+    );
+    let actions: Vec<String> = (0..2)
+        .filter_map(|_| seen_rx.recv_timeout(Duration::from_millis(500)).ok())
+        .collect();
+    assert!(
+        actions.iter().any(|a| a == "cancel"),
+        "the hop must cancel its worker on the deadline, got {actions:?}"
     );
 }

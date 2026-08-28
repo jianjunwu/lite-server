@@ -360,6 +360,7 @@ impl GrpcService {
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip,
             deadline_unix_ns: deadline.unix_ns,
+            deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector,
         };
