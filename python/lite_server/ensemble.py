@@ -310,7 +310,10 @@ class EnsembleDAG:
                     "dag_selector must be a $request.<path> ref with non-empty "
                     f"segments, got {self.dag_selector!r} (R21)"
                 )
-            if any(s.inputs for s in self.dags.values()):
+            # `is not None`, not truthiness: the server deserializes
+            # `inputs: {}` into Some(empty map), so an empty declaration
+            # is still a declaration (inputs_decl.is_some() → R22).
+            if any(s.inputs is not None for s in self.dags.values()):
                 raise ValueError(
                     "dag_selector requires anonymous-root sets — a set declares "
                     "inputs (MIMO envelopes carry no $request root, R5) (R22)"

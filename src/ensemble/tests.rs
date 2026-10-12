@@ -2707,6 +2707,22 @@ fn d41_selector_multi_segment_resolution() {
     );
 }
 
+/// R22 (audit 2026-10-12): an EMPTY `inputs: {}` declaration still
+/// deserializes to `Some(empty map)` → `inputs_decl.is_some()` → the load
+/// must fail with R22. Pins the server side of the Python parity gap
+/// (python/lite_server/ensemble.py `any(s.inputs ...)` treats `{}` as
+/// falsy and lets the combination through).
+#[test]
+fn d41_selector_forbids_empty_inputs_decl() {
+    // The named set's step declares no input refs — otherwise R5 (no
+    // anonymous root in declared-inputs ensembles) fires during set parse,
+    // before the R22 container check this test pins.
+    let yaml = "ensemble:\n  dag_selector: \"$request.modelName\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    named:\n      inputs: {}\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {}\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("selector + empty declared-inputs set must be rejected (R22)");
+    assert!(err.to_string().contains("(R22)"), "got: {err}");
+}
+
 // === E7 (batch 4④): multi-sink outputs ===
 
 /// E7: `output` and `outputs` are mutually exclusive (二选一).

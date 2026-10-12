@@ -482,3 +482,21 @@ def test_to_config_full_fills_dag_selector_default():
     dag = EnsembleDAG(steps=[Step(name="a", model="m", inputs={})])
     cfg = dag.to_config(full=True)["ensemble"]
     assert cfg["dag_selector"] is None
+
+
+def test_dag_selector_forbids_empty_inputs_decl():
+    # R22 parity (audit 2026-10-12): the server deserializes `inputs: {}`
+    # into Some(empty map), so inputs_decl.is_some() holds and the load
+    # fails with R22. The Python mirror must reject the same combination —
+    # `any(s.inputs ...)` treats an empty dict as falsy and lets it
+    # through, deferring the failure to server load time.
+    with pytest.raises(ValueError, match="R22"):
+        EnsembleDAG(
+            dags={
+                "named": DagSet(
+                    steps=[Step(name="a", model="m", inputs={})],
+                    inputs={},
+                ),
+            },
+            dag_selector="$request.modelName",
+        )
