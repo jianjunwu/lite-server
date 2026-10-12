@@ -462,7 +462,10 @@ fn parse_dag_selector_ref(raw: &str) -> Result<Vec<String>, AppError> {
 /// D41: resolve the body-field dag selector against the request root.
 /// Missing path / null / non-JSON roots (binary, envelope) → `None` (the
 /// default set applies); a string passes D22 validation; any other type is
-/// a 400 naming the source ref (never a silent default fallback).
+/// a 400 naming the source ref (never a silent default fallback). An ARRAY
+/// root is also a 400: the WS/h2/gRPC-bidi aggregators build exactly this
+/// shape from a multi-frame JSON upload, and a named set field is
+/// unreachable there — defaulting would silently misroute the request.
 pub fn resolve_dag_selector_from_value(
     payload: &EnsembleValue,
     path: &[String],
@@ -478,6 +481,12 @@ pub fn resolve_dag_selector_from_value(
         // Binary / envelope roots carry no addressable selector field.
         EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. } => return Ok(None),
     };
+    if root.is_array() {
+        return Err(AppError::InvalidRequestBody(format!(
+            "dag_selector '{source_ref}': request root is a JSON array — a named set \
+             field cannot be addressed on it (D41)"
+        )));
+    }
     let mut cur = root;
     for seg in path {
         match cur.get(seg.as_str()) {

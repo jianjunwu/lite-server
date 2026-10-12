@@ -507,7 +507,21 @@ pub(crate) async fn execute_step(
             )?,
             _ => None,
         };
-        let child_plan = select_dag_set(&child_container, nested_selector.as_deref())?;
+        // D41 debuggability parity with the top-level funnel (exec.rs
+        // select_dag_set map_err): a body-resolved unknown name's 400 names
+        // the child's source ref — otherwise the client cannot tell the
+        // value came from the body, not a header nested calls never carry.
+        let child_plan = select_dag_set(&child_container, nested_selector.as_deref()).map_err(
+            |e| match (&e, &nested_selector, &child_container.dag_selector) {
+                (AppError::InvalidRequestBody(m), Some(_), Some(path)) => {
+                    AppError::InvalidRequestBody(format!(
+                        "{m} — resolved from body field '$request.{}' (D41)",
+                        path.join(".")
+                    ))
+                }
+                _ => e,
+            },
+        )?;
         if child_plan.steps[child_plan.output_step].stream || !child_plan.chains.is_empty() {
             return Err(AppError::InvalidRequestBody(format!(
                 "nested ensemble '{}' contains a streaming step — nested ensembles \

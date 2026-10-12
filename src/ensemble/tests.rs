@@ -2660,8 +2660,15 @@ fn d41_selector_resolution() {
         assert!(err.to_string().contains("(D41)"), "got: {err}");
         assert!(err.to_string().contains("$request.modelName"), "got: {err}");
     }
-    // Non-object root → field absent → None.
-    assert_eq!(resolve(json!([1, 2])).unwrap(), None);
+    // Array root → 400 (D41): the streaming aggregators (WS/h2/gRPC bidi)
+    // build an array root from a multi-frame JSON upload — a named set field
+    // is unreachable there, so fail fast instead of silently defaulting.
+    let err = resolve(json!([1, 2])).unwrap_err();
+    assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    assert!(err.to_string().contains("(D41)"), "got: {err}");
+    assert!(err.to_string().contains("$request.modelName"), "got: {err}");
+    // Scalar root → field absent → None (default), unchanged.
+    assert_eq!(resolve(json!("fast")).unwrap(), None);
     // Binary / envelope roots carry no selector field → None.
     assert_eq!(
         resolve_dag_selector_from_value(

@@ -1089,6 +1089,33 @@ const ENS_DAGS_SEL_YAML: &str = r#"ensemble:
             data: "$request.text"
 "#;
 
+/// D41 streaming: a selector model whose fast set streams — the WS/bidi
+/// body-routing tests need a set whose selection is observable as tokens.
+const ENS_DAGS_STREAM_SEL_YAML: &str = r#"ensemble:
+  dag_selector: "$request.modelName"
+  dags:
+    default:
+      steps:
+        - name: main
+          model: pre
+          version: "1"
+          inputs:
+            text: "$request.text"
+    fast:
+      steps:
+        - name: pre
+          model: pre
+          version: "1"
+          inputs:
+            text: "$request.text"
+        - name: tail
+          model: tail
+          version: "1"
+          stream: true
+          inputs:
+            pre: "$pre.pre"
+"#;
+
 /// D41: `$request.dag` must mirror the BODY-RESOLVED set name — the guard
 /// step runs only on the fast set (observable via the dag_seen alias).
 const ENS_SEL_WHEN_YAML: &str = r#"ensemble:
@@ -1377,6 +1404,7 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_multisink", ENS_MULTISINK_YAML);
     write_ensemble(repo, "ens_dags", ENS_DAGS_YAML);
     write_ensemble(repo, "ens_dags_sel", ENS_DAGS_SEL_YAML);
+    write_ensemble(repo, "ens_dags_stream_sel", ENS_DAGS_STREAM_SEL_YAML);
     write_ensemble(repo, "ens_sel_when", ENS_SEL_WHEN_YAML);
     write_ensemble(repo, "ens_sel_parent", ENS_SEL_PARENT_YAML);
     write_ensemble(repo, "ens_when", ENS_WHEN_YAML);
@@ -1403,7 +1431,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -1819,7 +1847,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -4910,6 +4938,33 @@ async fn test_audit_d41_nested_child() {
     assert!(body.contains(r#""pre""#), "nested child must run its default set: {body}");
 }
 
+/// D41 debuggability parity: a body-resolved UNKNOWN set name at a NESTED
+/// selector-configured child must 400 naming BOTH the unknown set and the
+/// body source ref — the top-level funnel annotates the source
+/// (exec.rs select_dag_set map_err); the nested path must too.
+#[serial]
+#[tokio::test]
+async fn test_audit_d41_nested_unknown_set_names_ref() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_sel_parent", "ens_dags_sel"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_sel_parent/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"modelName": "nope", "text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("nope"), "must name the unknown set: {body}");
+    assert!(
+        body.contains("$request.modelName"),
+        "must name the child's body source ref (D41 parity with the top-level funnel): {body}"
+    );
+}
+
 /// D41: the gRPC path resolves the body selector when the metadata channel
 /// carries no x-lite-dag value.
 #[cfg(unix)]
@@ -4990,6 +5045,256 @@ async fn test_audit_d41_batch_dags_form() {
         String::from_utf8_lossy(&items[1].data).contains(r#""pre""#),
         "element 1 must route to default: {}",
         String::from_utf8_lossy(&items[1].data)
+    );
+
+    // Array-root element: a JSON array can never carry the named selector
+    // field → element-level 400 naming the source ref (D41), never a
+    // silent default. Sibling elements still succeed.
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_dags_sel".into(),
+        version: "1".into(),
+        items: vec![
+            br#"["a"]"#.to_vec().into(),
+            br#"{"text":"ok"}"#.to_vec().into(),
+        ],
+        headers: Default::default(),
+    });
+    let resp = client.batch_infer(req).await.expect("array element must fail per-element, not the batch");
+    let items = resp.into_inner().items;
+    assert_eq!(items.len(), 2);
+    let st = items[0].status.as_ref().unwrap();
+    assert_eq!(st.code, "Error", "array root must 400 the element");
+    assert!(
+        st.message.contains("$request.modelName"),
+        "element error must name the source ref: {}",
+        st.message
+    );
+    assert_eq!(items[1].status.as_ref().unwrap().code, "Ok");
+    assert!(String::from_utf8_lossy(&items[1].data).contains(r#""pre""#));
+}
+
+/// D41: WS body routing — a single text frame carrying the selector field
+/// selects the set before the close-frame trigger; the streaming fast set
+/// answers with tokens.
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_ws_body_routing() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dags_stream_sel"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dags_stream_sel/stream", http_port);
+    use futures::{SinkExt, StreamExt};
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"modelName":"fast","text":"hello world"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // App-level close frame → aggregation trigger (D33).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut tokens: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    if v.get("error").is_some() {
+                        panic!("WS body routing must not error: {t}");
+                    }
+                    if let Some(tok) = v.get("token").and_then(|x| x.as_str()) {
+                        tokens.push(tok.to_string());
+                    }
+                    if v.get("done").and_then(|x| x.as_bool()) == Some(true) {
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if let Ok(v) = serde_json::from_slice::<Value>(&b) {
+                    if let Some(tok) = v.get("token").and_then(|x| x.as_str()) {
+                        tokens.push(tok.to_string());
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => break,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["hello", "world"],
+        "WS body selector must route to the streaming fast set: {tokens:?}"
+    );
+}
+
+/// D41: WS multi-frame JSON aggregation builds an ARRAY root — a named
+/// selector field is unreachable there, so the request must fail fast
+/// naming the source ref (never silently default).
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_ws_multi_frame_array_root_rejected() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dags_sel"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dags_sel/stream", http_port);
+    use futures::{SinkExt, StreamExt};
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"modelName":"fast","text":"a"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"b"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_selector_error = false;
+    let mut close_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let msg = v["error"]["message"].as_str().unwrap_or("");
+                    if msg.contains("$request.modelName") {
+                        saw_selector_error = true;
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(cf)))) => {
+                close_code = cf.map(|f| u16::from(f.code));
+                break;
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_selector_error,
+        "multi-frame WS upload must fail naming the selector ref (D41)"
+    );
+    assert_eq!(close_code, Some(1003), "a 4xx selector error closes with 1003");
+}
+
+/// D41: gRPC bidi body routing — the Open frame's initial_data carries the
+/// selector field; half-close triggers execution on the streaming fast set.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_grpc_bidi_body_routing() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiOpen};
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_dags_stream_sel"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<BidiChunk>(16);
+    tx.send(BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(bidi_chunk::Payload::Open(BidiOpen {
+            model_name: "ens_dags_stream_sel".into(),
+            version: "1".into(),
+            initial_data: bytes::Bytes::from(r#"{"modelName":"fast","text":"hello world"}"#),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    // Half-close → trigger (D33).
+    drop(tx);
+
+    let resp = client
+        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .await
+        .expect("bidi body routing must open");
+    let mut out = resp.into_inner();
+    let mut tokens: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), out.message()).await {
+            Ok(Ok(Some(chunk))) => match chunk.payload {
+                Some(bidi_chunk::Payload::Data(d)) => {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
+                        if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
+                            tokens.push(t.to_string());
+                        }
+                    }
+                }
+                Some(bidi_chunk::Payload::Close(_)) => break,
+                _ => {}
+            },
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["hello", "world"],
+        "gRPC bidi body selector must route to the streaming fast set: {tokens:?}"
+    );
+}
+
+/// D41: gRPC bidi multi-frame JSON aggregation builds an ARRAY root — the
+/// RPC must fail naming the selector source ref (never silently default).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_grpc_bidi_multi_frame_array_root_rejected() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiData, BidiOpen};
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_dags_sel"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<BidiChunk>(16);
+    tx.send(BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(bidi_chunk::Payload::Open(BidiOpen {
+            model_name: "ens_dags_sel".into(),
+            version: "1".into(),
+            initial_data: bytes::Bytes::from(r#"{"modelName":"fast","text":"a"}"#),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    tx.send(BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(bidi_chunk::Payload::Data(BidiData {
+            data: bytes::Bytes::from(r#"{"text":"b"}"#),
+        })),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    let err = client
+        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .await
+        .expect_err("multi-frame bidi upload with a selector must fail (D41)");
+    assert!(
+        err.message().contains("$request.modelName"),
+        "error must name the selector source ref: {}",
+        err.message()
     );
 }
 
