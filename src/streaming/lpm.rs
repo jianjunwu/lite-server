@@ -170,7 +170,10 @@ mod tests {
         };
         let decoded = roundtrip(&chunk);
         assert_eq!(decoded.stream_id, "c1");
-        assert!(matches!(decoded.payload, Some(pb::bidi_chunk::Payload::Close(_))));
+        assert!(matches!(
+            decoded.payload,
+            Some(pb::bidi_chunk::Payload::Close(_))
+        ));
     }
 
     #[test]

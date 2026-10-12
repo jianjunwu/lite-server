@@ -19,7 +19,8 @@ fn gzip_decoded_body(body: axum::body::Body) -> axum::body::Body {
     let byte_stream = body
         .into_data_stream() // trailers dropped (unused in this codebase)
         .map(|frame| frame.map_err(std::io::Error::other));
-    let decoder = async_compression::tokio::bufread::GzipDecoder::new(StreamReader::new(byte_stream));
+    let decoder =
+        async_compression::tokio::bufread::GzipDecoder::new(StreamReader::new(byte_stream));
     axum::body::Body::from_stream(ReaderStream::new(decoder))
 }
 
@@ -34,7 +35,11 @@ pub(crate) async fn request_decompression_middleware(req: Request, next: Next) -
     if req.uri().path().ends_with("/bidi") {
         return next.run(req).await;
     }
-    let encoding = raw.to_str().map(str::trim).unwrap_or("").to_ascii_lowercase();
+    let encoding = raw
+        .to_str()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match encoding.as_str() {
         "identity" | "" => {
             // Strip and pass through (identity = no encoding per RFC 9110).
@@ -46,9 +51,9 @@ pub(crate) async fn request_decompression_middleware(req: Request, next: Next) -
             let (mut parts, body) = req.into_parts();
             parts.headers.remove(CONTENT_ENCODING);
             parts.headers.remove(CONTENT_LENGTH); // stale after decode
-            // An exactly-empty body carries no gzip frame to decode; some
-            // clients send Content-Encoding unconditionally. Pass it through
-            // instead of surfacing the decoder's unexpected-EOF as a 400.
+                                                  // An exactly-empty body carries no gzip frame to decode; some
+                                                  // clients send Content-Encoding unconditionally. Pass it through
+                                                  // instead of surfacing the decoder's unexpected-EOF as a 400.
             use axum::body::HttpBody as _;
             let body = if body.size_hint().exact() == Some(0) {
                 body
@@ -147,11 +152,20 @@ mod tests {
 
     async fn response_bytes(resp: Response) -> Vec<u8> {
         use http_body_util::BodyExt;
-        resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
     }
 
     fn post_req(uri: &str, body: Vec<u8>) -> Request {
-        Request::builder().method("POST").uri(uri).body(Body::from(body)).unwrap()
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(body))
+            .unwrap()
     }
 
     fn gzip_req(uri: &str, body: Vec<u8>) -> Request {
@@ -166,7 +180,10 @@ mod tests {
     #[tokio::test]
     async fn should_pass_through_when_no_content_encoding() {
         let app = app_with("/echo", post(echo_body));
-        let resp = app.oneshot(post_req("/echo", b"hello".to_vec())).await.unwrap();
+        let resp = app
+            .oneshot(post_req("/echo", b"hello".to_vec()))
+            .await
+            .unwrap();
         assert_eq!(response_bytes(resp).await, b"hello");
     }
 

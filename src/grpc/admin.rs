@@ -55,8 +55,23 @@ impl GrpcAdminService {
 
     /// D27 控制面审计——委托共享助手（`src/audit.rs`），与 HTTP admin 同
     /// 记录形状（含 key 指纹）。
-    fn audit(&self, cx: &Option<RequestContext>, action: &str, model: &str, version: Option<&str>, details: &str) {
-        crate::audit::control_plane(cx.as_ref(), &self.access_control, Protocol::Grpc, action, model, version, details);
+    fn audit(
+        &self,
+        cx: &Option<RequestContext>,
+        action: &str,
+        model: &str,
+        version: Option<&str>,
+        details: &str,
+    ) {
+        crate::audit::control_plane(
+            cx.as_ref(),
+            &self.access_control,
+            Protocol::Grpc,
+            action,
+            model,
+            version,
+            details,
+        );
     }
 }
 
@@ -109,11 +124,7 @@ async fn pump_download_chunks(
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "DownloadModel: read {} failed: {}",
-                    path.display(),
-                    e
-                );
+                tracing::warn!("DownloadModel: read {} failed: {}", path.display(), e);
                 // Surface the truncation explicitly — a clean end
                 // here would read as a successful short download.
                 let _ = tokio::time::timeout(
@@ -166,7 +177,8 @@ impl Admin for GrpcAdminService {
         _req: Request<pb::GetInfoRequest>,
     ) -> Result<Response<pb::GetInfoResponse>, Status> {
         let loaded_models = self
-            .app_state.registry
+            .app_state
+            .registry
             .list_loaded()
             .into_iter()
             .map(|(n, v, _)| format!("{}/{}", n, v))
@@ -183,7 +195,8 @@ impl Admin for GrpcAdminService {
         _req: Request<pb::ListModelsRequest>,
     ) -> Result<Response<pb::ListModelsResponse>, Status> {
         let models = self
-            .app_state.registry
+            .app_state
+            .registry
             .list_loaded()
             .into_iter()
             .map(|(name, version, mv)| pb::ModelSummary {
@@ -247,7 +260,10 @@ impl Admin for GrpcAdminService {
         let (version, ready) = match req.get_ref().version.as_deref() {
             Some(v) => {
                 crate::validation::validate_version(v).map_err(to_status)?;
-                (Some(v.to_string()), self.app_state.registry.is_ready(&model_name, Some(v)))
+                (
+                    Some(v.to_string()),
+                    self.app_state.registry.is_ready(&model_name, Some(v)),
+                )
             }
             None => {
                 let active = self.app_state.registry.get_active_version(&model_name);
@@ -281,7 +297,8 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .app_state.registry
+                .app_state
+                .registry
                 .routing_pick(&model_name)
                 .or_else(|| self.app_state.registry.get_active_version(&model_name))
                 .ok_or_else(|| {
@@ -292,7 +309,8 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let mv = self
-            .app_state.registry
+            .app_state
+            .registry
             .get(&model_name, Some(&resolved))
             .ok_or_else(|| {
                 to_status(AppError::ModelNotFound(format!(
@@ -302,7 +320,8 @@ impl Admin for GrpcAdminService {
             })?;
         let total = mv.workers.len();
         let outlier = self
-            .app_state.worker_manager
+            .app_state
+            .worker_manager
             .inference_queue()
             .get_outlier_state(&model_name, &resolved);
         let (workers, healthy_workers) = match outlier {
@@ -362,7 +381,8 @@ impl Admin for GrpcAdminService {
         let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
         self.app_state.config.apply_model_defaults(&mut config);
 
-        self.app_state.worker_manager
+        self.app_state
+            .worker_manager
             .load_model(&model_name, &version, &config)
             .await
             .map_err(to_status)?;
@@ -375,7 +395,8 @@ impl Admin for GrpcAdminService {
         // Auto-activate if no active version (mirrors HTTP).
         let prev_active = self.app_state.registry.get_active_version(&model_name);
         if prev_active.is_none() {
-            self.app_state.registry
+            self.app_state
+                .registry
                 .activate_version(&model_name, &version)
                 .map_err(to_status)?;
         }
@@ -405,7 +426,8 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .app_state.registry
+                .app_state
+                .registry
                 .get_active_version(&model_name)
                 .ok_or_else(|| {
                     to_status(AppError::ModelNotFound(format!(
@@ -415,7 +437,8 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let success = self
-            .app_state.worker_manager
+            .app_state
+            .worker_manager
             .unload_model(&model_name, Some(&version))
             .await
             .map_err(to_status)?;
@@ -427,11 +450,14 @@ impl Admin for GrpcAdminService {
         }
         // Recompute the file-watcher flag (mirrors HTTP unload_model_impl).
         let any_hot_reload = self
-            .app_state.registry
+            .app_state
+            .registry
             .list_loaded()
             .iter()
             .any(|(_, _, mv)| mv.config.hot_reload);
-        self.app_state.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+        self.app_state
+            .has_hot_reload
+            .store(any_hot_reload, Ordering::Relaxed);
         self.audit(&cx, "unload", &model_name, Some(&version), "unloaded");
         Ok(Response::new(pb::UnloadModelResponse {
             success: true,
@@ -452,7 +478,8 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .app_state.registry
+                .app_state
+                .registry
                 .get_active_version(&model_name)
                 .ok_or_else(|| {
                     to_status(AppError::ModelNotFound(format!(
@@ -462,7 +489,8 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let success = self
-            .app_state.worker_manager
+            .app_state
+            .worker_manager
             .reload_model(&model_name, Some(&version))
             .await
             .map_err(to_status)?;
@@ -491,7 +519,8 @@ impl Admin for GrpcAdminService {
 
         let previous = self.app_state.registry.get_active_version(&model_name);
         let success = self
-            .app_state.registry
+            .app_state
+            .registry
             .activate_version(&model_name, &version)
             .map_err(to_status)?;
         if !success {
@@ -510,7 +539,8 @@ impl Admin for GrpcAdminService {
         // Explicit activate is a hard cutover (§4.3): target gets 100% weight.
         // Registry activate is pointer-only so internal re-activations don't
         // clobber a canary split.
-        self.app_state.registry
+        self.app_state
+            .registry
             .set_weights(&model_name, &HashMap::from([(version.clone(), 100u32)]))
             .map_err(to_status)?;
         for mv in self.app_state.registry.list_versions(&model_name) {
@@ -521,7 +551,8 @@ impl Admin for GrpcAdminService {
                 prometheus::record_version_switch(&model_name, from, &version);
             }
         }
-        self.app_state.callback_runner
+        self.app_state
+            .callback_runner
             .on_model_activate(&ModelLifecycleContext {
                 model_name: model_name.clone(),
                 version: version.clone(),
@@ -563,15 +594,11 @@ impl Admin for GrpcAdminService {
             req.get_ref().weights.clone()
         } else {
             // P5-2 canary 糖: convert (canary_version, canary_percent) to weights.
-            let canary_version = req
-                .get_ref()
-                .canary_version
-                .as_deref()
-                .ok_or_else(|| {
-                    super::err(Status::invalid_argument(
-                        "SetRouting: `canary_version` required when `weights` is absent",
-                    ))
-                })?;
+            let canary_version = req.get_ref().canary_version.as_deref().ok_or_else(|| {
+                super::err(Status::invalid_argument(
+                    "SetRouting: `canary_version` required when `weights` is absent",
+                ))
+            })?;
             let canary_percent = req.get_ref().canary_percent.ok_or_else(|| {
                 super::err(Status::invalid_argument(
                     "SetRouting: `canary_percent` required when `weights` is absent",
@@ -583,7 +610,12 @@ impl Admin for GrpcAdminService {
                     "SetRouting: `canary_percent` must be 0..=100",
                 )));
             }
-            if self.app_state.registry.get(&model_name, Some(canary_version)).is_none() {
+            if self
+                .app_state
+                .registry
+                .get(&model_name, Some(canary_version))
+                .is_none()
+            {
                 return Err(to_status(AppError::VersionNotFound(
                     model_name.clone(),
                     canary_version.to_string(),
@@ -609,12 +641,14 @@ impl Admin for GrpcAdminService {
 
         // Capture old weights for the audit before/after.
         let old: HashMap<String, u32> = self
-            .app_state.registry
+            .app_state
+            .registry
             .list_versions(&model_name)
             .into_iter()
             .map(|mv| (mv.version, mv.weight))
             .collect();
-        self.app_state.registry
+        self.app_state
+            .registry
             .set_weights(&model_name, &effective)
             .map_err(to_status)?;
         for mv in self.app_state.registry.list_versions(&model_name) {
@@ -651,7 +685,8 @@ impl Admin for GrpcAdminService {
                 vec![v.to_string()]
             }
             None => self
-                .app_state.registry
+                .app_state
+                .registry
                 .list_versions(&model_name)
                 .into_iter()
                 .map(|mv| mv.version)
@@ -666,9 +701,9 @@ impl Admin for GrpcAdminService {
             // inference_count = Σ REQUESTS_TOTAL across status families.
             let mut inference_count = 0u64;
             for fam in ["2xx", "3xx", "4xx", "5xx"] {
-                inference_count +=
-                    prometheus::REQUESTS_TOTAL.with_label_values(&[&model_name, &version, fam]).get()
-                        as u64;
+                inference_count += prometheus::REQUESTS_TOTAL
+                    .with_label_values(&[&model_name, &version, fam])
+                    .get() as u64;
             }
             let hist = prometheus::REQUEST_DURATION.with_label_values(&[&model_name, &version]);
             let samples = hist.get_sample_count();
@@ -677,11 +712,13 @@ impl Admin for GrpcAdminService {
             } else {
                 0.0
             };
-            let queue_depth =
-                prometheus::QUEUE_DEPTH.with_label_values(&[&model_name, &version]).get() as i64;
+            let queue_depth = prometheus::QUEUE_DEPTH
+                .with_label_values(&[&model_name, &version])
+                .get() as i64;
 
             let outlier = self
-                .app_state.worker_manager
+                .app_state
+                .worker_manager
                 .inference_queue()
                 .get_outlier_state(&model_name, &version);
             let workers: Vec<pb::WorkerStats> = (0..mv.workers.len() as u32)
@@ -986,7 +1023,9 @@ impl Admin for GrpcAdminService {
         }
 
         if staged.is_empty() {
-            return Err(to_status(AppError::Validation("no files uploaded".to_string())));
+            return Err(to_status(AppError::Validation(
+                "no files uploaded".to_string(),
+            )));
         }
 
         let outcome = crate::http::handlers::files::finalize_upload(
@@ -1120,7 +1159,11 @@ impl Admin for GrpcAdminService {
             has_file: out["has_file"].as_bool().unwrap_or(false),
             redacted: out["redacted"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             etag: out["etag"].as_str().map(String::from),
             loaded_at: out["loaded_at"].as_u64(),
@@ -1171,13 +1214,15 @@ impl Admin for GrpcAdminService {
                 "config.yaml changed since the provided etag; re-read and retry, or set force",
             ),
             ConfigPatchError::Invalid { message, .. } => Status::invalid_argument(message),
-            ConfigPatchError::ReloadFailed { message, rolled_back, .. } => Status::internal(
-                if rolled_back {
-                    format!("reload failed: {message}; config.yaml rolled back to the previous content")
-                } else {
-                    format!("reload failed: {message}")
-                },
-            ),
+            ConfigPatchError::ReloadFailed {
+                message,
+                rolled_back,
+                ..
+            } => Status::internal(if rolled_back {
+                format!("reload failed: {message}; config.yaml rolled back to the previous content")
+            } else {
+                format!("reload failed: {message}")
+            }),
         })?;
         self.audit(
             &cx,
@@ -1193,7 +1238,11 @@ impl Admin for GrpcAdminService {
             etag: out["etag"].as_str().map(String::from),
             warnings: out["warnings"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }))
     }
@@ -1217,7 +1266,11 @@ impl Admin for GrpcAdminService {
                 .unwrap_or_default(),
             redacted: out["redacted"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }))
     }
@@ -1247,7 +1300,8 @@ impl Admin for GrpcAdminService {
                 })
                 .collect(),
         }))
-    }}
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1374,8 +1428,11 @@ mod tests {
     #[tokio::test]
     async fn list_versions_returns_active_and_weights() {
         let reg = two_version_registry("lv_m");
-        reg.set_weights("lv_m", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
-            .unwrap();
+        reg.set_weights(
+            "lv_m",
+            &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]),
+        )
+        .unwrap();
         let svc = build_admin_service(reg);
         let resp = svc
             .list_versions(Request::new(pb::ListVersionsRequest {
@@ -1585,7 +1642,11 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resp.weights.get("2"), Some(&10), "canary gets canary_percent");
+        assert_eq!(
+            resp.weights.get("2"),
+            Some(&10),
+            "canary gets canary_percent"
+        );
         assert_eq!(
             resp.weights.get("1"),
             Some(&90),
@@ -1649,7 +1710,10 @@ mod tests {
         let s = &resp.stats[0];
         assert_eq!(s.version, "1");
         assert!(s.inference_count >= 1, "REQUESTS_TOTAL 2xx must be counted");
-        assert!(s.avg_duration_ms > 0.0, "avg_duration must reflect the sample");
+        assert!(
+            s.avg_duration_ms > 0.0,
+            "avg_duration must reflect the sample"
+        );
         // mv.workers is empty (no real workers) → no WorkerStats rows; the
         // per-worker counter is still read for any worker index that exists.
         assert!(s.workers.is_empty());
@@ -1872,7 +1936,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.success);
-        assert!(!repo.join("mymodel").join("1").exists(), "version dir must be removed");
+        assert!(
+            !repo.join("mymodel").join("1").exists(),
+            "version dir must be removed"
+        );
 
         // Idempotent (HTTP parity): deleting a nonexistent version succeeds.
         let resp2 = svc
@@ -1981,7 +2048,11 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resp.deleted, vec!["1".to_string()], "lowest version deleted");
+        assert_eq!(
+            resp.deleted,
+            vec!["1".to_string()],
+            "lowest version deleted"
+        );
         assert!(resp.failed.is_empty());
         assert!(!repo.join("mymodel").join("1").exists());
         assert!(repo.join("mymodel").join("2").exists());
@@ -2009,7 +2080,11 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resp.deleted, vec!["2".to_string()]);
-        assert_eq!(resp.failed.len(), 1, "active v1 without force fails individually");
+        assert_eq!(
+            resp.failed.len(),
+            1,
+            "active v1 without force fails individually"
+        );
         assert_eq!(resp.failed[0].version, "1");
         assert!(!resp.failed[0].error.is_empty());
         assert!(repo.join("mymodel").join("1").exists());
@@ -2061,7 +2136,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.success);
-        assert!(!repo.join("mymodel").exists(), "whole model dir must be removed");
+        assert!(
+            !repo.join("mymodel").exists(),
+            "whole model dir must be removed"
+        );
         assert!(!root_artifact.exists(), "root .lma must be removed (G5)");
         assert!(!copy.exists(), ".artifacts copy must be removed (G5)");
 
@@ -2112,14 +2190,13 @@ mod tests {
         let mut config = config_with_repo(&repo);
         config.orchestration.load_models = vec!["mymodel".to_string()];
         config.orchestration.models = vec![strategy("mymodel", &["1"])];
-        let svc = build_admin_service_with_config(
-            Arc::new(ModelRegistry::new()),
-            repo.clone(),
-            config,
-        );
+        let svc =
+            build_admin_service_with_config(Arc::new(ModelRegistry::new()), repo.clone(), config);
 
         let resp = svc
-            .repository_drift(Request::new(pb::RepositoryDriftRequest { model_name: None }))
+            .repository_drift(Request::new(pb::RepositoryDriftRequest {
+                model_name: None,
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -2306,9 +2383,12 @@ mod tests {
     async fn download_model_bare_uses_active_version() {
         let repo = unique_repo("e2e-bare");
         make_disk_version(&repo, "mymodel", "1").await;
-        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), b"ACTIVE-ONE")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            repo.join("mymodel").join("1").join("model.py"),
+            b"ACTIVE-ONE",
+        )
+        .await
+        .unwrap();
         let reg = two_version_registry("mymodel"); // v1 active
         let (port, shutdown_tx, _handle) =
             spawn_admin_grpc_server_with_repo(reg, repo.clone(), config_with_repo(&repo)).await;
@@ -2330,7 +2410,10 @@ mod tests {
                 assembled.extend_from_slice(&chunk.data);
             }
         }
-        assert_eq!(assembled, b"ACTIVE-ONE", "bare download must target the active version");
+        assert_eq!(
+            assembled, b"ACTIVE-ONE",
+            "bare download must target the active version"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = tokio::fs::remove_dir_all(&repo).await;
@@ -2394,10 +2477,11 @@ mod tests {
         // Exactly 4 MiB: four 1 MiB chunks fill the 4-slot channel
         // precisely; the pump then hits EOF with the channel full and the
         // terminal-frame send stalls (the receiver is never polled).
-        tokio::fs::write(&path, vec![7u8; 4 * 1024 * 1024]).await.unwrap();
+        tokio::fs::write(&path, vec![7u8; 4 * 1024 * 1024])
+            .await
+            .unwrap();
         let file = tokio::fs::File::open(&path).await.unwrap();
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(4);
         let task = tokio::spawn(pump_download_chunks(file, path.clone(), tx));
 
         // Virtual clock: the pump's 60s send bound must fire long before
@@ -2554,8 +2638,11 @@ mod tests {
         let model_dir = pack_tmp.join("pkgmodel").join("2");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("model.py"), "def predict(x): return x").unwrap();
-        std::fs::write(model_dir.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n")
-            .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\n",
+        )
+        .unwrap();
         let output = std::process::Command::new(crate::python::resolve_python_interpreter())
             .args([
                 "-m",
@@ -2647,7 +2734,10 @@ mod tests {
                 assembled.extend_from_slice(&chunk.data);
             }
         }
-        assert_eq!(assembled, artifact_bytes, "download must serve the retained artifact");
+        assert_eq!(
+            assembled, artifact_bytes,
+            "download must serve the retained artifact"
+        );
         let term = terminal.expect("terminal frame required");
         assert_eq!(term.size, artifact_bytes.len() as u64);
 
@@ -2784,10 +2874,8 @@ mod tests {
                 tokio::fs::write(dir.join("model.py"), "def predict(x): return x")
                     .await
                     .unwrap();
-                let svc = build_admin_service_with_repo(
-                    Arc::new(ModelRegistry::new()),
-                    repo2.clone(),
-                );
+                let svc =
+                    build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo2.clone());
                 let mut req = Request::new(pb::DeleteVersionRequest {
                     model_name: "mymodel".to_string(),
                     version: "1".to_string(),
@@ -2832,12 +2920,9 @@ mod tests {
         let repo = unique_repo("cap");
         let mut config = config_with_repo(&repo);
         config.server.max_upload_bytes = Some(10);
-        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
-            Arc::new(ModelRegistry::new()),
-            repo.clone(),
-            config,
-        )
-        .await;
+        let (port, shutdown_tx, _handle) =
+            spawn_admin_grpc_server_with_repo(Arc::new(ModelRegistry::new()), repo.clone(), config)
+                .await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let mut client = connect_admin(port).await;
 
@@ -3071,7 +3156,9 @@ mod tests {
             "unpack failed: {}",
             String::from_utf8_lossy(&unpack.stderr)
         );
-        let model_py = tokio::fs::read(out.join("1").join("model.py")).await.unwrap();
+        let model_py = tokio::fs::read(out.join("1").join("model.py"))
+            .await
+            .unwrap();
         assert_eq!(model_py, b"def predict(x): return x");
 
         let _ = shutdown_tx.send(());
@@ -3098,7 +3185,11 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument, "no selector: {err}");
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "no selector: {err}"
+        );
 
         // An invalid version string in the list.
         let err = svc
@@ -3110,7 +3201,11 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument, "bad version: {err}");
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "bad version: {err}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }
@@ -3240,7 +3335,10 @@ mod tests {
             .unwrap()
             .into_inner();
         let tree: serde_json::Value = serde_json::from_str(&resp.config_json).unwrap();
-        assert_eq!(tree["metrics"]["timeline_max_points"], serde_json::json!(1440));
+        assert_eq!(
+            tree["metrics"]["timeline_max_points"],
+            serde_json::json!(1440)
+        );
         // Secret redacted; source labels still attached per leaf.
         assert_eq!(
             tree["access_control"]["admin"]["http"]["value"],
@@ -3248,7 +3346,9 @@ mod tests {
         );
         assert!(!resp.config_json.contains("topsecret"));
         assert_eq!(
-            resp.sources.get("metrics.timeline_max_points").map(String::as_str),
+            resp.sources
+                .get("metrics.timeline_max_points")
+                .map(String::as_str),
             Some("file")
         );
         assert_eq!(
@@ -3289,10 +3389,14 @@ mod tests {
         assert!(!resp.reloaded);
         assert_eq!(resp.etag.as_deref().map(str::len), Some(16));
 
-        let written = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        let written = tokio::fs::read_to_string(dir.join("config.yaml"))
+            .await
+            .unwrap();
         assert!(written.contains("max_batch_size: 32"));
         // Backup holds the pre-write bytes.
-        let bak = tokio::fs::read_to_string(dir.join("config.yaml.bak")).await.unwrap();
+        let bak = tokio::fs::read_to_string(dir.join("config.yaml.bak"))
+            .await
+            .unwrap();
         assert_eq!(bak, "max_batch_size: 8\n");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
@@ -3323,7 +3427,9 @@ mod tests {
         assert!(!resp.valid);
         assert!(!resp.written);
         assert!(!resp.warnings.is_empty());
-        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml"))
+            .await
+            .unwrap();
         assert_eq!(on_disk, "max_batch_size: 8\n");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
@@ -3351,7 +3457,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml"))
+            .await
+            .unwrap();
         assert_eq!(on_disk, "max_batch_size: 8\n");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
@@ -3379,7 +3487,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml")).await.unwrap();
+        let on_disk = tokio::fs::read_to_string(dir.join("config.yaml"))
+            .await
+            .unwrap();
         assert_eq!(on_disk, "max_batch_size: 8\n");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;

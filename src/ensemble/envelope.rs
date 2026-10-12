@@ -45,7 +45,10 @@ pub fn parse_root_inputs(
         match &payload {
             // R19/D14: `$inputs` is a reserved namespace on legacy payloads.
             EnsembleValue::Json(v) => {
-                if v.as_object().map(|o| o.contains_key("$inputs")).unwrap_or(false) {
+                if v.as_object()
+                    .map(|o| o.contains_key("$inputs"))
+                    .unwrap_or(false)
+                {
                     return Err(AppError::InvalidRequestBody(
                         "'$inputs' is a reserved namespace (D14) — this ensemble has no \
                          inputs declaration; send a plain JSON body"
@@ -81,13 +84,16 @@ pub fn parse_root_inputs(
             ));
         }
     };
-    let inputs = head.get("inputs").and_then(|i| i.as_array()).ok_or_else(|| {
-        AppError::InvalidRequestBody(
-            "declared-inputs ensemble requires a KServe envelope with an inputs[] \
+    let inputs = head
+        .get("inputs")
+        .and_then(|i| i.as_array())
+        .ok_or_else(|| {
+            AppError::InvalidRequestBody(
+                "declared-inputs ensemble requires a KServe envelope with an inputs[] \
              array (R18/D31)"
-                .to_string(),
-        )
-    })?;
+                    .to_string(),
+            )
+        })?;
 
     let mut values: IndexMap<String, EnsembleValue> = IndexMap::new();
     let mut offset = 0usize;
@@ -168,7 +174,9 @@ pub fn parse_root_inputs(
                     offset = end;
                     EnsembleValue::Binary(
                         Bytes::copy_from_slice(slice),
-                        d.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                        d.content_type
+                            .clone()
+                            .unwrap_or_else(|| "application/octet-stream".to_string()),
                         d.shape.clone(),
                         d.datatype.clone(),
                     )
@@ -220,13 +228,16 @@ pub(crate) fn decode_binary_marker(v: &Value) -> Result<(Bytes, String), AppErro
             "binary input data must be a {\"$binary_b64\": ...} marker object".to_string(),
         )
     })?;
-    let b64 = obj.get("$binary_b64").and_then(|b| b.as_str()).ok_or_else(|| {
-        AppError::InvalidRequestBody(
-            "binary marker object is missing the \"$binary_b64\" field".to_string(),
-        )
-    })?;
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-        .map_err(|e| {
+    let b64 = obj
+        .get("$binary_b64")
+        .and_then(|b| b.as_str())
+        .ok_or_else(|| {
+            AppError::InvalidRequestBody(
+                "binary marker object is missing the \"$binary_b64\" field".to_string(),
+            )
+        })?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).map_err(|e| {
             AppError::InvalidRequestBody(format!("invalid base64 in $binary_b64 marker: {e}"))
         })?;
     let ct = obj
@@ -268,9 +279,7 @@ pub fn split_envelope(blob: &[u8]) -> Result<(serde_json::Value, Option<Bytes>),
         ));
     }
     let head: serde_json::Value = serde_json::from_slice(&blob[12..head_end]).map_err(|_| {
-        AppError::InvalidRequestBody(
-            "LSBE-1 envelope head is not valid JSON (D32)".to_string(),
-        )
+        AppError::InvalidRequestBody("LSBE-1 envelope head is not valid JSON (D32)".to_string())
     })?;
     let tail = if head_end == blob.len() {
         None
@@ -295,7 +304,10 @@ pub fn ensemble_payload_from_bytes(
     // parsing so a container is never misread as a payload.
     if data.starts_with(b"LSB1") {
         let (head, tail) = split_envelope(data)?;
-        return Ok(EnsembleValue::Envelope { head, tail: tail.unwrap_or_default() });
+        return Ok(EnsembleValue::Envelope {
+            head,
+            tail: tail.unwrap_or_default(),
+        });
     }
     // §5.5.7 legacy byte-compat: ANY valid JSON — objects, arrays, scalars,
     // whitespace-prefixed — parses as Json (the historical gRPC unary
@@ -345,4 +357,3 @@ pub fn bidi_envelope_frame(
     }
     ensemble_payload_from_bytes(frame, ct)
 }
-

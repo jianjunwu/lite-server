@@ -630,7 +630,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -647,7 +652,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -663,7 +673,10 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
 async fn load_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v2/repository/models/{}/versions/{}/load", base, model, version))
+        .post(format!(
+            "{}/v2/repository/models/{}/versions/{}/load",
+            base, model, version
+        ))
         .send()
         .await
         .expect("load request failed");
@@ -679,7 +692,10 @@ async fn load_model(base: &str, model: &str, version: &str) {
 async fn unload_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let _ = client
-        .post(format!("{}/v2/repository/models/{}/versions/{}/unload", base, model, version))
+        .post(format!(
+            "{}/v2/repository/models/{}/versions/{}/unload",
+            base, model, version
+        ))
         .send()
         .await;
 }
@@ -740,10 +756,7 @@ class SlowAPI(LitAPI):
 /// can observe that the server's StreamCancel reached the worker.
 #[cfg(unix)]
 fn create_bidi_model_repo(marker: &std::path::Path) -> std::path::PathBuf {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-bidi-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("lite-server-bidi-{}", std::process::id()));
     let model_dir = tmp.join("bidi_model/1");
     std::fs::create_dir_all(&model_dir).unwrap();
     std::fs::write(
@@ -855,7 +868,9 @@ fn kill_stale_on_port(port: u16) {
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -876,11 +891,14 @@ async fn ensure_shared_server() {
             kill_stale_on_port(SHARED_PORT);
             let repo = test_model_repo();
             let child = start_server(&[
-                "--port", &SHARED_PORT.to_string(),
-                "--model-repo", &repo.to_string_lossy(),
+                "--port",
+                &SHARED_PORT.to_string(),
+                "--model-repo",
+                &repo.to_string_lossy(),
                 "--no-metrics",
                 "--no-grpc",
-                "--log-level", "warn",
+                "--log-level",
+                "warn",
             ]);
             *guard = Some(child);
             register_shared_cleanup();
@@ -1071,15 +1089,20 @@ fn create_g_test_repo() -> &'static std::path::PathBuf {
             std::fs::write(dir.join("model.py"), py).unwrap();
             std::fs::write(dir.join("config.yaml"), cfg).unwrap();
         };
-        write_model("eof_model", G_EOF_PY,
+        write_model(
+            "eof_model",
+            G_EOF_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
 accelerator: cpu
 devices: 1
 workers_per_device: 1
-");
-        write_model("stream_counted", QUICK_STREAM_PY,
+",
+        );
+        write_model(
+            "stream_counted",
+            QUICK_STREAM_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
@@ -1087,8 +1110,11 @@ accelerator: cpu
 devices: 1
 workers_per_device: 2
 max_requests: 2
-");
-        write_model("stream_legacy", QUICK_STREAM_PY,
+",
+        );
+        write_model(
+            "stream_legacy",
+            QUICK_STREAM_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
@@ -1097,16 +1123,22 @@ devices: 1
 workers_per_device: 2
 max_requests: 2
 count_streams_toward_max_requests: false
-");
-        write_model("ens_pre", G_PRE_PY,
+",
+        );
+        write_model(
+            "ens_pre",
+            G_PRE_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: false
 accelerator: cpu
 devices: 1
 workers_per_device: 1
-");
-        write_model("ens_tail", G_TAIL_PY,
+",
+        );
+        write_model(
+            "ens_tail",
+            G_TAIL_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
@@ -1114,8 +1146,11 @@ accelerator: cpu
 devices: 1
 workers_per_device: 2
 max_requests: 2
-");
-        write_model("cap_model", G_SLOW_PY,
+",
+        );
+        write_model(
+            "cap_model",
+            G_SLOW_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
@@ -1123,8 +1158,11 @@ accelerator: cpu
 devices: 1
 workers_per_device: 2
 max_concurrent_streams: 2
-");
-        write_model("grace_model", G_GRACE_PY,
+",
+        );
+        write_model(
+            "grace_model",
+            G_GRACE_PY,
             "max_batch_size: 1
 batch_timeout: 0.0
 stream: true
@@ -1134,7 +1172,8 @@ workers_per_device: 1
 max_requests: 1
 recycle_stream_drain_timeout_secs: 1
 recycle_stream_grace_ms: 3000
-");
+",
+        );
         // Ensemble model: config.yaml only (no model.py).
         let ens_dir = tmp.join("ens_budget_model").join("1");
         std::fs::create_dir_all(&ens_dir).unwrap();
@@ -1153,11 +1192,15 @@ async fn ensure_g_server() {
             kill_stale_on_port(G_METRICS_PORT);
             let repo = create_g_test_repo();
             let child = start_server(&[
-                "--port", &G_PORT.to_string(),
-                "--metrics-port", &G_METRICS_PORT.to_string(),
-                "--model-repo", &repo.to_string_lossy(),
+                "--port",
+                &G_PORT.to_string(),
+                "--metrics-port",
+                &G_METRICS_PORT.to_string(),
+                "--model-repo",
+                &repo.to_string_lossy(),
                 "--no-grpc",
-                "--log-level", "warn",
+                "--log-level",
+                "warn",
             ]);
             *guard = Some(child);
             false
@@ -1206,7 +1249,11 @@ async fn test_health_probes() {
     assert_eq!(body["status"], "alive");
 
     // startupz: nothing Pending/Loading → 200
-    let resp = client.get(format!("{}/startupz", base)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/startupz", base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "started");
@@ -1218,8 +1265,12 @@ async fn test_health_probes() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ready");
-    let models: Vec<&str> = body["models"].as_array().unwrap()
-        .iter().filter_map(|m| m.as_str()).collect();
+    let models: Vec<&str> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
     assert!(models.contains(&MODEL), "readyz models: {:?}", models);
 
     // /health: per-version status (snake_case serde) + loaded_at epoch secs,
@@ -1228,14 +1279,25 @@ async fn test_health_probes() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ready");
-    let entry = body["models"].as_array().unwrap().iter()
+    let entry = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
         .find(|m| m["name"] == MODEL)
-        .and_then(|m| m["versions"].as_array().unwrap().iter()
-            .find(|e| e["version"] == "1"))
+        .and_then(|m| {
+            m["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["version"] == "1")
+        })
         .expect("test_model/1 must appear in /health");
     assert_eq!(entry["status"], "ready");
-    assert!(entry["loaded_at"].as_u64().is_some(),
-        "loaded_at must be epoch seconds: {:?}", entry);
+    assert!(
+        entry["loaded_at"].as_u64().is_some(),
+        "loaded_at must be epoch seconds: {:?}",
+        entry
+    );
 
     unload_model(&base, MODEL, "1").await;
 }
@@ -1248,11 +1310,14 @@ async fn test_readyz_503_when_no_models() {
     kill_stale_on_port(http_port);
     let repo = test_model_repo();
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
         "--no-metrics",
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -1263,7 +1328,11 @@ async fn test_readyz_503_when_no_models() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "not_ready");
 
-    let resp = client.get(format!("{}/startupz", base)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/startupz", base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let resp = client.get(format!("{}/livez", base)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -1286,7 +1355,9 @@ async fn test_model_health_fields() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/health", base, MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["name"], MODEL);
@@ -1295,9 +1366,16 @@ async fn test_model_health_fields() {
     assert!(!workers.is_empty());
     assert_eq!(workers[0]["ejected"], false);
 
-    let resp = client.get(format!("{}/v2/models", base)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/v2/models", base))
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
-    let entry = body["models"].as_array().unwrap().iter()
+    let entry = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
         .find(|m| m["name"] == MODEL)
         .expect("test_model must appear in /v2/models");
     assert_eq!(entry["status"], "ready");
@@ -1318,8 +1396,14 @@ async fn test_custom_route_probe_leaf_served() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/livez", base, ROUTE_MODEL))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 200, "probe leaf is not reserved in the model namespace");
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "probe leaf is not reserved in the model namespace"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["alive"], true);
 
@@ -1357,23 +1441,35 @@ async fn test_model_load_ready_infer_unload() {
     // Ready check
     let resp = client
         .get(format!("{}/v2/models/{}/ready", base, MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], true);
 
     // List models
-    let resp = client.get(format!("{}/v2/models", base)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/v2/models", base))
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
-    let models: Vec<&str> = body["models"].as_array().unwrap()
-        .iter().filter_map(|m| m["name"].as_str()).collect();
+    let models: Vec<&str> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .collect();
     assert!(models.contains(&MODEL), "model not in list: {:?}", models);
 
     // Infer
     let resp = client
         .post(format!("{}/v2/models/{}/infer", base, MODEL))
         .json(&json!({"input": 5}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 10);
@@ -1384,7 +1480,9 @@ async fn test_model_load_ready_infer_unload() {
     // Verify gone
     let resp = client
         .get(format!("{}/v2/models/{}/ready", base, MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], false);
 }
@@ -1403,7 +1501,9 @@ async fn test_warmup_enabled_model_loads_and_serves() {
     // Warmup completed → serving.
     let resp = client
         .get(format!("{}/v2/models/warmup_model/ready", base))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], true);
@@ -1412,7 +1512,9 @@ async fn test_warmup_enabled_model_loads_and_serves() {
     let resp = client
         .post(format!("{}/v2/models/warmup_model/infer", base))
         .json(&json!({"input": 7}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 14);
@@ -1438,8 +1540,13 @@ async fn test_warmup_failure_marks_version_failed() {
 
     // Load returns an error (WorkerCrashed) — do not use load_model (asserts 200).
     let resp = client
-        .post(format!("{}/v2/repository/models/warmup_fail_model/versions/1/load", base))
-        .send().await.unwrap();
+        .post(format!(
+            "{}/v2/repository/models/warmup_fail_model/versions/1/load",
+            base
+        ))
+        .send()
+        .await
+        .unwrap();
     assert!(
         !resp.status().is_success(),
         "warmup-failing load must error, got {}",
@@ -1456,13 +1563,23 @@ async fn test_warmup_failure_marks_version_failed() {
     // /health exposes the Failed state + last_failure reason.
     let resp = client.get(format!("{}/health", base)).send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
-    let entry = body["models"].as_array().unwrap().iter()
+    let entry = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
         .find(|m| m["name"] == "warmup_fail_model")
-        .and_then(|m| m["versions"].as_array().unwrap().iter()
-            .find(|e| e["version"] == "1"))
+        .and_then(|m| {
+            m["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["version"] == "1")
+        })
         .expect("warmup_fail_model/1 must be registered (Failed) in /health");
     assert_eq!(entry["status"], "failed");
-    let reason = entry["last_failure"].as_str().expect("last_failure must be set");
+    let reason = entry["last_failure"]
+        .as_str()
+        .expect("last_failure must be set");
     assert!(
         reason.contains("does_not_exist.json") || reason.contains("dummy input"),
         "last_failure should mention the dummy input: {}",
@@ -1483,7 +1600,9 @@ async fn test_model_list_versions() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/versions", base, MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     let versions = body["versions"].as_array().unwrap();
@@ -1503,7 +1622,9 @@ async fn test_model_infer_versioned() {
     let resp = client
         .post(format!("{}/v2/models/{}/versions/1/infer", base, MODEL))
         .json(&json!({"input": 7}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 14);
@@ -1525,7 +1646,9 @@ async fn test_custom_route_status() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/status", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["model_loaded"], true);
@@ -1544,7 +1667,9 @@ async fn test_custom_route_path_params() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/pets/123", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["pet_id"], "123");
@@ -1563,7 +1688,9 @@ async fn test_custom_route_post_body_and_method() {
     let resp = client
         .post(format!("{}/v2/models/{}/echo", base, ROUTE_MODEL))
         .json(&json!({"hello": "world"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["echo"], json!({"hello": "world"}));
@@ -1586,11 +1713,16 @@ async fn test_custom_route_reserved_leaf_does_not_shadow_inference() {
     let resp = client
         .post(format!("{}/v2/models/{}/infer", base, ROUTE_MODEL))
         .json(&json!({"input": 5}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 10);
-    assert!(body.get("shadowed").is_none(), "custom /infer must not shadow");
+    assert!(
+        body.get("shadowed").is_none(),
+        "custom /infer must not shadow"
+    );
 
     unload_model(&base, ROUTE_MODEL, "1").await;
 }
@@ -1605,7 +1737,9 @@ async fn test_custom_route_unknown_tail_404() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/no-such-route", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
     unload_model(&base, ROUTE_MODEL, "1").await;
@@ -1622,7 +1756,9 @@ async fn test_custom_route_wrong_method_405() {
     // /status is GET-only → POST must return 405 (not 404).
     let resp = client
         .post(format!("{}/v2/models/{}/status", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 405);
 
     unload_model(&base, ROUTE_MODEL, "1").await;
@@ -1640,15 +1776,25 @@ async fn test_custom_route_multi_version_isolation() {
     load_model(&base, ROUTE_MODEL, "2").await;
 
     let resp = client
-        .get(format!("{}/v2/models/{}/versions/1/status", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .get(format!(
+            "{}/v2/models/{}/versions/1/status",
+            base, ROUTE_MODEL
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["version"], "v1");
 
     let resp = client
-        .get(format!("{}/v2/models/{}/versions/2/status", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .get(format!(
+            "{}/v2/models/{}/versions/2/status",
+            base, ROUTE_MODEL
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["version"], "v2");
@@ -1669,12 +1815,17 @@ async fn test_custom_route_ctx_server_registry() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/models", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     let names: Vec<&str> = body["loaded"]
-        .as_array().expect("loaded must be an array")
-        .iter().filter_map(|m| m["name"].as_str()).collect();
+        .as_array()
+        .expect("loaded must be an array")
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .collect();
     assert!(names.contains(&ROUTE_MODEL), "loaded={:?}", names);
 
     unload_model(&base, ROUTE_MODEL, "1").await;
@@ -1692,9 +1843,14 @@ async fn test_custom_route_ctx_server_cross_model_infer() {
     load_model(&base, ROUTE_MODEL, "1").await;
 
     let resp = client
-        .post(format!("{}/v2/models/{}/call_test_model", base, ROUTE_MODEL))
+        .post(format!(
+            "{}/v2/models/{}/call_test_model",
+            base, ROUTE_MODEL
+        ))
         .json(&json!({}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["test_model_out"]["output"], 14);
@@ -1716,7 +1872,9 @@ async fn test_custom_route_ctx_server_self_infer_rejected() {
     let resp = client
         .post(format!("{}/v2/models/{}/call_self", base, ROUTE_MODEL))
         .json(&json!({}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 500);
 
     unload_model(&base, ROUTE_MODEL, "1").await;
@@ -1735,7 +1893,9 @@ async fn test_custom_route_streaming() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/ticks", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let ticks_status = resp.status();
     let ticks_headers = resp.headers().clone();
     let body = resp.text().await.unwrap();
@@ -1753,7 +1913,9 @@ async fn test_custom_route_streaming() {
 
     let resp = client
         .get(format!("{}/v2/models/{}/download", base, ROUTE_MODEL))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
@@ -1776,11 +1938,14 @@ async fn test_model_repository_index() {
 
     let resp = client
         .post(format!("{}/v2/repository/index", base))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     // Response can be array or object with models key
-    let models = body.as_array()
+    let models = body
+        .as_array()
         .or_else(|| body["models"].as_array())
         .expect("expected array or {models: [...]}");
     assert!(!models.is_empty(), "repository index should not be empty");
@@ -1881,10 +2046,14 @@ async fn test_http_response_compression() {
     let resp = client
         .get(format!("{}/health", base))
         .header("accept-encoding", "gzip")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
         Some("gzip"),
         "JSON response must be gzip-compressed"
     );
@@ -1896,10 +2065,22 @@ async fn test_http_response_compression() {
         .post(format!("{}/v2/models/{}/events", base, MODEL))
         .header("accept-encoding", "gzip")
         .json(&json!({"input": 3}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
-    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
-    assert!(content_type.contains("text/event-stream"), "expected SSE content-type, got: {}", content_type);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected SSE content-type, got: {}",
+        content_type
+    );
     assert!(
         resp.headers().get("content-encoding").is_none(),
         "SSE responses must not be compressed"
@@ -1914,16 +2095,27 @@ async fn test_http_response_compression() {
             _ => break,
         }
     }
-    assert!(body.contains("data:"), "SSE response should contain data frames: {}", body);
+    assert!(
+        body.contains("data:"),
+        "SSE response should contain data frames: {}",
+        body
+    );
 
     // 3. WS handshake and streaming are unaffected.
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/{}/stream", http_port, MODEL);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect failed");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect failed");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&json!({"input": 4})).unwrap(),
-    )).await.unwrap();
+    ))
+    .await
+    .unwrap();
     let msg = ws.next().await.expect("WS must yield a message").unwrap();
-    assert!(msg.is_text() || msg.is_binary(), "WS must deliver a data frame");
+    assert!(
+        msg.is_text() || msg.is_binary(),
+        "WS must deliver a data frame"
+    );
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
@@ -2004,17 +2196,16 @@ fn assert_socket_mode(path: &str, mode: u32) {
 #[tokio::test]
 #[serial]
 async fn test_grpc_uds_infer_health_default_mode() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port(); // parsed but unused for bind (UDS)
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
-    let tmp_dir =
-        std::env::temp_dir().join(format!("lite-server-grpc-uds-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-grpc-uds-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let sock = unique_uds_path("default");
     let _ = std::fs::remove_file(&sock);
@@ -2035,10 +2226,11 @@ async fn test_grpc_uds_infer_health_default_mode() {
     let channel = uds_grpc_channel(&sock).await;
 
     // Health: overall service "" → SERVING once the model is ready.
-    let mut health =
-        tonic_health::pb::health_client::HealthClient::new(channel.clone());
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel.clone());
     let hresp = health
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: String::new(),
+        })
         .await
         .expect("Health.check over UDS must succeed")
         .into_inner();
@@ -2057,8 +2249,8 @@ async fn test_grpc_uds_infer_health_default_mode() {
             data: br#"{"input":21}"#.to_vec().into(),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await
         .expect("Infer over UDS must succeed")
         .into_inner();
@@ -2107,10 +2299,11 @@ async fn test_grpc_uds_custom_socket_mode() {
     // Connecting + a Health round-trip proves the socket is live; no model is
     // loaded here, so the overall status is NOT_SERVING (we only require Ok).
     let channel = uds_grpc_channel(&sock).await;
-    let mut health =
-        tonic_health::pb::health_client::HealthClient::new(channel);
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
     health
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: String::new(),
+        })
         .await
         .expect("Health.check over UDS must succeed");
 
@@ -2130,9 +2323,9 @@ async fn test_grpc_uds_custom_socket_mode() {
 #[tokio::test]
 #[serial]
 async fn test_grpc_graceful_shutdown_drains_inflight() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
@@ -2170,8 +2363,8 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
                 data: br#"{"input":21}"#.to_vec().into(),
                 headers: HashMap::new(),
 
-            ..Default::default()
-})
+                ..Default::default()
+            })
             .await
     });
     sleep(Duration::from_millis(400)).await; // let predict start
@@ -2196,7 +2389,10 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
         let _ = child.kill();
         let _ = child.wait();
     }
-    assert!(exited, "server must self-exit after draining in-flight gRPC");
+    assert!(
+        exited,
+        "server must self-exit after draining in-flight gRPC"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2309,9 +2505,9 @@ async fn test_graceful_shutdown_aborts_inflight_after_timeout() {
 #[tokio::test]
 #[serial]
 async fn test_grpc_shutdown_rejects_new_rpcs() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
@@ -2349,8 +2545,8 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
                 data: br#"{"input":21}"#.to_vec().into(),
                 headers: HashMap::new(),
 
-            ..Default::default()
-})
+                ..Default::default()
+            })
             .await
     });
     sleep(Duration::from_millis(400)).await; // let predict start
@@ -2367,8 +2563,8 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
             data: br#"{"input":99}"#.to_vec().into(),
             headers: HashMap::new(),
 
-        ..Default::default()
-}),
+            ..Default::default()
+        }),
     )
     .await;
     if let Ok(Ok(_)) = infer2 {
@@ -2432,7 +2628,12 @@ async fn test_shutdown_health_goes_unavailable() {
 
     let client = reqwest::Client::new();
     assert_eq!(
-        client.get(format!("{}/readyz", base)).send().await.unwrap().status(),
+        client
+            .get(format!("{}/readyz", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
     );
 
@@ -2480,10 +2681,22 @@ async fn test_sse_streaming() {
     let resp = client
         .post(format!("{}/v2/models/{}/events", base, MODEL))
         .json(&json!({"input": 3}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
-    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
-    assert!(content_type.contains("text/event-stream"), "expected SSE content-type, got: {}", content_type);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected SSE content-type, got: {}",
+        content_type
+    );
 
     // Bound the drain: the SSE response must terminate (close the body) once
     // the worker sends [DONE]. If the server keeps the stream open (cleanup
@@ -2494,7 +2707,11 @@ async fn test_sse_streaming() {
         .expect("SSE response body did not close within 15s")
         .unwrap();
     // SSE format: "data: {...}\n\n"
-    assert!(body.contains("data:"), "SSE response should contain data frames: {}", body);
+    assert!(
+        body.contains("data:"),
+        "SSE response should contain data frames: {}",
+        body
+    );
 
     unload_model(&base, MODEL, "1").await;
 }
@@ -2539,10 +2756,7 @@ async fn test_http_sse_decoupled_pushes_chunks_then_done() {
         .unwrap();
 
     // Parse SSE lines: "data: <json>\n\n". Each chunk is a "data:" line.
-    let data_lines: Vec<&str> = body
-        .lines()
-        .filter(|l| l.starts_with("data: "))
-        .collect();
+    let data_lines: Vec<&str> = body.lines().filter(|l| l.starts_with("data: ")).collect();
     // 3 data chunks + [DONE] = 4 data lines
     assert_eq!(
         data_lines.len(),
@@ -2573,9 +2787,9 @@ async fn test_http_sse_decoupled_pushes_chunks_then_done() {
 #[tokio::test]
 #[serial]
 async fn test_websocket_streaming() {
-    use tokio_tungstenite::connect_async;
     use futures::SinkExt;
     use futures::StreamExt;
+    use tokio_tungstenite::connect_async;
 
     let base = shared_base().await;
 
@@ -2587,7 +2801,9 @@ async fn test_websocket_streaming() {
     // Send inference request as text (JSON)
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&json!({"input": 4})).unwrap(),
-    )).await.expect("WS send failed");
+    ))
+    .await
+    .expect("WS send failed");
 
     // Collect messages until done or timeout
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2595,24 +2811,22 @@ async fn test_websocket_streaming() {
 
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                match msg {
-                    tokio_tungstenite::tungstenite::Message::Text(text) => {
-                        let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-                        if body.get("done").is_some() || body.get("error").is_some() {
-                            got_response = true;
-                            break;
-                        }
-                        if body.get("output").is_some() {
-                            got_response = true;
-                        }
+            Ok(Some(Ok(msg))) => match msg {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    if body.get("done").is_some() || body.get("error").is_some() {
+                        got_response = true;
+                        break;
                     }
-                    tokio_tungstenite::tungstenite::Message::Binary(_) => {
+                    if body.get("output").is_some() {
                         got_response = true;
                     }
-                    _ => {}
                 }
-            }
+                tokio_tungstenite::tungstenite::Message::Binary(_) => {
+                    got_response = true;
+                }
+                _ => {}
+            },
             _ => break,
         }
     }
@@ -2628,9 +2842,9 @@ async fn test_websocket_streaming() {
 #[tokio::test]
 #[serial]
 async fn test_http_ws_decoupled_pushes_chunks_then_done() {
-    use tokio_tungstenite::connect_async;
     use futures::SinkExt;
     use futures::StreamExt;
+    use tokio_tungstenite::connect_async;
 
     let base = shared_base().await;
 
@@ -2651,9 +2865,7 @@ async fn test_http_ws_decoupled_pushes_chunks_then_done() {
 
     // Collect messages until the server closes the socket after Done.
     let mut msgs: Vec<String> = Vec::new();
-    while let Ok(Some(Ok(msg))) =
-        tokio::time::timeout(Duration::from_secs(10), ws.next()).await
-    {
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
         match msg {
             tokio_tungstenite::tungstenite::Message::Binary(b) => {
                 msgs.push(format!("bin:{}", String::from_utf8_lossy(&b)));
@@ -2676,7 +2888,10 @@ async fn test_http_ws_decoupled_pushes_chunks_then_done() {
         let v: Value = serde_json::from_str(json_str).expect("chunk data is JSON");
         assert_eq!(v["index"], i, "chunks must arrive in order");
     }
-    assert_eq!(msgs[3], "txt:{\"done\":true}", "terminal frame must be Done");
+    assert_eq!(
+        msgs[3], "txt:{\"done\":true}",
+        "terminal frame must be Done"
+    );
 
     unload_model(&base, DECOUPLED_MODEL, "1").await;
 }
@@ -2686,8 +2901,8 @@ async fn test_http_ws_decoupled_pushes_chunks_then_done() {
 #[tokio::test]
 #[serial]
 async fn test_ws_bidi_binary_forwarding() {
-    use futures::StreamExt;
     use futures::SinkExt;
+    use futures::StreamExt;
     use tokio_tungstenite::connect_async;
 
     let base = shared_base().await;
@@ -2699,13 +2914,21 @@ async fn test_ws_bidi_binary_forwarding() {
     // First frame: JSON payload (legacy).
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&json!({"input": 1})).unwrap(),
-    )).await.expect("WS send first frame failed");
+    ))
+    .await
+    .expect("WS send first frame failed");
 
     // Two additional Binary frames (bidi).
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![1, 2, 3]))
-        .await.expect("WS send binary 1 failed");
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![4, 5, 6]))
-        .await.expect("WS send binary 2 failed");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+        1, 2, 3,
+    ]))
+    .await
+    .expect("WS send binary 1 failed");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+        4, 5, 6,
+    ]))
+    .await
+    .expect("WS send binary 2 failed");
 
     // Collect messages until done/error or timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2724,7 +2947,10 @@ async fn test_ws_bidi_binary_forwarding() {
             _ => break,
         }
     }
-    assert!(got_terminal, "WS bidi: expected terminal frame after binary chunks");
+    assert!(
+        got_terminal,
+        "WS bidi: expected terminal frame after binary chunks"
+    );
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
@@ -2735,8 +2961,8 @@ async fn test_ws_bidi_binary_forwarding() {
 #[tokio::test]
 #[serial]
 async fn test_ws_bidi_app_level_close() {
-    use futures::StreamExt;
     use futures::SinkExt;
+    use futures::StreamExt;
     use tokio_tungstenite::connect_async;
 
     let base = shared_base().await;
@@ -2748,12 +2974,16 @@ async fn test_ws_bidi_app_level_close() {
     // First frame: JSON payload.
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&json!({"input": 2})).unwrap(),
-    )).await.expect("WS send first frame failed");
+    ))
+    .await
+    .expect("WS send first frame failed");
 
     // App-level close frame.
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"type":"close"}"#.to_string(),
-    )).await.expect("WS send close frame failed");
+    ))
+    .await
+    .expect("WS send close frame failed");
 
     // Collect messages until done/error or timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2772,7 +3002,10 @@ async fn test_ws_bidi_app_level_close() {
             _ => break,
         }
     }
-    assert!(got_terminal, "WS bidi close: expected terminal frame after app-level close");
+    assert!(
+        got_terminal,
+        "WS bidi close: expected terminal frame after app-level close"
+    );
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
@@ -2784,8 +3017,8 @@ async fn test_ws_bidi_app_level_close() {
 #[tokio::test]
 #[serial]
 async fn test_ws_bidi_unknown_control_frame() {
-    use futures::StreamExt;
     use futures::SinkExt;
+    use futures::StreamExt;
     use tokio_tungstenite::connect_async;
 
     let base = shared_base().await;
@@ -2797,12 +3030,16 @@ async fn test_ws_bidi_unknown_control_frame() {
     // First frame: JSON payload.
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&json!({"input": 3})).unwrap(),
-    )).await.expect("WS send first frame failed");
+    ))
+    .await
+    .expect("WS send first frame failed");
 
     // Unknown control frame.
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"type":"unknown_cmd"}"#.to_string(),
-    )).await.expect("WS send unknown frame failed");
+    ))
+    .await
+    .expect("WS send unknown frame failed");
 
     // Collect until error or timeout.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2821,7 +3058,10 @@ async fn test_ws_bidi_unknown_control_frame() {
             _ => break,
         }
     }
-    assert!(got_error, "WS bidi: expected error frame after unknown control frame");
+    assert!(
+        got_error,
+        "WS bidi: expected error frame after unknown control frame"
+    );
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
@@ -2896,7 +3136,10 @@ async fn test_ws_first_frame_text_invalid_json_rejected() {
     let base = shared_base().await;
     load_model(&base, "ws_probe_model", "1").await;
 
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/stream",
+        SHARED_PORT
+    );
     let mut ws = ws_connect_with_ct(&ws_url, None).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         "this is not json".to_string(),
@@ -2939,7 +3182,10 @@ async fn test_ws_first_frame_binary_missing_ct_injected() {
     let base = shared_base().await;
     load_model(&base, "ws_probe_model", "1").await;
 
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/stream",
+        SHARED_PORT
+    );
     let v = ws_binary_first_frame_probe(&ws_url, None).await;
     assert_eq!(v["kind"], "bytes", "Binary first frame must dispatch raw");
     assert_eq!(v["len"], 3, "all 3 bytes must arrive");
@@ -2959,7 +3205,10 @@ async fn test_ws_first_frame_binary_non_json_ct_preserved() {
     let base = shared_base().await;
     load_model(&base, "ws_probe_model", "1").await;
 
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/stream",
+        SHARED_PORT
+    );
     let v = ws_binary_first_frame_probe(&ws_url, Some("image/png")).await;
     assert_eq!(v["kind"], "bytes");
     assert_eq!(
@@ -2979,7 +3228,10 @@ async fn test_ws_first_frame_binary_json_ct_rewritten() {
     let base = shared_base().await;
     load_model(&base, "ws_probe_model", "1").await;
 
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/stream",
+        SHARED_PORT
+    );
     // Binary frame carrying non-UTF8 bytes + a JSON upgrade CT: 0.8.2 lossy-
     // decoded and rejected it; now the frame type wins and it stays raw.
     let v = ws_binary_first_frame_probe(&ws_url, Some("application/json")).await;
@@ -3005,7 +3257,10 @@ async fn test_ws_decoupled_first_frame_binary_missing_ct_injected() {
         SHARED_PORT
     );
     let v = ws_binary_first_frame_probe(&ws_url, None).await;
-    assert_eq!(v["kind"], "bytes", "decoupled: Binary first frame must dispatch raw");
+    assert_eq!(
+        v["kind"], "bytes",
+        "decoupled: Binary first frame must dispatch raw"
+    );
     assert_eq!(v["len"], 3);
     assert_eq!(v["ct"], "application/octet-stream");
 
@@ -3043,11 +3298,15 @@ async fn test_metrics_endpoint() {
     kill_stale_on_port(metrics_port);
     let repo = test_model_repo();
     let server = start_server(&[
-        "--port", &port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
 
     wait_for_server(port, 15).await;
@@ -3059,7 +3318,9 @@ async fn test_metrics_endpoint() {
 
     let resp = client
         .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("liteserver"), "metrics body: {}", body);
@@ -3088,10 +3349,14 @@ async fn test_error_response_format() {
     assert_eq!(resp.status(), 404);
 
     // Verify response headers
-    assert!(resp.headers().get("x-request-id").is_some(),
-        "x-request-id must be present on error responses");
-    assert!(resp.headers().get("x-processing-time-ms").is_some(),
-        "x-processing-time-ms must be present on error responses");
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present on error responses"
+    );
+    assert!(
+        resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on error responses"
+    );
 
     // Verify error body: type, message, code, param
     let body: Value = resp.json().await.unwrap();
@@ -3100,8 +3365,11 @@ async fn test_error_response_format() {
     assert_eq!(err["type"], "not_found_error");
     assert!(!err["message"].as_str().unwrap().is_empty());
     assert_eq!(err["code"], "model_not_found");
-    assert!(err["param"].is_null(),
-        "param should be null but was {}", err["param"]);
+    assert!(
+        err["param"].is_null(),
+        "param should be null but was {}",
+        err["param"]
+    );
 }
 
 #[tokio::test]
@@ -3110,21 +3378,29 @@ async fn test_observability_headers_on_success() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .get(format!("{}/health", base))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
 
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("x-request-id").is_some(),
-        "x-request-id must be present on success responses");
-    assert!(resp.headers().get("x-processing-time-ms").is_some(),
-        "x-processing-time-ms must be present on success responses");
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present on success responses"
+    );
+    assert!(
+        resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on success responses"
+    );
     // x-processing-time-ms should be a non-negative integer
-    let ms = resp.headers().get("x-processing-time-ms").unwrap().to_str().unwrap();
-    assert!(ms.parse::<u64>().is_ok(),
-        "x-processing-time-ms should be a u64, got: {}", ms);
+    let ms = resp
+        .headers()
+        .get("x-processing-time-ms")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ms.parse::<u64>().is_ok(),
+        "x-processing-time-ms should be a u64, got: {}",
+        ms
+    );
 }
 
 #[tokio::test]
@@ -3143,7 +3419,11 @@ async fn test_x_client_request_id_propagation() {
 
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-request-id").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         trace_id,
         "x-request-id should echo x-client-request-id"
     );
@@ -3168,10 +3448,14 @@ async fn test_infer_error_response_has_code_and_param() {
         .unwrap();
 
     assert_eq!(resp.status(), 400);
-    assert!(resp.headers().get("x-request-id").is_some(),
-        "x-request-id must be present");
-    assert!(resp.headers().get("x-processing-time-ms").is_some(),
-        "x-processing-time-ms must be present");
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present"
+    );
+    assert!(
+        resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present"
+    );
 
     let body: Value = resp.json().await.unwrap();
     let err = &body["error"];
@@ -3484,7 +3768,11 @@ async fn test_infer_cors_success_and_rate_limit_error() {
         .get("retry-after")
         .expect("429 must carry Retry-After");
     let secs: u64 = retry.to_str().unwrap().parse().unwrap();
-    assert!((1..=60).contains(&secs), "Retry-After {} out of range", secs);
+    assert!(
+        (1..=60).contains(&secs),
+        "Retry-After {} out of range",
+        secs
+    );
     assert_eq!(
         resp.headers()
             .get("access-control-allow-origin")
@@ -3520,7 +3808,8 @@ class TestAPI(LitAPI):
         return output
 "#;
 
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-hotreload-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-hotreload-{}", std::process::id()));
     let repo_src = test_model_repo().clone();
     let repo_dst = tmp_dir.join("model_repo");
 
@@ -3537,11 +3826,14 @@ class TestAPI(LitAPI):
     let port = next_test_port();
     kill_stale_on_port(port);
     let server = start_server(&[
-        "--port", &port.to_string(),
-        "--model-repo", &repo_dst.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &repo_dst.to_string_lossy(),
         "--no-metrics",
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
 
     wait_for_server(port, 15).await;
@@ -3553,7 +3845,9 @@ class TestAPI(LitAPI):
     let resp = client
         .post(format!("{}/v2/models/test_model/infer", base))
         .json(&json!({"input": 5}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 10);
@@ -3569,7 +3863,9 @@ class TestAPI(LitAPI):
         let resp = client
             .post(format!("{}/v2/models/test_model/infer", base))
             .json(&json!({"input": 5}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         if resp.status() == 200 {
             let body: Value = resp.json().await.unwrap();
             if body["output"] == 15 {
@@ -3579,7 +3875,10 @@ class TestAPI(LitAPI):
         }
         sleep(Duration::from_millis(500)).await;
     }
-    assert!(reloaded, "hot reload did not pick up model change within 30s");
+    assert!(
+        reloaded,
+        "hot reload did not pick up model change within 30s"
+    );
 
     stop_server(server);
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -3646,11 +3945,14 @@ class TestAPI(LitAPI):
     let port = next_test_port();
     kill_stale_on_port(port);
     let server = start_server(&[
-        "--port", &port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &tmp_dir.to_string_lossy(),
         "--no-metrics",
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
 
     wait_for_server(port, 15).await;
@@ -3661,14 +3963,18 @@ class TestAPI(LitAPI):
     let resp = client
         .post(format!("{}/v2/models/test_model/infer", base))
         .json(&json!({"input": 5}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 10);
     let boot_before = body["boot"].as_str().unwrap().to_string();
 
     // Change only the data file — the hook must pick it up in-process.
-    tokio::fs::write(version_dir.join("mult.txt"), "3\n").await.unwrap();
+    tokio::fs::write(version_dir.join("mult.txt"), "3\n")
+        .await
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut refreshed = false;
@@ -3676,7 +3982,9 @@ class TestAPI(LitAPI):
         let resp = client
             .post(format!("{}/v2/models/test_model/infer", base))
             .json(&json!({"input": 5}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         if resp.status() == 200 {
             let body: Value = resp.json().await.unwrap();
             if body["output"] == 15 {
@@ -3692,7 +4000,10 @@ class TestAPI(LitAPI):
         }
         sleep(Duration::from_millis(500)).await;
     }
-    assert!(refreshed, "on_file_changed hook did not pick up mult.txt change within 30s");
+    assert!(
+        refreshed,
+        "on_file_changed hook did not pick up mult.txt change within 30s"
+    );
 
     stop_server(server);
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -3726,11 +4037,16 @@ class ReloadAPI(LitAPI):
         return output
 "#;
 
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-reloadver-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-reloadver-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    let base_cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
+    let base_cfg =
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
     for (v, cfg) in [
-        ("1", format!("{}workers_per_device: 2\nmax_requests: 1\n", base_cfg)),
+        (
+            "1",
+            format!("{}workers_per_device: 2\nmax_requests: 1\n", base_cfg),
+        ),
         ("2", format!("{}workers_per_device: 1\n", base_cfg)),
     ] {
         let dir = tmp_dir.join("reload_model").join(v);
@@ -3744,11 +4060,15 @@ class ReloadAPI(LitAPI):
     kill_stale_on_port(port);
     kill_stale_on_port(metrics_port);
     let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &tmp_dir.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
@@ -3756,10 +4076,18 @@ class ReloadAPI(LitAPI):
 
     // /health (§4.5): per-version entries nested under their model.
     let health_entry = |body: &Value, v: &str| {
-        body["models"].as_array().unwrap().iter()
+        body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find(|m| m["name"] == "reload_model")
-            .and_then(|m| m["versions"].as_array().unwrap().iter()
-                .find(|e| e["version"] == v))
+            .and_then(|m| {
+                m["versions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["version"] == v)
+            })
             .cloned()
     };
     let get_health = || async {
@@ -3781,7 +4109,9 @@ class ReloadAPI(LitAPI):
     let get_metrics = || async {
         let resp = client
             .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         resp.text().await.unwrap()
     };
 
@@ -3806,22 +4136,37 @@ class ReloadAPI(LitAPI):
     let v2_loaded_at = v2["loaded_at"].clone();
     // L3: without this presence check a missing loaded_at would make the
     // poll-loop equality below pass vacuously (Null == Null).
-    assert!(v2_loaded_at.as_u64().is_some(), "v2 loaded_at: {:?}", v2_loaded_at);
+    assert!(
+        v2_loaded_at.as_u64().is_some(),
+        "v2 loaded_at: {:?}",
+        v2_loaded_at
+    );
     let body = get_health().await;
     let v1_loaded_at = health_entry(&body, "1").expect("v1 loaded")["loaded_at"].clone();
-    assert!(v1_loaded_at.as_u64().is_some(), "v1 loaded_at: {:?}", v1_loaded_at);
+    assert!(
+        v1_loaded_at.as_u64().is_some(),
+        "v1 loaded_at: {:?}",
+        v1_loaded_at
+    );
 
     // Make v2 the active version.
     let resp = client
-        .post(format!("{}/v2/models/reload_model/versions/2/activate", base))
-        .send().await.unwrap();
+        .post(format!(
+            "{}/v2/models/reload_model/versions/2/activate",
+            base
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Hit v1's per-worker max_requests via the versioned path.
     let resp = client
         .post(format!("{}/v2/models/reload_model/versions/1/infer", base))
         .json(&json!({"input": 21}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Poll: exactly one rolling recycle for v1 (one worker only — its
@@ -3832,9 +4177,17 @@ class ReloadAPI(LitAPI):
     while tokio::time::Instant::now() < deadline {
         let body = get_health().await;
         let v2 = health_entry(&body, "2").expect("v2 must stay registered");
-        assert_eq!(v2["status"], "ready", "active v2 must be untouched: {:?}", v2);
-        assert_eq!(v2["loaded_at"], v2_loaded_at, "active v2 must not be reloaded");
-        let v1 = health_entry(&body, "1").expect("v1 must stay registered — rolling recycle is not an unload");
+        assert_eq!(
+            v2["status"], "ready",
+            "active v2 must be untouched: {:?}",
+            v2
+        );
+        assert_eq!(
+            v2["loaded_at"], v2_loaded_at,
+            "active v2 must not be reloaded"
+        );
+        let v1 = health_entry(&body, "1")
+            .expect("v1 must stay registered — rolling recycle is not an unload");
         assert_eq!(v1["loaded_at"], v1_loaded_at, "v1 must not be reloaded");
         let m = get_metrics().await;
         assert_eq!(rolling_recycles(&m, "2"), 0.0, "v2 must not recycle");
@@ -3844,7 +4197,10 @@ class ReloadAPI(LitAPI):
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(recycled, "v1 did not roll a worker within 60s of hitting max_requests");
+    assert!(
+        recycled,
+        "v1 did not roll a worker within 60s of hitting max_requests"
+    );
 
     // Exactly one slot recycled, and v1 returns to ready.
     let m = get_metrics().await;
@@ -3868,9 +4224,14 @@ class ReloadAPI(LitAPI):
     // The recycled standby version must not steal the active pointer (§4.3).
     let resp = client
         .get(format!("{}/v2/models/reload_model/versions", base))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["active_version"], "2", "active must stay v2 after v1 recycle");
+    assert_eq!(
+        body["active_version"], "2",
+        "active must stay v2 after v1 recycle"
+    );
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
@@ -3913,11 +4274,15 @@ class RollingAPI(LitAPI):
     kill_stale_on_port(port);
     kill_stale_on_port(metrics_port);
     let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &tmp_dir.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
@@ -3930,8 +4295,14 @@ class RollingAPI(LitAPI):
         let resp = client
             .post(format!("{}/v2/models/rolling_model/infer", base))
             .json(&json!({"input": i}))
-            .send().await.unwrap();
-        assert_eq!(resp.status(), 200, "request {i} must be served during recycle");
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i} must be served during recycle"
+        );
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["output"], json!(i * 2));
     }
@@ -3942,7 +4313,9 @@ class RollingAPI(LitAPI):
     while tokio::time::Instant::now() < deadline {
         let resp = client
             .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         let body = resp.text().await.unwrap();
         let count = body.lines()
             .find(|l| l.starts_with(
@@ -3957,7 +4330,10 @@ class RollingAPI(LitAPI):
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(recycled, "at least one worker must be recycled during the burst");
+    assert!(
+        recycled,
+        "at least one worker must be recycled during the burst"
+    );
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
@@ -4005,11 +4381,15 @@ class ReadyAPI(LitAPI):
     kill_stale_on_port(port);
     kill_stale_on_port(metrics_port);
     let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &tmp_dir.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(port, 60).await;
     let base = format!("http://127.0.0.1:{}", port);
@@ -4023,7 +4403,9 @@ class ReadyAPI(LitAPI):
         let resp = client
             .post(format!("{}/v2/models/ready_model/infer", base))
             .json(&json!({"input": i}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             resp.status(),
             200,
@@ -4039,7 +4421,9 @@ class ReadyAPI(LitAPI):
     while tokio::time::Instant::now() < deadline {
         let resp = client
             .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         let body = resp.text().await.unwrap();
         let count = body.lines()
             .find(|l| l.starts_with(
@@ -4131,13 +4515,20 @@ class ReplayAPI(LitAPI):
     // worker 0 is found by pgrep below, and a stale match would be killed
     // instead of the real one.
     let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "lite_server.worker.inference --model-name replay_model"])
+        .args([
+            "-9",
+            "-f",
+            "lite_server.worker.inference --model-name replay_model",
+        ])
         .status();
     let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &tmp_dir.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     // 60s: dedicated-server startup is the suite's bottleneck under full
     // parallel load (30s proved flaky there).
@@ -4180,7 +4571,9 @@ class ReplayAPI(LitAPI):
 
     // 1. Occupy the serial respawn listener: blocker_model crosses its
     //    budget and its replacement takes ~8s to start.
-    let status = infer("blocker_model", false).await.expect("blocker answered");
+    let status = infer("blocker_model", false)
+        .await
+        .expect("blocker answered");
     assert_eq!(status, 200);
 
     // 2. replay_model slot 0 crosses its budget; its recycle signal queues
@@ -4281,11 +4674,19 @@ class LruAPI(LitAPI):
     let client = reqwest::Client::new();
 
     let health_versions = |body: &Value| -> Vec<String> {
-        body["models"].as_array().unwrap().iter()
+        body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
             .filter(|m| m["name"] == "lru_model")
-            .flat_map(|m| m["versions"].as_array().unwrap().iter()
-                .map(|e| e["version"].as_str().unwrap().to_string())
-                .collect::<Vec<_>>())
+            .flat_map(|m| {
+                m["versions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["version"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
             .collect()
     };
 
@@ -4302,14 +4703,20 @@ class LruAPI(LitAPI):
     let body: Value = resp.json().await.unwrap();
     let mut versions = health_versions(&body);
     versions.sort();
-    assert_eq!(versions, vec!["1".to_string(), "3".to_string()],
-        "v2 must be evicted, active v1 and new v3 remain: {:?}", body["models"]);
+    assert_eq!(
+        versions,
+        vec!["1".to_string(), "3".to_string()],
+        "v2 must be evicted, active v1 and new v3 remain: {:?}",
+        body["models"]
+    );
 
     // Active v1 still serves.
     let resp = client
         .post(format!("{}/v2/models/lru_model/infer", base))
         .json(&json!({"input": 21}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 42);
@@ -4348,7 +4755,12 @@ fn write_poll_model_version(repo: &std::path::Path, version: &str) {
     std::fs::write(dir.join("config.yaml"), POLL_MODEL_CFG).unwrap();
 }
 
-fn write_auto_poll_server_yaml(tmp_dir: &std::path::Path, port: u16, grpc_port: u16, metrics_port: u16) -> std::path::PathBuf {
+fn write_auto_poll_server_yaml(
+    tmp_dir: &std::path::Path,
+    port: u16,
+    grpc_port: u16,
+    metrics_port: u16,
+) -> std::path::PathBuf {
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
         &server_yaml,
@@ -4399,11 +4811,19 @@ fn write_auto_poll_strategy_yaml(
 
 /// Versions of poll_model listed in a /health response body.
 fn poll_model_versions(body: &Value) -> Vec<String> {
-    body["models"].as_array().unwrap().iter()
+    body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
         .filter(|m| m["name"] == "poll_model")
-        .flat_map(|m| m["versions"].as_array().unwrap().iter()
-            .map(|e| e["version"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>())
+        .flat_map(|m| {
+            m["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["version"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -4411,7 +4831,8 @@ fn poll_model_versions(body: &Value) -> Vec<String> {
 /// discovered by the poller and loaded without any API call.
 #[tokio::test]
 async fn test_auto_poll_discovers_new_version() {
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-disc-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-autopoll-disc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     write_poll_model_version(&tmp_dir, "1");
 
@@ -4453,7 +4874,10 @@ async fn test_auto_poll_discovers_new_version() {
 /// the poller (declarative semantics — disk state is the source of truth).
 #[tokio::test]
 async fn test_auto_poll_unloads_removed_version() {
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-unload-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-autopoll-unload-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     write_poll_model_version(&tmp_dir, "1");
     write_poll_model_version(&tmp_dir, "2");
@@ -4506,7 +4930,10 @@ async fn test_auto_poll_unloads_removed_version() {
 /// target set is the single latest version).
 #[tokio::test]
 async fn test_auto_poll_latest_unloads_superseded_version() {
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-latest-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-autopoll-latest-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     write_poll_model_version(&tmp_dir, "1");
 
@@ -4551,12 +4978,14 @@ async fn test_auto_poll_latest_unloads_superseded_version() {
 /// in versions_to_load must NOT be loaded, no matter how many poll ticks pass.
 #[tokio::test]
 async fn test_auto_poll_explicit_ignores_unlisted_version() {
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-expl-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-autopoll-expl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     write_poll_model_version(&tmp_dir, "1");
 
     let port = next_test_port();
-    let server_yaml = write_auto_poll_strategy_yaml(&tmp_dir, port, 18117, 18118, "explicit", &["1"]);
+    let server_yaml =
+        write_auto_poll_strategy_yaml(&tmp_dir, port, 18117, 18118, "explicit", &["1"]);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(port, 60).await;
@@ -4595,7 +5024,9 @@ async fn test_auto_poll_explicit_ignores_unlisted_version() {
 /// Two versions of canary_model — v1 computes x*2, v2 computes x*3, so
 /// responses identify the serving version (§4.3 weights / §4.4 canary pin).
 fn write_canary_model_repo(tmp_dir: &std::path::Path) {
-    let model_py = |factor: i32| format!(r#"from lite_server import LitAPI
+    let model_py = |factor: i32| {
+        format!(
+            r#"from lite_server import LitAPI
 
 
 class CanaryAPI(LitAPI):
@@ -4610,7 +5041,10 @@ class CanaryAPI(LitAPI):
 
     def encode_response(self, output):
         return output
-"#, factor);
+"#,
+            factor
+        )
+    };
 
     let _ = std::fs::remove_dir_all(tmp_dir);
     let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
@@ -4632,7 +5066,8 @@ async fn test_weighted_routing_canary() {
 
     let port = next_test_port();
     kill_stale_on_port(port);
-    let cfg_dir = std::env::temp_dir().join(format!("lite-server-canary-cfg-{}", std::process::id()));
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let server_yaml = cfg_dir.join("server.yaml");
     std::fs::write(
@@ -4655,8 +5090,10 @@ async fn test_weighted_routing_canary() {
     let infer_output = |headers: &[(&str, &str)]| {
         let base = base.clone();
         let client = client.clone();
-        let headers: Vec<(String, String)> =
-            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         async move {
             let mut req = client
                 .post(format!("{}/v2/models/canary_model/infer", base))
@@ -4666,7 +5103,9 @@ async fn test_weighted_routing_canary() {
             }
             let resp = req.send().await.unwrap();
             assert_eq!(resp.status(), 200);
-            resp.json::<Value>().await.unwrap()["output"].as_i64().unwrap()
+            resp.json::<Value>().await.unwrap()["output"]
+                .as_i64()
+                .unwrap()
         }
     };
     let put_weights = |body: &str| {
@@ -4678,7 +5117,9 @@ async fn test_weighted_routing_canary() {
                 .put(format!("{}/v2/models/canary_model/routing", base))
                 .header("content-type", "application/json")
                 .body(body)
-                .send().await.unwrap();
+                .send()
+                .await
+                .unwrap();
             assert_eq!(resp.status(), 200);
         }
     };
@@ -4697,7 +5138,11 @@ async fn test_weighted_routing_canary() {
             v2_count += 1;
         }
     }
-    assert!((2..=25).contains(&v2_count), "v2 served {} / 100, expected ~10", v2_count);
+    assert!(
+        (2..=25).contains(&v2_count),
+        "v2 served {} / 100, expected ~10",
+        v2_count
+    );
 
     // Header pin beats weights: 0/100 with x-lite-version: 1 → v1.
     put_weights(r#"{"weights":{"2":100}}"#).await;
@@ -4710,11 +5155,20 @@ async fn test_weighted_routing_canary() {
 
     // activate(v1) is a hard cutover: weights become 100/0.
     let resp = client
-        .post(format!("{}/v2/models/canary_model/versions/1/activate", base))
-        .send().await.unwrap();
+        .post(format!(
+            "{}/v2/models/canary_model/versions/1/activate",
+            base
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     for _ in 0..20 {
-        assert_eq!(infer_output(&[]).await, 2, "activate must hard-switch to v1");
+        assert_eq!(
+            infer_output(&[]).await,
+            2,
+            "activate must hard-switch to v1"
+        );
     }
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -4723,7 +5177,9 @@ async fn test_weighted_routing_canary() {
 /// Streaming variant of the canary fixture — v1 yields token "one", v2 yields
 /// token "two", so the first SSE frame identifies the serving version.
 fn write_canary_stream_model_repo(tmp_dir: &std::path::Path) {
-    let model_py = |token: &str| format!(r#"from lite_server import LitAPI
+    let model_py = |token: &str| {
+        format!(
+            r#"from lite_server import LitAPI
 
 
 class CanaryStreamAPI(LitAPI):
@@ -4735,7 +5191,10 @@ class CanaryStreamAPI(LitAPI):
 
     async def stream_predict(self, request, ctx):
         yield {{"token": "{token}"}}
-"#, token = token);
+"#,
+            token = token
+        )
+    };
 
     let _ = std::fs::remove_dir_all(tmp_dir);
     let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
@@ -4753,8 +5212,8 @@ class CanaryStreamAPI(LitAPI):
 /// the SSE gap (weighted split + pin + versioned-path skip).
 #[tokio::test]
 async fn test_weighted_routing_canary_sse() {
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-canary-sse-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-sse-{}", std::process::id()));
     write_canary_stream_model_repo(&tmp_dir);
 
     let port = next_test_port();
@@ -4785,8 +5244,10 @@ async fn test_weighted_routing_canary_sse() {
     let sse_version = |headers: &[(&str, &str)]| {
         let base = base.clone();
         let client = client.clone();
-        let headers: Vec<(String, String)> =
-            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         async move {
             let mut req = client
                 .post(format!("{}/v2/models/canary_stream_model/events", base))
@@ -4856,7 +5317,9 @@ async fn test_weighted_routing_canary_sse() {
 
     // Versioned URL skips pin and weights: /versions/1/events under 0/100.
     let resp = client
-        .post(format!("{base}/v2/models/canary_stream_model/versions/1/events"))
+        .post(format!(
+            "{base}/v2/models/canary_stream_model/versions/1/events"
+        ))
         .json(&json!({"input": 1}))
         .send()
         .await
@@ -4877,7 +5340,9 @@ async fn test_weighted_routing_canary_sse() {
 /// Bidi variant of the canary fixture — v1's `on_chunk` returns token "one",
 /// v2 returns token "two", so the echo frame identifies the serving version.
 fn write_canary_bidi_model_repo(tmp_dir: &std::path::Path) {
-    let model_py = |token: &str| format!(r#"from lite_server import LitAPI
+    let model_py = |token: &str| {
+        format!(
+            r#"from lite_server import LitAPI
 
 
 class BidiHandler:
@@ -4906,7 +5371,10 @@ class CanaryBidiAPI(LitAPI):
 
     def bidi_stream(self):
         return BidiHandler()
-"#, token = token);
+"#,
+            token = token
+        )
+    };
 
     let _ = std::fs::remove_dir_all(tmp_dir);
     let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
@@ -4933,8 +5401,10 @@ async fn test_weighted_routing_canary_h2_bidi() {
 
     let port = next_test_port();
     kill_stale_on_port(port);
-    let cfg_dir =
-        std::env::temp_dir().join(format!("lite-server-canary-bidi-cfg-{}", std::process::id()));
+    let cfg_dir = std::env::temp_dir().join(format!(
+        "lite-server-canary-bidi-cfg-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let server_yaml = cfg_dir.join("server.yaml");
     std::fs::write(
@@ -4963,12 +5433,13 @@ async fn test_weighted_routing_canary_h2_bidi() {
     let bidi_version = |path: String, headers: &[(&str, &str)]| {
         let base = base.clone();
         let client = client.clone();
-        let headers: Vec<(String, String)> =
-            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         async move {
             async fn read_frame(
-                stream: &mut (impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-                              + Unpin),
+                stream: &mut (impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin),
                 buf: &mut bytes::BytesMut,
             ) -> pb::BidiChunk {
                 use futures::StreamExt;
@@ -4988,9 +5459,8 @@ async fn test_weighted_routing_canary_h2_bidi() {
             let (body_tx, body_rx) =
                 tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
             let body_rx = std::sync::Arc::new(std::sync::Mutex::new(body_rx));
-            let body_stream = futures::stream::poll_fn(move |cx| {
-                body_rx.lock().unwrap().poll_recv(cx)
-            });
+            let body_stream =
+                futures::stream::poll_fn(move |cx| body_rx.lock().unwrap().poll_recv(cx));
             // Full-duplex bootstrap: the server awaits the first LPM frame
             // before committing the 200 — queue BidiOpen up front.
             body_tx
@@ -5086,7 +5556,11 @@ async fn test_weighted_routing_canary_h2_bidi() {
     // 100/0: all traffic to v1.
     put_weights(r#"{"weights":{"1":100,"2":0}}"#).await;
     for _ in 0..20 {
-        assert_eq!(bidi_version(bare.clone(), &[]).await, 1, "100/0 must serve only v1");
+        assert_eq!(
+            bidi_version(bare.clone(), &[]).await,
+            1,
+            "100/0 must serve only v1"
+        );
     }
 
     // 90/10: roughly proportional split (n=100, expect ~10 v2, wide bounds).
@@ -5105,7 +5579,11 @@ async fn test_weighted_routing_canary_h2_bidi() {
 
     // Header pin beats weights: 0/100 with x-lite-version: 1 → v1.
     put_weights(r#"{"weights":{"2":100}}"#).await;
-    assert_eq!(bidi_version(bare.clone(), &[]).await, 2, "100% v2 after zeroing v1");
+    assert_eq!(
+        bidi_version(bare.clone(), &[]).await,
+        2,
+        "100% v2 after zeroing v1"
+    );
     assert_eq!(
         bidi_version(bare.clone(), &[("x-lite-version", "1")]).await,
         1,
@@ -5114,7 +5592,11 @@ async fn test_weighted_routing_canary_h2_bidi() {
 
     // Versioned URL skips pin and weights: /versions/1/bidi under 0/100.
     assert_eq!(
-        bidi_version("/v2/models/canary_bidi_model/versions/1/bidi".to_string(), &[]).await,
+        bidi_version(
+            "/v2/models/canary_bidi_model/versions/1/bidi".to_string(),
+            &[]
+        )
+        .await,
         1,
         "versioned path must serve the explicit v1"
     );
@@ -5143,10 +5625,11 @@ async fn test_grpc_canary_pin_parity() {
                 .map(|p| HashMap::from([("x-lite-version".to_string(), p.to_string())]))
                 .unwrap_or_default(),
 
-        ..Default::default()
-});
+            ..Default::default()
+        });
         if let Some(p) = pin_metadata {
-            req.metadata_mut().insert("x-lite-version", p.parse().unwrap());
+            req.metadata_mut()
+                .insert("x-lite-version", p.parse().unwrap());
         }
         let resp = infer.infer(req).await?.into_inner();
         let body: Value = serde_json::from_slice(&resp.data).unwrap();
@@ -5157,9 +5640,13 @@ async fn test_grpc_canary_pin_parity() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-grpc-canary-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-canary-{}", std::process::id()));
     write_canary_model_repo(&tmp_dir);
-    let cfg_dir = std::env::temp_dir().join(format!("lite-server-grpc-canary-cfg-{}", std::process::id()));
+    let cfg_dir = std::env::temp_dir().join(format!(
+        "lite-server-grpc-canary-cfg-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let server_yaml = cfg_dir.join("server.yaml");
     std::fs::write(
@@ -5183,34 +5670,57 @@ async fn test_grpc_canary_pin_parity() {
         .put(format!("{}/v2/models/canary_model/routing", base))
         .header("content-type", "application/json")
         .body(r#"{"weights":{"2":100}}"#)
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
-        .unwrap()
-        .connect()
+        .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
     let mut infer = LiteServerClient::new(channel);
 
     // metadata pin → v1 despite 0/100 weights.
-    assert_eq!(grpc_infer(&mut infer, Some("1"), None).await.unwrap(), 2,
-        "metadata pin must route to v1");
+    assert_eq!(
+        grpc_infer(&mut infer, Some("1"), None).await.unwrap(),
+        2,
+        "metadata pin must route to v1"
+    );
     // proto headers map fallback → v1.
-    assert_eq!(grpc_infer(&mut infer, None, Some("1")).await.unwrap(), 2,
-        "proto headers map pin must route to v1");
+    assert_eq!(
+        grpc_infer(&mut infer, None, Some("1")).await.unwrap(),
+        2,
+        "proto headers map pin must route to v1"
+    );
     // metadata beats proto headers when both are present.
-    assert_eq!(grpc_infer(&mut infer, Some("1"), Some("2")).await.unwrap(), 2,
-        "metadata pin must win over proto headers pin");
+    assert_eq!(
+        grpc_infer(&mut infer, Some("1"), Some("2")).await.unwrap(),
+        2,
+        "metadata pin must win over proto headers pin"
+    );
     // no pin → weighted routing (v2).
-    assert_eq!(grpc_infer(&mut infer, None, None).await.unwrap(), 3,
-        "no pin → weights route to v2");
+    assert_eq!(
+        grpc_infer(&mut infer, None, None).await.unwrap(),
+        3,
+        "no pin → weights route to v2"
+    );
     // pin to an unregistered version → NotFound.
     let err = grpc_infer(&mut infer, Some("9"), None).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::NotFound, "unknown pin version → NotFound");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "unknown pin version → NotFound"
+    );
     // invalid pin → InvalidArgument.
     let err = grpc_infer(&mut infer, Some("a b"), None).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument, "invalid pin → InvalidArgument");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "invalid pin → InvalidArgument"
+    );
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
@@ -5221,9 +5731,11 @@ async fn test_grpc_canary_pin_parity() {
 async fn test_canary_override_default_off_ignores_pin() {
     let port = next_test_port();
     kill_stale_on_port(port);
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-off-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-off-{}", std::process::id()));
     write_canary_model_repo(&tmp_dir);
-    let cfg_dir = std::env::temp_dir().join(format!("lite-server-canary-off-cfg-{}", std::process::id()));
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-off-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let server_yaml = cfg_dir.join("server.yaml");
     std::fs::write(
@@ -5246,7 +5758,9 @@ async fn test_canary_override_default_off_ignores_pin() {
         .put(format!("{}/v2/models/canary_model/routing", base))
         .header("content-type", "application/json")
         .body(r#"{"weights":{"2":100}}"#)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let infer_output = |pin: Option<&str>| {
@@ -5261,13 +5775,27 @@ async fn test_canary_override_default_off_ignores_pin() {
                 req = req.header("x-lite-version", p);
             }
             let resp = req.send().await.unwrap();
-            assert_eq!(resp.status(), 200, "pin must not affect status when switch is off");
-            resp.json::<Value>().await.unwrap()["output"].as_i64().unwrap()
+            assert_eq!(
+                resp.status(),
+                200,
+                "pin must not affect status when switch is off"
+            );
+            resp.json::<Value>().await.unwrap()["output"]
+                .as_i64()
+                .unwrap()
         }
     };
 
-    assert_eq!(infer_output(Some("1")).await, 3, "switch off → pin ignored, weights (v2) serve");
-    assert_eq!(infer_output(Some("9")).await, 3, "switch off → unknown pin ignored, no 404");
+    assert_eq!(
+        infer_output(Some("1")).await,
+        3,
+        "switch off → pin ignored, weights (v2) serve"
+    );
+    assert_eq!(
+        infer_output(Some("9")).await,
+        3,
+        "switch off → unknown pin ignored, no 404"
+    );
     assert_eq!(infer_output(None).await, 3);
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -5341,8 +5869,8 @@ async fn test_grpc_infer_aggregates_into_batch() {
         data: payload.clone(),
         headers: HashMap::new(),
 
-    ..Default::default()
-};
+        ..Default::default()
+    };
     // infer() takes &mut self, so clone the client for concurrent calls.
     let mut c1 = client.clone();
     let mut c2 = client.clone();
@@ -5352,8 +5880,14 @@ async fn test_grpc_infer_aggregates_into_batch() {
 
     let ja: Value = serde_json::from_slice(&ra.data).expect("infer A data is JSON");
     let jb: Value = serde_json::from_slice(&rb.data).expect("infer B data is JSON");
-    assert_eq!(ja["batch_size"], 2, "gRPC infer A must be batched into size 2");
-    assert_eq!(jb["batch_size"], 2, "gRPC infer B must be batched into size 2");
+    assert_eq!(
+        ja["batch_size"], 2,
+        "gRPC infer A must be batched into size 2"
+    );
+    assert_eq!(
+        jb["batch_size"], 2,
+        "gRPC infer B must be batched into size 2"
+    );
 
     unload_model(&base, BATCH_MODEL, "1").await;
 }
@@ -5427,7 +5961,10 @@ async fn test_grpc_decoupled_infer_pushes_chunks_then_final() {
         let v: Value = serde_json::from_slice(&frame.data).expect("chunk data is JSON");
         assert_eq!(v["index"], i, "chunks must arrive in order");
     }
-    assert!(frames[3].is_final, "last frame must be terminal is_final=true");
+    assert!(
+        frames[3].is_final,
+        "last frame must be terminal is_final=true"
+    );
 
     unload_model(&base, DECOUPLED_MODEL, "1").await;
 }
@@ -5550,17 +6087,20 @@ async fn test_grpc_decoupled_client_disconnect_reclaims_stream() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-p9disc-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-p9disc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_slow_decoupled_repo(&repo);
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--grpc-port", &grpc_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
         "--no-metrics",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -5638,8 +6178,7 @@ async fn test_grpc_decoupled_idle_timeout_closes_stream() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-p9idle-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-p9idle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     // 永不推送的模型：sleep 30s 后才 close。
     let dir = repo.join("never_push/1");
@@ -5666,8 +6205,8 @@ class NeverPushAPI(LitAPI):
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-p9idle-yaml-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p9idle-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -5720,7 +6259,10 @@ class NeverPushAPI(LitAPI):
         elapsed < Duration::from_secs(15),
         "idle timeout must reclaim the stuck stream promptly, took {elapsed:?}"
     );
-    assert!(!saw_final, "idle-reclaimed stream must not report a normal final frame");
+    assert!(
+        !saw_final,
+        "idle-reclaimed stream must not report a normal final frame"
+    );
 
     unload_model(&base, "never_push", "1").await;
     let _ = std::fs::remove_dir_all(&repo);
@@ -5777,8 +6319,8 @@ async fn test_grpc_infer_records_request_metrics() {
             data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await;
     assert!(ok.is_ok(), "gRPC infer must succeed: {:?}", ok.err());
 
@@ -5790,8 +6332,8 @@ async fn test_grpc_infer_records_request_metrics() {
             data: Bytes::from_static(b"{}"),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await
         .expect_err("unknown model must fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
@@ -5805,8 +6347,11 @@ async fn test_grpc_infer_records_request_metrics() {
         .await
         .unwrap();
     assert!(
-        body.contains("liteserver_requests_total{model=\"test_model\",status=\"2xx\",version=\"1\"}"),
-        "2xx series missing: {}", body
+        body.contains(
+            "liteserver_requests_total{model=\"test_model\",status=\"2xx\",version=\"1\"}"
+        ),
+        "2xx series missing: {}",
+        body
     );
     // A2 (leak-gap-audit-0821): a never-registered model's reject records
     // under the constant ~unknown~ label — nothing ever unloads such a pair,
@@ -5814,18 +6359,28 @@ async fn test_grpc_infer_records_request_metrics() {
     // cardinality attack). Registered models keep their real labels.
     assert!(
         body.contains("liteserver_requests_total{model=\"~unknown~\",status=\"4xx\",version=\"\"}"),
-        "4xx series under the constant unknown-model label missing: {}", body
+        "4xx series under the constant unknown-model label missing: {}",
+        body
     );
     assert!(
-        !body.contains("liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"),
-        "a never-registered model name must not create its own series: {}", body
+        !body.contains(
+            "liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"
+        ),
+        "a never-registered model name must not create its own series: {}",
+        body
     );
     // GIE/EPP 语义 gauge（默认 namespace `liteserver`）：TotalQueuedRequests
     // 映射既有 queue depth；KVCacheUtilization 无 KV 概念上报 N/A (NaN)。
-    assert!(body.contains("liteserver:total_queued_requests"),
-        "GIE TotalQueuedRequests gauge missing: {}", body);
-    assert!(body.contains("liteserver:kv_cache_utilization NaN"),
-        "GIE KVCacheUtilization must be NaN (N/A): {}", body);
+    assert!(
+        body.contains("liteserver:total_queued_requests"),
+        "GIE TotalQueuedRequests gauge missing: {}",
+        body
+    );
+    assert!(
+        body.contains("liteserver:kv_cache_utilization NaN"),
+        "GIE KVCacheUtilization must be NaN (N/A): {}",
+        body
+    );
 
     unload_model(&base, MODEL, "1").await;
 }
@@ -5881,14 +6436,11 @@ async fn test_grpc_infer_echoes_request_id() {
         data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
         headers: HashMap::new(),
 
-    ..Default::default()
-});
+        ..Default::default()
+    });
     req.metadata_mut()
         .insert("x-client-request-id", "p22-foo".parse().unwrap());
-    let resp = client
-        .infer(req)
-        .await
-        .expect("gRPC infer must succeed");
+    let resp = client.infer(req).await.expect("gRPC infer must succeed");
     let md = resp.metadata();
     assert_eq!(
         md.get("x-request-id").and_then(|v| v.to_str().ok()),
@@ -5908,8 +6460,8 @@ async fn test_grpc_infer_echoes_request_id() {
         data: Bytes::from_static(b"{}"),
         headers: HashMap::new(),
 
-    ..Default::default()
-});
+        ..Default::default()
+    });
     err_req
         .metadata_mut()
         .insert("x-client-request-id", "p22-bar".parse().unwrap());
@@ -5919,7 +6471,9 @@ async fn test_grpc_infer_echoes_request_id() {
         .expect_err("unknown model must fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
     assert_eq!(
-        err.metadata().get("x-request-id").and_then(|v| v.to_str().ok()),
+        err.metadata()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
         Some("p22-bar"),
         "x-request-id must echo on the error path too: {:?}",
         err.metadata()
@@ -5983,13 +6537,18 @@ async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
         data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
         headers: HashMap::new(),
 
-    ..Default::default()
-};
+        ..Default::default()
+    };
 
     // burst=3：前 3 次放行。
     for i in 0..3 {
         let r = client.infer(mk()).await;
-        assert!(r.is_ok(), "request {} must be allowed: {:?}", i + 1, r.err());
+        assert!(
+            r.is_ok(),
+            "request {} must be allowed: {:?}",
+            i + 1,
+            r.err()
+        );
     }
     // 第 4 次 ResourceExhausted + retry-after。
     let err = client
@@ -6050,8 +6609,12 @@ async fn test_grpc_health_service() {
 
     // No models loaded: overall NOT_SERVING.
     let resp = client
-        .check(HealthCheckRequest { service: String::new() })
-        .await.unwrap().into_inner();
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resp.status(), ServingStatus::NotServing);
 
     load_model(&base, MODEL, "1").await;
@@ -6059,24 +6622,39 @@ async fn test_grpc_health_service() {
     // Overall and per-model services go SERVING (load syncs before the
     // admin call returns, so no polling needed).
     let resp = client
-        .check(HealthCheckRequest { service: String::new() })
-        .await.unwrap().into_inner();
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resp.status(), ServingStatus::Serving);
     let resp = client
-        .check(HealthCheckRequest { service: MODEL.to_string() })
-        .await.unwrap().into_inner();
+        .check(HealthCheckRequest {
+            service: MODEL.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resp.status(), ServingStatus::Serving);
 
     // Per-version service "{model}/{version}" (§4.5).
     let resp = client
-        .check(HealthCheckRequest { service: format!("{}/1", MODEL) })
-        .await.unwrap().into_inner();
+        .check(HealthCheckRequest {
+            service: format!("{}/1", MODEL),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resp.status(), ServingStatus::Serving);
 
     // Unknown service → NotFound per the health-check spec.
     let err = client
-        .check(HealthCheckRequest { service: "no_such_model".to_string() })
-        .await.unwrap_err();
+        .check(HealthCheckRequest {
+            service: "no_such_model".to_string(),
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 
     unload_model(&base, MODEL, "1").await;
@@ -6084,17 +6662,27 @@ async fn test_grpc_health_service() {
     // After unload the per-model service is cleared and the overall
     // service flips back to NOT_SERVING.
     let err = client
-        .check(HealthCheckRequest { service: MODEL.to_string() })
-        .await.unwrap_err();
+        .check(HealthCheckRequest {
+            service: MODEL.to_string(),
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
     // The per-version service is cleared too.
     let err = client
-        .check(HealthCheckRequest { service: format!("{}/1", MODEL) })
-        .await.unwrap_err();
+        .check(HealthCheckRequest {
+            service: format!("{}/1", MODEL),
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
     let resp = client
-        .check(HealthCheckRequest { service: String::new() })
-        .await.unwrap().into_inner();
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resp.status(), ServingStatus::NotServing);
 }
 
@@ -6150,13 +6738,15 @@ async fn test_grpc_response_compression_gzip() {
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await
         .expect("infer must succeed");
 
     assert_eq!(
-        resp.metadata().get("grpc-encoding").and_then(|v| v.to_str().ok()),
+        resp.metadata()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok()),
         Some("gzip"),
         "response must be gzip-compressed when enabled and the client accepts it"
     );
@@ -6271,8 +6861,10 @@ class SlowAPI(LitAPI):
 #[tokio::test]
 #[serial]
 async fn test_ensemble_total_timeout_bounds_serial_layers() {
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ensemble-timeout-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ensemble-timeout-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_slow_submodel(&repo, "a");
     write_slow_submodel(&repo, "b");
@@ -6402,17 +6994,17 @@ class SubAPI(LitAPI):
 #[tokio::test]
 #[serial]
 async fn test_grpc_ensemble_infer_walks_dag() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-{}", std::process::id()));
+    let repo =
+        std::env::temp_dir().join(format!("lite-server-grpc-ensemble-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     // echo sub-model: echoes request.x as {"out": x}.
     write_submodel(
@@ -6454,8 +7046,10 @@ ensemble:
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-grpc-ensemble-yaml-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -6485,14 +7079,13 @@ ensemble:
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 5})).unwrap()),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await
         .expect("ensemble gRPC Infer must walk the DAG, not error")
         .into_inner();
 
-    let got: Value =
-        serde_json::from_slice(&resp.data).expect("ensemble response must be JSON");
+    let got: Value = serde_json::from_slice(&resp.data).expect("ensemble response must be JSON");
     assert_eq!(
         got["out"].as_i64(),
         Some(10),
@@ -6511,17 +7104,19 @@ ensemble:
 #[tokio::test]
 #[serial]
 async fn test_grpc_ensemble_dag_error_maps_to_status() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-cycle-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-grpc-ensemble-cycle-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_submodel(
         &repo,
@@ -6550,8 +7145,10 @@ ensemble:
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-cycle-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-grpc-ensemble-cycle-yaml-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -6596,8 +7193,8 @@ ensemble:
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 1})).unwrap()),
             headers: HashMap::new(),
 
-        ..Default::default()
-})
+            ..Default::default()
+        })
         .await;
 
     assert!(
@@ -6629,13 +7226,11 @@ async fn test_access_control_admin_key_mode_both_protocols() {
     kill_stale_on_port(grpc_port);
 
     // Empty model repo: GetInfo / list_models / health work without workers.
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-p71-empty-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-p71-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-p71-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-p71-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -6675,7 +7270,11 @@ async fn test_access_control_admin_key_mode_both_protocols() {
 
     // HTTP admin (list_models, header "x-api-key"): no key → 401, key → 200.
     let client = reqwest::Client::new();
-    let no_key = client.get(format!("{}/v2/models", base)).send().await.unwrap();
+    let no_key = client
+        .get(format!("{}/v2/models", base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(no_key.status(), 401, "HTTP admin without key must be 401");
     let with_key = client
         .get(format!("{}/v2/models", base))
@@ -6718,8 +7317,7 @@ async fn test_grpc_admin_load_unload_happy_path() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
-    let tmp_dir =
-        std::env::temp_dir().join(format!("lite-server-p62-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-p62-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -6740,7 +7338,10 @@ async fn test_grpc_admin_load_unload_happy_path() {
 
     // Load(真实 Python worker 拉起)→ ModelReady 轮询转就绪。
     let load = admin
-        .load_model(LoadModelRequest { model_name: MODEL.to_string(), version: "1".to_string() })
+        .load_model(LoadModelRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+        })
         .await
         .expect("LoadModel happy path");
     assert!(load.into_inner().success);
@@ -6748,7 +7349,10 @@ async fn test_grpc_admin_load_unload_happy_path() {
     let mut ready = false;
     for _ in 0..100 {
         let r = admin
-            .model_ready(ModelReadyRequest { model_name: MODEL.to_string(), version: Some("1".to_string()) })
+            .model_ready(ModelReadyRequest {
+                model_name: MODEL.to_string(),
+                version: Some("1".to_string()),
+            })
             .await
             .expect("ModelReady")
             .into_inner();
@@ -6766,14 +7370,20 @@ async fn test_grpc_admin_load_unload_happy_path() {
         .expect("ListModels")
         .into_inner();
     assert!(
-        models.models.iter().any(|m| m.name == MODEL && m.version == "1"),
+        models
+            .models
+            .iter()
+            .any(|m| m.name == MODEL && m.version == "1"),
         "loaded model must appear in ListModels: {:?}",
         models.models
     );
 
     // Unload → ListModels 不再含该模型。
     let unload = admin
-        .unload_model(UnloadModelRequest { model_name: MODEL.to_string(), version: Some("1".to_string()) })
+        .unload_model(UnloadModelRequest {
+            model_name: MODEL.to_string(),
+            version: Some("1".to_string()),
+        })
         .await
         .expect("UnloadModel happy path");
     assert!(unload.into_inner().success);
@@ -6806,19 +7416,17 @@ async fn test_admin_bind_splits_admin_onto_udf() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let admin_sock = std::env::temp_dir()
-        .join(format!("lite-server-p72-admin-{}.sock", std::process::id()));
+    let admin_sock =
+        std::env::temp_dir().join(format!("lite-server-p72-admin-{}.sock", std::process::id()));
     let admin_sock_str = admin_sock.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&admin_sock);
 
     // Empty model repo — only Admin GetInfo / health are exercised.
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-p72-empty-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-p72-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-p72-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-p72-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -6841,18 +7449,26 @@ async fn test_admin_bind_splits_admin_onto_udf() {
     let main_channel = grpc_tcp_channel(grpc_port).await;
     let mut main_admin = AdminClient::new(main_channel.clone());
     let main_admin_res = main_admin.get_info(GetInfoRequest {}).await;
-    assert!(main_admin_res.is_err(), "Admin on main port must be rejected");
+    assert!(
+        main_admin_res.is_err(),
+        "Admin on main port must be rejected"
+    );
     assert_eq!(
         main_admin_res.err().unwrap().code(),
         tonic::Code::Unimplemented,
         "Admin RPC on main port → UNIMPLEMENTED (service not registered)"
     );
-    let mut main_health =
-        tonic_health::pb::health_client::HealthClient::new(main_channel);
+    let mut main_health = tonic_health::pb::health_client::HealthClient::new(main_channel);
     let health = main_health
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: String::new(),
+        })
         .await;
-    assert!(health.is_ok(), "health must stay on the main port: {:?}", health.err());
+    assert!(
+        health.is_ok(),
+        "health must stay on the main port: {:?}",
+        health.err()
+    );
 
     // Admin UDS: Admin RPC → OK, and the socket is owner-only 0o600.
     let admin_channel = uds_grpc_channel(&admin_sock_str).await;
@@ -7110,7 +7726,10 @@ async fn sigint_during_model_load_exits_cleanly() {
 #[tokio::test]
 async fn sigint_during_model_load_exits_cleanly_python_embedded() {
     let probe = Command::new("python3")
-        .args(["-c", "from lite_server import serve; assert serve is not None"])
+        .args([
+            "-c",
+            "from lite_server import serve; assert serve is not None",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -7521,7 +8140,8 @@ async fn test_p_deadline_http_client_and_fallback() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = create_slow_model_repo_workers(2, 4);
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-pdeadline-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-pdeadline-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -7610,19 +8230,17 @@ async fn test_p_deadline_http_client_and_fallback() {
 #[tokio::test]
 #[serial]
 async fn test_p_deadline_grpc_server_timeout() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = create_slow_model_repo(5);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-pdeadline-grpc-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-pdeadline-grpc-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -7680,9 +8298,9 @@ async fn test_p_deadline_grpc_server_timeout() {
 #[tokio::test]
 #[serial]
 async fn test_p_deadline_grpc_batch_infer_must_enforce_server_timeout() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::BatchInferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
@@ -7756,10 +8374,8 @@ async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-bidi-cancel-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-bidi-cancel-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let marker = tmp_dir.join("cancel.marker");
     let repo = create_bidi_model_repo(&marker);
@@ -7871,10 +8487,8 @@ async fn test_d4_grpc_bidi_half_close_sends_close_to_worker() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-bidi-halfclose-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-bidi-halfclose-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let marker = tmp_dir.join("halfclose.marker");
     let model_dir = tmp_dir.join("bidi_hc/1");
@@ -8030,10 +8644,7 @@ async fn test_h2_bidi_prior_knowledge_full_duplex() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-h2bidi-{}",
-        std::process::id()
-    ));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-h2bidi-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let model_dir = tmp_dir.join("h2bidi/1");
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -8093,12 +8704,9 @@ class BidiAPI(LitAPI):
     // h2 prior-knowledge client with a live, streamed request body.
     // (reqwest's wrap_stream needs a Sync stream; poll the tokio mpsc
     // receiver through a mutex — poll_recv never blocks.)
-    let (body_tx, body_rx) =
-        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
     let body_rx = std::sync::Arc::new(std::sync::Mutex::new(body_rx));
-    let body_stream = futures::stream::poll_fn(move |cx| {
-        body_rx.lock().unwrap().poll_recv(cx)
-    });
+    let body_stream = futures::stream::poll_fn(move |cx| body_rx.lock().unwrap().poll_recv(cx));
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .build()
@@ -8272,9 +8880,14 @@ class BidiAPI(LitAPI):
     )
     .unwrap();
     let server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -8442,10 +9055,8 @@ async fn test_grpc_bidi_first_message_timeout() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-bidi-fmto-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-bidi-fmto-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let marker = tmp_dir.join("fmto.marker");
     let repo = create_bidi_model_repo(&marker);
@@ -8509,10 +9120,7 @@ async fn test_ws_first_message_timeout() {
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-ws-fmto-{}",
-        std::process::id()
-    ));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-ws-fmto-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let repo = create_test_model_repo();
     let server_yaml = tmp_dir.join("server.yaml");
@@ -8563,10 +9171,7 @@ async fn test_feature_toggles_unmount_routes() {
     kill_stale_on_port(grpc_port);
     kill_stale_on_port(metrics_port);
     let repo = create_test_model_repo();
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-feat-off-{}",
-        std::process::id()
-    ));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-feat-off-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -8588,18 +9193,49 @@ async fn test_feature_toggles_unmount_routes() {
     let client = reqwest::Client::new();
     // Sanity: an always-on route still answers (server is up and routing).
     assert_eq!(
-        client.get(format!("{}/health", base)).send().await.unwrap().status(),
+        client
+            .get(format!("{}/health", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
     );
     // timeline / alerts / version_compare unmounted → 404.
-    assert_eq!(client.get(format!("{}/metrics/timeline", base)).send().await.unwrap().status(), 404);
     assert_eq!(
-        client.get(format!("{}/metrics/timeline/test_model", base)).send().await.unwrap().status(),
+        client
+            .get(format!("{}/metrics/timeline", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         404
     );
-    assert_eq!(client.get(format!("{}/metrics/alerts", base)).send().await.unwrap().status(), 404);
     assert_eq!(
-        client.get(format!("{}/v2/models/test_model/compare", base)).send().await.unwrap().status(),
+        client
+            .get(format!("{}/metrics/timeline/test_model", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/metrics/alerts", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/v2/models/test_model/compare", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         404
     );
     // streaming off → SSE + WS routes unmounted → 404.
@@ -8614,7 +9250,12 @@ async fn test_feature_toggles_unmount_routes() {
         404
     );
     assert_eq!(
-        client.get(format!("{}/v2/models/test_model/stream", base)).send().await.unwrap().status(),
+        client
+            .get(format!("{}/v2/models/test_model/stream", base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         404
     );
 }
@@ -8636,10 +9277,8 @@ async fn test_grpc_streaming_disabled_returns_unimplemented() {
     kill_stale_on_port(grpc_port);
     kill_stale_on_port(metrics_port);
     let repo = test_model_repo();
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-grpcs-off-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpcs-off-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -8711,7 +9350,8 @@ async fn test_cache_registry_snapshots_and_restores() {
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-cache-cfg-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-cache-cfg-{}", std::process::id()));
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::create_dir_all(&tmp_dir).unwrap();
     std::fs::write(
@@ -8901,7 +9541,10 @@ async fn test_cache_registry_stale_pin_blocks_auto_activation() {
         .iter()
         .find(|x| x["version"] == "1")
         .expect("v1 registered after the failed load");
-    assert_eq!(v1["status"], "failed", "v1 must be broken after the failed load");
+    assert_eq!(
+        v1["status"], "failed",
+        "v1 must be broken after the failed load"
+    );
     assert_eq!(
         info["active_version"].as_str(),
         Some("2"),
@@ -9056,8 +9699,7 @@ async fn test_worker_spawn_works_with_python3_only_path() {
     // nearby) and the worker would import-fail on `google.protobuf` for reasons
     // unrelated to the interpreter-name fallback under test. The wrapper execs
     // the real venv interpreter, so argv[0] points at it and site-packages load.
-    let bin_dir =
-        std::env::temp_dir().join(format!("lite-server-py3bin-{}", std::process::id()));
+    let bin_dir = std::env::temp_dir().join(format!("lite-server-py3bin-{}", std::process::id()));
     std::fs::create_dir_all(&bin_dir).unwrap();
     let out = std::process::Command::new("python3")
         .arg("-c")
@@ -9068,7 +9710,11 @@ async fn test_worker_spawn_works_with_python3_only_path() {
     let real_python = String::from_utf8(out.stdout).unwrap();
     let real_python = real_python.trim();
     let wrapper = bin_dir.join("python3");
-    std::fs::write(&wrapper, format!("#!/bin/sh\nexec {} \"$@\"\n", real_python)).unwrap();
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec {} \"$@\"\n", real_python),
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&wrapper, perms).unwrap();
@@ -9078,8 +9724,7 @@ async fn test_worker_spawn_works_with_python3_only_path() {
     );
 
     let repo = test_model_repo();
-    let tmp_dir =
-        std::env::temp_dir().join(format!("lite-server-py3only-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-py3only-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -9139,8 +9784,7 @@ async fn test_log_level_warning_is_accepted() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(metrics_port);
 
-    let tmp_dir =
-        std::env::temp_dir().join(format!("lite-server-loglvl-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-loglvl-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -9214,19 +9858,28 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
     let repo = test_model_repo();
 
     let child = start_server(&[
-        "--port", &http_port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
+        "--port",
+        &http_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
         "--no-grpc",
-        "--log-level", "warn",
+        "--log-level",
+        "warn",
         // Fast health-check cadence so a frozen worker is killed within
         // ~1s — mirrors the in-crate kill-escalation test
         // (inference_queue.rs:2961).
-        "--health-check-interval", "0.5",
-        "--health-check-timeout", "0.1",
-        "--health-check-kill-threshold", "2",
-        "--ejection-error-threshold", "1",
-        "--ejection-max-percent", "100",
+        "--health-check-interval",
+        "0.5",
+        "--health-check-timeout",
+        "0.1",
+        "--health-check-kill-threshold",
+        "2",
+        "--ejection-error-threshold",
+        "1",
+        "--ejection-max-percent",
+        "100",
     ]);
     let server_pid = child.id() as i32;
     let _guard = ServerGuard(Some(child));
@@ -9252,7 +9905,8 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
     loop {
         let body = match client
             .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
-            .send().await
+            .send()
+            .await
         {
             Ok(r) => r.text().await.unwrap_or_default(),
             Err(_) => String::new(),
@@ -9296,7 +9950,8 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
     let resp = client
         .get(format!("{}/v2/models/route_model/status", base))
         .timeout(Duration::from_secs(5))
-        .send().await
+        .send()
+        .await
         .expect("status route request failed");
     assert_eq!(
         resp.status(),
@@ -9312,7 +9967,8 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
         .post(format!("{}/v2/models/route_model/infer", base))
         .json(&json!({"input": 5}))
         .timeout(Duration::from_secs(5))
-        .send().await
+        .send()
+        .await
         .expect("infer request failed");
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -9378,7 +10034,10 @@ async fn test_unary_json_response_byte_identical() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert_eq!(text, r#"{"a":2,"z":1}"#, "JSON path must stay byte-identical");
+    assert_eq!(
+        text, r#"{"a":2,"z":1}"#,
+        "JSON path must stay byte-identical"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -9406,8 +10065,10 @@ async fn test_unary_raw_bytes_request_passthrough() {
     assert_eq!(resp.status(), 200, "raw bytes request must succeed");
 
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["raw_len"], 256,
-        "worker must receive all 256 raw bytes unchanged");
+    assert_eq!(
+        body["raw_len"], 256,
+        "worker must receive all 256 raw bytes unchanged"
+    );
     unload_model(&base, "raw_echo_model", "1").await;
 }
 
@@ -9426,7 +10087,11 @@ async fn test_unary_missing_content_type_defaults_json() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "JSON request without content-type must succeed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "JSON request without content-type must succeed"
+    );
     unload_model(&base, "raw_echo_model", "1").await;
 }
 
@@ -9449,7 +10114,10 @@ async fn test_unary_415_content_encoding() {
     assert_eq!(resp.status(), 415, "Content-Encoding must return 415");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "unsupported_media_type");
-    assert!(body["error"]["message"].as_str().unwrap().contains("Content-Encoding"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Content-Encoding"));
     unload_model(&base, "raw_echo_model", "1").await;
 }
 
@@ -9481,8 +10149,11 @@ async fn test_unary_large_json_payload_8mb() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200,
-        "8 MB JSON must succeed with new 64 MiB default body limit");
+    assert_eq!(
+        resp.status(),
+        200,
+        "8 MB JSON must succeed with new 64 MiB default body limit"
+    );
     unload_model(&base, "raw_echo_model", "1").await;
 }
 
@@ -9550,8 +10221,10 @@ async fn test_ensemble_accepts_json() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-http-ensemble-ct-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-http-ensemble-ct-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_submodel(
         &repo,
@@ -9591,9 +10264,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -9626,8 +10304,10 @@ async fn test_ensemble_binary_root_field_access_400() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-http-ensemble-raw-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-http-ensemble-raw-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_submodel(&repo, "echo", r#"        return {"out": x}"#);
     let ens_dir = repo.join("ensemble_model/1");
@@ -9647,9 +10327,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -9666,7 +10351,11 @@ ensemble:
         .unwrap();
     // B3: binary root input is accepted (D7 relaxed), but field access
     // ($request.x) on binary → 400 (E7: no field semantics on bytes).
-    assert_eq!(resp.status(), 400, "field access on binary root must be 400");
+    assert_eq!(
+        resp.status(),
+        400,
+        "field access on binary root must be 400"
+    );
     let body: Value = resp.json().await.unwrap();
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(
@@ -9692,8 +10381,10 @@ async fn test_audit_ensemble_binary_egress_invalid_media_type() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-http-ensemble-badmt-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-http-ensemble-badmt-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     // Submodel declares a non-JSON media_type containing CR/LF (invalid in an
     // HTTP header value). Content is raw bytes, so the step output becomes
@@ -9743,9 +10434,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -9758,9 +10454,8 @@ ensemble:
         .json(&json!({"x": 1}))
         .send()
         .await;
-    let resp = result.expect(
-        "handler must not panic on invalid media_type — a response must come back",
-    );
+    let resp =
+        result.expect("handler must not panic on invalid media_type — a response must come back");
     assert_eq!(
         resp.status(),
         500,
@@ -9781,8 +10476,10 @@ async fn test_ensemble_binary_root_to_json_chain() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ensemble-binchain-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ensemble-binchain-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     // vision: reports whether it received raw bytes and how many.
     write_submodel(
@@ -9819,9 +10516,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -9894,8 +10596,10 @@ async fn test_ensemble_step_binary_output_referenced_downstream_400() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ensemble-stepbin-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ensemble-stepbin-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_binary_submodel(&repo, "binout");
     write_submodel(&repo, "echo", r#"        return {"out": x}"#);
@@ -9921,9 +10625,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -9963,8 +10672,10 @@ async fn test_ensemble_final_binary_output_http_passthrough() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ensemble-finalbin-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ensemble-finalbin-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_binary_submodel(&repo, "binout");
     let ens_dir = repo.join("ensemble_model/1");
@@ -9984,9 +10695,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{}", http_port);
@@ -10028,17 +10744,19 @@ ensemble:
 #[tokio::test]
 #[serial]
 async fn test_grpc_ensemble_malformed_json_becomes_binary() {
-    use std::collections::HashMap;
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
 
     let http_port = next_test_port();
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-bin-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-grpc-ensemble-bin-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     // probe: reports whether it received raw bytes and how many.
     write_submodel(
@@ -10062,8 +10780,10 @@ ensemble:
     )
     .unwrap();
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-grpc-ensemble-bin-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-grpc-ensemble-bin-yaml-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -10163,8 +10883,7 @@ async fn test_unary_413_body_too_large() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-413-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-413-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -10180,13 +10899,20 @@ async fn test_unary_413_body_too_large() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://127.0.0.1:{}/v2/models/whatever/infer", http_port))
+        .post(format!(
+            "http://127.0.0.1:{}/v2/models/whatever/infer",
+            http_port
+        ))
         .header("content-type", "application/octet-stream")
         .body(vec![b'x'; 64])
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 413, "body over the 16-byte limit must be 413");
+    assert_eq!(
+        resp.status(),
+        413,
+        "body over the 16-byte limit must be 413"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "payload_too_large");
     assert_eq!(body["error"]["max_size"], 16);
@@ -10281,15 +11007,19 @@ class TritonEchoAPI(LitAPI):
 async fn test_unary_triton_binary_e2e() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-triton-e2e-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-triton-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_triton_binary_split_model(&repo, "triton_split");
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10318,7 +11048,10 @@ async fn test_unary_triton_binary_e2e() {
         json!([205, 60, 102, 64, 102, 66]),
         "input3 = 3×FP16 LE"
     );
-    assert!(v["binary_data"].get("input1").is_none(), "JSON data 的 input 不进 binary_data");
+    assert!(
+        v["binary_data"].get("input1").is_none(),
+        "JSON data 的 input 不进 binary_data"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -10332,15 +11065,20 @@ async fn test_unary_triton_binary_e2e() {
 async fn test_unary_triton_binary_byte_identical() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-triton-bytes-{}", std::process::id()));
+    let repo =
+        std::env::temp_dir().join(format!("lite-server-triton-bytes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_triton_binary_echo_model(&repo, "triton_echo");
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10378,16 +11116,21 @@ async fn test_unary_triton_binary_metrics() {
     let metrics_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(metrics_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-triton-metrics-{}", std::process::id()));
+    let repo =
+        std::env::temp_dir().join(format!("lite-server-triton-metrics-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_triton_binary_echo_model(&repo, "triton_echo");
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10428,15 +11171,19 @@ async fn test_unary_triton_binary_metrics() {
 async fn test_unary_triton_binary_400_mismatch() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-triton-400-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-triton-400-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_triton_binary_echo_model(&repo, "triton_echo");
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10472,8 +11219,7 @@ async fn test_unary_triton_binary_400_mismatch() {
 async fn test_kserve_flat_worker_error_e2e() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-kserve-flat-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-kserve-flat-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     let dir = repo.join("boom/1");
     std::fs::create_dir_all(&dir).unwrap();
@@ -10502,9 +11248,14 @@ class BoomAPI(LitAPI):
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10531,7 +11282,10 @@ class BoomAPI(LitAPI):
         .unwrap();
     assert_eq!(resp.status(), 400);
     let v: Value = resp.json().await.unwrap();
-    assert!(v["error"].is_object(), "非信封请求保持 OpenAI 形状,got: {v}");
+    assert!(
+        v["error"].is_object(),
+        "非信封请求保持 OpenAI 形状,got: {v}"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -10545,8 +11299,7 @@ class BoomAPI(LitAPI):
 async fn test_binary_data_output_e2e() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-bdo-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-bdo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     // worker 返回 KServe 信封(FP32 输出)
     let dir = repo.join("env_model/1");
@@ -10578,9 +11331,14 @@ class EnvAPI(LitAPI):
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10634,7 +11392,13 @@ class EnvAPI(LitAPI):
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("content-type").unwrap().to_str().unwrap().contains("json"));
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("json"));
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -10647,8 +11411,10 @@ class EnvAPI(LitAPI):
 async fn test_triton_binary_ensemble_rejects() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-triton-ensemble-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-triton-ensemble-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_submodel(&repo, "echo", r#"        return {"out": x}"#);
     let ens_dir = repo.join("ensemble_model/1");
@@ -10668,9 +11434,14 @@ ensemble:
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10705,8 +11476,7 @@ ensemble:
 fn body_bytes_count(body: &str, content_type: &str) -> u64 {
     let needle = format!("content_type=\"{content_type}\"");
     for line in body.lines() {
-        if line.starts_with("lite_server_http_request_body_bytes_count{")
-            && line.contains(&needle)
+        if line.starts_with("lite_server_http_request_body_bytes_count{") && line.contains(&needle)
         {
             return line
                 .rsplit_once(' ')
@@ -10819,9 +11589,14 @@ async fn test_v2_bare_load_alias() {
     kill_stale_on_port(http_port);
     let repo = test_model_repo();
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -10926,7 +11701,13 @@ async fn test_generate_stream_sse_envelope() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "generate_stream 必须可开流");
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
     let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
         .await
@@ -10993,7 +11774,11 @@ async fn test_generate_stream_nonstream_worker_and_unary_untouched() {
         .await
         .unwrap();
     assert_eq!(ev.status(), 200, "/events 基线");
-    assert_eq!(gen.status(), 200, "非流式 worker 的 generate_stream 与 /events 同路径");
+    assert_eq!(
+        gen.status(),
+        200,
+        "非流式 worker 的 generate_stream 与 /events 同路径"
+    );
 
     // 非流式 /infer 回归
     let infer = client
@@ -11029,7 +11814,10 @@ async fn test_generate_stream_legacy_events_untouched() {
         .expect("events 响应必须在超时内关闭")
         .unwrap();
     assert!(body.contains("data:"), "/events 帧必须存在: {body}");
-    assert!(body.contains("[DONE]"), "/events 自有格式保持 [DONE] 终止: {body}");
+    assert!(
+        body.contains("[DONE]"),
+        "/events 自有格式保持 [DONE] 终止: {body}"
+    );
 
     unload_model(&base, MODEL, "1").await;
 }
@@ -11054,7 +11842,11 @@ async fn test_generate_stream_triton_binary_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "TritonBinary 请求组合必须透传(透传哲学)");
+    assert_eq!(
+        resp.status(),
+        200,
+        "TritonBinary 请求组合必须透传(透传哲学)"
+    );
 
     unload_model(&base, MODEL, "1").await;
 }
@@ -11068,8 +11860,7 @@ async fn test_generate_stream_triton_binary_request() {
 async fn test_generate_stream_mid_stream_error() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-gen-err-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-gen-err-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     let dir = repo.join("gen_err/1");
     std::fs::create_dir_all(&dir).unwrap();
@@ -11098,9 +11889,14 @@ class GenErrAPI(LitAPI):
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -11119,7 +11915,10 @@ class GenErrAPI(LitAPI):
         .await
         .expect("generate_stream 响应必须在超时内关闭")
         .unwrap();
-    assert!(body.contains("data: {\"token\":\"hello\"}"), "首个 chunk 正常: {body}");
+    assert!(
+        body.contains("data: {\"token\":\"hello\"}"),
+        "首个 chunk 正常: {body}"
+    );
     assert!(
         body.contains("\"error\""),
         "流中途错误必须携带在后续 data: 事件内(Triton 行为): {body}"
@@ -11189,15 +11988,19 @@ class OpenAICompatAPI(LitAPI):
 async fn test_chat_completions_unary() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-oai-unary-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-oai-unary-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_openai_compat_model(&repo, "chat", false);
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -11232,13 +12035,12 @@ async fn test_chat_completions_unary() {
 async fn test_v1_gate_scoped_to_openai_compact() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-oai-gate-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-oai-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_openai_compat_model(&repo, "chat", false);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-oai-gate-cfg-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-oai-gate-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -11273,7 +12075,10 @@ async fn test_v1_gate_scoped_to_openai_compact() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["error"]["type"], "authentication_error");
     assert!(
-        v["error"]["message"].as_str().unwrap().contains("missing API key"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing API key"),
         "缺 header 文案:{}",
         v["error"]["message"]
     );
@@ -11319,7 +12124,11 @@ async fn test_v1_gate_scoped_to_openai_compact() {
 
     // 3. /v1/models 缺 key → 401(OpenAI SDK 会先打它;列表端点无 model
     // 上下文,per-model policies.auth 覆盖不到);带 key → 200 列表。
-    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401, "/v1/models 也要 key");
     let resp = client
         .get(format!("{base}/v1/models"))
@@ -11354,15 +12163,19 @@ async fn test_v1_gate_scoped_to_openai_compact() {
 async fn test_chat_completions_sse() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-oai-sse-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-oai-sse-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_openai_compat_model(&repo, "chat", true);
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -11380,15 +12193,30 @@ async fn test_chat_completions_sse() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
     let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
         .await
         .expect("SSE 响应必须在超时内关闭")
         .unwrap();
-    assert!(body.contains("data: {\"id\""), "逐 chunk 帧必须存在: {body}");
-    assert!(body.contains("\"chat.completion.chunk\""), "chunk 对象形状: {body}");
-    assert!(body.contains("data: [DONE]"), "OpenAI SSE 以 [DONE] 终止: {body}");
+    assert!(
+        body.contains("data: {\"id\""),
+        "逐 chunk 帧必须存在: {body}"
+    );
+    assert!(
+        body.contains("\"chat.completion.chunk\""),
+        "chunk 对象形状: {body}"
+    );
+    assert!(
+        body.contains("data: [DONE]"),
+        "OpenAI SSE 以 [DONE] 终止: {body}"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -11401,15 +12229,19 @@ async fn test_chat_completions_sse() {
 async fn test_completions_and_embeddings() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-oai-others-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-oai-others-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_openai_compat_model(&repo, "chat", false);
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -11451,7 +12283,11 @@ async fn test_v1_models_list_and_retrieve() {
     load_model(&base, MODEL, "1").await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["object"], "list");
@@ -11514,8 +12350,7 @@ async fn test_v1_404_model_not_found() {
 async fn test_v1_mid_stream_error() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-oai-err-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-oai-err-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     let dir = repo.join("chat/1");
     std::fs::create_dir_all(&dir).unwrap();
@@ -11545,9 +12380,14 @@ class ErrAPI(LitAPI):
     .unwrap();
 
     let _server = ServerGuard::start(&[
-        "--port", &http_port.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-grpc", "--no-metrics", "--log-level", "warn",
+        "--port",
+        &http_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
     ]);
     wait_for_server(http_port, 60).await;
     let base = format!("http://127.0.0.1:{http_port}");
@@ -11637,8 +12477,8 @@ async fn test_telemetry_traceparent_e2e_and_sigterm_flush_http() {
     let _ = std::fs::remove_dir_all(&repo);
     write_tp_echo_repo(&repo);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-ptrace-yaml-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-ptrace-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -11705,8 +12545,8 @@ async fn test_telemetry_traceparent_e2e_grpc() {
     let _ = std::fs::remove_dir_all(&repo);
     write_tp_echo_repo(&repo);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-ptraceg-yaml-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-ptraceg-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -11734,8 +12574,10 @@ async fn test_telemetry_traceparent_e2e_grpc() {
         headers: HashMap::new(),
         ..Default::default()
     });
-    req.metadata_mut()
-        .insert("traceparent", tonic::metadata::MetadataValue::from_static(TP_VALUE));
+    req.metadata_mut().insert(
+        "traceparent",
+        tonic::metadata::MetadataValue::from_static(TP_VALUE),
+    );
     let resp = client.infer(req).await.expect("grpc infer").into_inner();
     let body: Value = serde_json::from_slice(&resp.data).unwrap();
     let echoed = body["tp"].as_str().unwrap_or("");
@@ -11760,7 +12602,11 @@ async fn should_send_terminal_error_frame_when_worker_dies_mid_stream() {
     // Clean leftover workers from a previous failed run — the worker is
     // found by pgrep on its unique model name below.
     let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "lite_server.worker.inference --model-name eof_model"])
+        .args([
+            "-9",
+            "-f",
+            "lite_server.worker.inference --model-name eof_model",
+        ])
         .status();
     let base = g_base().await;
     load_model(&base, "eof_model", "1").await;
@@ -11864,13 +12710,18 @@ async fn should_roll_recycle_on_pure_streaming_load() {
             let resp = client
                 .post(format!("{}/v2/models/{}/events", base, model))
                 .json(&json!({"input": i}))
-                .send().await.unwrap();
+                .send()
+                .await
+                .unwrap();
             assert_eq!(resp.status(), 200, "{model} stream {i} must be served");
             let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
                 .await
                 .expect("stream body closes")
                 .unwrap();
-            assert!(body.contains("data:"), "{model} stream {i} has chunks: {body}");
+            assert!(
+                body.contains("data:"),
+                "{model} stream {i} has chunks: {body}"
+            );
         }
     }
 
@@ -11880,20 +12731,33 @@ async fn should_roll_recycle_on_pure_streaming_load() {
     while tokio::time::Instant::now() < deadline {
         let body = client
             .get(format!("{}/metrics", g_metrics_base()))
-            .send().await.unwrap().text().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         if rolling_recycle_count(&body, "stream_counted") >= 1.0 {
             recycled = true;
             break;
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(recycled, "G3: pure streaming load must trigger a rolling recycle");
+    assert!(
+        recycled,
+        "G3: pure streaming load must trigger a rolling recycle"
+    );
 
     // The escape-hatch model must NOT have recycled (the counted model's
     // recycle window above gave it ample time to prove the negative).
     let body = client
         .get(format!("{}/metrics", g_metrics_base()))
-        .send().await.unwrap().text().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert_eq!(
         rolling_recycle_count(&body, "stream_legacy"),
         0.0,
@@ -11917,13 +12781,18 @@ async fn should_count_ensemble_streams_per_dag_node_toward_max_requests() {
         let resp = client
             .post(format!("{}/v2/models/ens_budget_model/events", base))
             .json(&json!({"text": "a b"}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200, "ensemble stream {i} must be served");
         let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
             .await
             .expect("ensemble stream body closes")
             .unwrap();
-        assert!(body.contains("data:"), "ensemble stream {i} has chunks: {body}");
+        assert!(
+            body.contains("data:"),
+            "ensemble stream {i} has chunks: {body}"
+        );
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -11931,14 +12800,22 @@ async fn should_count_ensemble_streams_per_dag_node_toward_max_requests() {
     while tokio::time::Instant::now() < deadline {
         let body = client
             .get(format!("{}/metrics", g_metrics_base()))
-            .send().await.unwrap().text().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         if rolling_recycle_count(&body, "ens_tail") >= 1.0 {
             recycled = true;
             break;
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(recycled, "T4b: ensemble streams must count per DAG node — the tail must roll-recycle");
+    assert!(
+        recycled,
+        "T4b: ensemble streams must count per DAG node — the tail must roll-recycle"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -11974,9 +12851,13 @@ async fn should_reject_streams_over_max_concurrent_streams() {
     assert_eq!(s1.status(), 200);
     assert_eq!(s2.status(), 200);
     let _ = tokio::time::timeout(Duration::from_secs(10), s1.chunk())
-        .await.expect("s1 first chunk").unwrap();
+        .await
+        .expect("s1 first chunk")
+        .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), s2.chunk())
-        .await.expect("s2 first chunk").unwrap();
+        .await
+        .expect("s2 first chunk")
+        .unwrap();
 
     // Third concurrent open → 429 + Retry-After.
     let s3 = open_stream().await;
@@ -11988,8 +12869,12 @@ async fn should_reject_streams_over_max_concurrent_streams() {
 
     // Drain both streams to completion (natural end releases the permits),
     // then a new stream is admitted again.
-    let _ = tokio::time::timeout(Duration::from_secs(20), s1.text()).await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(20), s2.text()).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(20), s1.text())
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(20), s2.text())
+        .await
+        .unwrap();
     let s4 = open_stream().await;
     assert_eq!(s4.status(), 200, "a closed stream's permit must re-admit");
 }
@@ -12042,14 +12927,22 @@ async fn should_close_decoupled_stream_cleanly_within_recycle_grace() {
     while tokio::time::Instant::now() < deadline {
         let body = client
             .get(format!("{}/metrics", g_metrics_base()))
-            .send().await.unwrap().text().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         if rolling_recycle_count(&body, "grace_model") >= 1.0 {
             recycled = true;
             break;
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(recycled, "the worker must still roll-recycle after the graceful close");
+    assert!(
+        recycled,
+        "the worker must still roll-recycle after the graceful close"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -12376,9 +13269,11 @@ async fn sigterm_evicts_uncooperative_stream_and_records_metrics() {
                     }
                     let evicted = body
                         .lines()
-                        .find(|l| l.starts_with(
-                            "liteserver_shutdown_streams_evicted_total{model=\"shutdown_slow\"",
-                        ))
+                        .find(|l| {
+                            l.starts_with(
+                                "liteserver_shutdown_streams_evicted_total{model=\"shutdown_slow\"",
+                            )
+                        })
                         .and_then(|l| l.rsplit_once(' '))
                         .and_then(|(_, n)| n.parse::<f64>().ok())
                         .unwrap_or(0.0);
@@ -12406,7 +13301,10 @@ async fn sigterm_evicts_uncooperative_stream_and_records_metrics() {
     );
 
     let (saw_draining, saw_evicted) = scrape.await.unwrap();
-    assert!(saw_draining, "liteserver_draining must be 1 during the drain window");
+    assert!(
+        saw_draining,
+        "liteserver_draining must be 1 during the drain window"
+    );
     assert!(
         saw_evicted,
         "the eviction must count toward liteserver_shutdown_streams_evicted_total"

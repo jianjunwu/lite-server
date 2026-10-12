@@ -116,7 +116,10 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 pub async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let models = state.registry.list_loaded();
-    let loaded: Vec<String> = models.iter().map(|(n, v, _)| format!("{}/{}", n, v)).collect();
+    let loaded: Vec<String> = models
+        .iter()
+        .map(|(n, v, _)| format!("{}/{}", n, v))
+        .collect();
     Json(json!({
         "server": "lite-server",
         "version": env!("CARGO_PKG_VERSION"),
@@ -187,7 +190,9 @@ pub async fn timeline_handler(
 }
 
 async fn timeline_json(model_name: &str, version: &str, step: usize) -> impl IntoResponse {
-    let entries = crate::metrics::aggregator::TIMELINE.get_timeline(model_name, version).await;
+    let entries = crate::metrics::aggregator::TIMELINE
+        .get_timeline(model_name, version)
+        .await;
     let entries = crate::metrics::aggregator::downsample_entries(entries, step);
     (
         timeline_headers(),
@@ -208,9 +213,10 @@ pub async fn timeline_model_handler(
 ) -> Result<impl IntoResponse, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let step = parse_step(&query)?;
-    let version = state.registry.get_active_version(&model_name).ok_or_else(|| {
-        AppError::ModelNotFound(format!("{} has no active version", model_name))
-    })?;
+    let version = state
+        .registry
+        .get_active_version(&model_name)
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?;
     Ok(timeline_json(&model_name, &version, step).await)
 }
 
@@ -228,7 +234,10 @@ pub async fn timeline_model_version_handler(
 // ===== Alerts =====
 
 pub async fn alerts_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let alerts = state.alert_engine.evaluate(&crate::metrics::aggregator::TIMELINE).await;
+    let alerts = state
+        .alert_engine
+        .evaluate(&crate::metrics::aggregator::TIMELINE)
+        .await;
     Json(json!({ "alerts": alerts }))
 }
 
@@ -250,7 +259,9 @@ pub async fn compare_versions_handler(
     match crate::metrics::aggregator::VersionComparator::compare(
         &crate::metrics::aggregator::TIMELINE,
         &model_name,
-    ).await {
+    )
+    .await
+    {
         Some(comp) => Ok(Json(json!(comp))),
         None => Err(AppError::ModelNotFound(format!(
             "No timeline data for model {}",
@@ -258,4 +269,3 @@ pub async fn compare_versions_handler(
         ))),
     }
 }
-

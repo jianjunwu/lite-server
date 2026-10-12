@@ -668,7 +668,9 @@ pub struct RateLimitConfig {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        Self { max_buckets: 65_536 }
+        Self {
+            max_buckets: 65_536,
+        }
     }
 }
 
@@ -715,7 +717,6 @@ impl Default for ModelRepositoryConfig {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -897,26 +898,66 @@ impl ModelTunables {
     /// Overlay fields set in `other` on top of `self` (CLI overrides win over
     /// config.yaml model_defaults).
     pub fn merge_from(&mut self, other: &ModelTunables) {
-        if other.max_queue_size.is_some() { self.max_queue_size = other.max_queue_size; }
-        if other.max_requests.is_some() { self.max_requests = other.max_requests; }
-        if other.max_requests_jitter.is_some() { self.max_requests_jitter = other.max_requests_jitter; }
-        if other.recycle_max_percent.is_some() { self.recycle_max_percent = other.recycle_max_percent; }
-        if other.count_streams_toward_max_requests.is_some() { self.count_streams_toward_max_requests = other.count_streams_toward_max_requests; }
-        if other.recycle_stream_drain_timeout_secs.is_some() { self.recycle_stream_drain_timeout_secs = other.recycle_stream_drain_timeout_secs; }
-        if other.max_concurrent_streams.is_some() { self.max_concurrent_streams = other.max_concurrent_streams; }
-        if other.recycle_stream_grace_ms.is_some() { self.recycle_stream_grace_ms = other.recycle_stream_grace_ms; }
-        if other.request_timeout.is_some() { self.request_timeout = other.request_timeout; }
-        if other.health_check_interval.is_some() { self.health_check_interval = other.health_check_interval; }
-        if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
-        if other.ejection_timeout.is_some() { self.ejection_timeout = other.ejection_timeout; }
-        if other.ejection_max_percent.is_some() { self.ejection_max_percent = other.ejection_max_percent; }
-        if other.ejection_max_timeout.is_some() { self.ejection_max_timeout = other.ejection_max_timeout; }
-        if other.max_retries.is_some() { self.max_retries = other.max_retries; }
-        if other.startup_timeout.is_some() { self.startup_timeout = other.startup_timeout; }
-        if other.health_check_timeout.is_some() { self.health_check_timeout = other.health_check_timeout; }
-        if other.health_check_kill_threshold.is_some() { self.health_check_kill_threshold = other.health_check_kill_threshold; }
-        if other.worker_kill_timeout.is_some() { self.worker_kill_timeout = other.worker_kill_timeout; }
-        if other.hook_http_timeout.is_some() { self.hook_http_timeout = other.hook_http_timeout; }
+        if other.max_queue_size.is_some() {
+            self.max_queue_size = other.max_queue_size;
+        }
+        if other.max_requests.is_some() {
+            self.max_requests = other.max_requests;
+        }
+        if other.max_requests_jitter.is_some() {
+            self.max_requests_jitter = other.max_requests_jitter;
+        }
+        if other.recycle_max_percent.is_some() {
+            self.recycle_max_percent = other.recycle_max_percent;
+        }
+        if other.count_streams_toward_max_requests.is_some() {
+            self.count_streams_toward_max_requests = other.count_streams_toward_max_requests;
+        }
+        if other.recycle_stream_drain_timeout_secs.is_some() {
+            self.recycle_stream_drain_timeout_secs = other.recycle_stream_drain_timeout_secs;
+        }
+        if other.max_concurrent_streams.is_some() {
+            self.max_concurrent_streams = other.max_concurrent_streams;
+        }
+        if other.recycle_stream_grace_ms.is_some() {
+            self.recycle_stream_grace_ms = other.recycle_stream_grace_ms;
+        }
+        if other.request_timeout.is_some() {
+            self.request_timeout = other.request_timeout;
+        }
+        if other.health_check_interval.is_some() {
+            self.health_check_interval = other.health_check_interval;
+        }
+        if other.ejection_error_threshold.is_some() {
+            self.ejection_error_threshold = other.ejection_error_threshold;
+        }
+        if other.ejection_timeout.is_some() {
+            self.ejection_timeout = other.ejection_timeout;
+        }
+        if other.ejection_max_percent.is_some() {
+            self.ejection_max_percent = other.ejection_max_percent;
+        }
+        if other.ejection_max_timeout.is_some() {
+            self.ejection_max_timeout = other.ejection_max_timeout;
+        }
+        if other.max_retries.is_some() {
+            self.max_retries = other.max_retries;
+        }
+        if other.startup_timeout.is_some() {
+            self.startup_timeout = other.startup_timeout;
+        }
+        if other.health_check_timeout.is_some() {
+            self.health_check_timeout = other.health_check_timeout;
+        }
+        if other.health_check_kill_threshold.is_some() {
+            self.health_check_kill_threshold = other.health_check_kill_threshold;
+        }
+        if other.worker_kill_timeout.is_some() {
+            self.worker_kill_timeout = other.worker_kill_timeout;
+        }
+        if other.hook_http_timeout.is_some() {
+            self.hook_http_timeout = other.hook_http_timeout;
+        }
     }
 }
 
@@ -1309,7 +1350,6 @@ pub enum QueueTimeoutAction {
     Reject,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
@@ -1465,7 +1505,10 @@ impl ModelConfig {
         check_duration_secs("batch_timeout", self.batch_timeout)?;
         check_duration_secs("min_batch_timeout", self.min_batch_timeout)?;
         check_duration_secs("request_timeout", self.request_timeout)?;
-        check_duration_secs("recycle_stream_drain_timeout_secs", self.recycle_stream_drain_timeout_secs)?;
+        check_duration_secs(
+            "recycle_stream_drain_timeout_secs",
+            self.recycle_stream_drain_timeout_secs,
+        )?;
         check_duration_secs("health_check_interval", self.health_check_interval)?;
         check_duration_secs("ejection_timeout", self.ejection_timeout)?;
         check_duration_secs("startup_timeout", self.startup_timeout)?;
@@ -1605,10 +1648,7 @@ impl ModelConfig {
         if self.continuous_batching {
             // One worker per unique device (written/ascending order preserved).
             let mut seen = std::collections::HashSet::new();
-            Ok(plan
-                .into_iter()
-                .filter(|d| seen.insert(*d))
-                .collect())
+            Ok(plan.into_iter().filter(|d| seen.insert(*d)).collect())
         } else {
             Ok(plan)
         }
@@ -1714,45 +1754,96 @@ impl CliOverrides {
     /// these paths read as "cli" regardless of file/default content.
     pub fn overridden_paths(&self) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
-        if self.port.is_some() { out.insert("server.http_port".to_string()); }
-        if self.host.is_some() { out.insert("server.host".to_string()); }
-        if self.model_repo.is_some() { out.insert("model_repository.path".to_string()); }
-        if self.threads.is_some() { out.insert("server.threads".to_string()); }
-        if self.timeout.is_some() { out.insert("server.timeout".to_string()); }
-        if self.log_level.is_some() { out.insert("logging.level".to_string()); }
-        if self.log_info_output.is_some() { out.insert("logging.info_output".to_string()); }
-        if self.log_error_output.is_some() { out.insert("logging.error_output".to_string()); }
-        if self.log_rotation.is_some() { out.insert("logging.rotation".to_string()); }
-        if self.grpc_port.is_some() { out.insert("server.grpc_port".to_string()); }
-        if self.metrics_port.is_some() { out.insert("server.metrics_port".to_string()); }
-        if self.no_grpc { out.insert("grpc.enabled".to_string()); }
-        if self.no_metrics { out.insert("metrics.enabled".to_string()); }
-        if self.no_streaming_metrics { out.insert("features.streaming_metrics".to_string()); }
-        if self.graceful_timeout.is_some() { out.insert("server.graceful_timeout".to_string()); }
-        if self.keepalive_timeout.is_some() { out.insert("server.keepalive_timeout".to_string()); }
-        if self.shutdown_stream_grace_ms.is_some() { out.insert("server.shutdown_stream_grace_ms".to_string()); }
+        if self.port.is_some() {
+            out.insert("server.http_port".to_string());
+        }
+        if self.host.is_some() {
+            out.insert("server.host".to_string());
+        }
+        if self.model_repo.is_some() {
+            out.insert("model_repository.path".to_string());
+        }
+        if self.threads.is_some() {
+            out.insert("server.threads".to_string());
+        }
+        if self.timeout.is_some() {
+            out.insert("server.timeout".to_string());
+        }
+        if self.log_level.is_some() {
+            out.insert("logging.level".to_string());
+        }
+        if self.log_info_output.is_some() {
+            out.insert("logging.info_output".to_string());
+        }
+        if self.log_error_output.is_some() {
+            out.insert("logging.error_output".to_string());
+        }
+        if self.log_rotation.is_some() {
+            out.insert("logging.rotation".to_string());
+        }
+        if self.grpc_port.is_some() {
+            out.insert("server.grpc_port".to_string());
+        }
+        if self.metrics_port.is_some() {
+            out.insert("server.metrics_port".to_string());
+        }
+        if self.no_grpc {
+            out.insert("grpc.enabled".to_string());
+        }
+        if self.no_metrics {
+            out.insert("metrics.enabled".to_string());
+        }
+        if self.no_streaming_metrics {
+            out.insert("features.streaming_metrics".to_string());
+        }
+        if self.graceful_timeout.is_some() {
+            out.insert("server.graceful_timeout".to_string());
+        }
+        if self.keepalive_timeout.is_some() {
+            out.insert("server.keepalive_timeout".to_string());
+        }
+        if self.shutdown_stream_grace_ms.is_some() {
+            out.insert("server.shutdown_stream_grace_ms".to_string());
+        }
         let t = &self.tunables;
         let mut tunable = |name: &str, set: bool| {
-            if set { out.insert(format!("model_defaults.{name}")); }
+            if set {
+                out.insert(format!("model_defaults.{name}"));
+            }
         };
         tunable("max_queue_size", t.max_queue_size.is_some());
         tunable("max_requests", t.max_requests.is_some());
         tunable("max_requests_jitter", t.max_requests_jitter.is_some());
         tunable("recycle_max_percent", t.recycle_max_percent.is_some());
-        tunable("count_streams_toward_max_requests", t.count_streams_toward_max_requests.is_some());
-        tunable("recycle_stream_drain_timeout_secs", t.recycle_stream_drain_timeout_secs.is_some());
+        tunable(
+            "count_streams_toward_max_requests",
+            t.count_streams_toward_max_requests.is_some(),
+        );
+        tunable(
+            "recycle_stream_drain_timeout_secs",
+            t.recycle_stream_drain_timeout_secs.is_some(),
+        );
         tunable("max_concurrent_streams", t.max_concurrent_streams.is_some());
-        tunable("recycle_stream_grace_ms", t.recycle_stream_grace_ms.is_some());
+        tunable(
+            "recycle_stream_grace_ms",
+            t.recycle_stream_grace_ms.is_some(),
+        );
         tunable("request_timeout", t.request_timeout.is_some());
         tunable("health_check_interval", t.health_check_interval.is_some());
-        tunable("ejection_error_threshold", t.ejection_error_threshold.is_some());
+        tunable(
+            "ejection_error_threshold",
+            t.ejection_error_threshold.is_some(),
+        );
         tunable("ejection_timeout", t.ejection_timeout.is_some());
         tunable("ejection_max_percent", t.ejection_max_percent.is_some());
         tunable("ejection_max_timeout", t.ejection_max_timeout.is_some());
         tunable("max_retries", t.max_retries.is_some());
         tunable("startup_timeout", t.startup_timeout.is_some());
         tunable("health_check_timeout", t.health_check_timeout.is_some());
-        tunable("health_check_kill_threshold", t.health_check_kill_threshold.is_some());
+        tunable(
+            "health_check_kill_threshold",
+            t.health_check_kill_threshold.is_some(),
+        );
         tunable("worker_kill_timeout", t.worker_kill_timeout.is_some());
         tunable("hook_http_timeout", t.hook_http_timeout.is_some());
         out
@@ -1876,18 +1967,37 @@ impl Config {
                  (0 rejects every request body); omit it for the 64 MiB default"
             );
         }
-        if self.server.balance_rel_threshold < 0.0 || !self.server.balance_rel_threshold.is_finite() {
+        if self.server.balance_rel_threshold < 0.0 || !self.server.balance_rel_threshold.is_finite()
+        {
             anyhow::bail!(
                 "config field `server.balance_rel_threshold` must be a finite non-negative multiplier, got {}",
                 self.server.balance_rel_threshold
             );
         }
-        check_duration_secs("tunables.reconcile_coalesce_secs", self.tunables.reconcile_coalesce_secs)?;
-        check_duration_secs("tunables.hot_reload_cooldown_secs", self.tunables.hot_reload_cooldown_secs)?;
-        check_duration_secs("tunables.watcher_debounce_secs", self.tunables.watcher_debounce_secs)?;
-        check_duration_secs("tunables.file_changed_timeout_secs", self.tunables.file_changed_timeout_secs)?;
-        check_duration_secs("tunables.worker_stderr_drain_secs", self.tunables.worker_stderr_drain_secs)?;
-        check_duration_secs("tunables.unpack_timeout_secs", self.tunables.unpack_timeout_secs)?;
+        check_duration_secs(
+            "tunables.reconcile_coalesce_secs",
+            self.tunables.reconcile_coalesce_secs,
+        )?;
+        check_duration_secs(
+            "tunables.hot_reload_cooldown_secs",
+            self.tunables.hot_reload_cooldown_secs,
+        )?;
+        check_duration_secs(
+            "tunables.watcher_debounce_secs",
+            self.tunables.watcher_debounce_secs,
+        )?;
+        check_duration_secs(
+            "tunables.file_changed_timeout_secs",
+            self.tunables.file_changed_timeout_secs,
+        )?;
+        check_duration_secs(
+            "tunables.worker_stderr_drain_secs",
+            self.tunables.worker_stderr_drain_secs,
+        )?;
+        check_duration_secs(
+            "tunables.unpack_timeout_secs",
+            self.tunables.unpack_timeout_secs,
+        )?;
         // F-12: h2's legal max-frame-size range is [2^14, 2^24-1]; the h2
         // crate hard-asserts it per new connection (a plain assert!, active
         // in release), so an out-of-range value must fail startup validation
@@ -1909,8 +2019,7 @@ impl Config {
         //   (out-of-range silently never-samples)
         // - control_mode: a free-form string compared == "auto" at boot, so
         //   a typo silently disables the reconcile loop
-        if !crate::metrics::prometheus::is_valid_metric_namespace(&self.metrics.metric_namespace)
-        {
+        if !crate::metrics::prometheus::is_valid_metric_namespace(&self.metrics.metric_namespace) {
             anyhow::bail!(
                 "config field `metrics.metric_namespace` '{}' is not a valid Prometheus name segment",
                 self.metrics.metric_namespace
@@ -1989,8 +2098,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.telemetry.enabled = true;
         cfg.telemetry.protocol = TelemetryProtocol::Http;
-        let err = cfg.validate().expect_err("protocol=http + enabled 必须 fail-fast");
-        assert!(err.to_string().contains("telemetry.protocol"), "报错须点名字段: {err}");
+        let err = cfg
+            .validate()
+            .expect_err("protocol=http + enabled 必须 fail-fast");
+        assert!(
+            err.to_string().contains("telemetry.protocol"),
+            "报错须点名字段: {err}"
+        );
         // grpc（默认）与 enabled=false 不受影响。
         cfg.telemetry.protocol = TelemetryProtocol::Grpc;
         assert!(cfg.validate().is_ok());
@@ -2028,10 +2142,9 @@ mod tests {
         // G1 (Q1 ruling): every worker process has its own engine state (CUDA
         // graphs / allocator pools), so the default must warm ALL workers —
         // `worker` scope, not the legacy version-wide single pass.
-        let p: WarmupPolicy = serde_yaml::from_str(
-            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
-        )
-        .unwrap();
+        let p: WarmupPolicy =
+            serde_yaml::from_str("enabled: true\nsamples:\n  - input_ref: warmup/input.json\n")
+                .unwrap();
         assert_eq!(p.scope, WarmupScope::Worker);
     }
 
@@ -2057,10 +2170,9 @@ mod tests {
         // G2: a respawned replacement worker is a cold process, so re-warming
         // after respawn defaults on (Q2 ruling 2026-08-18); `respawn: false`
         // opts out.
-        let p: WarmupPolicy = serde_yaml::from_str(
-            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
-        )
-        .unwrap();
+        let p: WarmupPolicy =
+            serde_yaml::from_str("enabled: true\nsamples:\n  - input_ref: warmup/input.json\n")
+                .unwrap();
         assert!(p.respawn, "respawn re-warm must default on");
         let p: WarmupPolicy = serde_yaml::from_str(
             "enabled: true\nrespawn: false\nsamples:\n  - input_ref: warmup/input.json\n",
@@ -2075,10 +2187,9 @@ mod tests {
         // G4/G5/G7: total budget / concurrency / retries are all additive —
         // defaults preserve the pre-knob behavior (no total budget, serial,
         // fail-fast).
-        let p: WarmupPolicy = serde_yaml::from_str(
-            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
-        )
-        .unwrap();
+        let p: WarmupPolicy =
+            serde_yaml::from_str("enabled: true\nsamples:\n  - input_ref: warmup/input.json\n")
+                .unwrap();
         assert_eq!(p.total_timeout_secs, 0.0, "no total budget by default");
         assert_eq!(p.concurrency, 1, "serial by default");
         assert_eq!(p.retries, 0, "fail-fast by default (D33)");
@@ -2116,10 +2227,9 @@ mod tests {
         assert_eq!(s.mode, WarmupSampleMode::Unary);
         assert_eq!(s.completion, None);
 
-        let s: WarmupSample = serde_yaml::from_str(
-            "input_ref: warmup/in.json\nmode: stream\ncompletion: drain\n",
-        )
-        .unwrap();
+        let s: WarmupSample =
+            serde_yaml::from_str("input_ref: warmup/in.json\nmode: stream\ncompletion: drain\n")
+                .unwrap();
         assert_eq!(s.mode, WarmupSampleMode::Stream);
         assert_eq!(s.completion, Some(WarmupStreamCompletion::Drain));
     }
@@ -2198,7 +2308,9 @@ mod tests {
             "enabled: true\ndummy_input_ref: warmup/input.json\n",
         ] {
             let p: WarmupPolicy = serde_yaml::from_str(yaml).unwrap();
-            let err = p.validate().expect_err("legacy warmup shape must fail validation");
+            let err = p
+                .validate()
+                .expect_err("legacy warmup shape must fail validation");
             assert!(err.to_string().contains("M7"), "error must name M7: {err}");
         }
     }
@@ -2206,7 +2318,10 @@ mod tests {
     #[test]
     fn warmup_enabled_requires_nonempty_samples_with_input_ref() {
         let p: WarmupPolicy = serde_yaml::from_str("enabled: true\n").unwrap();
-        assert!(p.validate().is_err(), "enabled but samples empty → fail-fast");
+        assert!(
+            p.validate().is_err(),
+            "enabled but samples empty → fail-fast"
+        );
         let p: WarmupPolicy =
             serde_yaml::from_str("enabled: true\nsamples:\n  - input_ref: \"\"\n").unwrap();
         assert!(p.validate().is_err(), "empty input_ref → fail-fast");
@@ -2219,8 +2334,7 @@ mod tests {
     fn warmup_legacy_config_file_fails_load() {
         // 端到端：含旧字段的 config.yaml 经 load_model_config 直接报错（reconcile
         // /ensemble 的吞错点已改为可见错误，不会再静默 default）。
-        let tmp =
-            std::env::temp_dir().join(format!("liteserver-warmup-m7-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("liteserver-warmup-m7-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join("config.yaml");
         fs::write(
@@ -2318,10 +2432,7 @@ mod tests {
     /// instead of serving a server that refuses all inference traffic.
     #[test]
     fn validate_rejects_zero_max_request_body_bytes() {
-        let cfg: Config = serde_yaml::from_str(
-            "server:\n  max_request_body_bytes: 0\n",
-        )
-        .unwrap();
+        let cfg: Config = serde_yaml::from_str("server:\n  max_request_body_bytes: 0\n").unwrap();
         let err = cfg.validate().expect_err("0 must be rejected");
         assert!(
             err.to_string().contains("max_request_body_bytes"),
@@ -2329,10 +2440,8 @@ mod tests {
         );
         // Absent (default 64 MiB) and a positive value still pass.
         Config::default().validate().expect("default validates");
-        let cfg: Config = serde_yaml::from_str(
-            "server:\n  max_request_body_bytes: 1048576\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            serde_yaml::from_str("server:\n  max_request_body_bytes: 1048576\n").unwrap();
         cfg.validate().expect("positive value validates");
     }
 
@@ -2497,7 +2606,8 @@ mod tests {
 
     #[test]
     fn test_orchestration_section_parses_poll_interval() {
-        let yaml = "orchestration:\n  control_mode: auto\n  poll_interval: 10\n  load_models:\n    - m1\n";
+        let yaml =
+            "orchestration:\n  control_mode: auto\n  poll_interval: 10\n  load_models:\n    - m1\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.orchestration.control_mode, "auto");
         assert_eq!(cfg.orchestration.poll_interval, 10);
@@ -2564,7 +2674,10 @@ mod tests {
             "an unparseable trusted_proxies CIDR must fail config-check, not boot"
         );
 
-        for bad in ["telemetry:\n  sample_ratio: 7\n", "telemetry:\n  sample_ratio: -0.5\n"] {
+        for bad in [
+            "telemetry:\n  sample_ratio: 7\n",
+            "telemetry:\n  sample_ratio: -0.5\n",
+        ] {
             let bad_ratio: Config = serde_yaml::from_str(bad).unwrap();
             assert!(
                 bad_ratio.validate().is_err(),
@@ -2677,15 +2790,17 @@ mod tests {
     fn trusted_proxies_defaults_empty() {
         // fail-safe default: empty → client proxy headers ignored, peer used.
         assert!(Config::default().server.trusted_proxies.is_empty());
-        assert!(ServerConfig::default().trusted_networks().unwrap().is_empty());
+        assert!(ServerConfig::default()
+            .trusted_networks()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn trusted_proxies_parses_cidr_and_bare_ip() {
-        let cfg: Config = serde_yaml::from_str(
-            "server:\n  trusted_proxies: [\"10.0.0.0/8\", \"192.168.0.1\"]\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            serde_yaml::from_str("server:\n  trusted_proxies: [\"10.0.0.0/8\", \"192.168.0.1\"]\n")
+                .unwrap();
         let nets = cfg.server.trusted_networks().unwrap();
         assert_eq!(nets.len(), 2);
         use std::net::IpAddr;
@@ -3026,7 +3141,11 @@ mod tests {
         };
         yaml_defaults.merge_from(&cli);
         assert_eq!(yaml_defaults.max_queue_size, Some(500), "CLI field wins");
-        assert_eq!(yaml_defaults.request_timeout, Some(30.0), "unset CLI field preserves YAML value");
+        assert_eq!(
+            yaml_defaults.request_timeout,
+            Some(30.0),
+            "unset CLI field preserves YAML value"
+        );
     }
 
     #[test]
@@ -3084,7 +3203,10 @@ mod tests {
     #[test]
     fn test_health_check_kill_threshold_default() {
         let cfg = ModelConfig::default();
-        assert_eq!(cfg.health_check_kill_threshold, 0, "kill should be disabled by default");
+        assert_eq!(
+            cfg.health_check_kill_threshold, 0,
+            "kill should be disabled by default"
+        );
     }
 
     #[test]
@@ -3137,7 +3259,6 @@ mod tests {
         assert_eq!(cors.max_age_secs, 3600);
     }
 
-
     #[test]
     fn test_policies_default_empty() {
         let cfg = ModelConfig::default();
@@ -3177,7 +3298,10 @@ policies:
         let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
         let auth = cfg.policies.auth.unwrap();
         assert_eq!(auth.header, "X-API-Key");
-        assert!(auth.keys.is_empty(), "empty keys = any non-empty value passes");
+        assert!(
+            auth.keys.is_empty(),
+            "empty keys = any non-empty value passes"
+        );
     }
 
     #[test]
@@ -3186,7 +3310,11 @@ policies:
         let dir = std::env::temp_dir().join("lite-server-policy-env-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        std::fs::write(&path, "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_KEY}\", \"sk-static\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_KEY}\", \"sk-static\"]\n",
+        )
+        .unwrap();
         let cfg = load_model_config(&path).unwrap();
         let auth = cfg.policies.auth.unwrap();
         assert_eq!(auth.keys, vec!["sk-from-env", "sk-static"]);
@@ -3199,7 +3327,11 @@ policies:
         let dir = std::env::temp_dir().join("lite-server-policy-env-fail-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        std::fs::write(&path, "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_MISSING}\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_MISSING}\"]\n",
+        )
+        .unwrap();
         let err = load_model_config(&path).unwrap_err();
         assert!(
             err.to_string().contains("LITE_TEST_POLICY_MISSING"),
@@ -3211,8 +3343,14 @@ policies:
 
     #[test]
     fn test_unix_socket_path_detects_unix_prefix() {
-        assert_eq!(unix_socket_path("unix:/tmp/lite-server.sock"), Some("/tmp/lite-server.sock"));
-        assert_eq!(unix_socket_path("unix:./lite-server.sock"), Some("./lite-server.sock"));
+        assert_eq!(
+            unix_socket_path("unix:/tmp/lite-server.sock"),
+            Some("/tmp/lite-server.sock")
+        );
+        assert_eq!(
+            unix_socket_path("unix:./lite-server.sock"),
+            Some("./lite-server.sock")
+        );
     }
 
     #[test]
@@ -3379,11 +3517,13 @@ policies:
 
     #[test]
     fn test_recycle_max_percent_validate_range() {
-        let validate = |recycle_max_percent| ModelConfig {
-            recycle_max_percent,
-            ..Default::default()
-        }
-        .validate();
+        let validate = |recycle_max_percent| {
+            ModelConfig {
+                recycle_max_percent,
+                ..Default::default()
+            }
+            .validate()
+        };
         assert!(
             validate(0).is_err(),
             "0% would silently floor to one concurrent recycle via .max(1)"
@@ -3550,7 +3690,10 @@ policies:
         // None / "auto" resolve to a single device 0.
         assert_eq!(plan(""), vec![0]);
         assert_eq!(plan("devices: auto\n"), vec![0]);
-        assert_eq!(plan("devices: \"auto\"\nworkers_per_device: 2\n"), vec![0, 0]);
+        assert_eq!(
+            plan("devices: \"auto\"\nworkers_per_device: 2\n"),
+            vec![0, 0]
+        );
     }
 
     #[test]
@@ -3568,15 +3711,9 @@ policies:
     fn device_plan_map_form_groups_workers_per_device_index() {
         // Map keys are device indices (quoted strings), values are explicit
         // per-device worker counts; expansion groups by ascending index.
-        assert_eq!(
-            plan("devices: { \"1\": 2, \"3\": 1 }\n"),
-            vec![1, 1, 3]
-        );
+        assert_eq!(plan("devices: { \"1\": 2, \"3\": 1 }\n"), vec![1, 1, 3]);
         // Ascending-device expansion holds regardless of YAML key order.
-        assert_eq!(
-            plan("devices: { \"3\": 1, \"1\": 2 }\n"),
-            vec![1, 1, 3]
-        );
+        assert_eq!(plan("devices: { \"3\": 1, \"1\": 2 }\n"), vec![1, 1, 3]);
     }
 
     #[test]

@@ -111,7 +111,9 @@ fn kill_stale_on_port(port: u16) {
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -129,7 +131,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -144,7 +151,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<serde_json::Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -323,11 +335,7 @@ async fn boot(extra: &str, models: &[&str]) -> (String, ServerGuard, std::path::
     let server_yaml = write_server_yaml(&repo, http_port, extra, models);
     let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(http_port, 30).await;
-    (
-        format!("http://127.0.0.1:{}", http_port),
-        guard,
-        repo,
-    )
+    (format!("http://127.0.0.1:{}", http_port), guard, repo)
 }
 
 fn port_of(base: &str) -> u16 {
@@ -349,8 +357,9 @@ async fn streaming_gauge(base: &str, model: &str, protocol: &str) -> Option<f64>
         .await
         .ok()?;
     for line in text.lines() {
-        if line.starts_with(&format!("liteserver_streaming_connections{{model=\"{model}\""))
-            && line.contains(&format!("protocol=\"{protocol}\""))
+        if line.starts_with(&format!(
+            "liteserver_streaming_connections{{model=\"{model}\""
+        )) && line.contains(&format!("protocol=\"{protocol}\""))
         {
             return line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok());
         }
@@ -368,9 +377,7 @@ async fn wait_gauge(base: &str, model: &str, protocol: &str, want: f64, timeout_
         }
         sleep(Duration::from_millis(200)).await;
     }
-    panic!(
-        "gauge liteserver_streaming_connections[{model},{protocol}] never reached {want}"
-    );
+    panic!("gauge liteserver_streaming_connections[{model},{protocol}] never reached {want}");
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +403,9 @@ async fn test_k3_ws_no_server_ping_keepalive() {
     wait_ready_all(&base, &["stall"]).await;
     let http_port = port_of(&base);
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/stall/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     // Start the stream: the writer loop (with its keepalive ticker) runs only
     // after the first client frame. The stall model then produces no chunks,
@@ -442,7 +451,9 @@ async fn test_k3_ws_keepalive_disabled_sends_no_ping() {
     wait_ready_all(&base, &["stall"]).await;
     let http_port = port_of(&base);
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/stall/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(Message::Text(r#"{"text":"hi"}"#.to_string()))
         .await
         .expect("send first frame");
@@ -541,7 +552,9 @@ async fn test_l1_ws_send_no_deadline_holds_connection() {
         "x-lite-timeout",
         tokio_tungstenite::tungstenite::http::HeaderValue::from_static("2"),
     );
-    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("WS connect");
     ws.send(Message::Text(r#"{"text":"go"}"#.into()))
         .await
         .unwrap();
@@ -693,7 +706,10 @@ async fn test_rn13_admission_slot_held_for_stream_lifetime() {
     drop(resp1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let resp = open_stream().send().await.expect("probe request must complete");
+        let resp = open_stream()
+            .send()
+            .await
+            .expect("probe request must complete");
         let status = resp.status().as_u16();
         drop(resp);
         if status == 200 {
@@ -816,9 +832,11 @@ async fn test_rn13_h2_bidi_admission_slot_held_for_session_lifetime() {
     });
     // The upstream body stays half-open: the Open frame is buffered, the
     // sender is held by the test — the session is alive and silent.
-    let (body_tx, body_rx) =
-        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
-    body_tx.send(Ok(open)).await.expect("open frame must buffer");
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    body_tx
+        .send(Ok(open))
+        .await
+        .expect("open frame must buffer");
     let resp = h2
         .post(format!("{base}/v2/models/stall/bidi"))
         .header("Content-Type", "application/json")

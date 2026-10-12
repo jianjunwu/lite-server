@@ -43,15 +43,20 @@ fn d30_element_payload(
         });
     }
     if crate::grpc::payload::grpc_payload_is_json(headers) {
-        let v: serde_json::Value = serde_json::from_slice(data)
-            .map_err(|e| format!("element is not valid JSON: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(data).map_err(|e| format!("element is not valid JSON: {e}"))?;
         Ok(crate::ensemble::EnsembleValue::Json(v))
     } else {
         let ct = headers
             .get("content-type")
             .cloned()
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        Ok(crate::ensemble::EnsembleValue::Binary(data.clone(), ct, None, None))
+        Ok(crate::ensemble::EnsembleValue::Binary(
+            data.clone(),
+            ct,
+            None,
+            None,
+        ))
     }
 }
 
@@ -142,7 +147,12 @@ impl GrpcService {
                     .registry
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
-                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+                    .ok_or_else(|| {
+                        err(Status::not_found(format!(
+                            "{} has no active version",
+                            model_name
+                        )))
+                    })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
@@ -158,7 +168,12 @@ impl GrpcService {
         let mv = self.registry.get(model_name, Some(&resolved_version));
         if let Some(mv) = &mv {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+            enforce_grpc_rate_limit(
+                &self.rate_limiter,
+                mv.policies.rate_limit.as_ref(),
+                model_name,
+                &client_ip,
+            )?;
         }
 
         // Fire InferenceRequest callback — batch_infer now mirrors unary
@@ -187,7 +202,11 @@ impl GrpcService {
         // (§4.4 unary rows, B3 direct propagation) and never fail the whole
         // batch. A streaming DAG is an unsupported combination → whole-RPC
         // InvalidArgument.
-        if mv.as_ref().map(|m| m.model_type == ModelType::Ensemble).unwrap_or(false) {
+        if mv
+            .as_ref()
+            .map(|m| m.model_type == ModelType::Ensemble)
+            .unwrap_or(false)
+        {
             // E8-1 (D38): extract + D22-validate the selector here —
             // grpc_metadata is in scope at the caller.
             let dag_selector = crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
@@ -278,9 +297,7 @@ impl GrpcService {
         let resp = match crate::deadline::remaining(deadline.unix_ns) {
             Some(t) => match tokio::time::timeout(t, client.send(internal_req)).await {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    return Err(err(Status::internal(format!("worker error: {}", e))))
-                }
+                Ok(Err(e)) => return Err(err(Status::internal(format!("worker error: {}", e)))),
                 Err(_) => {
                     return Err(err(Status::deadline_exceeded(format!(
                         "inference timed out after {:.1}s",
@@ -348,9 +365,10 @@ impl GrpcService {
         // lives there).
         dag_selector: Option<String>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
-        let plan = crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
-            .await
-            .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
+        let plan =
+            crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
+                .await
+                .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
         // D30: streaming DAGs are unsupported in batch. The dags form's
         // container plan carries EMPTY steps — the check must consult the
         // set the request will run: the header-selected set (D38), the
@@ -393,8 +411,7 @@ impl GrpcService {
         let snapshot = Arc::new(crate::ensemble::VersionSnapshot::default());
 
         let item_count = req.items.len();
-        let mut set: tokio::task::JoinSet<(usize, pb::InferResponse)> =
-            tokio::task::JoinSet::new();
+        let mut set: tokio::task::JoinSet<(usize, pb::InferResponse)> = tokio::task::JoinSet::new();
         let mut items: Vec<Option<pb::InferResponse>> = vec![None; item_count];
         for (i, item) in req.items.into_iter().enumerate() {
             // RN-3 (resource-leak-plan): bound concurrent element tasks — an
@@ -403,9 +420,13 @@ impl GrpcService {
             // window drains one completed task before spawning past the cap;
             // order is preserved by the index slots.
             while set.len() >= BATCH_ENSEMBLE_MAX_CONCURRENT {
-                let Some(joined) = set.join_next().await else { break };
+                let Some(joined) = set.join_next().await else {
+                    break;
+                };
                 let (j, resp) = joined.map_err(|e| {
-                    err(Status::internal(format!("batch element task join error: {e}")))
+                    err(Status::internal(format!(
+                        "batch element task join error: {e}"
+                    )))
                 })?;
                 items[j] = Some(resp);
             }
@@ -427,16 +448,24 @@ impl GrpcService {
             let snapshot = Arc::clone(&snapshot);
             set.spawn(async move {
                 let resp = match crate::ensemble::execute_ensemble_inner(
-                    state, &model, &version, payload, &request_id_elem, opts, &snapshot, 0, &[],
+                    state,
+                    &model,
+                    &version,
+                    payload,
+                    &request_id_elem,
+                    opts,
+                    &snapshot,
+                    0,
+                    &[],
                 )
                 .await
                 {
                     Ok(crate::ensemble::EnsembleOutcome::Unary(v)) => d30_element_ok(v),
-                    Ok(crate::ensemble::EnsembleOutcome::Stream(_)) => d30_element_error(
-                        &AppError::Internal(
+                    Ok(crate::ensemble::EnsembleOutcome::Stream(_)) => {
+                        d30_element_error(&AppError::Internal(
                             "ensemble returned a stream from batch (D30 violation)".to_string(),
-                        ),
-                    ),
+                        ))
+                    }
                     Err(e) => d30_element_error(&e),
                 };
                 (i, resp)
@@ -446,7 +475,9 @@ impl GrpcService {
         // Drain the remaining in-flight element tasks.
         while let Some(joined) = set.join_next().await {
             let (i, resp) = joined.map_err(|e| {
-                err(Status::internal(format!("batch element task join error: {e}")))
+                err(Status::internal(format!(
+                    "batch element task join error: {e}"
+                )))
             })?;
             items[i] = Some(resp);
         }
@@ -470,20 +501,23 @@ mod tests {
     fn d30_element_payload_classification() {
         let json_headers: HashMap<String, String> =
             [("content-type".to_string(), "application/json".to_string())].into();
-        let v = d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &json_headers).unwrap();
+        let v =
+            d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &json_headers).unwrap();
         assert_eq!(
             v,
             crate::ensemble::EnsembleValue::Json(serde_json::json!({"a": 1}))
         );
 
         // Missing content-type → JSON default (unary parity).
-        let v = d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &HashMap::new()).unwrap();
+        let v = d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &HashMap::new())
+            .unwrap();
         assert!(matches!(v, crate::ensemble::EnsembleValue::Json(_)));
 
         // Non-JSON content-type → Binary with the declared content-type.
         let bin_headers: HashMap<String, String> =
             [("content-type".to_string(), "image/png".to_string())].into();
-        let v = d30_element_payload(&bytes::Bytes::from_static(&[0x00, 0x01]), &bin_headers).unwrap();
+        let v =
+            d30_element_payload(&bytes::Bytes::from_static(&[0x00, 0x01]), &bin_headers).unwrap();
         match v {
             crate::ensemble::EnsembleValue::Binary(data, ct, ..) => {
                 assert_eq!(data.as_ref(), &[0x00, 0x01]);
@@ -513,7 +547,11 @@ mod tests {
 
         let e = crate::error::AppError::InferenceTimeout("t".to_string());
         assert!(
-            d30_element_error(&e).status.unwrap().message.starts_with("504"),
+            d30_element_error(&e)
+                .status
+                .unwrap()
+                .message
+                .starts_with("504"),
             "step timeout → 504"
         );
     }
@@ -522,7 +560,9 @@ mod tests {
     /// through verbatim (InferResponse carries no per-item content-type).
     #[test]
     fn d30_element_ok_shapes() {
-        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 1})));
+        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Json(
+            serde_json::json!({"x": 1}),
+        ));
         assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
         assert_eq!(resp.data.as_ref(), &br#"{"x":1}"#[..]);
 

@@ -19,7 +19,10 @@ fn project_root() -> std::path::PathBuf {
 }
 
 fn lite_server_bin() -> std::path::PathBuf {
-    project_root().join("target").join("debug").join("lite-server-core")
+    project_root()
+        .join("target")
+        .join("debug")
+        .join("lite-server-core")
 }
 
 fn start_server(args: &[&str]) -> std::process::Child {
@@ -86,16 +89,22 @@ impl Drop for ServerGuard {
 
 #[cfg(unix)]
 fn kill_stale_on_port(port: u16) {
-    let output = Command::new("lsof").args(["-ti", &format!(":{}", port)]).output();
+    let output = Command::new("lsof")
+        .args(["-ti", &format!(":{}", port)])
+        .output();
     if let Ok(out) = output {
         let pids = String::from_utf8_lossy(&out.stdout);
         for pid_str in pids.lines() {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let ps = Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output();
+                let ps = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "comm="])
+                    .output();
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -106,7 +115,14 @@ fn kill_stale_on_port(port: u16) {
 #[cfg(unix)]
 fn established_tcp(pid: u32) -> usize {
     let out = Command::new("lsof")
-        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:ESTABLISHED"])
+        .args([
+            "-nP",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:ESTABLISHED",
+        ])
         .output();
     match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
@@ -174,7 +190,9 @@ impl TestPki {
     fn new(cn: &str) -> Self {
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         Self {
@@ -245,7 +263,12 @@ async fn wait_for_https_server(client: &reqwest::Client, port: u16, timeout_secs
     let url = format!("https://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -269,7 +292,12 @@ async fn load_model_https(client: &reqwest::Client, base: &str, model: &str, ver
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return;
@@ -298,10 +326,12 @@ async fn assert_https_infer(client: &reqwest::Client, base: &str) {
 // gRPC TLS channel helpers
 // ---------------------------------------------------------------------------
 
-fn grpc_tls_config(pki: &TestPki, client: Option<(String, String)>) -> tonic::transport::ClientTlsConfig {
-    let mut cfg = tonic::transport::ClientTlsConfig::new().ca_certificate(
-        tonic::transport::Certificate::from_pem(&pki.ca_pem),
-    );
+fn grpc_tls_config(
+    pki: &TestPki,
+    client: Option<(String, String)>,
+) -> tonic::transport::ClientTlsConfig {
+    let mut cfg = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(&pki.ca_pem));
     if let Some((cert, key)) = client {
         cfg = cfg.identity(tonic::transport::Identity::from_pem(cert, key));
     }
@@ -328,7 +358,9 @@ async fn assert_grpc_infer_and_health(channel: tonic::transport::Channel) {
 
     let mut health = tonic_health::pb::health_client::HealthClient::new(channel.clone());
     let hresp = health
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: String::new(),
+        })
         .await
         .expect("Health.check over TLS must succeed")
         .into_inner();
@@ -347,7 +379,11 @@ async fn assert_grpc_infer_and_health(channel: tonic::transport::Channel) {
         .expect("Infer over TLS must succeed")
         .into_inner();
     let body = String::from_utf8_lossy(&resp.data);
-    assert!(body.contains("42"), "test_model doubles 21 -> 42; got: {}", body);
+    assert!(
+        body.contains("42"),
+        "test_model doubles 21 -> 42; got: {}",
+        body
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +432,10 @@ async fn test_tls_one_way_http_and_grpc() {
         .timeout(Duration::from_secs(2))
         .send()
         .await;
-    assert!(plaintext.is_err(), "plaintext must not work on the TLS port");
+    assert!(
+        plaintext.is_err(),
+        "plaintext must not work on the TLS port"
+    );
 
     // gRPC: Infer + Health over one-way TLS.
     let channel = grpc_channel(grpc_port, grpc_tls_config(&pki, None))
@@ -448,7 +487,10 @@ async fn test_mtls_http_and_grpc() {
         .timeout(Duration::from_secs(3))
         .send()
         .await;
-    assert!(rejected.is_err(), "mTLS must reject a client without a certificate");
+    assert!(
+        rejected.is_err(),
+        "mTLS must reject a client without a certificate"
+    );
 
     // HTTP: valid client certificate → health + infer.
     load_model_https(&mtls_client, &base, MODEL, "1").await;
@@ -462,16 +504,24 @@ async fn test_mtls_http_and_grpc() {
         Ok(channel) => {
             let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
             let first_rpc = health
-                .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+                .check(tonic_health::pb::HealthCheckRequest {
+                    service: String::new(),
+                })
                 .await;
-            assert!(first_rpc.is_err(), "mTLS must reject the first RPC without a client cert");
+            assert!(
+                first_rpc.is_err(),
+                "mTLS must reject the first RPC without a client cert"
+            );
         }
     }
 
     // gRPC: valid client certificate → Infer + Health.
-    let channel = grpc_channel(grpc_port, grpc_tls_config(&pki, Some((client_cert, client_key))))
-        .await
-        .expect("gRPC mTLS connect with client cert");
+    let channel = grpc_channel(
+        grpc_port,
+        grpc_tls_config(&pki, Some((client_cert, client_key))),
+    )
+    .await
+    .expect("gRPC mTLS connect with client cert");
     assert_grpc_infer_and_health(channel).await;
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -540,7 +590,10 @@ async fn test_tls_cert_rotation_via_sighup() {
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(rotated, "SIGHUP must rotate the certificate without a restart");
+    assert!(
+        rotated,
+        "SIGHUP must rotate the certificate without a restart"
+    );
 
     // The old CA's client must now fail (the server switched chains). Build a
     // FRESH client: the pre-rotation one may hold a pooled keep-alive
@@ -567,7 +620,11 @@ fn test_rustls_single_version_in_tree() {
         .current_dir(project_root())
         .output()
         .expect("cargo tree must run");
-    assert!(output.status.success(), "cargo tree -i rustls failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "cargo tree -i rustls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut versions: Vec<&str> = stdout
         .lines()

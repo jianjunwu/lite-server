@@ -189,7 +189,11 @@ fn summarize(samples: &[f64], wall: Duration) -> serde_json::Value {
         let idx = ((s.len() as f64) * p).ceil() as usize;
         s[idx.saturating_sub(1).min(s.len() - 1)] * 1000.0
     };
-    let mean = if s.is_empty() { 0.0 } else { s.iter().sum::<f64>() / s.len() as f64 * 1000.0 };
+    let mean = if s.is_empty() {
+        0.0
+    } else {
+        s.iter().sum::<f64>() / s.len() as f64 * 1000.0
+    };
     serde_json::json!({
         "n": s.len(),
         "rps": (s.len() as f64 / wall.as_secs_f64()).round(),
@@ -200,7 +204,10 @@ fn summarize(samples: &[f64], wall: Duration) -> serde_json::Value {
 }
 
 /// HTTP unary infer：POST /v2/models/echo_model/infer，{"input":1}。
-async fn bench_http_unary(client: &reqwest::Client, port: u16) -> Result<serde_json::Value, String> {
+async fn bench_http_unary(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<serde_json::Value, String> {
     let url = format!("http://127.0.0.1:{port}/v2/models/echo_model/infer");
     let wall_start = Instant::now();
     let latencies: Vec<f64> = stream::iter(0..HTTP_REQUESTS)
@@ -343,7 +350,9 @@ async fn bench_sse(client: &reqwest::Client, port: u16) -> Result<serde_json::Va
         ok += 1;
     }
     if ok < SSE_STREAMS / 2 {
-        return Err(format!("sse_stream: only {ok}/{SSE_STREAMS} streams succeeded"));
+        return Err(format!(
+            "sse_stream: only {ok}/{SSE_STREAMS} streams succeeded"
+        ));
     }
     let chunks_seen = intervals.len();
     Ok(serde_json::json!({

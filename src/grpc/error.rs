@@ -50,7 +50,9 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         return Status::new(tonic::Code::FailedPrecondition, e.client_message());
     }
     let http_status: u16 = match e {
-        AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => 404,
+        AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => {
+            404
+        }
         AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
         AppError::VersionAlreadyLoaded(_, _) => 409,
         AppError::InferenceTimeout(_) | AppError::IdleTimeout(_) => 504,
@@ -118,7 +120,12 @@ pub(super) fn try_parse_model_error(data: &serde_json::Value) -> Option<ParsedMo
     let message = err.get("message")?.as_str()?.to_string();
     let code = err.get("code").and_then(|c| c.as_str()).map(String::from);
     let param = err.get("param").and_then(|p| p.as_str()).map(String::from);
-    Some(ParsedModelError { error_type, message, code, param })
+    Some(ParsedModelError {
+        error_type,
+        message,
+        code,
+        param,
+    })
 }
 
 /// Build a gRPC Status from a parsed model error. The message keeps the
@@ -293,7 +300,10 @@ mod tests {
         // not supported" signal, not an internal server fault — gRPC has no
         // 405 analogue; Unimplemented is the conventional mapping.
         assert_eq!(http_status_to_grpc_code(405), tonic::Code::Unimplemented);
-        assert_eq!(http_status_to_grpc_code(429), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            http_status_to_grpc_code(429),
+            tonic::Code::ResourceExhausted
+        );
         assert_eq!(http_status_to_grpc_code(503), tonic::Code::Unavailable);
         assert_eq!(http_status_to_grpc_code(504), tonic::Code::DeadlineExceeded);
         // Unknown HTTP status falls back to Internal
@@ -303,16 +313,40 @@ mod tests {
 
     #[test]
     fn test_error_type_to_grpc_code() {
-        assert_eq!(error_type_to_grpc_code("invalid_request_error"), tonic::Code::InvalidArgument);
-        assert_eq!(error_type_to_grpc_code("authentication_error"), tonic::Code::Unauthenticated);
-        assert_eq!(error_type_to_grpc_code("permission_denied_error"), tonic::Code::PermissionDenied);
-        assert_eq!(error_type_to_grpc_code("not_found_error"), tonic::Code::NotFound);
-        assert_eq!(error_type_to_grpc_code("service_unavailable"), tonic::Code::Unavailable);
-        assert_eq!(error_type_to_grpc_code("model_not_ready"), tonic::Code::Unavailable);
+        assert_eq!(
+            error_type_to_grpc_code("invalid_request_error"),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            error_type_to_grpc_code("authentication_error"),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            error_type_to_grpc_code("permission_denied_error"),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            error_type_to_grpc_code("not_found_error"),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            error_type_to_grpc_code("service_unavailable"),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            error_type_to_grpc_code("model_not_ready"),
+            tonic::Code::Unavailable
+        );
         // P9-1: decoupled stream on a model without predict_decoupled.
-        assert_eq!(error_type_to_grpc_code("not_implemented"), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error_type_to_grpc_code("not_implemented"),
+            tonic::Code::FailedPrecondition
+        );
         // Unknown falls back to Internal
-        assert_eq!(error_type_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
+        assert_eq!(
+            error_type_to_grpc_code("UNKNOWN_CODE"),
+            tonic::Code::Internal
+        );
     }
 
     #[test]
@@ -328,12 +362,19 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert_eq!(status.message(), "[invalid_request_error] bad input");
         // Structured details: standard gRPC ErrorInfo
-        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        let info = status
+            .get_details_error_info()
+            .expect("should carry ErrorInfo");
         assert_eq!(info.reason, "invalid_input");
         assert_eq!(info.domain, "lite-server");
-        assert_eq!(info.metadata.get("error_type").map(String::as_str),
-            Some("invalid_request_error"));
-        assert_eq!(info.metadata.get("param").map(String::as_str), Some("temperature"));
+        assert_eq!(
+            info.metadata.get("error_type").map(String::as_str),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            info.metadata.get("param").map(String::as_str),
+            Some("temperature")
+        );
     }
 
     #[test]
@@ -345,7 +386,9 @@ mod tests {
             param: None,
         };
         let status = model_error_status(tonic::Code::Internal, &parsed);
-        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        let info = status
+            .get_details_error_info()
+            .expect("should carry ErrorInfo");
         assert_eq!(info.reason, "model_error");
         assert!(!info.metadata.contains_key("param"));
     }

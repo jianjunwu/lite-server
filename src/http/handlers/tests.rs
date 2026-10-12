@@ -1,9 +1,9 @@
 use super::inference::resolve_version;
 use super::*;
 use crate::http::state::AppState;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -11,8 +11,8 @@ mod version_routing_tests {
     use super::*;
     use crate::config::Config;
     use crate::inference_queue::InferenceQueue;
-    use crate::registry::ModelRegistry;
     use crate::registry::types::ModelType;
+    use crate::registry::ModelRegistry;
     use crate::worker::WorkerManager;
     use axum::body::Body;
     use axum::http::{HeaderName, HeaderValue, Request, StatusCode};
@@ -58,7 +58,13 @@ mod version_routing_tests {
         for v in versions {
             state
                 .registry
-                .register(model, v, Default::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .register(
+                    model,
+                    v,
+                    Default::default(),
+                    ModelType::LitAPI,
+                    std::path::PathBuf::new(),
+                )
                 .unwrap();
             state.registry.mark_ready(model, v).unwrap();
         }
@@ -233,7 +239,14 @@ mod version_routing_tests {
         register_ready(&state, "m", &["1", "2"]);
         state.registry.activate_version("m", "1").unwrap();
 
-        for bad in ["a/b", "a b", "a..b", ".hidden", "trailing.", &"x".repeat(65)] {
+        for bad in [
+            "a/b",
+            "a b",
+            "a..b",
+            ".hidden",
+            "trailing.",
+            &"x".repeat(65),
+        ] {
             let err = resolve_version(&state, "m", None, &pinned_header(bad))
                 .await
                 .unwrap_err();
@@ -255,7 +268,10 @@ mod version_routing_tests {
 
     fn routing_router(state: Arc<AppState>) -> Router {
         Router::new()
-            .route("/v2/models/:model_name/routing", axum::routing::put(set_routing_handler))
+            .route(
+                "/v2/models/:model_name/routing",
+                axum::routing::put(set_routing_handler),
+            )
             .with_state(state)
     }
 
@@ -277,13 +293,23 @@ mod version_routing_tests {
         let state = test_state();
         register_ready(&state, "m", &["1", "2"]);
 
-        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"1":90,"2":10}}"#).await;
+        let resp = put_routing(
+            routing_router(state.clone()),
+            "m",
+            r#"{"weights":{"1":90,"2":10}}"#,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 90);
         assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 10);
 
         // Atomic full-set: unlisted versions are zeroed.
-        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"2":50}}"#).await;
+        let resp = put_routing(
+            routing_router(state.clone()),
+            "m",
+            r#"{"weights":{"2":50}}"#,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
         assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 50);
@@ -294,7 +320,12 @@ mod version_routing_tests {
         let state = test_state();
         register_ready(&state, "m", &["1"]);
 
-        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"nope":100}}"#).await;
+        let resp = put_routing(
+            routing_router(state.clone()),
+            "m",
+            r#"{"weights":{"nope":100}}"#,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
 
@@ -368,8 +399,14 @@ mod version_routing_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(state.registry.get("m", Some("1")).is_none(), "active v1 must be unloaded");
-        assert!(state.registry.get("m", Some("2")).is_some(), "weighted v2 must be untouched");
+        assert!(
+            state.registry.get("m", Some("1")).is_none(),
+            "active v1 must be unloaded"
+        );
+        assert!(
+            state.registry.get("m", Some("2")).is_some(),
+            "weighted v2 must be untouched"
+        );
     }
 
     #[tokio::test]
@@ -395,8 +432,14 @@ mod version_routing_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(state.registry.get("m", Some("1")).is_some(), "active v1 untouched");
-        assert!(state.registry.get("m", Some("2")).is_none(), "explicit v2 unloaded");
+        assert!(
+            state.registry.get("m", Some("1")).is_some(),
+            "active v1 untouched"
+        );
+        assert!(
+            state.registry.get("m", Some("2")).is_none(),
+            "explicit v2 unloaded"
+        );
     }
 
     #[tokio::test]
@@ -412,16 +455,27 @@ mod version_routing_tests {
         state.registry.activate_version("m", "1").unwrap();
 
         let app = Router::new()
-            .route("/v2/models/:model_name/health", axum::routing::get(model_health_handler))
+            .route(
+                "/v2/models/:model_name/health",
+                axum::routing::get(model_health_handler),
+            )
             .with_state(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/v2/models/m/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/models/m/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["version"], "2", "bare health must follow the routing pick");
+        assert_eq!(
+            json["version"], "2",
+            "bare health must follow the routing pick"
+        );
     }
 
     #[tokio::test]
@@ -437,7 +491,12 @@ mod version_routing_tests {
             )
             .with_state(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/v2/models/m/versions/1/ready").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/models/m/versions/1/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -457,16 +516,27 @@ mod version_routing_tests {
         state.registry.activate_version("m", "2").unwrap();
 
         let app = Router::new()
-            .route("/metrics/timeline/:model_name", axum::routing::get(timeline_model_handler))
+            .route(
+                "/metrics/timeline/:model_name",
+                axum::routing::get(timeline_model_handler),
+            )
             .with_state(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/metrics/timeline/m").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/timeline/m")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["version"], "2", "bare timeline must default to the active version");
+        assert_eq!(
+            json["version"], "2",
+            "bare timeline must default to the active version"
+        );
     }
 
     // ===== M3: step downsampling + coverage headers =====
@@ -481,7 +551,11 @@ mod version_routing_tests {
     async fn timeline_step_zero_is_rejected() {
         let app = Router::new().route("/metrics/timeline", axum::routing::get(timeline_handler));
         let resp = get(app, "/metrics/timeline?step=0").await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "step=0 must be rejected");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "step=0 must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -516,7 +590,9 @@ mod version_routing_tests {
             resp.headers().get("x-timeline-interval").unwrap(),
             &TIMELINE.sample_interval_secs().to_string(),
         );
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let full = json["snapshots"]
             .as_array()
@@ -528,7 +604,9 @@ mod version_routing_tests {
 
         // A step beyond the point count keeps exactly the latest point.
         let resp = get(app, "/metrics/timeline?step=100000").await;
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let sampled = json["snapshots"]
             .as_array()
@@ -537,8 +615,15 @@ mod version_routing_tests {
             .find(|s| s["model"] == "m3_step")
             .unwrap();
         let entries = sampled["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "oversized step must keep the latest point");
-        assert_eq!(entries[0]["timestamp"], full["entries"].as_array().unwrap().last().unwrap()["timestamp"]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "oversized step must keep the latest point"
+        );
+        assert_eq!(
+            entries[0]["timestamp"],
+            full["entries"].as_array().unwrap().last().unwrap()["timestamp"]
+        );
 
         TIMELINE.remove("m3_step", "1").await;
     }
@@ -551,8 +636,10 @@ mod version_routing_tests {
         use crate::metrics::accelerator;
         crate::metrics::prometheus::register_metrics().ok();
         accelerator::reset_for_tests();
-        let app =
-            Router::new().route("/metrics/accelerator", axum::routing::get(accelerator_handler));
+        let app = Router::new().route(
+            "/metrics/accelerator",
+            axum::routing::get(accelerator_handler),
+        );
 
         // No reports → empty array (not an error).
         let resp = get(app.clone(), "/metrics/accelerator").await;
@@ -602,7 +689,11 @@ mod version_routing_tests {
 
         let app = crate::http::routes::create_routes(test_state());
         let resp = get(app, "/metrics/accelerator").await;
-        assert_eq!(resp.status(), StatusCode::OK, "default config mounts the route");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "default config mounts the route"
+        );
     }
 
     // ===== §4.5: multi-version health =====
@@ -624,7 +715,12 @@ mod version_routing_tests {
             )
             .with_state(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/v2/models/m/versions").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/models/m/versions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -642,7 +738,10 @@ mod version_routing_tests {
         assert_eq!(v1["weight"], 90);
         assert_eq!(v1["workers"]["total"], 0);
         assert_eq!(v1["workers"]["ready"], 0);
-        assert!(v1["loaded_at"].as_u64().is_some(), "loaded_at must be epoch secs");
+        assert!(
+            v1["loaded_at"].as_u64().is_some(),
+            "loaded_at must be epoch secs"
+        );
 
         let v2 = versions.iter().find(|v| v["version"] == "2").unwrap();
         assert_eq!(v2["active"], false);
@@ -661,7 +760,12 @@ mod version_routing_tests {
             .route("/health", axum::routing::get(health_handler))
             .with_state(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -678,7 +782,10 @@ mod version_routing_tests {
         assert_eq!(versions.len(), 2);
         assert!(versions.iter().all(|v| v["status"] == "ready"));
         assert!(versions.iter().all(|v| v["loaded_at"].as_u64().is_some()));
-        assert!(m.get("version").is_none(), "flat per-version fields must be gone");
+        assert!(
+            m.get("version").is_none(),
+            "flat per-version fields must be gone"
+        );
     }
 
     #[tokio::test]
@@ -699,8 +806,12 @@ mod version_routing_tests {
             }),
             ..Default::default()
         };
-        state.registry.set_policies("m", "1", Some(policies("https://v1.example")));
-        state.registry.set_policies("m", "2", Some(policies("https://v2.example")));
+        state
+            .registry
+            .set_policies("m", "1", Some(policies("https://v1.example")));
+        state
+            .registry
+            .set_policies("m", "2", Some(policies("https://v2.example")));
 
         let app = Router::new()
             .route(
@@ -911,7 +1022,13 @@ mod version_routing_tests {
         // v1 = active but Failed; v2 = Ready (the pin target).
         state
             .registry
-            .register("m", "1", Default::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                "m",
+                "1",
+                Default::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         state
             .registry
@@ -935,7 +1052,8 @@ mod version_routing_tests {
 
         let url = format!("ws://{addr}/v2/models/m/stream");
         let mut req = url.into_client_request().unwrap();
-        req.headers_mut().insert("x-lite-version", "2".parse().unwrap());
+        req.headers_mut()
+            .insert("x-lite-version", "2".parse().unwrap());
         let (mut ws, _) = tokio_tungstenite::connect_async(req)
             .await
             .expect("WS connect failed");
@@ -967,7 +1085,9 @@ mod version_routing_tests {
 
         let alerts = state.alert_engine.evaluate(&agg).await;
         assert!(
-            alerts.iter().any(|a| a.rule == "queue_depth" && a.severity == "warning" && a.model == "b5_model"),
+            alerts.iter().any(|a| a.rule == "queue_depth"
+                && a.severity == "warning"
+                && a.model == "b5_model"),
             "configured threshold (5) must fire at depth 7, got {alerts:?}"
         );
         crate::metrics::prometheus::QUEUE_DEPTH
@@ -1030,9 +1150,7 @@ mod custom_route_callback_tests {
             "sanity: handlers.rs must reference fire_inference_request somewhere"
         );
 
-        let fn_has_req_cb = fn_body
-            .iter()
-            .any(|l| l.contains("fire_inference_request"));
+        let fn_has_req_cb = fn_body.iter().any(|l| l.contains("fire_inference_request"));
         let fn_has_resp_cb = fn_body
             .iter()
             .any(|l| l.contains("fire_inference_response"));
@@ -1076,18 +1194,18 @@ mod custom_route_callback_tests {
                 break;
             }
         }
-        let do_infer_body: Vec<&&str> =
-            infer_lines[do_infer_start..=do_infer_end].iter().collect();
+        let do_infer_body: Vec<&&str> = infer_lines[do_infer_start..=do_infer_end].iter().collect();
         assert!(
-            do_infer_body.iter().any(|l| l.contains("fire_inference_request")),
+            do_infer_body
+                .iter()
+                .any(|l| l.contains("fire_inference_request")),
             "do_infer must fire fire_inference_request (sanity check)"
         );
         assert!(
-            do_infer_body.iter().any(|l| l.contains("fire_inference_response")),
+            do_infer_body
+                .iter()
+                .any(|l| l.contains("fire_inference_response")),
             "do_infer must fire fire_inference_response (sanity check)"
         );
     }
-
-
-
 }

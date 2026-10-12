@@ -79,7 +79,11 @@ pub(super) async fn process_watch_events(
     for (path, kind) in events {
         // Skip endpoint files and Python cache
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.ends_with("_endpoint.py") || name == "__pycache__" || name.ends_with(".pyc") || name.ends_with(".pyo") {
+            if name.ends_with("_endpoint.py")
+                || name == "__pycache__"
+                || name.ends_with(".pyc")
+                || name.ends_with(".pyo")
+            {
                 continue;
             }
         }
@@ -110,8 +114,8 @@ pub(super) async fn process_watch_events(
                     }
                     let key = (model_name.to_string(), version.to_string());
                     let version_dir = repo_path.join(model_name).join(version);
-                    let is_live = registry.get(model_name, Some(version)).is_some()
-                        && version_dir.exists();
+                    let is_live =
+                        registry.get(model_name, Some(version)).is_some() && version_dir.exists();
                     if path.is_dir() {
                         // Dir events on a live version (e.g. mtime changes
                         // when files are written inside) carry no signal.
@@ -188,7 +192,10 @@ pub(super) async fn process_watch_events(
         let key = (name.clone(), version.clone());
         if let Some(last) = last_reload.get(&key) {
             if Instant::now().duration_since(*last) < cooldown {
-                info!("Hot reload: skipping {} version {} (cooldown)", name, version);
+                info!(
+                    "Hot reload: skipping {} version {} (cooldown)",
+                    name, version
+                );
                 continue;
             }
         }
@@ -198,7 +205,10 @@ pub(super) async fn process_watch_events(
         // unload between classification and here is impossible on this task.
         if let Some(mv) = registry.get(&name, Some(&version)) {
             if !mv.config.hot_reload {
-                debug!("Hot reload: skipping {} version {} (hot_reload=false)", name, version);
+                debug!(
+                    "Hot reload: skipping {} version {} (hot_reload=false)",
+                    name, version
+                );
                 continue;
             }
 
@@ -211,7 +221,10 @@ pub(super) async fn process_watch_events(
                     matches_patterns(fname, &mv.config.hot_reload_patterns)
                 });
                 if !any_match {
-                    debug!("Hot reload: skipping {} version {} (no pattern match)", name, version);
+                    debug!(
+                        "Hot reload: skipping {} version {} (no pattern match)",
+                        name, version
+                    );
                     continue;
                 }
             }
@@ -222,7 +235,11 @@ pub(super) async fn process_watch_events(
             // unless every worker of the version reports handled.
             let changed: Vec<String> = trigger_files
                 .get(&key)
-                .map(|fs| fs.iter().map(|f| f.to_string_lossy().into_owned()).collect())
+                .map(|fs| {
+                    fs.iter()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .collect()
+                })
                 .unwrap_or_default();
             // Batch 0: a config.yaml change bypasses the FILE_CHANGED hook —
             // max_batch_size & co. are __init__ constructor parameters that an
@@ -232,7 +249,11 @@ pub(super) async fn process_watch_events(
             let config_changed = changed.iter().any(|f| {
                 std::path::Path::new(f).file_name().and_then(|n| n.to_str()) == Some("config.yaml")
             });
-            if !config_changed && worker_manager.notify_file_changed(&name, &version, &changed).await {
+            if !config_changed
+                && worker_manager
+                    .notify_file_changed(&name, &version, &changed)
+                    .await
+            {
                 info!(
                     "Hot reload: {} version {} refreshed in-process via on_file_changed (no restart)",
                     name, version
@@ -289,14 +310,20 @@ pub(super) async fn process_watch_events(
                     // Dir gone → unload. This invariant holds in every mode:
                     // the files no longer exist, the worker cannot serve.
                     had_unloads = true;
-                    info!("Hot reload: auto-unloading removed model {} version {}", name, version);
+                    info!(
+                        "Hot reload: auto-unloading removed model {} version {}",
+                        name, version
+                    );
                     let _ = worker_manager.unload_model(&name, Some(&version)).await;
                 }
             }
 
             // P2: Re-check hot_reload flag after potential unloads
             if had_unloads {
-                let any_hot_reload = registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
+                let any_hot_reload = registry
+                    .list_loaded()
+                    .iter()
+                    .any(|(_, _, mv)| mv.config.hot_reload);
                 has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
                 if !any_hot_reload {
                     info!("Hot reload: no more enabled models, watcher will skip events");
@@ -440,10 +467,10 @@ mod tests {
     use crate::callback::CallbackRunner;
     use crate::inference_queue::InferenceQueue;
 
-
     #[tokio::test]
     async fn test_file_watcher_aborts_cleanly() {
-        let tmp_dir = std::env::temp_dir().join(format!("lite-server-fw-test-{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("lite-server-fw-test-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
 
         let registry = Arc::new(ModelRegistry::new());
@@ -459,7 +486,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
+            false,
+            Duration::from_millis(2500),
+            registry,
+        ));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -475,7 +510,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_watcher_detects_changes() {
-        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-detect-{}", std::process::id()));
+        let tmp_dir_raw =
+            std::env::temp_dir().join(format!("lite-server-fw-detect-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
         let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
         let sub_dir = tmp_dir.join("model").join("1");
@@ -496,7 +532,15 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
+            false,
+            Duration::from_millis(2500),
+            registry,
+        ));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -505,10 +549,10 @@ mod tests {
         tokio::fs::write(&model_py, "modified").await.unwrap();
 
         // Wait for event with timeout
-        let paths = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            rx.recv()
-        ).await.expect("Timeout waiting for watcher event").expect("Channel closed");
+        let paths = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("Timeout waiting for watcher event")
+            .expect("Channel closed");
 
         // Check if strip_prefix works
         for (p, _kind) in &paths {
@@ -529,7 +573,8 @@ mod tests {
     /// arriving.
     #[tokio::test]
     async fn watcher_must_flush_within_a_bounded_window_under_continuous_churn() {
-        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-churn-{}", std::process::id()));
+        let tmp_dir_raw =
+            std::env::temp_dir().join(format!("lite-server-fw-churn-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
         let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
         let sub_dir = tmp_dir.join("model").join("1");
@@ -550,7 +595,13 @@ mod tests {
         let has_hot_reload = Arc::new(AtomicBool::new(true));
         let debounce = Duration::from_millis(1000);
         let handle = tokio::spawn(start_file_watcher(
-            tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, debounce, registry,
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
+            true,
+            debounce,
+            registry,
         ));
 
         // Give the watcher time to start.
@@ -609,8 +660,12 @@ mod tests {
         let tmp = test_repo_dir("new");
         let version_dir = tmp.join("m").join("1");
         tokio::fs::create_dir_all(&version_dir).await.unwrap();
-        tokio::fs::write(version_dir.join("config.yaml"), "hot_reload: true\n").await.unwrap();
-        tokio::fs::write(version_dir.join("model.py"), "class M: pass").await.unwrap();
+        tokio::fs::write(version_dir.join("config.yaml"), "hot_reload: true\n")
+            .await
+            .unwrap();
+        tokio::fs::write(version_dir.join("model.py"), "class M: pass")
+            .await
+            .unwrap();
 
         let registry = Arc::new(ModelRegistry::new());
         let wm = build_test_worker_manager(tmp.clone(), registry.clone());
@@ -628,7 +683,9 @@ mod tests {
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             registry.get("m", Some("1")).is_none(),
@@ -649,7 +706,13 @@ mod tests {
         // Version dir does NOT exist (already deleted); registry still lists it.
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("m").join("1"))
+            .register(
+                "m",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                tmp.join("m").join("1"),
+            )
             .unwrap();
         let wm = build_test_worker_manager(tmp.clone(), registry.clone());
         let (tx, mut rx) = mpsc::channel::<()>(8);
@@ -658,7 +721,10 @@ mod tests {
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![(tmp.join("m").join("1").join("model.py"), WatchEventKind::Remove)],
+            vec![(
+                tmp.join("m").join("1").join("model.py"),
+                WatchEventKind::Remove,
+            )],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -666,7 +732,9 @@ mod tests {
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             registry.get("m", Some("1")).is_some(),
@@ -692,7 +760,13 @@ mod tests {
         // workers are spawned; the assertion targets the trigger channel.
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, version_dir.clone())
+            .register(
+                "m",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                version_dir.clone(),
+            )
             .unwrap();
         let wm = build_test_worker_manager(tmp.clone(), registry.clone());
         let (tx, mut rx) = mpsc::channel::<()>(8);
@@ -709,7 +783,9 @@ mod tests {
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             rx.try_recv().is_err(),
@@ -732,7 +808,13 @@ mod tests {
 
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register("live", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("live").join("1"))
+            .register(
+                "live",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                tmp.join("live").join("1"),
+            )
             .unwrap();
         let wm = build_test_worker_manager(tmp.clone(), registry.clone());
         let trigger = None;
@@ -752,7 +834,9 @@ mod tests {
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             !last_reload.contains_key(&("gone".to_string(), "1".to_string())),
@@ -866,7 +950,13 @@ class TestAPI(LitAPI):
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("m").join("1"))
+            .register(
+                "m",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                tmp.join("m").join("1"),
+            )
             .unwrap();
         let wm = build_test_worker_manager(tmp.clone(), registry.clone());
         let trigger: Option<mpsc::Sender<()>> = None;
@@ -874,7 +964,10 @@ class TestAPI(LitAPI):
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![(tmp.join("m").join("1").join("model.py"), WatchEventKind::Remove)],
+            vec![(
+                tmp.join("m").join("1").join("model.py"),
+                WatchEventKind::Remove,
+            )],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -882,7 +975,9 @@ class TestAPI(LitAPI):
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(
             registry.get("m", Some("1")).is_none(),
@@ -895,9 +990,11 @@ class TestAPI(LitAPI):
     // ===== P2: reconcile loop (tick resync + event trigger) =====
 
     #[tokio::test]
-    async fn file_watcher_forwards_events_when_always_forward_without_hot_reload() {        // control_mode=auto: lifecycle events must reach the reconciler even
+    async fn file_watcher_forwards_events_when_always_forward_without_hot_reload() {
+        // control_mode=auto: lifecycle events must reach the reconciler even
         // when no loaded model has hot_reload enabled.
-        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-auto-{}", std::process::id()));
+        let tmp_dir_raw =
+            std::env::temp_dir().join(format!("lite-server-fw-auto-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
         let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
         let sub_dir = tmp_dir.join("model").join("1");
@@ -910,15 +1007,20 @@ class TestAPI(LitAPI):
 
         let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, Duration::from_millis(2500), registry));
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
+            true,
+            Duration::from_millis(2500),
+            registry,
+        ));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         tokio::fs::write(&model_py, "modified").await.unwrap();
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            rx.recv()
-        ).await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;
         assert!(
             result.is_ok(),
             "auto mode: watcher must forward events even with no hot_reload models"
@@ -952,14 +1054,23 @@ class TestAPI(LitAPI):
         // Loaded model WITHOUT hot_reload — the gate must still forward so a
         // later dir removal can unload it.
         registry
-            .register("model", "1", ModelConfig::default(), ModelType::LitAPI, sub_dir.clone())
+            .register(
+                "model",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                sub_dir.clone(),
+            )
             .unwrap();
         let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
 
         let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(start_file_watcher(
-            tmp_dir.clone(), worker_manager, tx, has_hot_reload,
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
             false, // always_forward = false (manual mode)
             Duration::from_millis(300),
             registry.clone(),
@@ -968,10 +1079,7 @@ class TestAPI(LitAPI):
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         tokio::fs::write(&model_py, "modified").await.unwrap();
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            rx.recv(),
-        ).await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), rx.recv()).await;
         assert!(
             result.is_ok(),
             "manual mode with loaded models: watcher must forward events; \
@@ -1003,7 +1111,10 @@ class TestAPI(LitAPI):
         let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(start_file_watcher(
-            tmp_dir.clone(), worker_manager, tx, has_hot_reload,
+            tmp_dir.clone(),
+            worker_manager,
+            tx,
+            has_hot_reload,
             false, // always_forward = false (manual mode)
             Duration::from_millis(300),
             registry.clone(),
@@ -1012,10 +1123,7 @@ class TestAPI(LitAPI):
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         tokio::fs::write(&model_py, "modified").await.unwrap();
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        ).await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv()).await;
         assert!(
             result.is_err(),
             "manual mode with empty registry: watcher must skip events (P2)"
@@ -1083,7 +1191,8 @@ class TestAPI(LitAPI):
         std::fs::write(
             version_dir.join("config.yaml"),
             "hot_reload: true\nstartup_timeout: 5\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(version_dir.join("model.py"), "raise SystemExit(1)\n").unwrap();
 
         let messages = run_capturing_logs(|| {
@@ -1105,7 +1214,8 @@ class TestAPI(LitAPI):
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
-                ).await;
+                )
+                .await;
                 assert!(
                     registry.get("m", Some("1")).is_none(),
                     "manual mode: new version dir must NOT be auto-loaded — \
@@ -1115,12 +1225,16 @@ class TestAPI(LitAPI):
         });
 
         assert!(
-            messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            messages
+                .iter()
+                .any(|m| m.contains("manual") && m.contains("Admin API")),
             "manual mode: a new version dir must log guidance to load explicitly; got: {:?}",
             messages
         );
         assert!(
-            !messages.iter().any(|m| m.contains("auto-loading") || m.contains("Hot load failed")),
+            !messages
+                .iter()
+                .any(|m| m.contains("auto-loading") || m.contains("Hot load failed")),
             "manual mode: no load attempt may happen; got: {:?}",
             messages
         );
@@ -1158,7 +1272,8 @@ class TestAPI(LitAPI):
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
-                ).await;
+                )
+                .await;
                 assert!(
                     registry.get("m", Some("1")).is_none(),
                     "manual mode: a file edit must not load the version"
@@ -1167,7 +1282,9 @@ class TestAPI(LitAPI):
         });
 
         assert!(
-            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            !messages
+                .iter()
+                .any(|m| m.contains("manual") && m.contains("Admin API")),
             "file edit in an existing unloaded version must not warn; got: {:?}",
             messages
         );
@@ -1222,7 +1339,8 @@ class TestAPI(LitAPI):
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
-                ).await;
+                )
+                .await;
                 assert!(
                     registry.get("m", Some("2")).is_none(),
                     "manual mode: a moved-in version must not be auto-loaded"
@@ -1231,7 +1349,9 @@ class TestAPI(LitAPI):
         });
 
         assert!(
-            messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            messages
+                .iter()
+                .any(|m| m.contains("manual") && m.contains("Admin API")),
             "a version dir appearing via rename/move must warn like a dir Create; got: {:?}",
             messages
         );
@@ -1272,7 +1392,8 @@ class TestAPI(LitAPI):
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
-                ).await;
+                )
+                .await;
                 assert!(
                     registry.get("m", Some("1")).is_none(),
                     "manual mode: mkdir inside an unloaded version must not load it"
@@ -1281,7 +1402,9 @@ class TestAPI(LitAPI):
         });
 
         assert!(
-            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            !messages
+                .iter()
+                .any(|m| m.contains("manual") && m.contains("Admin API")),
             "mkdir inside an existing unloaded version must not warn 'New version'; got: {:?}",
             messages
         );
@@ -1311,9 +1434,8 @@ class TestAPI(LitAPI):
                 let mut last_reload = std::collections::HashMap::new();
                 let flag = AtomicBool::new(true);
                 // What notify delivers for dir mtime/attr churn.
-                let kind = WatchEventKind::from(notify::EventKind::Modify(
-                    notify::event::ModifyKind::Any,
-                ));
+                let kind =
+                    WatchEventKind::from(notify::EventKind::Modify(notify::event::ModifyKind::Any));
                 let _ = process_watch_events(
                     vec![(version_dir, kind)],
                     tmp.clone(),
@@ -1323,12 +1445,15 @@ class TestAPI(LitAPI):
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
-                ).await;
+                )
+                .await;
             }
         });
 
         assert!(
-            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            !messages
+                .iter()
+                .any(|m| m.contains("manual") && m.contains("Admin API")),
             "dir mtime churn on an existing unloaded version must stay debug; got: {:?}",
             messages
         );
@@ -1437,7 +1562,10 @@ class TestAPI(LitAPI):
     ) {
         let flag = AtomicBool::new(true);
         process_watch_events(
-            vec![(tmp.join("m").join("1").join("config.yaml"), WatchEventKind::Modify)],
+            vec![(
+                tmp.join("m").join("1").join("config.yaml"),
+                WatchEventKind::Modify,
+            )],
             tmp.clone(),
             wm,
             registry,

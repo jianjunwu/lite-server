@@ -95,7 +95,10 @@ pub enum AppError {
 
     /// Request body exceeded `server.max_request_body_bytes` (HTTP 413).
     #[error("payload too large: {max_size} bytes max")]
-    PayloadTooLarge { max_size: usize, actual_size: Option<u64> },
+    PayloadTooLarge {
+        max_size: usize,
+        actual_size: Option<u64>,
+    },
 
     /// A syntactically valid Range header names bytes outside the
     /// representation (HTTP 416, with `Content-Range: bytes */size`).
@@ -211,23 +214,26 @@ impl AppError {
             // the active version + the force override) — safe to pass
             // through, same as InvalidRequestBody.
             AppError::Conflict(detail) => detail.clone(),
-            AppError::PayloadTooLarge { max_size, actual_size } => {
+            AppError::PayloadTooLarge {
+                max_size,
+                actual_size,
+            } => {
                 if let Some(actual) = actual_size {
                     format!(
                         "request body too large: {} bytes exceeds the {} bytes limit",
                         actual, max_size
                     )
                 } else {
-                    format!(
-                        "request body exceeds the {} bytes limit",
-                        max_size
-                    )
+                    format!("request body exceeds the {} bytes limit", max_size)
                 }
             }
             AppError::UnsupportedMediaType(detail) => detail.clone(),
             // Server-generated from the representation size — safe to surface.
             AppError::RangeNotSatisfiable { size } => {
-                format!("requested range is not satisfiable (representation size: {} bytes)", size)
+                format!(
+                    "requested range is not satisfiable (representation size: {} bytes)",
+                    size
+                )
             }
             AppError::Unauthorized(detail) => detail.clone(),
             // Server-generated, names only model/version/slot — safe like Conflict.
@@ -360,7 +366,11 @@ impl AppError {
         }
         // PayloadTooLarge:413 + extra{max_size, actual_size}——各协议
         // renderer 决定是否合入(Legacy 合入;Kserve 按规范丢弃)。
-        if let AppError::PayloadTooLarge { max_size, actual_size } = &self {
+        if let AppError::PayloadTooLarge {
+            max_size,
+            actual_size,
+        } = &self
+        {
             return CanonicalError {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 error_type: "invalid_request_error".to_string(),
@@ -437,7 +447,10 @@ impl AppError {
                 | AppError::WorkerRecycling(_)
                 | AppError::StreamingCapacityExceeded(_)
         ) {
-            Some(HashMap::from([("retry-after".to_string(), "1".to_string())]))
+            Some(HashMap::from([(
+                "retry-after".to_string(),
+                "1".to_string(),
+            )]))
         } else if let AppError::RateLimitExceeded { retry_after_secs } = &self {
             Some(HashMap::from([(
                 "retry-after".to_string(),
@@ -479,7 +492,10 @@ pub struct ProtocolError {
 
 impl From<AppError> for ProtocolError {
     fn from(error: AppError) -> Self {
-        ProtocolError { error, protocol: crate::protocol::ApiProtocol::Legacy }
+        ProtocolError {
+            error,
+            protocol: crate::protocol::ApiProtocol::Legacy,
+        }
     }
 }
 
@@ -543,9 +559,18 @@ mod tests {
     /// wire as a nonstandard status line.
     #[test]
     fn model_error_status_code_out_of_range_falls_back_to_500() {
-        assert_eq!(model_error(999).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(model_error(0).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(model_error(99).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            model_error(999).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            model_error(0).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            model_error(99).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         // In-range values pass through untouched.
         assert_eq!(model_error(404).http_status(), StatusCode::NOT_FOUND);
         assert_eq!(model_error(200).http_status(), StatusCode::OK);
@@ -554,13 +579,14 @@ mod tests {
 
     #[test]
     fn test_pub_error_message_does_not_leak_paths() {
-        let err = AppError::ModelNotFound(
-            "bert at /home/user/models/bert".to_string());
+        let err = AppError::ModelNotFound("bert at /home/user/models/bert".to_string());
         assert_eq!(err.pub_error_message(), "model not found");
         assert!(!err.pub_error_message().contains("/home/user"));
 
-        let err = AppError::Io(
-            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        let err = AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
         assert_eq!(err.pub_error_message(), "internal server error");
         assert!(!err.pub_error_message().contains("file not found"));
 
@@ -609,7 +635,8 @@ mod tests {
         assert_eq!(
             AppError::Serialization(
                 serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
-            ).pub_error_message(),
+            )
+            .pub_error_message(),
             "serialization error"
         );
     }
@@ -621,7 +648,10 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = response.headers().get("retry-after");
-        assert!(retry_after.is_some(), "QueueFull should have Retry-After header");
+        assert!(
+            retry_after.is_some(),
+            "QueueFull should have Retry-After header"
+        );
         assert_eq!(retry_after.unwrap().to_str().unwrap(), "1");
     }
 
@@ -630,27 +660,38 @@ mod tests {
         use axum::response::IntoResponse;
         let err = AppError::ModelNotFound("test".to_string());
         let response = err.into_response();
-        assert!(response.headers().get("retry-after").is_none(),
-            "non-QueueFull errors should not have Retry-After header");
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "non-QueueFull errors should not have Retry-After header"
+        );
     }
 
     #[tokio::test]
     async fn should_return_503_with_retry_after_when_worker_recycling() {
         use axum::response::IntoResponse;
         let err = AppError::WorkerRecycling(
-            "x-lite-worker-id 0 is rolling-recycling for m/1".to_string());
+            "x-lite-worker-id 0 is rolling-recycling for m/1".to_string(),
+        );
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("1"),
             "a recycling rejection is transient — the client must be told to retry"
         );
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "worker_recycling");
         // Server-generated detail names only model/version/worker — safe to surface.
-        assert!(body["error"]["message"].as_str().unwrap().contains("rolling-recycling"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rolling-recycling"));
     }
 
     // ===== ModelError tests =====
@@ -719,8 +760,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "server_error");
         // Must NOT leak internal details
-        assert!(body["error"]["message"].as_str().unwrap().contains("unavailable"));
-        assert!(!body["error"]["message"].as_str().unwrap().contains("traceback"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable"));
+        assert!(!body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("traceback"));
         // Verify code + param are present
         assert_eq!(body["error"]["code"], "internal_error");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
@@ -734,7 +781,9 @@ mod tests {
         let err = AppError::ModelNotFound("bert".to_string());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "model_not_found");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
@@ -742,22 +791,59 @@ mod tests {
 
     #[test]
     fn test_error_code_values_all_variants() {
-        assert_eq!(AppError::ModelNotFound("x".into()).error_code(), "model_not_found");
-        assert_eq!(AppError::ModelNotReady("x".into()).error_code(), "model_not_ready");
-        assert_eq!(AppError::VersionNotFound("a".into(), "b".into()).error_code(), "version_not_found");
-        assert_eq!(AppError::VersionAlreadyLoaded("a".into(), "b".into()).error_code(), "version_already_loaded");
-        assert_eq!(AppError::InferenceTimeout("x".into()).error_code(), "timeout");
+        assert_eq!(
+            AppError::ModelNotFound("x".into()).error_code(),
+            "model_not_found"
+        );
+        assert_eq!(
+            AppError::ModelNotReady("x".into()).error_code(),
+            "model_not_ready"
+        );
+        assert_eq!(
+            AppError::VersionNotFound("a".into(), "b".into()).error_code(),
+            "version_not_found"
+        );
+        assert_eq!(
+            AppError::VersionAlreadyLoaded("a".into(), "b".into()).error_code(),
+            "version_already_loaded"
+        );
+        assert_eq!(
+            AppError::InferenceTimeout("x".into()).error_code(),
+            "timeout"
+        );
         assert_eq!(AppError::QueueFull("x".into()).error_code(), "queue_full");
-        assert_eq!(AppError::WorkerCrashed("x".into()).error_code(), "internal_error");
-        assert_eq!(AppError::Validation("x".into()).error_code(), "invalid_parameter_value");
-        assert_eq!(AppError::Config("x".into()).error_code(), "invalid_configuration");
-        assert_eq!(AppError::Internal("x".into()).error_code(), "internal_error");
-        assert_eq!(AppError::Transport("x".into()).error_code(), "internal_error");
+        assert_eq!(
+            AppError::WorkerCrashed("x".into()).error_code(),
+            "internal_error"
+        );
+        assert_eq!(
+            AppError::Validation("x".into()).error_code(),
+            "invalid_parameter_value"
+        );
+        assert_eq!(
+            AppError::Config("x".into()).error_code(),
+            "invalid_configuration"
+        );
+        assert_eq!(
+            AppError::Internal("x".into()).error_code(),
+            "internal_error"
+        );
+        assert_eq!(
+            AppError::Transport("x".into()).error_code(),
+            "internal_error"
+        );
         assert_eq!(AppError::Python("x".into()).error_code(), "internal_error");
-        assert_eq!(AppError::Serialization(
-            serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
-        ).error_code(), "parse_error");
-        assert_eq!(AppError::FrameTooLarge.error_code(), "content_size_limit_exceeded");
+        assert_eq!(
+            AppError::Serialization(
+                serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
+            )
+            .error_code(),
+            "parse_error"
+        );
+        assert_eq!(
+            AppError::FrameTooLarge.error_code(),
+            "content_size_limit_exceeded"
+        );
     }
 
     #[test]
@@ -778,7 +864,9 @@ mod tests {
             headers: None,
         }));
         let response = err.into_response();
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "invalid_input");
         assert_eq!(body["error"]["param"], "temperature");
@@ -796,7 +884,9 @@ mod tests {
             headers: None,
         }));
         let response = err.into_response();
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "invalid_input");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
@@ -829,7 +919,9 @@ mod tests {
         use axum::response::IntoResponse;
         let response = AppError::RouteNotFound.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "not_found_error");
         assert_eq!(body["error"]["code"], "route_not_found");
@@ -841,7 +933,9 @@ mod tests {
         use axum::response::IntoResponse;
         let response = AppError::MethodNotAllowed.into_response();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "method_not_allowed");
         assert_eq!(body["error"]["code"], "method_not_allowed");
@@ -854,7 +948,9 @@ mod tests {
         let err = AppError::VersionAlreadyLoaded("m1".into(), "1".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "conflict_error");
         assert_eq!(body["error"]["code"], "version_already_loaded");
@@ -867,38 +963,58 @@ mod tests {
         // Client should see the parse detail — it describes their own request
         // body and carries no internal information.
         let err = AppError::InvalidRequestBody(
-            "Failed to parse the request body as JSON: expected value at line 1 column 1".into());
+            "Failed to parse the request body as JSON: expected value at line 1 column 1".into(),
+        );
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "invalid_request_body");
-        assert!(body["error"]["message"].as_str().unwrap().contains("expected value"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected value"));
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 
     #[tokio::test]
     async fn test_invalid_query_param_passthrough_detail() {
         use axum::response::IntoResponse;
-        let err = AppError::InvalidQueryParam(
-            "Failed to deserialize query string: invalid type".into());
+        let err =
+            AppError::InvalidQueryParam("Failed to deserialize query string: invalid type".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "invalid_query_param");
-        assert!(body["error"]["message"].as_str().unwrap().contains("invalid type"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid type"));
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 
     #[test]
     fn test_framework_error_codes() {
         assert_eq!(AppError::RouteNotFound.error_code(), "route_not_found");
-        assert_eq!(AppError::MethodNotAllowed.error_code(), "method_not_allowed");
-        assert_eq!(AppError::InvalidRequestBody("x".into()).error_code(), "invalid_request_body");
-        assert_eq!(AppError::InvalidQueryParam("x".into()).error_code(), "invalid_query_param");
+        assert_eq!(
+            AppError::MethodNotAllowed.error_code(),
+            "method_not_allowed"
+        );
+        assert_eq!(
+            AppError::InvalidRequestBody("x".into()).error_code(),
+            "invalid_request_body"
+        );
+        assert_eq!(
+            AppError::InvalidQueryParam("x".into()).error_code(),
+            "invalid_query_param"
+        );
     }
 
     // ===== C7: client errors (incl. 429) log at info, server errors at error =====
@@ -909,12 +1025,19 @@ mod tests {
     async fn test_client_errors_log_at_info_not_error() {
         use axum::response::IntoResponse;
         // 429 (rate limit) must not spam at ERROR under load — log at INFO.
-        let c = event_counts(|| { let _ = AppError::RateLimitExceeded { retry_after_secs: 1 }.into_response(); });
+        let c = event_counts(|| {
+            let _ = AppError::RateLimitExceeded {
+                retry_after_secs: 1,
+            }
+            .into_response();
+        });
         assert_eq!(c.error, 0, "429 must not log at error");
         assert_eq!(c.info, 1, "429 should log at info");
 
         // 4xx validation likewise.
-        let c = event_counts(|| { let _ = AppError::InvalidRequestBody("bad".into()).into_response(); });
+        let c = event_counts(|| {
+            let _ = AppError::InvalidRequestBody("bad".into()).into_response();
+        });
         assert_eq!(c.error, 0);
         assert_eq!(c.info, 1);
     }
@@ -922,7 +1045,9 @@ mod tests {
     #[tokio::test]
     async fn test_server_errors_still_log_at_error() {
         use axum::response::IntoResponse;
-        let c = event_counts(|| { let _ = AppError::WorkerCrashed("boom".into()).into_response(); });
+        let c = event_counts(|| {
+            let _ = AppError::WorkerCrashed("boom".into()).into_response();
+        });
         assert_eq!(c.error, 1, "5xx must still log at error");
         assert_eq!(c.info, 0);
     }

@@ -83,7 +83,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -97,10 +102,7 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
 /// and loaded on server startup.
 #[tokio::test]
 async fn test_lma_autodiscovery_on_startup() {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-lma-test-{}",
-        std::process::id()
-    ));
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-lma-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -222,10 +224,7 @@ orchestration:
         }
         sleep(Duration::from_millis(500)).await;
     }
-    assert!(
-        ready,
-        "model from .lma should be auto-discovered and ready"
-    );
+    assert!(ready, "model from .lma should be auto-discovered and ready");
 
     // 8. Inference should work
     let resp = client
@@ -251,7 +250,11 @@ fn pack_model_to(tmp_dir: &std::path::Path, name: &str, model_py: &str) -> std::
     let v1_dir = model_dir.join("1");
     std::fs::create_dir_all(&v1_dir).unwrap();
     std::fs::write(v1_dir.join("model.py"), model_py).unwrap();
-    std::fs::write(v1_dir.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
 
     let output = Command::new("python")
         .args([
@@ -274,7 +277,11 @@ fn pack_model_to(tmp_dir: &std::path::Path, name: &str, model_py: &str) -> std::
     tmp_dir.join(format!("{}_v1.lma", name))
 }
 
-fn write_server_yaml_all(tmp_dir: &std::path::Path, port: u16, repo_dir: &std::path::Path) -> std::path::PathBuf {
+fn write_server_yaml_all(
+    tmp_dir: &std::path::Path,
+    port: u16,
+    repo_dir: &std::path::Path,
+) -> std::path::PathBuf {
     let content = format!(
         r#"
 server:
@@ -326,10 +333,8 @@ async fn wait_ready(base: &str, model: &str) -> bool {
 /// mtime is older than the directory it produced.
 #[tokio::test]
 async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-lma-h6-edit-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-lma-h6-edit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -345,7 +350,10 @@ async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
     let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
     wait_for_server(port, 30).await;
     let base = format!("http://127.0.0.1:{}", port);
-    assert!(wait_ready(&base, "my_model").await, "model must be ready after first boot");
+    assert!(
+        wait_ready(&base, "my_model").await,
+        "model must be ready after first boot"
+    );
     drop(server_a);
 
     // Local edit on the extracted tree.
@@ -357,7 +365,10 @@ async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
     // Restart against the same repo.
     let server_b = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
     wait_for_server(port, 30).await;
-    assert!(wait_ready(&base, "my_model").await, "model must be ready after restart");
+    assert!(
+        wait_ready(&base, "my_model").await,
+        "model must be ready after restart"
+    );
 
     let after = std::fs::read_to_string(&extracted).unwrap();
     assert!(
@@ -373,10 +384,8 @@ async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
 /// the updated content lands via staging + swap.
 #[tokio::test]
 async fn test_lma_restart_reunpacks_when_artifact_newer() {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-lma-h6-newer-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-lma-h6-newer-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -392,7 +401,10 @@ async fn test_lma_restart_reunpacks_when_artifact_newer() {
     let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
     wait_for_server(port, 30).await;
     let base = format!("http://127.0.0.1:{}", port);
-    assert!(wait_ready(&base, "my_model").await, "model must be ready after first boot");
+    assert!(
+        wait_ready(&base, "my_model").await,
+        "model must be ready after first boot"
+    );
     drop(server_a);
 
     // Replace the artifact with a NEW pack (newer mtime; sleep past the
@@ -405,7 +417,10 @@ async fn test_lma_restart_reunpacks_when_artifact_newer() {
 
     let server_b = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
     wait_for_server(port, 30).await;
-    assert!(wait_ready(&base, "my_model").await, "model must be ready after restart");
+    assert!(
+        wait_ready(&base, "my_model").await,
+        "model must be ready after restart"
+    );
 
     let extracted = repo_dir.join("my_model").join("1").join("model.py");
     let after = std::fs::read_to_string(&extracted).unwrap();

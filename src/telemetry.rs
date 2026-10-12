@@ -90,14 +90,16 @@ impl<'a> opentelemetry::propagation::Injector for HeadersInjector<'a> {
 /// Returns an empty `Context` when no propagator is configured (telemetry off).
 /// Inbound baggage is scrubbed per the installed [`BaggagePolicy`] (§4.0.7).
 pub fn extract(headers: &axum::http::HeaderMap) -> Context {
-    let cx = opentelemetry::global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)));
+    let cx =
+        opentelemetry::global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)));
     scrub_baggage_with(cx, baggage_policy())
 }
 
 /// Extract the inbound OTel parent context from gRPC metadata.
 /// Inbound baggage is scrubbed per the installed [`BaggagePolicy`] (§4.0.7).
 pub fn extract_grpc(metadata: &tonic::metadata::MetadataMap) -> Context {
-    let cx = opentelemetry::global::get_text_map_propagator(|p| p.extract(&MetadataExtractor(metadata)));
+    let cx =
+        opentelemetry::global::get_text_map_propagator(|p| p.extract(&MetadataExtractor(metadata)));
     scrub_baggage_with(cx, baggage_policy())
 }
 
@@ -122,12 +124,15 @@ struct BaggagePolicy {
 impl Default for BaggagePolicy {
     /// 未安装策略时的兜底：全拒（deny-all）。
     fn default() -> Self {
-        Self { allowlist: Vec::new(), max_entries: 16, max_entry_bytes: 128 }
+        Self {
+            allowlist: Vec::new(),
+            max_entries: 16,
+            max_entry_bytes: 128,
+        }
     }
 }
 
-static BAGGAGE_POLICY: once_cell::sync::OnceCell<BaggagePolicy> =
-    once_cell::sync::OnceCell::new();
+static BAGGAGE_POLICY: once_cell::sync::OnceCell<BaggagePolicy> = once_cell::sync::OnceCell::new();
 
 /// 当前策略引用：init 已安装用安装的，否则默认全拒（feature 关/单测直调）。
 fn baggage_policy() -> &'static BaggagePolicy {
@@ -251,7 +256,9 @@ mod otel {
     use super::*;
     use crate::config::TelemetryProtocol;
     use opentelemetry::KeyValue;
-    use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider};
+    use opentelemetry_sdk::trace::{
+        BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+    };
     use opentelemetry_sdk::Resource;
     use std::time::Duration;
 
@@ -322,7 +329,10 @@ mod otel {
             attributes: &[KeyValue],
             links: &[opentelemetry::trace::Link],
         ) -> opentelemetry::trace::SamplingResult {
-            let ratio = match attributes.iter().find(|kv| kv.key.as_str() == "endpoint.class") {
+            let ratio = match attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == "endpoint.class")
+            {
                 Some(kv) if matches!(&*kv.value.as_str(), "health" | "admin") => {
                     self.health_admin_ratio
                 }
@@ -354,7 +364,8 @@ mod otel {
         fn export(
             &self,
             batch: Vec<opentelemetry_sdk::trace::SpanData>,
-        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
             let n = batch.len() as u64;
             let fut = self.inner.export(batch);
             async move {
@@ -395,7 +406,10 @@ mod otel {
         fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
             self.inner.force_flush()
         }
-        fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        fn shutdown_with_timeout(
+            &self,
+            timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
             self.inner.shutdown_with_timeout(timeout)
         }
         fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -497,9 +511,10 @@ mod otel {
                 .build()
             {
                 Ok(metric_exporter) => {
-                    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter)
-                        .with_interval(Duration::from_millis(cfg.export_interval_millis))
-                        .build();
+                    let reader =
+                        opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter)
+                            .with_interval(Duration::from_millis(cfg.export_interval_millis))
+                            .build();
                     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
                         .with_reader(reader)
                         .with_resource(resource.clone())
@@ -607,7 +622,10 @@ pub fn record_stream_duration(stream_kind: &str, seconds: f64) {
             .with_unit("s")
             .build()
     });
-    histogram.record(seconds, &[KeyValue::new("stream_kind", stream_kind.to_string())]);
+    histogram.record(
+        seconds,
+        &[KeyValue::new("stream_kind", stream_kind.to_string())],
+    );
 }
 
 pub fn record_stream_chunks(protocol: &str, count: u64) {
@@ -672,7 +690,10 @@ mod tests {
 
     #[test]
     fn scrub_allowlist_keeps_only_listed_keys() {
-        let policy = BaggagePolicy { allowlist: vec!["tenant".to_string()], ..Default::default() };
+        let policy = BaggagePolicy {
+            allowlist: vec!["tenant".to_string()],
+            ..Default::default()
+        };
         let cx = cx_with_baggage(&[("tenant", "acme"), ("internal", "top-secret")]);
         assert_eq!(baggage_keys(&scrub_baggage_with(cx, &policy)), ["tenant"]);
     }
@@ -709,7 +730,8 @@ mod tests {
         let src = include_str!("http/mod.rs");
         let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
         assert!(
-            src[..boundary].contains("\"endpoint.class\" = crate::access_control::classify_http_path"),
+            src[..boundary]
+                .contains("\"endpoint.class\" = crate::access_control::classify_http_path"),
             "B4: http.server span 必须在创建时 stamp endpoint.class（分类采样依据）"
         );
     }
@@ -736,13 +758,23 @@ mod tests {
     #[test]
     fn health_admin_spans_use_independent_ratio() {
         // default=1.0（全采）+ health_admin=0.0 → health/admin 全丢、其余全采。
-        let sampler =
-            super::otel::PerClassSampler { default_ratio: 1.0, health_admin_ratio: 0.0 };
+        let sampler = super::otel::PerClassSampler {
+            default_ratio: 1.0,
+            health_admin_ratio: 0.0,
+        };
         use opentelemetry::trace::SamplingDecision::*;
-        let class = |c: &str| vec![opentelemetry::KeyValue::new("endpoint.class", c.to_string())];
+        let class = |c: &str| {
+            vec![opentelemetry::KeyValue::new(
+                "endpoint.class",
+                c.to_string(),
+            )]
+        };
         assert_eq!(sample_decision(&sampler, &class("health")), Drop);
         assert_eq!(sample_decision(&sampler, &class("admin")), Drop);
-        assert_eq!(sample_decision(&sampler, &class("inference")), RecordAndSample);
+        assert_eq!(
+            sample_decision(&sampler, &class("inference")),
+            RecordAndSample
+        );
         // 无 endpoint.class 属性 → 默认比率。
         assert_eq!(sample_decision(&sampler, &[]), RecordAndSample);
     }
@@ -751,10 +783,17 @@ mod tests {
     #[test]
     fn health_admin_ratio_is_independent_of_default_ratio() {
         // 反向：default=0.0 + health_admin=1.0 → health 采、inference 丢。
-        let sampler =
-            super::otel::PerClassSampler { default_ratio: 0.0, health_admin_ratio: 1.0 };
+        let sampler = super::otel::PerClassSampler {
+            default_ratio: 0.0,
+            health_admin_ratio: 1.0,
+        };
         use opentelemetry::trace::SamplingDecision::*;
-        let class = |c: &str| vec![opentelemetry::KeyValue::new("endpoint.class", c.to_string())];
+        let class = |c: &str| {
+            vec![opentelemetry::KeyValue::new(
+                "endpoint.class",
+                c.to_string(),
+            )]
+        };
         assert_eq!(sample_decision(&sampler, &class("health")), RecordAndSample);
         assert_eq!(sample_decision(&sampler, &class("inference")), Drop);
     }
@@ -834,7 +873,7 @@ mod tests {
     #[test]
     fn inject_extract_roundtrip_with_propagator() {
         use opentelemetry::propagation::TextMapCompositePropagator;
-        use opentelemetry::trace::{Tracer, TracerProvider, TraceContextExt};
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
         use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
         // Install the composite propagator for this test (process-global).
         opentelemetry::global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
@@ -879,8 +918,12 @@ mod tests {
         ]));
 
         let mut inbound = axum::http::HeaderMap::new();
-        inbound
-            .insert("baggage", "tenant=acme;user_id=u1;internal=top-secret".parse().unwrap());
+        inbound.insert(
+            "baggage",
+            "tenant=acme;user_id=u1;internal=top-secret"
+                .parse()
+                .unwrap(),
+        );
         let cx = extract(&inbound);
         let items: Vec<String> = cx.baggage().iter().map(|(k, _)| k.to_string()).collect();
         assert!(
@@ -937,7 +980,10 @@ mod otel_health_tests {
     impl SpanExporter for FakeExporter {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
             if self.fail {
-                Err(OTelSdkError::InternalFailure(format!("boom ({})", batch.len())))
+                Err(OTelSdkError::InternalFailure(format!(
+                    "boom ({})",
+                    batch.len()
+                )))
             } else {
                 Ok(())
             }
@@ -947,7 +993,12 @@ mod otel_health_tests {
     #[derive(Debug)]
     struct NoopProcessor;
     impl SpanProcessor for NoopProcessor {
-        fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &opentelemetry::Context) {}
+        fn on_start(
+            &self,
+            _span: &mut opentelemetry_sdk::trace::Span,
+            _cx: &opentelemetry::Context,
+        ) {
+        }
         fn on_end(&self, _span: SpanData) {}
         fn force_flush(&self) -> OTelSdkResult {
             Ok(())
@@ -979,24 +1030,41 @@ mod otel_health_tests {
         let fails0 = crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.get();
         let ok0 = crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.get();
 
-        let good = CountingExporter { inner: FakeExporter { fail: false } };
+        let good = CountingExporter {
+            inner: FakeExporter { fail: false },
+        };
         SpanExporter::export(&good, vec![fake_span_data("a"), fake_span_data("b")])
             .await
             .expect("ok exporter");
-        let bad = CountingExporter { inner: FakeExporter { fail: true } };
+        let bad = CountingExporter {
+            inner: FakeExporter { fail: true },
+        };
         let _ = SpanExporter::export(&bad, vec![fake_span_data("c")]).await;
 
-        assert_eq!(crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.get(), ok0 + 2, "成功按 batch 大小计数");
-        assert_eq!(crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.get(), fails0 + 1, "失败按批次计数");
+        assert_eq!(
+            crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.get(),
+            ok0 + 2,
+            "成功按 batch 大小计数"
+        );
+        assert_eq!(
+            crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.get(),
+            fails0 + 1,
+            "失败按批次计数"
+        );
     }
 
     #[test]
     fn counting_processor_counts_ended_spans() {
         let ended0 = crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.get();
-        let p = CountingProcessor { inner: NoopProcessor };
+        let p = CountingProcessor {
+            inner: NoopProcessor,
+        };
         p.on_end(fake_span_data("x"));
         p.on_end(fake_span_data("y"));
-        assert_eq!(crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.get(), ended0 + 2);
+        assert_eq!(
+            crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.get(),
+            ended0 + 2
+        );
     }
 
     /// link_parent 在 OTel layer 活跃时把 trace_id/span_id record 到 span
@@ -1065,11 +1133,24 @@ mod otel_health_tests {
         handle.join().unwrap();
 
         let rec = rec.lock().unwrap();
-        let get = |n: &str| rec.recorded.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        let get = |n: &str| {
+            rec.recorded
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.clone())
+        };
         let trace_id = get("trace_id").expect("link_parent 须 record trace_id");
-        assert_eq!(trace_id.trim_matches('"').len(), 32, "trace_id 为 32 hex: {trace_id}");
+        assert_eq!(
+            trace_id.trim_matches('"').len(),
+            32,
+            "trace_id 为 32 hex: {trace_id}"
+        );
         let span_id = get("span_id").expect("link_parent 须 record span_id");
-        assert_eq!(span_id.trim_matches('"').len(), 16, "span_id 为 16 hex: {span_id}");
+        assert_eq!(
+            span_id.trim_matches('"').len(),
+            16,
+            "span_id 为 16 hex: {span_id}"
+        );
     }
 
     /// 无 OTel layer 时 link_parent 不 record（字段保持 Empty，不 panic）。
@@ -1115,7 +1196,10 @@ mod prop_tests {
     }
 
     fn map_of(cx: &Context) -> StdMap<String, String> {
-        cx.baggage().iter().map(|(k, (v, _))| (k.to_string(), v.as_str().to_string())).collect()
+        cx.baggage()
+            .iter()
+            .map(|(k, (v, _))| (k.to_string(), v.as_str().to_string()))
+            .collect()
     }
 
     proptest! {

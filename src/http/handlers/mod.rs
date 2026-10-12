@@ -1,13 +1,13 @@
 use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::protocol::ApiProtocol;
-use axum::{extract::Query, response::Json};
 use axum::http::header::HeaderMap;
+#[cfg(test)]
+use axum::response::Response;
+use axum::{extract::Query, response::Json};
 use bytes::Bytes;
 #[cfg(test)]
 use serde_json::Value;
-#[cfg(test)]
-use axum::response::Response;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -61,7 +61,8 @@ pub struct ApiQuery<T>(pub T);
 impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
 where
     S: Send + Sync,
-    Query<T>: axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+    Query<T>:
+        axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
 {
     type Rejection = ProtocolError;
 
@@ -158,12 +159,11 @@ where
             let headers = req.headers();
             let ct_header = headers.get(axum::http::header::CONTENT_TYPE);
             let is_json = match ct_header {
-                None => true, // missing → default to JSON (D2)
+                None => true,                       // missing → default to JSON (D2)
                 Some(v) => is_json_content_type(v), // parse failure → raw (D2)
             };
-            let content_type: Option<String> = ct_header
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
+            let content_type: Option<String> =
+                ct_header.and_then(|v| v.to_str().ok()).map(str::to_string);
             let has_encoding = headers.contains_key(axum::http::header::CONTENT_ENCODING);
             // D4/D5 (P1): advertised body size for the 413 error body.
             let content_length = headers
@@ -181,47 +181,59 @@ where
 
         // D6: no decompression layer — any Content-Encoding → 415.
         if has_content_encoding {
-            return Err(pe(protocol, AppError::UnsupportedMediaType(
-                "Content-Encoding (compressed request body) is not supported; \
+            return Err(pe(
+                protocol,
+                AppError::UnsupportedMediaType(
+                    "Content-Encoding (compressed request body) is not supported; \
                  send the request body uncompressed"
-                    .into(),
-            )));
+                        .into(),
+                ),
+            ));
         }
 
         let (parts, body) = req.into_parts();
         let max_size = state.max_body_bytes();
-        let bytes = axum::body::Bytes::from_request(
-            axum::extract::Request::from_parts(parts, body),
-            state,
-        )
-        .await
-        .map_err(|rejection| {
-            pe(protocol, crate::error::map_body_rejection(rejection, max_size, content_length))
-        })?;
+        let bytes =
+            axum::body::Bytes::from_request(axum::extract::Request::from_parts(parts, body), state)
+                .await
+                .map_err(|rejection| {
+                    pe(
+                        protocol,
+                        crate::error::map_body_rejection(rejection, max_size, content_length),
+                    )
+                })?;
 
         // Triton Binary Tensor Data Extension(D2/C3):header 存在即优先于
         // Content-Type 分流。N>0 → TritonBinary(JSON 头 &RawValue 校验 +
         // Σ binary_data_size 结构校验);N==0 → 落回既有分流(byte-identical)。
         if let Some(raw) = ihcl {
             let n = raw.parse::<usize>().map_err(|_| {
-                pe(protocol, AppError::InvalidRequestBody(format!(
-                    "invalid inference-header-content-length: {raw}"
-                )))
+                pe(
+                    protocol,
+                    AppError::InvalidRequestBody(format!(
+                        "invalid inference-header-content-length: {raw}"
+                    )),
+                )
             })?;
             if n > 0 {
                 if n > bytes.len() {
-                    return Err(pe(protocol, AppError::InvalidRequestBody(format!(
-                        "inference-header-content-length {n} exceeds body length {}",
-                        bytes.len()
-                    ))));
+                    return Err(pe(
+                        protocol,
+                        AppError::InvalidRequestBody(format!(
+                            "inference-header-content-length {n} exceeds body length {}",
+                            bytes.len()
+                        )),
+                    ));
                 }
-                let total = triton_binary_tail_sum(&bytes[..n])
-                    .map_err(|e| pe(protocol, e))?;
+                let total = triton_binary_tail_sum(&bytes[..n]).map_err(|e| pe(protocol, e))?;
                 let tail_len = bytes.len() - n;
                 if total as usize != tail_len {
-                    return Err(pe(protocol, AppError::InvalidRequestBody(format!(
+                    return Err(pe(
+                        protocol,
+                        AppError::InvalidRequestBody(format!(
                         "binary_data_size sum {total} does not match binary tail length {tail_len}"
-                    ))));
+                    )),
+                    ));
                 }
                 return Ok(ApiBody(RequestBody::TritonBinary {
                     body: bytes,
@@ -234,10 +246,12 @@ where
         if is_json {
             // D3: zero-allocation syntax validation via `&RawValue` —
             // a full parse (not just first-byte sniffing), no DOM materialized.
-            serde_json::from_slice::<&serde_json::value::RawValue>(&bytes)
-                .map_err(|e| {
-                    pe(protocol, AppError::InvalidRequestBody(format!("invalid JSON body: {e}")))
-                })?;
+            serde_json::from_slice::<&serde_json::value::RawValue>(&bytes).map_err(|e| {
+                pe(
+                    protocol,
+                    AppError::InvalidRequestBody(format!("invalid JSON body: {e}")),
+                )
+            })?;
             Ok(ApiBody(RequestBody::Json(bytes)))
         } else {
             let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -367,7 +381,6 @@ mod tests;
 #[cfg(test)]
 mod triton_binary_tests;
 
-
 /// Pure decision for the peer-IP fallback layer: return the IP string to inject
 /// as `x-real-ip`, or `None`. Injection is skipped when a proxy header is
 /// already present (never overwrite a client/proxy-supplied value) or when
@@ -376,8 +389,7 @@ pub(crate) fn peer_ip_fallback_target(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Option<String> {
-    let has_proxy = headers.contains_key("x-forwarded-for")
-        || headers.contains_key("x-real-ip");
+    let has_proxy = headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip");
     if has_proxy {
         return None;
     }
@@ -471,9 +483,8 @@ fn auth_gate_for_unknown_model(
 /// F-23: whether to emit the empty-IP-scope warning for this model — true on
 /// the first call per model, false afterwards (process-wide dedup).
 fn should_warn_empty_ip_scope(model_name: &str) -> bool {
-    static WARNED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<String>>,
-    > = std::sync::OnceLock::new();
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
     WARNED
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
         .lock()
@@ -527,9 +538,6 @@ async fn enforce_rate_limit(
 // (inference.rs / custom_routes.rs) are unchanged.
 pub(crate) use crate::protocol::inject_response_headers;
 
-
-
-
 #[cfg(test)]
 mod extractor_tests {
     use super::*;
@@ -538,34 +546,52 @@ mod extractor_tests {
     use tower::ServiceExt;
 
     async fn read_error_body(response: Response) -> Value {
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         serde_json::from_slice(&body_bytes).unwrap()
     }
 
     #[tokio::test]
     async fn test_api_json_valid_body_passes() {
-        let app = axum::Router::new().route("/t", axum::routing::post(
-            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+        let app = axum::Router::new().route(
+            "/t",
+            axum::routing::post(|ApiJson(v): ApiJson<Value>| async move { v.to_string() }),
+        );
 
         let response = app
-            .oneshot(Request::builder().uri("/t").method("POST")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"input": 1}"#)).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/t")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input": 1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_api_json_malformed_body_standardized_error() {
-        let app = axum::Router::new().route("/t", axum::routing::post(
-            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+        let app = axum::Router::new().route(
+            "/t",
+            axum::routing::post(|ApiJson(v): ApiJson<Value>| async move { v.to_string() }),
+        );
 
         let response = app
-            .oneshot(Request::builder().uri("/t").method("POST")
-                .header("content-type", "application/json")
-                .body(Body::from("{not json")).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/t")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = read_error_body(response).await;
@@ -576,13 +602,21 @@ mod extractor_tests {
 
     #[tokio::test]
     async fn test_api_json_missing_content_type_standardized_error() {
-        let app = axum::Router::new().route("/t", axum::routing::post(
-            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+        let app = axum::Router::new().route(
+            "/t",
+            axum::routing::post(|ApiJson(v): ApiJson<Value>| async move { v.to_string() }),
+        );
 
         let response = app
-            .oneshot(Request::builder().uri("/t").method("POST")
-                .body(Body::from(r#"{"input": 1}"#)).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/t")
+                    .method("POST")
+                    .body(Body::from(r#"{"input": 1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = read_error_body(response).await;
@@ -592,14 +626,27 @@ mod extractor_tests {
     #[tokio::test]
     async fn test_api_query_invalid_param_standardized_error() {
         #[derive(serde::Deserialize)]
-        struct TestQuery { #[allow(dead_code)] flag: bool }
+        struct TestQuery {
+            #[allow(dead_code)]
+            flag: bool,
+        }
 
-        let app = axum::Router::new().route("/t", axum::routing::get(
-            |ApiQuery(q): ApiQuery<TestQuery>| async move { q.flag.to_string() }));
+        let app = axum::Router::new().route(
+            "/t",
+            axum::routing::get(
+                |ApiQuery(q): ApiQuery<TestQuery>| async move { q.flag.to_string() },
+            ),
+        );
 
         let response = app
-            .oneshot(Request::builder().uri("/t?flag=notabool").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/t?flag=notabool")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = read_error_body(response).await;
@@ -635,7 +682,9 @@ mod api_body_tests {
     }
 
     async fn read_error_body(response: axum::response::Response) -> Value {
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         serde_json::from_slice(&body_bytes).unwrap()
     }
 
@@ -704,14 +753,18 @@ mod api_body_tests {
     fn test_app(max_body: usize) -> axum::Router {
         let state = Arc::new(TestState { max_body });
         axum::Router::new()
-            .route("/echo-kind", axum::routing::post(
-                |ApiBody(body): ApiBody| async move { body.kind().to_string() },
-            ))
-            .route("/echo-bytes", axum::routing::post(
-                |ApiBody(body): ApiBody| async move {
+            .route(
+                "/echo-kind",
+                axum::routing::post(
+                    |ApiBody(body): ApiBody| async move { body.kind().to_string() },
+                ),
+            )
+            .route(
+                "/echo-bytes",
+                axum::routing::post(|ApiBody(body): ApiBody| async move {
                     axum::body::Body::from(body.bytes())
-                },
-            ))
+                }),
+            )
             .layer(axum::extract::DefaultBodyLimit::max(max_body))
             .with_state(state)
     }
@@ -731,7 +784,9 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert_eq!(body, "json");
     }
 
@@ -749,7 +804,9 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert_eq!(body, "json");
     }
 
@@ -768,7 +825,9 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert_eq!(body, "raw");
     }
 
@@ -789,7 +848,10 @@ mod api_body_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = read_error_body(response).await;
         assert_eq!(body["error"]["code"], "invalid_request_body");
-        assert!(body["error"]["message"].as_str().unwrap().contains("invalid JSON"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON"));
     }
 
     #[tokio::test]
@@ -829,7 +891,10 @@ mod api_body_tests {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let body = read_error_body(response).await;
         assert_eq!(body["error"]["code"], "unsupported_media_type");
-        assert!(body["error"]["message"].as_str().unwrap().contains("Content-Encoding"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Content-Encoding"));
     }
 
     #[tokio::test]
@@ -849,7 +914,9 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), input.as_bytes());
     }
 
@@ -893,8 +960,11 @@ mod api_body_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK,
-            "body exactly at limit ({limit} bytes) must be accepted");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "body exactly at limit ({limit} bytes) must be accepted"
+        );
     }
 
     #[tokio::test]
@@ -913,8 +983,12 @@ mod api_body_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE,
-            "body at limit+1 ({}) bytes must be rejected 413", limit + 1);
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body at limit+1 ({}) bytes must be rejected 413",
+            limit + 1
+        );
     }
 
     // ------------------------------------------------------------------
@@ -936,8 +1010,13 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body, "json", "scalar number 42 must be valid JSON → Json variant");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, "json",
+            "scalar number 42 must be valid JSON → Json variant"
+        );
     }
 
     #[tokio::test]
@@ -955,8 +1034,13 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body, "json", "scalar string must be valid JSON → Json variant");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, "json",
+            "scalar string must be valid JSON → Json variant"
+        );
     }
 
     #[tokio::test]
@@ -974,8 +1058,13 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body, "json", "scalar null must be valid JSON → Json variant");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, "json",
+            "scalar null must be valid JSON → Json variant"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -997,8 +1086,13 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body, "raw", "application/x-tensor must dispatch to Raw variant");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, "raw",
+            "application/x-tensor must dispatch to Raw variant"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1023,9 +1117,14 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body.as_ref(), input.as_bytes(),
-            "non-canonical JSON with extra whitespace must be byte-identical");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            input.as_bytes(),
+            "non-canonical JSON with extra whitespace must be byte-identical"
+        );
     }
 
     #[tokio::test]
@@ -1044,9 +1143,14 @@ mod api_body_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert_eq!(body.as_ref(), input.as_bytes(),
-            "JSON with Unicode escapes and emoji must be byte-identical");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            input.as_bytes(),
+            "JSON with Unicode escapes and emoji must be byte-identical"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1140,10 +1244,12 @@ mod api_body_tests {
         let original = Bytes::from(data);
         let cloned = original.clone();
 
-        assert_eq!(original.len(), cloned.len(),
-            "clone must preserve length");
-        assert_eq!(original.as_ptr(), cloned.as_ptr(),
-            "clone must share the same underlying buffer pointer");
+        assert_eq!(original.len(), cloned.len(), "clone must preserve length");
+        assert_eq!(
+            original.as_ptr(),
+            cloned.as_ptr(),
+            "clone must share the same underlying buffer pointer"
+        );
     }
 }
 
@@ -1153,7 +1259,7 @@ mod status_family_tests {
 
     #[test]
     fn test_status_family_mapping() {
-        assert_eq!(status_family(0), "2xx");     // unset → success
+        assert_eq!(status_family(0), "2xx"); // unset → success
         assert_eq!(status_family(200), "2xx");
         assert_eq!(status_family(201), "2xx");
         assert_eq!(status_family(302), "3xx");
@@ -1163,7 +1269,6 @@ mod status_family_tests {
         assert_eq!(status_family(503), "5xx");
     }
 }
-
 
 #[cfg(test)]
 mod client_ip_tests {

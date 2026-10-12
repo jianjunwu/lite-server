@@ -113,8 +113,7 @@ pub fn service_interceptor(
 /// 不触碰消息流）。P-XFF：trusted 取空（fail-safe）——生产栈用
 /// `service_interceptor` 注入真实 trusted。
 pub fn context_interceptor(mut request: Request<()>) -> Result<Request<()>, Status> {
-    let mut cx =
-        RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr(), &[]);
+    let mut cx = RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr(), &[]);
     // P5-1: TLS 连接经 tonic 的 TlsConnectInfo 携带 mTLS 客户端证书 → T1
     // principal（明文 TCP/UDS 恒为 None）。
     cx.principal = tls_principal(request.extensions());
@@ -127,9 +126,9 @@ pub fn context_interceptor(mut request: Request<()>) -> Result<Request<()>, Stat
 /// `Connected` impl 据此把 `TlsConnectInfo<TcpConnectInfo>`（含 peer certs）
 /// 放进 extensions。
 fn tls_principal(extensions: &tonic::Extensions) -> Option<String> {
-    let info = extensions.get::<tonic::transport::server::TlsConnectInfo<
-        tonic::transport::server::TcpConnectInfo,
-    >>()?;
+    let info = extensions
+        .get::<tonic::transport::server::TlsConnectInfo<tonic::transport::server::TcpConnectInfo>>(
+        )?;
     let certs = info.peer_certs()?;
     certs.first().map(crate::tls::principal_from_cert)
 }
@@ -175,7 +174,10 @@ mod tests {
     fn md_with(pairs: &[(&str, &str)]) -> MetadataMap {
         let mut md = MetadataMap::new();
         for (k, v) in pairs {
-            md.insert(MetadataKey::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            md.insert(
+                MetadataKey::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
         }
         md
     }
@@ -211,7 +213,10 @@ mod tests {
         assert_eq!(cx.client_ip, "10.0.0.1");
         assert_eq!(cx.protocol, Protocol::Grpc);
         assert!(cx.principal.is_none());
-        assert!(cx.trace_cx.get::<u32>().is_none(), "P-TRACE 前 trace_cx 为空 Context");
+        assert!(
+            cx.trace_cx.get::<u32>().is_none(),
+            "P-TRACE 前 trace_cx 为空 Context"
+        );
     }
 
     #[test]
@@ -222,7 +227,10 @@ mod tests {
         *request.metadata_mut() = md_with(&[("x-api-key", "sk-a")]);
         let request = context_interceptor(request).unwrap();
         assert_eq!(
-            request.metadata().get("x-api-key").and_then(|v| v.to_str().ok()),
+            request
+                .metadata()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
             Some("sk-a")
         );
         assert_eq!(*request.get_ref(), ());
@@ -253,20 +261,29 @@ mod tests {
     #[test]
     fn metadata_request_id_skips_invalid_value() {
         let md = md_with(&[("x-client-request-id", &"x".repeat(513))]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).request_id, "");
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, None, &[]).request_id,
+            ""
+        );
     }
 
     #[test]
     fn metadata_client_ip_prefers_xff_over_real_ip() {
         // 无 peer（UDS）+ 空 trusted：保留 header 优先语义。
         let md = md_with(&[("x-forwarded-for", "10.0.0.1"), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).client_ip, "10.0.0.1");
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, None, &[]).client_ip,
+            "10.0.0.1"
+        );
     }
 
     #[test]
     fn metadata_client_ip_skips_empty_xff() {
         let md = md_with(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).client_ip, "10.0.0.2");
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, None, &[]).client_ip,
+            "10.0.0.2"
+        );
     }
 
     // ===== P-XFF（gRPC 侧）：peer 锚定 fail-safe =====
@@ -320,7 +337,11 @@ mod tests {
     #[test]
     fn finalize_generates_uuid_when_request_id_absent() {
         let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), None, &[]);
-        assert!(Uuid::parse_str(&cx.request_id).is_ok(), "expected UUID, got {}", cx.request_id);
+        assert!(
+            Uuid::parse_str(&cx.request_id).is_ok(),
+            "expected UUID, got {}",
+            cx.request_id
+        );
     }
 
     #[test]
@@ -351,7 +372,13 @@ mod tests {
     #[test]
     fn finalize_falls_back_to_remote_addr() {
         // 无 header → peer（非受信直连 peer 即客户端）。
-        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), addr("192.168.1.1"), &[]);
+        let cx = finalize_context(
+            None,
+            &MetadataMap::new(),
+            &HashMap::new(),
+            addr("192.168.1.1"),
+            &[],
+        );
         assert_eq!(cx.client_ip, "192.168.1.1");
     }
 
@@ -388,7 +415,10 @@ mod tests {
         ]);
         let cx = finalize_context(prefilled, &md, &proto, None, &[]);
         assert_eq!(cx.request_id, "from-metadata");
-        assert_eq!(cx.client_ip, "10.0.0.3", "metadata 未给 client_ip 时 proto headers 生效");
+        assert_eq!(
+            cx.client_ip, "10.0.0.3",
+            "metadata 未给 client_ip 时 proto headers 生效"
+        );
     }
 
     // ===== 护栏：gRPC handler 不再各自 inline 提取 request_id/client_ip =====

@@ -85,12 +85,9 @@ impl Clone for EnsembleValue {
         match self {
             EnsembleValue::Json(v) => EnsembleValue::Json(v.clone()),
             EnsembleValue::RawJson(r) => EnsembleValue::RawJson(Arc::clone(r)),
-            EnsembleValue::Binary(b, ct, shape, dt) => EnsembleValue::Binary(
-                b.clone(),
-                ct.clone(),
-                shape.clone(),
-                dt.clone(),
-            ),
+            EnsembleValue::Binary(b, ct, shape, dt) => {
+                EnsembleValue::Binary(b.clone(), ct.clone(), shape.clone(), dt.clone())
+            }
             EnsembleValue::Envelope { head, tail } => EnsembleValue::Envelope {
                 head: head.clone(),
                 tail: tail.clone(),
@@ -336,4 +333,3 @@ lazy_static::lazy_static! {
         // must fail fast, not backtrack into target `dag` + op `in`.
         Regex::new(r"^\$(\S+)\s+(==|!=|contains|in)\s*(.+)$").expect("invalid when regex");
 }
-

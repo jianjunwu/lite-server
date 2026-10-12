@@ -87,7 +87,12 @@ impl GrpcService {
         // is missing, not ready, or fine (auth first, then rate limit).
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+            enforce_grpc_rate_limit(
+                &self.rate_limiter,
+                mv.policies.rate_limit.as_ref(),
+                model_name,
+                &client_ip,
+            )?;
         }
 
         if !self.registry.is_ready(model_name, Some(&resolved_version)) {
@@ -148,25 +153,30 @@ impl GrpcService {
                 // client must know the model contract, consistent with gRPC
                 // unary semantics).
                 let data = match result {
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
-                        bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
-                    }
+                    crate::ensemble::EnsembleOutcome::Unary(
+                        crate::ensemble::EnsembleValue::Json(v),
+                    ) => bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
                     // P2 (batch 6): raw-resident output → original bytes.
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => raw.bytes.clone(),
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct, ..)) => b,
+                    crate::ensemble::EnsembleOutcome::Unary(
+                        crate::ensemble::EnsembleValue::RawJson(raw),
+                    ) => raw.bytes.clone(),
+                    crate::ensemble::EnsembleOutcome::Unary(
+                        crate::ensemble::EnsembleValue::Binary(b, _ct, ..),
+                    ) => b,
                     // E7 (D32): the multi-sink response — InferResponse has
                     // no headers map, so the LSBE-1 container is the
                     // self-describing carrier (head + tail).
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
-                        crate::ensemble::encode_lsbe1(&head, &tail)
-                    }
+                    crate::ensemble::EnsembleOutcome::Unary(
+                        crate::ensemble::EnsembleValue::Envelope { head, tail },
+                    ) => crate::ensemble::encode_lsbe1(&head, &tail),
                     crate::ensemble::EnsembleOutcome::Stream(_) => {
                         // D1: a unary endpoint calling a streaming DAG is a
                         // client contract violation — InvalidArgument (parity
                         // with the HTTP 400).
                         return Err(err(app_error_to_grpc_status(
                             &AppError::InvalidRequestBody(
-                                "DAG contains a streaming step; use a streaming endpoint".to_string(),
+                                "DAG contains a streaming step; use a streaming endpoint"
+                                    .to_string(),
                             ),
                         )));
                     }
@@ -245,11 +255,11 @@ impl GrpcService {
             is_warmup: false,
             queue_depth_guard: None,
         };
-        let resp = match self
-            .worker_manager
-            .inference_queue()
-            .try_submit(model_name, &resolved_version, item)
-        {
+        let resp = match self.worker_manager.inference_queue().try_submit(
+            model_name,
+            &resolved_version,
+            item,
+        ) {
             Ok(()) => match crate::deadline::remaining(deadline.unix_ns) {
                 Some(t) => match tokio::time::timeout(t, response_rx).await {
                     Ok(Ok(resp)) => resp,
@@ -325,7 +335,11 @@ impl GrpcService {
                     code: s.code.clone(),
                     message: s.message.clone(),
                 });
-                let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+                let code = single
+                    .status
+                    .as_ref()
+                    .map(|s| s.code.as_str())
+                    .unwrap_or("Ok");
                 match code {
                     "Error" => {
                         let msg = grpc_status
@@ -335,12 +349,14 @@ impl GrpcService {
                         // If Status.message parses as u16, the worker signalled
                         // a model-level HTTPException with structured error in data.
                         if let Ok(http_status) = msg.parse::<u16>() {
-                            let data: serde_json::Value =
-                                serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
+                            let data: serde_json::Value = serde_json::from_slice(&single.data)
+                                .unwrap_or(serde_json::json!({}));
                             let parsed = try_parse_model_error(&data);
                             return Err(match parsed {
                                 Some(p) => err(model_error_status(
-                                    http_status_to_grpc_code(http_status), &p)),
+                                    http_status_to_grpc_code(http_status),
+                                    &p,
+                                )),
                                 None => err(Status::new(
                                     http_status_to_grpc_code(http_status),
                                     format!("[model_error] {}", msg),

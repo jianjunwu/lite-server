@@ -195,8 +195,7 @@ async fn load_session(
 /// Per-staging-dir mutex serializing `complete` calls for one session
 /// (the loser sees state != uploading → 409), and the delete handler
 /// against an in-flight complete.
-fn complete_locks()
--> &'static dashmap::DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>> {
+fn complete_locks() -> &'static dashmap::DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>> {
     static LOCKS: std::sync::OnceLock<
         dashmap::DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
     > = std::sync::OnceLock::new();
@@ -334,7 +333,13 @@ pub async fn get_upload_session(
 /// after an ambiguous failure is always safe).
 pub async fn put_session_chunk(
     State(state): State<Arc<AppState>>,
-    Path((model_name, version, sid, file_index, chunk_index)): Path<(String, String, String, usize, u64)>,
+    Path((model_name, version, sid, file_index, chunk_index)): Path<(
+        String,
+        String,
+        String,
+        usize,
+        u64,
+    )>,
     body: Body,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
@@ -345,9 +350,10 @@ pub async fn put_session_chunk(
             "session is completing; no further chunks accepted".to_string(),
         ));
     }
-    let file = meta.files.get(file_index).ok_or_else(|| {
-        AppError::Validation(format!("file index {} out of range", file_index))
-    })?;
+    let file = meta
+        .files
+        .get(file_index)
+        .ok_or_else(|| AppError::Validation(format!("file index {} out of range", file_index)))?;
     let expected = expected_chunks(file.size, meta.chunk_size);
     if chunk_index >= expected {
         return Err(AppError::Validation(format!(
@@ -365,7 +371,9 @@ pub async fn put_session_chunk(
     };
 
     let dir = chunks_dir(&staging, file_index);
-    tokio::fs::create_dir_all(&dir).await.map_err(AppError::Io)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(AppError::Io)?;
     let part = dir.join(format!("{}.part", chunk_index));
     let final_path = dir.join(chunk_index.to_string());
 
@@ -374,7 +382,8 @@ pub async fn put_session_chunk(
     let mut stream = body.into_data_stream();
     let write_result: Result<(), AppError> = async {
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| AppError::Transport(format!("read chunk body: {}", e)))?;
+            let chunk =
+                chunk.map_err(|e| AppError::Transport(format!("read chunk body: {}", e)))?;
             written += chunk.len() as u64;
             if written > want {
                 return Err(if written > meta.chunk_size {
@@ -559,7 +568,9 @@ async fn assemble_and_finalize(
     query: &UploadQuery,
 ) -> Result<FinalizedResponse, AppError> {
     let asm = staging.join(".assembled");
-    tokio::fs::create_dir_all(&asm).await.map_err(AppError::Io)?;
+    tokio::fs::create_dir_all(&asm)
+        .await
+        .map_err(AppError::Io)?;
     let mut staged: Vec<StagedUploadFile> = Vec::new();
     for (i, f) in meta.files.iter().enumerate() {
         let dest = if f.is_lma {
@@ -791,7 +802,10 @@ mod tests {
             .clone()
             .oneshot(json_req(
                 "POST",
-                &format!("/v2/repository/models/{}/versions/{}/upload-sessions", model, version),
+                &format!(
+                    "/v2/repository/models/{}/versions/{}/upload-sessions",
+                    model, version
+                ),
                 json!({ "files": files }),
             ))
             .await
@@ -846,7 +860,12 @@ mod tests {
         body_json(response).await
     }
 
-    async fn complete(app: &Router, model: &str, version: &str, sid: &str) -> axum::response::Response {
+    async fn complete(
+        app: &Router,
+        model: &str,
+        version: &str,
+        sid: &str,
+    ) -> axum::response::Response {
         complete_force(app, model, version, sid, false).await
     }
 
@@ -956,7 +975,13 @@ mod tests {
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
         // 3 chunks of 64 (192 bytes).
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 192 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 192 }]),
+        )
+        .await;
 
         put_chunk(&app, "mymodel", "1", &sid, 0, 2, vec![b'c'; 64]).await;
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64]).await;
@@ -982,7 +1007,13 @@ mod tests {
         let tmp = unique_tmp("strict");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 192 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 192 }]),
+        )
+        .await;
 
         // Non-final chunk with a short body → 400.
         let response = put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 10]).await;
@@ -1005,7 +1036,13 @@ mod tests {
         let tmp = unique_tmp("idem");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
 
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'x'; 64]).await;
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'y'; 64]).await;
@@ -1058,13 +1095,20 @@ mod tests {
         let committed = tokio::fs::read(tmp.join("mymodel").join("1").join("weights.bin"))
             .await
             .unwrap();
-        assert_eq!(committed, payload, "assembled bytes must equal the source file");
+        assert_eq!(
+            committed, payload,
+            "assembled bytes must equal the source file"
+        );
 
         // Staging is gone after a successful complete.
         let mut found_staging = false;
         let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_name().to_string_lossy().starts_with(".tmp-upload-") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-upload-")
+            {
                 found_staging = true;
             }
         }
@@ -1089,7 +1133,13 @@ mod tests {
         let tmp = unique_tmp("missing");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 128 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 128 }]),
+        )
+        .await;
 
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid).await;
@@ -1142,14 +1192,26 @@ mod tests {
         let app = test_router(test_app_state(tmp.clone()));
 
         // Land version 1 via a first session.
-        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid1 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid1).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         // A second session assembles fine but finalize rejects the commit
         // (existing version, no force) — the assembled output must go.
-        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid2 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid2).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -1181,7 +1243,13 @@ mod tests {
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
 
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64]).await;
 
         // Make the chunk-tree removal fail: a read-only subdir blocks
@@ -1202,7 +1270,10 @@ mod tests {
         // The version content committed fine.
         assert!(tmp.join("mymodel").join("1").join("w.bin").exists());
         // The residue carries the terminal state, not a wedging Completing.
-        assert!(staging.exists(), "the failed removal leaves the staging dir");
+        assert!(
+            staging.exists(),
+            "the failed removal leaves the staging dir"
+        );
         let session = get_session(&app, "mymodel", "1", &sid).await;
         assert_eq!(
             session["state"], "completed",
@@ -1242,7 +1313,13 @@ mod tests {
         // A second session for the same version replaces the dir wholesale
         // (swap semantics inherited from finalize_upload) — only with
         // explicit force; without it the complete would 409.
-        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "model.py", "size": 64 }])).await;
+        let sid2 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "model.py", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'n'; 64]).await;
         let response = complete_force(&app, "mymodel", "1", &sid2, true).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1263,14 +1340,26 @@ mod tests {
         let app = test_router(test_app_state(tmp.clone()));
 
         // Land version 1 via a first session.
-        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid1 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid1).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         // A second session for the same version: complete without force must
         // refuse to clobber the committed content...
-        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid2 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid2).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -1289,7 +1378,11 @@ mod tests {
         let committed = tokio::fs::read(tmp.join("mymodel").join("1").join("w.bin"))
             .await
             .unwrap();
-        assert_eq!(committed, vec![b'b'; 64], "force retry must swap the new content in");
+        assert_eq!(
+            committed,
+            vec![b'b'; 64],
+            "force retry must swap the new content in"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -1300,9 +1393,21 @@ mod tests {
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
 
-        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid1 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
-        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid2 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
 
         let (r1, r2) = tokio::join!(
@@ -1337,11 +1442,23 @@ mod tests {
         let app = test_router(test_app_state(tmp.clone()));
 
         // Land version 1, then stage a second session fully.
-        let sid1 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid1 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid1, 0, 0, vec![b'a'; 64]).await;
         let response = complete(&app, "mymodel", "1", &sid1).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let sid2 = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid2 = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid2, 0, 0, vec![b'b'; 64]).await;
 
         // Race the delete against the second complete (force: the version
@@ -1359,15 +1476,27 @@ mod tests {
             .unwrap()
         };
         let (rd, rc) = tokio::join!(delete, complete_force(&app, "mymodel", "1", &sid2, true));
-        assert_eq!(rd.status(), StatusCode::OK, "delete must not error under the lock");
-        assert_eq!(rc.status(), StatusCode::OK, "complete must not error under the lock");
+        assert_eq!(
+            rd.status(),
+            StatusCode::OK,
+            "delete must not error under the lock"
+        );
+        assert_eq!(
+            rc.status(),
+            StatusCode::OK,
+            "complete must not error under the lock"
+        );
 
         // Two defined outcomes: delete won (dir gone) or complete won (dir
         // holds exactly the new content). Anything else is a mixed state.
         let dir = tmp.join("mymodel").join("1");
         if dir.exists() {
             let committed = tokio::fs::read(dir.join("w.bin")).await.unwrap();
-            assert_eq!(committed, vec![b'b'; 64], "complete won: exact new content, no mix");
+            assert_eq!(
+                committed,
+                vec![b'b'; 64],
+                "complete won: exact new content, no mix"
+            );
         }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1381,7 +1510,13 @@ mod tests {
         let tmp = unique_tmp("delput");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
 
         let app2 = app.clone();
         let sid2 = sid.clone();
@@ -1422,7 +1557,13 @@ mod tests {
         let tmp = unique_tmp("delete");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
         put_chunk(&app, "mymodel", "1", &sid, 0, 0, vec![b'a'; 64]).await;
 
         let response = app
@@ -1444,7 +1585,11 @@ mod tests {
         let mut found_staging = false;
         let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_name().to_string_lossy().starts_with(".tmp-upload-") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-upload-")
+            {
                 found_staging = true;
             }
         }
@@ -1475,7 +1620,13 @@ mod tests {
         let tmp = unique_tmp("bound");
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let app = test_router(test_app_state(tmp.clone()));
-        let sid = init_session(&app, "mymodel", "1", json!([{ "name": "w.bin", "size": 64 }])).await;
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
 
         // Same sid under a different version must not resolve.
         let response = app
@@ -1505,13 +1656,21 @@ mod tests {
         for _ in 0..MAX_ACTIVE_SESSIONS {
             let response = app
                 .clone()
-                .oneshot(json_req("POST", uri, json!({ "files": [{ "name": "w.bin", "size": 1 }] })))
+                .oneshot(json_req(
+                    "POST",
+                    uri,
+                    json!({ "files": [{ "name": "w.bin", "size": 1 }] }),
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
         }
         let response = app
-            .oneshot(json_req("POST", uri, json!({ "files": [{ "name": "w.bin", "size": 1 }] })))
+            .oneshot(json_req(
+                "POST",
+                uri,
+                json!({ "files": [{ "name": "w.bin", "size": 1 }] }),
+            ))
             .await
             .unwrap();
         assert_eq!(

@@ -51,28 +51,32 @@ lazy_static! {
             "Accelerator compute utilization (0-100), reported by model code"
         ),
         &["device", "accel"]
-    ).unwrap();
+    )
+    .unwrap();
     pub static ref ACCELERATOR_MEMORY_USED_BYTES: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
             "lite_server_accelerator_memory_used_bytes",
             "Accelerator device memory in use (bytes), reported by model code"
         ),
         &["device", "accel"]
-    ).unwrap();
+    )
+    .unwrap();
     pub static ref ACCELERATOR_MEMORY_TOTAL_BYTES: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
             "lite_server_accelerator_memory_total_bytes",
             "Accelerator device memory capacity (bytes), reported by model code"
         ),
         &["device", "accel"]
-    ).unwrap();
+    )
+    .unwrap();
     pub static ref ACCELERATOR_TEMPERATURE_CELSIUS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
             "lite_server_accelerator_temperature_celsius",
             "Accelerator device temperature (Celsius), reported by model code"
         ),
         &["device", "accel"]
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 /// Register the accelerator families with the given registry. Called from
@@ -182,10 +186,16 @@ pub fn record_readings(readings: &[AcceleratorReading]) {
         // Non-finite readings (NaN/±inf) are dropped: a NaN gauge renders as
         // `NaN` in the text exposition, and serde_json turns Some(NaN) into
         // null — indistinguishable from "never reported".
-        let utilization = r.utilization_percent.filter(|v| v.is_finite()).map(|v| v as f64);
+        let utilization = r
+            .utilization_percent
+            .filter(|v| v.is_finite())
+            .map(|v| v as f64);
         let memory_used = r.memory_used_bytes.filter(|v| v.is_finite());
         let memory_total = r.memory_total_bytes.filter(|v| v.is_finite());
-        let temperature = r.temperature_celsius.filter(|v| v.is_finite()).map(|v| v as f64);
+        let temperature = r
+            .temperature_celsius
+            .filter(|v| v.is_finite())
+            .map(|v| v as f64);
         let labels: [&str; 2] = [&r.device, &r.accel];
         if let Some(v) = utilization {
             ACCELERATOR_UTILIZATION_PERCENT
@@ -193,10 +203,14 @@ pub fn record_readings(readings: &[AcceleratorReading]) {
                 .set(v);
         }
         if let Some(v) = memory_used {
-            ACCELERATOR_MEMORY_USED_BYTES.with_label_values(&labels).set(v);
+            ACCELERATOR_MEMORY_USED_BYTES
+                .with_label_values(&labels)
+                .set(v);
         }
         if let Some(v) = memory_total {
-            ACCELERATOR_MEMORY_TOTAL_BYTES.with_label_values(&labels).set(v);
+            ACCELERATOR_MEMORY_TOTAL_BYTES
+                .with_label_values(&labels)
+                .set(v);
         }
         if let Some(v) = temperature {
             ACCELERATOR_TEMPERATURE_CELSIUS

@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::http::state::AppState;
 use axum::extract::{Path, State};
 use axum::response::Json;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -141,7 +141,9 @@ pub async fn model_version_config_json(
     let (mut config, etag, has_file) = match tokio::fs::read(dir.join("config.yaml")).await {
         Ok(bytes) => {
             let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
-                AppError::Config(format!("invalid config.yaml for {model_name}/{version}: {e}"))
+                AppError::Config(format!(
+                    "invalid config.yaml for {model_name}/{version}: {e}"
+                ))
             })?;
             let value = serde_json::to_value(yaml)?;
             // An empty file parses as null — present it as an empty object.
@@ -175,7 +177,9 @@ pub async fn model_version_config_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    Ok(Json(model_version_config_json(&state, &model_name, &version).await?))
+    Ok(Json(
+        model_version_config_json(&state, &model_name, &version).await?,
+    ))
 }
 
 // ===== M5: server (instance) config read — plan §3.6 =====
@@ -302,7 +306,10 @@ pub enum ConfigPatchError {
     /// etag precondition failed; carries the file's current etag.
     Conflict { current_etag: Option<String> },
     /// The merged config is unusable; nothing was written.
-    Invalid { message: String, warnings: Vec<String> },
+    Invalid {
+        message: String,
+        warnings: Vec<String>,
+    },
     /// The reload after a successful write failed; carries whether the file
     /// rollback actually succeeded so the response never claims otherwise.
     /// `restored` reports whether the version was brought back up with the
@@ -510,8 +517,14 @@ pub(crate) async fn prepare_config_patch(
                     message: format!("existing config.yaml is unparseable, refusing to patch: {e}"),
                     warnings: vec![],
                 })?;
-            let value = serde_json::to_value(yaml).map_err(AppError::from).map_err(ConfigPatchError::App)?;
-            if value.is_null() { json!({}) } else { value }
+            let value = serde_json::to_value(yaml)
+                .map_err(AppError::from)
+                .map_err(ConfigPatchError::App)?;
+            if value.is_null() {
+                json!({})
+            } else {
+                value
+            }
         }
         None => json!({}),
     };
@@ -601,7 +614,9 @@ pub(crate) async fn write_prepared(prepared: &PreparedPatch) -> Result<(), Confi
             Err(e) => return Err(ConfigPatchError::App(AppError::Io(e))),
         };
         if current.as_deref() != Some(expected.as_str()) {
-            return Err(ConfigPatchError::Conflict { current_etag: current });
+            return Err(ConfigPatchError::Conflict {
+                current_etag: current,
+            });
         }
     }
 
@@ -895,7 +910,8 @@ mod tests {
     }
 
     fn temp_repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lite-m1-config-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-m1-config-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -948,7 +964,9 @@ mod tests {
     async fn unknown_version_is_not_found() {
         let repo = temp_repo("unknown");
         let state = test_state(repo.clone());
-        let err = model_version_config_json(&state, "ghost", "9").await.unwrap_err();
+        let err = model_version_config_json(&state, "ghost", "9")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::ModelNotFound(_)));
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -965,7 +983,10 @@ mod tests {
         let state = test_state(repo.clone());
 
         let out = model_version_config_json(&state, "m", "1").await.unwrap();
-        assert_eq!(out["config"]["policies"]["auth"]["keys"], json!(["***", "***"]));
+        assert_eq!(
+            out["config"]["policies"]["auth"]["keys"],
+            json!(["***", "***"])
+        );
         assert_eq!(out["config"]["webhook_secret"], json!("***"));
         assert_eq!(out["config"]["max_batch_size"], json!(8));
         let redacted = out["redacted"].as_array().unwrap();
@@ -980,7 +1001,9 @@ mod tests {
         let repo = temp_repo("bad-yaml");
         write_config(&repo, "m", "1", "a: [1, 2\n  b: {unclosed\n");
         let state = test_state(repo.clone());
-        let err = model_version_config_json(&state, "m", "1").await.unwrap_err();
+        let err = model_version_config_json(&state, "m", "1")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Config(_)));
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -1050,7 +1073,10 @@ mod tests {
         assert_eq!(out["written"], json!(false));
         assert_eq!(out["reloaded"], json!(false));
         // Nothing written: disk and etag are untouched.
-        assert_eq!(read_file(&repo, "m", "1", "config.yaml").as_deref(), Some("max_batch_size: 16\n"));
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some("max_batch_size: 16\n")
+        );
         assert!(read_file(&repo, "m", "1", "config.yaml.bak").is_none());
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1066,13 +1092,19 @@ mod tests {
             &state,
             "m",
             "1",
-            &patch_req(json!({"max_batch_size": "not-a-number"}), ConfigPatchMode::DryRun),
+            &patch_req(
+                json!({"max_batch_size": "not-a-number"}),
+                ConfigPatchMode::DryRun,
+            ),
         )
         .await
         .unwrap();
         assert_eq!(out["valid"], json!(false));
         assert!(!out["warnings"].as_array().unwrap().is_empty());
-        assert_eq!(read_file(&repo, "m", "1", "config.yaml").as_deref(), Some("max_batch_size: 16\n"));
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some("max_batch_size: 16\n")
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -1145,12 +1177,18 @@ mod tests {
             &state,
             "m",
             "1",
-            &patch_req(json!({"max_batch_size": "nope"}), ConfigPatchMode::WriteOnly),
+            &patch_req(
+                json!({"max_batch_size": "nope"}),
+                ConfigPatchMode::WriteOnly,
+            ),
         )
         .await
         .unwrap_err();
         assert!(matches!(err, ConfigPatchError::Invalid { .. }));
-        assert_eq!(read_file(&repo, "m", "1", "config.yaml").as_deref(), Some("max_batch_size: 16\n"));
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some("max_batch_size: 16\n")
+        );
         assert!(read_file(&repo, "m", "1", "config.yaml.bak").is_none());
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1194,7 +1232,9 @@ mod tests {
         .unwrap();
         assert_eq!(out["valid"], json!(true));
         let warnings = out["warnings"].as_array().unwrap();
-        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("totally_custom_key")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("totally_custom_key")));
 
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -1211,7 +1251,9 @@ mod tests {
             force: false,
             mode: ConfigPatchMode::WriteOnly,
         };
-        let err = model_version_config_patch(&state, "m", "1", &req).await.unwrap_err();
+        let err = model_version_config_patch(&state, "m", "1", &req)
+            .await
+            .unwrap_err();
         match err {
             ConfigPatchError::Conflict { current_etag } => {
                 assert_eq!(current_etag.as_deref().map(str::len), Some(16));
@@ -1219,10 +1261,15 @@ mod tests {
             other => panic!("expected conflict, got {other:?}"),
         }
         // Nothing written on conflict.
-        assert_eq!(read_file(&repo, "m", "1", "config.yaml").as_deref(), Some("max_batch_size: 16\n"));
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some("max_batch_size: 16\n")
+        );
 
         let forced = ConfigPatchRequest { force: true, ..req };
-        let out = model_version_config_patch(&state, "m", "1", &forced).await.unwrap();
+        let out = model_version_config_patch(&state, "m", "1", &forced)
+            .await
+            .unwrap();
         assert_eq!(out["written"], json!(true));
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1244,7 +1291,9 @@ mod tests {
             force: false,
             mode: ConfigPatchMode::WriteOnly,
         };
-        let out = model_version_config_patch(&state, "m", "1", &req).await.unwrap();
+        let out = model_version_config_patch(&state, "m", "1", &req)
+            .await
+            .unwrap();
         assert_eq!(out["written"], json!(true));
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1313,7 +1362,10 @@ mod tests {
             other => panic!("expected reload failure, got {other:?}"),
         }
         // The file is back to the pre-write bytes.
-        assert_eq!(read_file(&repo, "m", "1", "config.yaml").as_deref(), Some("max_batch_size: 16\n"));
+        assert_eq!(
+            read_file(&repo, "m", "1", "config.yaml").as_deref(),
+            Some("max_batch_size: 16\n")
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -1337,7 +1389,9 @@ mod tests {
             PrepareOutcome::DryRun(_) => panic!("apply_reload never yields a dry-run report"),
         };
         write_prepared(&prepared).await.unwrap();
-        let out = finish_apply_reload(&state.worker_manager, *prepared, Ok(true)).await.unwrap();
+        let out = finish_apply_reload(&state.worker_manager, *prepared, Ok(true))
+            .await
+            .unwrap();
         assert_eq!(out["reloaded"], json!(true));
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1427,7 +1481,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ConfigPatchError::App(AppError::ModelNotFound(_))));
+        assert!(matches!(
+            err,
+            ConfigPatchError::App(AppError::ModelNotFound(_))
+        ));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1496,10 +1553,7 @@ mod tests {
         let state = test_state_with(config, cli);
         let out = server_config_json(&state).unwrap();
         assert_eq!(out["config"]["server"]["http_port"], json!(9000));
-        assert_eq!(
-            out["sources"]["server.http_port"],
-            json!("cli")
-        );
+        assert_eq!(out["sources"]["server.http_port"], json!("cli"));
     }
 
     #[test]
@@ -1524,8 +1578,14 @@ mod tests {
         let state = test_state_with(config, crate::config::CliOverrides::default());
 
         let out = server_config_json(&state).unwrap();
-        assert_eq!(out["config"]["access_control"]["admin"]["http"]["value"], json!("***"));
-        assert_eq!(out["config"]["openai_compact"]["auth"]["value"], json!("***"));
+        assert_eq!(
+            out["config"]["access_control"]["admin"]["http"]["value"],
+            json!("***")
+        );
+        assert_eq!(
+            out["config"]["openai_compact"]["auth"]["value"],
+            json!("***")
+        );
         assert_eq!(out["config"]["telemetry"]["otlp_headers"], json!("***"));
         // Non-secret companions stay visible.
         assert_eq!(
@@ -1556,13 +1616,33 @@ mod tests {
         let out = server_config_json(&state).unwrap();
         // Sanity: the effective tree carries the known top-level sections and
         // every leaf path has a source label.
-        for section in ["server", "grpc", "metrics", "alerts", "access_control", "features"] {
-            assert!(out["config"].get(section).is_some(), "missing section {section}");
+        for section in [
+            "server",
+            "grpc",
+            "metrics",
+            "alerts",
+            "access_control",
+            "features",
+        ] {
+            assert!(
+                out["config"].get(section).is_some(),
+                "missing section {section}"
+            );
         }
         let sources = out["sources"].as_object().unwrap();
-        assert!(sources.len() > 50, "expected per-leaf sources, got {}", sources.len());
-        let non_default: Vec<_> = sources.iter().filter(|(_, s)| s.as_str() != Some("default")).collect();
-        assert!(non_default.is_empty(), "non-default sources: {non_default:?}");
+        assert!(
+            sources.len() > 50,
+            "expected per-leaf sources, got {}",
+            sources.len()
+        );
+        let non_default: Vec<_> = sources
+            .iter()
+            .filter(|(_, s)| s.as_str() != Some("default"))
+            .collect();
+        assert!(
+            non_default.is_empty(),
+            "non-default sources: {non_default:?}"
+        );
         assert!(out["redacted"].as_array().unwrap().is_empty());
     }
 
@@ -1590,7 +1670,12 @@ mod tests {
     async fn write_preserves_existing_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let repo = temp_repo("perms");
-        write_config(&repo, "m", "1", "max_batch_size: 16\npolicies:\n  auth:\n    keys: [secret]\n");
+        write_config(
+            &repo,
+            "m",
+            "1",
+            "max_batch_size: 16\npolicies:\n  auth:\n    keys: [secret]\n",
+        );
         let path = repo.join("m").join("1").join("config.yaml");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let state = test_state(repo.clone());
@@ -1725,7 +1810,11 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            ConfigPatchError::ReloadFailed { message, rolled_back, .. } => {
+            ConfigPatchError::ReloadFailed {
+                message,
+                rolled_back,
+                ..
+            } => {
                 assert!(
                     !rolled_back,
                     "rolled_back must be false when the rollback itself failed"
@@ -1747,7 +1836,6 @@ mod tests {
     /// returned in plaintext by GET /config.
     #[tokio::test]
     async fn warmup_sample_headers_are_redacted() {
-
         let repo = temp_repo("redact-warmup");
         write_config(
             &repo,
@@ -1879,7 +1967,8 @@ class TestAPI(LitAPI):
 "#,
         )
         .unwrap();
-        let good = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
+        let good =
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\n";
         std::fs::write(dir.join("config.yaml"), good).unwrap();
 
         let state = test_state(repo.clone());

@@ -1,6 +1,6 @@
 use crate::error::AppError;
-use dashmap::DashMap;
 use crate::http::state::AppState;
+use dashmap::DashMap;
 use indexmap::IndexMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -25,13 +25,17 @@ pub fn spawn_ensemble_warm(
     version: String,
 ) {
     tokio::spawn(async move {
-        let Some(plans) = plans else { return; };
+        let Some(plans) = plans else {
+            return;
+        };
         let key = PlanKey {
             model: model_name.clone(),
             version: version.clone(),
         };
         let plan = match plans
-            .get_or_load(key, || load_ensemble_plan(&repo_path, &model_name, &version))
+            .get_or_load(key, || {
+                load_ensemble_plan(&repo_path, &model_name, &version)
+            })
             .await
         {
             Ok(p) => p,
@@ -100,9 +104,13 @@ pub async fn get_ensemble_plan(
         version: version.to_string(),
     };
     match state.worker_manager.ensemble_plans() {
-        Some(cache) => cache
-            .get_or_load(key, || load_ensemble_plan(&state.repo_path, model_name, version))
-            .await,
+        Some(cache) => {
+            cache
+                .get_or_load(key, || {
+                    load_ensemble_plan(&state.repo_path, model_name, version)
+                })
+                .await
+        }
         None => load_ensemble_plan(&state.repo_path, model_name, version).await,
     }
 }
@@ -228,9 +236,10 @@ impl Drop for LoadingGuard<'_> {
     fn drop(&mut self) {
         // remove_if: atomic per shard — an invalidate + new-holder insert
         // racing the drop must not evict the NEW holder's cell (id check).
-        self.plans.remove_if(&self.key, |_, cell| {
-            matches!(cell, PlanCell::Loading { id, .. } if *id == self.id)
-        });
+        self.plans.remove_if(
+            &self.key,
+            |_, cell| matches!(cell, PlanCell::Loading { id, .. } if *id == self.id),
+        );
     }
 }
 
@@ -278,7 +287,10 @@ impl EnsemblePlanCache {
 
         // Fast path: a fresh Ready entry returns without any filesystem work.
         if let Some(cell) = self.plans.get(&key) {
-            if let PlanCell::Ready { plan, last_stat, .. } = &*cell {
+            if let PlanCell::Ready {
+                plan, last_stat, ..
+            } = &*cell
+            {
                 if last_stat.elapsed() < self.stat_interval {
                     return Ok(plan.clone());
                 }
@@ -297,7 +309,11 @@ impl EnsemblePlanCache {
                             AppError::Internal("ensemble plan load task dropped".to_string())
                         })?;
                     }
-                    PlanCell::Ready { plan, mtime, last_stat } => {
+                    PlanCell::Ready {
+                        plan,
+                        mtime,
+                        last_stat,
+                    } => {
                         if last_stat.elapsed() < self.stat_interval {
                             return Ok(plan.clone());
                         }
@@ -319,10 +335,17 @@ impl EnsemblePlanCache {
                     // We are the single-flight holder (review ④). Insert the
                     // Loading placeholder, drop the shard lock, then parse.
                     let my_id = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    vacant.insert(PlanCell::Loading { id: my_id, waiters: Vec::new() });
+                    vacant.insert(PlanCell::Loading {
+                        id: my_id,
+                        waiters: Vec::new(),
+                    });
                     // M5: recycle the cell if THIS future is cancelled
                     // mid-load (dropped before the write-back below).
-                    let _guard = LoadingGuard { plans: &self.plans, key: key.clone(), id: my_id };
+                    let _guard = LoadingGuard {
+                        plans: &self.plans,
+                        key: key.clone(),
+                        id: my_id,
+                    };
                     // C2 (resource-leak-plan): a panicking loader must not
                     // wedge the Loading slot — the task's death would leave
                     // the placeholder in place and every waiter parked
@@ -503,4 +526,3 @@ mod tests {
         }
     }
 }
-

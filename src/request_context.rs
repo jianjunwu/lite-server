@@ -71,9 +71,14 @@ pub(crate) fn http_client_ip(
 ) -> String {
     let xff = header_all(headers, "x-forwarded-for");
     let x_real_ip = header_first(headers, "x-real-ip");
-    extract_client_ip(xff.as_deref(), x_real_ip.as_deref(), peer.map(|p| p.ip()), trusted)
-        .map(|ip| ip.to_string())
-        .unwrap_or_default()
+    extract_client_ip(
+        xff.as_deref(),
+        x_real_ip.as_deref(),
+        peer.map(|p| p.ip()),
+        trusted,
+    )
+    .map(|ip| ip.to_string())
+    .unwrap_or_default()
 }
 
 /// Collect every value of a header (RFC appearance order), comma-joined. Used
@@ -210,7 +215,9 @@ impl RequestHints {
         let get = |k: &str| headers.get(k).map(|s| s.as_str());
         Self {
             priority: get("x-lite-priority").and_then(|s| s.parse().ok()),
-            affinity_key: get("x-lite-affinity-key").filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            affinity_key: get("x-lite-affinity-key")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
             direct_worker_id: get("x-lite-worker-id").and_then(|s| s.parse().ok()),
         }
     }
@@ -218,14 +225,15 @@ impl RequestHints {
     /// `true` when no hint was supplied (the common case) — lets callers skip
     /// the debug log and any future consumption work cheaply.
     pub fn is_empty(&self) -> bool {
-        self.priority.is_none()
-            && self.affinity_key.is_none()
-            && self.direct_worker_id.is_none()
+        self.priority.is_none() && self.affinity_key.is_none() && self.direct_worker_id.is_none()
     }
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
-    headers.get(key).and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty())
+    headers
+        .get(key)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -260,7 +268,10 @@ mod tests {
 
     #[test]
     fn request_hints_empty_when_absent_or_malformed() {
-        let h = headers_with(&[("x-lite-priority", "not-a-number"), ("x-lite-affinity-key", "")]);
+        let h = headers_with(&[
+            ("x-lite-priority", "not-a-number"),
+            ("x-lite-affinity-key", ""),
+        ]);
         let hints = RequestHints::from_http(&h);
         assert!(hints.is_empty(), "malformed/empty values drop to None");
     }
@@ -312,7 +323,10 @@ mod tests {
     fn http_client_ip_falls_back_to_peer_for_direct_connections() {
         // 直连（无代理头）：TCP peer 即客户端。
         let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        assert_eq!(http_client_ip(&HeaderMap::new(), Some(peer), &[]), "203.0.113.7");
+        assert_eq!(
+            http_client_ip(&HeaderMap::new(), Some(peer), &[]),
+            "203.0.113.7"
+        );
     }
 
     #[test]
@@ -364,11 +378,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         let mut parts = text.split('|');
         let request_id = parts.next().unwrap();
-        assert_eq!(request_id.len(), 36, "no RequestId stash → UUID v4, got {request_id}");
+        assert_eq!(
+            request_id.len(),
+            36,
+            "no RequestId stash → UUID v4, got {request_id}"
+        );
         assert_eq!(parts.next(), Some("10.0.0.9"));
         assert_eq!(parts.next(), Some("http"));
     }
@@ -390,9 +410,13 @@ mod tests {
         let mut request = Request::builder().uri("/t").body(Body::empty()).unwrap();
         request
             .extensions_mut()
-            .insert(crate::tls::TlsClientPrincipal(Some("spiffe://ns/svc".to_string())));
+            .insert(crate::tls::TlsClientPrincipal(Some(
+                "spiffe://ns/svc".to_string(),
+            )));
         let response = app.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "spiffe://ns/svc");
     }
 
@@ -410,7 +434,9 @@ mod tests {
 
         let request = Request::builder().uri("/t").body(Body::empty()).unwrap();
         let response = app.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "true");
     }
 
@@ -439,7 +465,9 @@ mod tests {
             .oneshot(Request::builder().uri("/t").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "stash-id-001");
     }
 
@@ -469,7 +497,9 @@ mod tests {
             .oneshot(Request::builder().uri("/t").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "42");
     }
 
@@ -490,7 +520,9 @@ mod tests {
             .oneshot(Request::builder().uri("/t").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "true");
     }
 
@@ -514,7 +546,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "36|10.0.0.5");
     }
 
@@ -525,7 +559,10 @@ mod tests {
         for (name, src) in [
             ("inference.rs", include_str!("http/handlers/inference.rs")),
             ("stream.rs", include_str!("http/handlers/stream.rs")),
-            ("custom_routes.rs", include_str!("http/handlers/custom_routes.rs")),
+            (
+                "custom_routes.rs",
+                include_str!("http/handlers/custom_routes.rs"),
+            ),
             ("handlers/mod.rs", include_str!("http/handlers/mod.rs")),
         ] {
             let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());

@@ -60,15 +60,13 @@ pub struct ModelEntry {
     pub weights: HashMap<String, u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LoadPolicy {
     #[default]
     Explicit,
     All,
     Latest,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelVersion {

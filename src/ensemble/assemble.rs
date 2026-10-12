@@ -11,10 +11,12 @@ use uuid::Uuid;
 
 use super::*;
 
-
 /// E6 (batch 4): the retry sleep — None when the step budget cannot cover
 /// it (fast-fail instead of sleeping into the deadline, §4.4 deadline row).
-pub(crate) fn retry_sleep_budget(step_deadline: Option<i64>, backoff: Duration) -> Option<Duration> {
+pub(crate) fn retry_sleep_budget(
+    step_deadline: Option<i64>,
+    backoff: Duration,
+) -> Option<Duration> {
     match crate::deadline::remaining(step_deadline) {
         Some(rem) if rem < backoff => None,
         _ => Some(backoff),
@@ -69,14 +71,13 @@ fn json_value_len_estimate(v: &serde_json::Value) -> usize {
         }
         Value::Number(_) => 16,
         Value::String(s) => s.len() + 2,
-        Value::Array(a) => {
-            a.iter().map(json_value_len_estimate).sum::<usize>() + a.len() + 2
+        Value::Array(a) => a.iter().map(json_value_len_estimate).sum::<usize>() + a.len() + 2,
+        Value::Object(o) => {
+            o.iter()
+                .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
+                .sum::<usize>()
+                + 2
         }
-        Value::Object(o) => o
-            .iter()
-            .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
-            .sum::<usize>()
-            + 2,
     }
 }
 
@@ -199,18 +200,12 @@ pub(crate) fn assemble_group_json(
         buf.push(b':');
         match src {
             ValueSource::Param(v) => {
-                serde::Serialize::serialize(
-                    v,
-                    &mut serde_json::Serializer::new(&mut buf),
-                )
-                .expect("Value serialization is infallible");
+                serde::Serialize::serialize(v, &mut serde_json::Serializer::new(&mut buf))
+                    .expect("Value serialization is infallible");
             }
             ValueSource::Input(EnsembleValue::Json(v)) => {
-                serde::Serialize::serialize(
-                    v,
-                    &mut serde_json::Serializer::new(&mut buf),
-                )
-                .expect("Value serialization is infallible");
+                serde::Serialize::serialize(v, &mut serde_json::Serializer::new(&mut buf))
+                    .expect("Value serialization is infallible");
             }
             ValueSource::Input(EnsembleValue::RawJson(raw)) => {
                 buf.extend_from_slice(&raw.bytes);
@@ -252,11 +247,19 @@ fn assemble_binary_passthrough(
 /// (inference.rs:266-267). A non-JSON media_type declares the payload opaque
 /// bytes; the JSON path is validated and errors are NOT swallowed (the old
 /// code collapsed invalid JSON to `{}` — this is the regression pin).
-pub(crate) fn parse_step_output(step_name: &str, single: pb::SingleResponse) -> Result<EnsembleValue, AppError> {
-    let is_binary = !single.media_type.is_empty()
-        && !single.media_type.starts_with("application/json");
+pub(crate) fn parse_step_output(
+    step_name: &str,
+    single: pb::SingleResponse,
+) -> Result<EnsembleValue, AppError> {
+    let is_binary =
+        !single.media_type.is_empty() && !single.media_type.starts_with("application/json");
     if is_binary {
-        Ok(EnsembleValue::Binary(single.data, single.media_type, None, None))
+        Ok(EnsembleValue::Binary(
+            single.data,
+            single.media_type,
+            None,
+            None,
+        ))
     } else if single.data.is_empty() {
         Ok(EnsembleValue::Json(json!({})))
     } else {
@@ -315,12 +318,7 @@ pub(crate) fn materialize_step_outputs(
                 }
                 out.push((
                     key,
-                    EnsembleValue::Binary(
-                        data.clone(),
-                        ct.clone(),
-                        shape.clone(),
-                        dt.clone(),
-                    ),
+                    EnsembleValue::Binary(data.clone(), ct.clone(), shape.clone(), dt.clone()),
                 ));
             }
             (EnsembleValue::Binary(..), InputType::Json) => {
@@ -442,7 +440,10 @@ pub(crate) async fn execute_step(
     // MIMO (R11/R12): static input-mode dispatch in declared configs; legacy
     // configs keep the dynamic runtime dispatch (byte-identical).
     let (payload_bytes, content_type_for_step) = assemble_step_payload(
-        &step.name, &resolved, &step.params, plan.input_mode(step_idx),
+        &step.name,
+        &resolved,
+        &step.params,
+        plan.input_mode(step_idx),
     )?;
 
     // Ensure sub-model is ready (shared autoload; unary readiness predicate)
@@ -451,21 +452,33 @@ pub(crate) async fn execute_step(
     let mut retries = 0;
     let max_retries = 30;
     let mut delay = Duration::from_millis(50);
-    while !state.registry.is_ready(&step.model, Some(&resolved_version)) && retries < max_retries {
+    while !state
+        .registry
+        .is_ready(&step.model, Some(&resolved_version))
+        && retries < max_retries
+    {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(500));
         retries += 1;
     }
 
-    if !state.registry.is_ready(&step.model, Some(&resolved_version)) {
+    if !state
+        .registry
+        .is_ready(&step.model, Some(&resolved_version))
+    {
         return Err(AppError::ModelNotReady(format!(
-            "sub-model {} v{} is not ready", step.model, resolved_version
+            "sub-model {} v{} is not ready",
+            step.model, resolved_version
         )));
     }
 
     // Get model version info
-    let mv = state.registry.get(&step.model, Some(&resolved_version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
+    let mv = state
+        .registry
+        .get(&step.model, Some(&resolved_version))
+        .ok_or_else(|| {
+            AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version))
+        })?;
 
     if mv.model_type == ModelType::Ensemble {
         // E1 (batch 3): nested ensemble — recurse with depth+1, the SAME
@@ -501,27 +514,27 @@ pub(crate) async fn execute_step(
         // body-field selector resolves it against the assembled payload —
         // the D4 check below must consult the SAME set execution selects.
         let nested_selector = match (&child_container.dag_selector, &child_value) {
-            (Some(path), Some(v)) => resolve_dag_selector_from_value(
-                &EnsembleValue::Json(v.clone()),
-                path,
-            )?,
+            (Some(path), Some(v)) => {
+                resolve_dag_selector_from_value(&EnsembleValue::Json(v.clone()), path)?
+            }
             _ => None,
         };
         // D41 debuggability parity with the top-level funnel (exec.rs
         // select_dag_set map_err): a body-resolved unknown name's 400 names
         // the child's source ref — otherwise the client cannot tell the
         // value came from the body, not a header nested calls never carry.
-        let child_plan = select_dag_set(&child_container, nested_selector.as_deref()).map_err(
-            |e| match (&e, &nested_selector, &child_container.dag_selector) {
-                (AppError::InvalidRequestBody(m), Some(_), Some(path)) => {
-                    AppError::InvalidRequestBody(format!(
-                        "{m} — resolved from body field '$request.{}' (D41)",
-                        path.join(".")
-                    ))
+        let child_plan =
+            select_dag_set(&child_container, nested_selector.as_deref()).map_err(|e| {
+                match (&e, &nested_selector, &child_container.dag_selector) {
+                    (AppError::InvalidRequestBody(m), Some(_), Some(path)) => {
+                        AppError::InvalidRequestBody(format!(
+                            "{m} — resolved from body field '$request.{}' (D41)",
+                            path.join(".")
+                        ))
+                    }
+                    _ => e,
                 }
-                _ => e,
-            },
-        )?;
+            })?;
         if child_plan.steps[child_plan.output_step].stream || !child_plan.chains.is_empty() {
             return Err(AppError::InvalidRequestBody(format!(
                 "nested ensemble '{}' contains a streaming step — nested ensembles \
@@ -590,7 +603,8 @@ pub(crate) async fn execute_step(
                 Ok(r) => r?,
                 Err(_) => {
                     return Err(AppError::InferenceTimeout(format!(
-                        "ensemble step {} timed out", step.name
+                        "ensemble step {} timed out",
+                        step.name
                     )))
                 }
             },
@@ -608,7 +622,10 @@ pub(crate) async fn execute_step(
 
     let num_workers = mv.workers.len();
     if num_workers == 0 {
-        return Err(AppError::WorkerCrashed(format!("{} has no workers", step.model)));
+        return Err(AppError::WorkerCrashed(format!(
+            "{} has no workers",
+            step.model
+        )));
     }
 
     // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
@@ -638,7 +655,10 @@ pub(crate) async fn execute_step(
     }
 
     let meta = build_step_meta(
-        &format!("{}:{}", request_id, step.name), client_ip, step_deadline, step_headers,
+        &format!("{}:{}", request_id, step.name),
+        client_ip,
+        step_deadline,
+        step_headers,
         payload_bytes.clone(),
     );
 
@@ -651,7 +671,12 @@ pub(crate) async fn execute_step(
     let mut backoff = Duration::from_millis(50);
     loop {
         // Send inference request through the unified queue
-        let uid = format!("ensemble_{}_{}_{}", step.model, resolved_version, Uuid::new_v4());
+        let uid = format!(
+            "ensemble_{}_{}_{}",
+            step.model,
+            resolved_version,
+            Uuid::new_v4()
+        );
 
         let (response_tx, response_rx) = oneshot::channel();
         let item = crate::inference_queue::QueueItem {
@@ -665,17 +690,22 @@ pub(crate) async fn execute_step(
             queue_depth_guard: None,
         };
 
-        match state.inference_queue.try_submit(&step.model, &resolved_version, item) {
+        match state
+            .inference_queue
+            .try_submit(&step.model, &resolved_version, item)
+        {
             Ok(()) => {}
             Err(crate::inference_queue::QueueError::Full) => {
                 // E6: queue pressure is NOT retryable (a retry adds pressure).
                 return Err(AppError::QueueFull(format!(
-                    "Queue full for {} {}", step.model, resolved_version
+                    "Queue full for {} {}",
+                    step.model, resolved_version
                 )));
             }
             Err(_) => {
                 return Err(AppError::ModelNotReady(format!(
-                    "Queue not available for {} {}", step.model, resolved_version
+                    "Queue not available for {} {}",
+                    step.model, resolved_version
                 )));
             }
         }
@@ -690,12 +720,14 @@ pub(crate) async fn execute_step(
                     Ok(Ok(resp)) => resp,
                     Ok(Err(_)) => {
                         return Err(AppError::InferenceTimeout(format!(
-                            "ensemble step {} response channel closed", step.name
+                            "ensemble step {} response channel closed",
+                            step.name
                         )));
                     }
                     Err(_) => {
                         return Err(AppError::InferenceTimeout(format!(
-                            "ensemble step {} timed out", step.name
+                            "ensemble step {} timed out",
+                            step.name
                         )));
                     }
                 },
@@ -703,13 +735,15 @@ pub(crate) async fn execute_step(
                     Ok(resp) => resp,
                     Err(_) => {
                         return Err(AppError::InferenceTimeout(format!(
-                            "ensemble step {} response channel closed", step.name
+                            "ensemble step {} response channel closed",
+                            step.name
                         )));
                     }
                 },
             };
             unary_response_to_value(&step.name, response, plan.step_raw_eligible[step_idx])
-        }.await;
+        }
+        .await;
 
         match result {
             Ok(value) => return materialize_step_outputs(step, value),
@@ -746,7 +780,11 @@ pub(crate) fn unary_response_to_value(
 ) -> Result<EnsembleValue, AppError> {
     match response.payload {
         Some(pb::response::Payload::Single(single)) => {
-            let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+            let code = single
+                .status
+                .as_ref()
+                .map(|s| s.code.as_str())
+                .unwrap_or("Ok");
             match code {
                 "Ok" => {
                     // P2 (batch 6): a raw-eligible (pass-through schema)
@@ -762,7 +800,8 @@ pub(crate) fn unary_response_to_value(
                     if raw_eligible
                         && !is_binary
                         && !single.data.is_empty()
-                        && serde_json::from_slice::<&serde_json::value::RawValue>(&single.data).is_ok()
+                        && serde_json::from_slice::<&serde_json::value::RawValue>(&single.data)
+                            .is_ok()
                     {
                         Ok(EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
                             single.data,
@@ -773,9 +812,17 @@ pub(crate) fn unary_response_to_value(
                     }
                 }
                 "Error" => {
-                    let msg = single.status.as_ref().and_then(|s| {
-                        if s.message.is_empty() { None } else { Some(s.message.clone()) }
-                    }).unwrap_or_else(|| "unknown worker error".to_string());
+                    let msg = single
+                        .status
+                        .as_ref()
+                        .and_then(|s| {
+                            if s.message.is_empty() {
+                                None
+                            } else {
+                                Some(s.message.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| "unknown worker error".to_string());
                     // §4.4: the worker carries the numeric HTTP status in
                     // Status.message (common._make_error_response). Parity
                     // with the unary queue path (inference.rs:425-465): a
@@ -793,18 +840,22 @@ pub(crate) fn unary_response_to_value(
                             let err_obj = data.get("error");
                             Err(AppError::ModelError(Box::new(ModelErrorData {
                                 status_code: http_status,
-                                error_type: err_obj.and_then(|e| e.get("type"))
+                                error_type: err_obj
+                                    .and_then(|e| e.get("type"))
                                     .and_then(|t| t.as_str())
                                     .unwrap_or("model_error")
                                     .to_string(),
-                                detail: err_obj.and_then(|e| e.get("message"))
+                                detail: err_obj
+                                    .and_then(|e| e.get("message"))
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("model error")
                                     .to_string(),
-                                code: err_obj.and_then(|e| e.get("code"))
+                                code: err_obj
+                                    .and_then(|e| e.get("code"))
                                     .and_then(|c| c.as_str())
                                     .map(|s| s.to_string()),
-                                param: err_obj.and_then(|e| e.get("param"))
+                                param: err_obj
+                                    .and_then(|e| e.get("param"))
                                     .and_then(|p| p.as_str())
                                     .map(|s| s.to_string()),
                                 headers: if single.headers.is_empty() {
@@ -818,13 +869,22 @@ pub(crate) fn unary_response_to_value(
                     }
                 }
                 _ => Err(AppError::WorkerCrashed(
-                    single.status.as_ref().and_then(|s| {
-                        if s.message.is_empty() { None } else { Some(s.message.clone()) }
-                    }).unwrap_or_else(|| "ensemble step inference error".to_string())
+                    single
+                        .status
+                        .as_ref()
+                        .and_then(|s| {
+                            if s.message.is_empty() {
+                                None
+                            } else {
+                                Some(s.message.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| "ensemble step inference error".to_string()),
                 )),
             }
         }
-        _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
+        _ => Err(AppError::WorkerCrashed(
+            "unexpected response type".to_string(),
+        )),
     }
 }
-

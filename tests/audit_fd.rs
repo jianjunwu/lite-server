@@ -80,7 +80,11 @@ mod fd_b {
         format!(
             "ipc://{}",
             std::env::temp_dir()
-                .join(format!("lite-server-audit-fd-b-{}-{}.sock", name, std::process::id()))
+                .join(format!(
+                    "lite-server-audit-fd-b-{}-{}.sock",
+                    name,
+                    std::process::id()
+                ))
                 .display()
         )
     }
@@ -159,7 +163,13 @@ mod fd_b {
 
     fn register_ready(registry: &ModelRegistry, model: &str, version: &str) {
         registry
-            .register(model, version, ModelConfig::default(), ModelType::LitAPI, PathBuf::new())
+            .register(
+                model,
+                version,
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                PathBuf::new(),
+            )
             .unwrap();
         registry.mark_ready(model, version).unwrap();
     }
@@ -446,10 +456,8 @@ mod fd_c {
     }
 
     fn sock_path(tag: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "lite-audit-fd-c-{tag}-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("lite-audit-fd-c-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -479,7 +487,10 @@ mod fd_c {
     async fn spawn_test_server(
         sock: &Path,
         deps: TestDeps,
-    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let options = HttpServerOptions {
             config: deps.config,
@@ -577,7 +588,10 @@ mod fd_c {
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = std::fs::remove_file(&sock);
 
-        assert_eq!(status, 101_u16, "WS handshake must be 101, got {status}\n{head}");
+        assert_eq!(
+            status, 101_u16,
+            "WS handshake must be 101, got {status}\n{head}"
+        );
         let connection = head
             .lines()
             .map(str::trim)
@@ -888,7 +902,9 @@ mod fd_e {
         };
         let lower = msg.to_lowercase();
         assert!(
-            lower.contains("bind") || lower.contains("address in use") || msg.contains("EADDRINUSE"),
+            lower.contains("bind")
+                || lower.contains("address in use")
+                || msg.contains("EADDRINUSE"),
             "a bind failure must be surfaced to the caller (not a generic \
              transport error that hides the root cause); got: {msg}"
         );
@@ -928,7 +944,10 @@ mod fd_e {
         while bound.send(&frame, zmq::DONTWAIT).is_ok() && queued < 2048 {
             queued += 1;
         }
-        assert!(queued > 0, "test premise: at least one frame must be queued");
+        assert!(
+            queued > 0,
+            "test premise: at least one frame must be queued"
+        );
 
         // Peer dies without reading a single byte.
         drop(peer1);

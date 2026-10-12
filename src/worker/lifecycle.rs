@@ -384,7 +384,13 @@ impl WorkerManager {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::with_capacity(1024);
             loop {
-                match super::process::read_stderr_line_bounded(&mut reader, &mut buf, stderr_line_cap).await {
+                match super::process::read_stderr_line_bounded(
+                    &mut reader,
+                    &mut buf,
+                    stderr_line_cap,
+                )
+                .await
+                {
                     Ok(0) => {
                         tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
                         break;
@@ -498,7 +504,6 @@ impl WorkerManager {
     }
 
     pub async fn load_model(
-
         &self,
         model_name: &str,
         version: &str,
@@ -726,8 +731,12 @@ impl WorkerManager {
                 // bail out — continuing would re-create just-removed entries
                 // and strand live workers nobody will ever stop. The error
                 // funnel below reaps the partially-registered set.
-                if !load_registration_alive(&self.registry, &self.shutdown_token, model_name, version)
-                {
+                if !load_registration_alive(
+                    &self.registry,
+                    &self.shutdown_token,
+                    model_name,
+                    version,
+                ) {
                     return Err(AppError::Internal(format!(
                         "load of {model_name} {version} aborted: torn down concurrently"
                     )));
@@ -749,16 +758,17 @@ impl WorkerManager {
                             .map(|s| (s.name.as_str(), s.metric_type.as_str()))
                             .collect();
                         crate::metrics::prometheus::register_custom_metrics(
-                            model_name,
-                            version,
-                            &spec_refs,
+                            model_name, version, &spec_refs,
                         );
                     }
                 }
 
                 // Store per-model policies declared in config.yaml
-                self.registry
-                    .set_policies(model_name, version, policies_from_config(&model_config));
+                self.registry.set_policies(
+                    model_name,
+                    version,
+                    policies_from_config(&model_config),
+                );
 
                 // Register custom @route declarations (phase 2)
                 self.upsert_routes(model_name, version, startup.custom_routes)
@@ -855,7 +865,10 @@ impl WorkerManager {
                         done_rx: Some(done_rx),
                         kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
                     });
-                    clients.entry(key.clone()).or_default().push(zmq_client.clone());
+                    clients
+                        .entry(key.clone())
+                        .or_default()
+                        .push(zmq_client.clone());
                 }
             }
             Ok((worker_infos, zmq_clients_for_model))
@@ -971,7 +984,9 @@ impl WorkerManager {
                         self.teardown_version_runtime(model_name, version).await;
                         // B6: deregister the version's custom families —
                         // a Failed version never sees an unload-time purge.
-                        crate::metrics::prometheus::remove_custom_version_metrics(model_name, version);
+                        crate::metrics::prometheus::remove_custom_version_metrics(
+                            model_name, version,
+                        );
                         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
                         self.sync_grpc_health().await;
                         crate::metrics::prometheus::record_model_load(model_name, version, false);
@@ -2143,9 +2158,13 @@ class TestAPI(LitAPI):
         // under way), then unload the version out from under the load.
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let spawned = std::fs::read_dir(&model_dir)
-                .unwrap()
-                .any(|e| e.unwrap().file_name().into_string().unwrap().starts_with("setup_pid_"));
+            let spawned = std::fs::read_dir(&model_dir).unwrap().any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .into_string()
+                    .unwrap()
+                    .starts_with("setup_pid_")
+            });
             if spawned {
                 break;
             }
@@ -2261,7 +2280,10 @@ class TestAPI(LitAPI):
         .with_ensemble_plans(Arc::new(crate::ensemble::EnsemblePlanCache::new()));
 
         let result = wm.load_model(tag, "1", &ModelConfig::default()).await;
-        assert!(result.is_err(), "an invalid ensemble DAG must fail the load");
+        assert!(
+            result.is_err(),
+            "an invalid ensemble DAG must fail the load"
+        );
 
         match registry.get(tag, Some("1")) {
             None => {} // removed — acceptable cleanup
@@ -2311,10 +2333,8 @@ class TestAPI(LitAPI):
 
         let queue = Arc::new(InferenceQueue::new());
         let endpoint = {
-            let sock = std::env::temp_dir().join(format!(
-                "lite-server-fqm-{}.sock",
-                std::process::id()
-            ));
+            let sock =
+                std::env::temp_dir().join(format!("lite-server-fqm-{}.sock", std::process::id()));
             format!("ipc://{}", sock.display())
         };
         let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
@@ -2510,7 +2530,10 @@ class TestAPI(LitAPI):
         };
 
         let result = wm.load_model(tag, "1", &config).await;
-        assert!(result.is_err(), "a missing warmup sample must fail the load");
+        assert!(
+            result.is_err(),
+            "a missing warmup sample must fail the load"
+        );
         assert_eq!(
             registry.get(tag, Some("1")).map(|mv| mv.status),
             Some(VersionStatus::Failed),
@@ -2550,10 +2573,8 @@ class TestAPI(LitAPI):
     /// WorkerManager over a real queue whose single worker is silent; the
     /// registered model dir carries one warmup sample file.
     async fn rewarm_harness(tag: &str) -> (Arc<WorkerManager>, std::path::PathBuf) {
-        let model_dir = std::env::temp_dir().join(format!(
-            "lite-server-rewarm-{tag}-{}",
-            std::process::id()
-        ));
+        let model_dir =
+            std::env::temp_dir().join(format!("lite-server-rewarm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&model_dir);
         std::fs::create_dir_all(model_dir.join("warmup")).unwrap();
         std::fs::write(model_dir.join("warmup").join("s1.json"), br#"{"x":1}"#).unwrap();
@@ -3226,11 +3247,7 @@ class TestAPI(LitAPI):
         tag: &str,
         setup_secs: u32,
         startup_concurrency: Option<usize>,
-    ) -> (
-        Arc<WorkerManager>,
-        Arc<ModelRegistry>,
-        std::path::PathBuf,
-    ) {
+    ) -> (Arc<WorkerManager>, Arc<ModelRegistry>, std::path::PathBuf) {
         let repo =
             std::env::temp_dir().join(format!("lite-server-par-{tag}-{}", std::process::id()));
         let model_dir = repo.join(tag).join("1");
@@ -4559,8 +4576,8 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_stream_first_chunk_cancels_instead_of_draining() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b6_stream-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b6_stream-{}", std::process::id()));
         let marker = repo.join("stream_marker.txt");
         // 200 chunks x 10ms = 2s if drained; first_chunk + cancel ≈ instant.
         let model_py = stream_marker_model(&marker, 200, 0.01);
@@ -4575,8 +4592,7 @@ class TestAPI(LitAPI):
             timeout_secs: 30.0,
             ..Default::default()
         };
-        let (wm, _registry, repo, result) =
-            warmup_e2e_load("b6_stream", &model_py, policy).await;
+        let (wm, _registry, repo, result) = warmup_e2e_load("b6_stream", &model_py, policy).await;
         result.expect("stream warmup must succeed");
         assert_eq!(
             std::fs::read_to_string(&marker)
@@ -4649,8 +4665,8 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_stream_drain_consumes_to_done() {
-        let repo = std::env::temp_dir()
-            .join(format!("lite-server-b4-b6_drain-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-b6_drain-{}", std::process::id()));
         let marker = repo.join("stream_marker.txt");
         let model_py = stream_marker_model(&marker, 3, 0.0);
         let policy = crate::config::WarmupPolicy {
@@ -4665,8 +4681,7 @@ class TestAPI(LitAPI):
             timeout_secs: 30.0,
             ..Default::default()
         };
-        let (wm, _registry, repo, result) =
-            warmup_e2e_load("b6_drain", &model_py, policy).await;
+        let (wm, _registry, repo, result) = warmup_e2e_load("b6_drain", &model_py, policy).await;
         result.expect("drain warmup must succeed");
         // Generator-entry marker: 2 iterations. If drain stopped early the
         // stream would leak; success already proves Done was received, and
@@ -4755,8 +4770,10 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn warmup_stream_timeout_cancels_worker_side_stream() {
-        let repo =
-            std::env::temp_dir().join(format!("lite-server-b4-b6_to_cancel-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-b4-b6_to_cancel-{}",
+            std::process::id()
+        ));
         let marker = repo.join("cancel_marker.txt");
         let model_py = format!(
             r#"from lite_server import LitAPI
@@ -5106,7 +5123,12 @@ class TestAPI(LitAPI):
         );
         let key = model_version_key(tag, "1");
         assert!(
-            !wm.workers.read().await.get(&key).unwrap_or(&vec![]).is_empty(),
+            !wm.workers
+                .read()
+                .await
+                .get(&key)
+                .unwrap_or(&vec![])
+                .is_empty(),
             "H2: the restored version must have live workers"
         );
         assert_eq!(
@@ -5198,7 +5220,9 @@ class TestAPI(LitAPI):
         let registry = Arc::new(ModelRegistry::new());
         let wm = h2_worker_manager(repo.clone(), registry.clone());
 
-        wm.load_model(tag, "1", &ModelConfig::default()).await.unwrap();
+        wm.load_model(tag, "1", &ModelConfig::default())
+            .await
+            .unwrap();
         let config2 = crate::config::load_model_config(&v2_dir.join("config.yaml")).unwrap();
         wm.load_model(tag, "2", &config2).await.unwrap();
         registry.activate_version(tag, "1").unwrap();
@@ -5206,7 +5230,10 @@ class TestAPI(LitAPI):
         // Break v2's on-disk config and reload the standby version.
         std::fs::write(v2_dir.join("config.yaml"), H2_BROKEN_CONFIG).unwrap();
         let result = wm.reload_model(tag, Some("2")).await;
-        assert!(result.is_err(), "the standby reload must report the failure");
+        assert!(
+            result.is_err(),
+            "the standby reload must report the failure"
+        );
 
         assert_eq!(
             registry.get(tag, Some("2")).map(|mv| mv.status),

@@ -11,12 +11,12 @@ use crate::grpc::error::{
 };
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
-use crate::registry::types::ModelType;
-use std::sync::Arc;
 use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -64,16 +64,18 @@ impl GrpcService {
         // forever. Only when the operator disabled BOTH budgets does the wait
         // stay unbounded (documented P-DEADLINE semantics).
         let first = match crate::deadline::to_instant(deadline.stream_meta_unix_ns()) {
-            Some(instant) => match tokio::time::timeout_at(instant.into(), stream.message()).await {
-                Ok(res) => {
-                    res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+            Some(instant) => {
+                match tokio::time::timeout_at(instant.into(), stream.message()).await {
+                    Ok(res) => {
+                        res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+                    }
+                    Err(_) => {
+                        return Err(err(Status::deadline_exceeded(
+                            "bidi stream did not send the opening message before the deadline",
+                        )));
+                    }
                 }
-                Err(_) => {
-                    return Err(err(Status::deadline_exceeded(
-                        "bidi stream did not send the opening message before the deadline",
-                    )));
-                }
-            },
+            }
             None => match self.decoupled_idle_timeout {
                 Some(idle) => match tokio::time::timeout(idle, stream.message()).await {
                     Ok(res) => {
@@ -92,57 +94,83 @@ impl GrpcService {
             },
         };
 
-        let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin, headers) = match first {
-            Some(chunk) => match chunk.payload {
-                Some(pb::bidi_chunk::Payload::Open(open)) => {
-                    let model_name = open.model_name;
-                    let version = if open.version.is_empty() {
-                        None
-                    } else {
-                        Some(open.version)
-                    };
+        let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin, headers) =
+            match first {
+                Some(chunk) => match chunk.payload {
+                    Some(pb::bidi_chunk::Payload::Open(open)) => {
+                        let model_name = open.model_name;
+                        let version = if open.version.is_empty() {
+                            None
+                        } else {
+                            Some(open.version)
+                        };
 
-                    if let Err(e) = crate::validation::validate_identifier(&model_name) {
-                        return Err(err(Status::invalid_argument(e.to_string())));
+                        if let Err(e) = crate::validation::validate_identifier(&model_name) {
+                            return Err(err(Status::invalid_argument(e.to_string())));
+                        }
+
+                        // P5-2: canary pin — metadata first, then BidiOpen.headers
+                        // (task C parity with unary's proto-headers fallback).
+                        let pin = canary_pin(
+                            &self.registry,
+                            self.canary_override,
+                            &model_name,
+                            &grpc_metadata,
+                            &open.headers,
+                        )?;
+
+                        // version="" → canary pin (P5-2, 开关开) → weighted routing
+                        // pick (§4.3), falling back to active; stamps last_used_at
+                        // (P0-2 bidi parity).
+                        let resolved_version = resolve_bidi_version(
+                            &self.registry,
+                            &model_name,
+                            version.as_deref(),
+                            pin.clone(),
+                        )?;
+
+                        if !self.registry.is_ready(&model_name, Some(&resolved_version)) {
+                            return Err(err(Status::unavailable(format!(
+                                "{} version {} is not ready",
+                                model_name, resolved_version
+                            ))));
+                        }
+
+                        // Auth: metadata first, then BidiOpen.headers (task C).
+                        if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
+                            enforce_auth_grpc(
+                                mv.policies.auth.as_ref(),
+                                &grpc_metadata,
+                                &open.headers,
+                            )?;
+                            // bidi key="ip" 共享 bucket（注释注明：所有 bidi 请求归一）。
+                            enforce_grpc_rate_limit(
+                                &self.rate_limiter,
+                                mv.policies.rate_limit.as_ref(),
+                                &model_name,
+                                &client_ip,
+                            )?;
+                        }
+
+                        let sid = format!("grpc-bidi-{}", Uuid::new_v4());
+                        (
+                            model_name,
+                            resolved_version,
+                            sid,
+                            open.initial_data,
+                            open.sequence_id,
+                            pin,
+                            open.headers,
+                        )
                     }
-
-                    // P5-2: canary pin — metadata first, then BidiOpen.headers
-                    // (task C parity with unary's proto-headers fallback).
-                    let pin = canary_pin(
-                        &self.registry,
-                        self.canary_override,
-                        &model_name,
-                        &grpc_metadata,
-                        &open.headers,
-                    )?;
-
-                    // version="" → canary pin (P5-2, 开关开) → weighted routing
-                    // pick (§4.3), falling back to active; stamps last_used_at
-                    // (P0-2 bidi parity).
-                    let resolved_version =
-                        resolve_bidi_version(&self.registry, &model_name, version.as_deref(), pin.clone())?;
-
-                    if !self.registry.is_ready(&model_name, Some(&resolved_version)) {
-                        return Err(err(Status::unavailable(format!(
-                            "{} version {} is not ready",
-                            model_name, resolved_version
-                        ))));
+                    _ => {
+                        return Err(err(Status::invalid_argument(
+                            "first message must be BidiOpen",
+                        )))
                     }
-
-                    // Auth: metadata first, then BidiOpen.headers (task C).
-                    if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
-                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &open.headers)?;
-                        // bidi key="ip" 共享 bucket（注释注明：所有 bidi 请求归一）。
-                        enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), &model_name, &client_ip)?;
-                    }
-
-                    let sid = format!("grpc-bidi-{}", Uuid::new_v4());
-                    (model_name, resolved_version, sid, open.initial_data, open.sequence_id, pin, open.headers)
-                }
-                _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
-            },
-            None => return Err(err(Status::invalid_argument("empty stream"))),
-        };
+                },
+                None => return Err(err(Status::invalid_argument("empty stream"))),
+            };
 
         // FD-1: gateway-side JSON validation of BidiOpen.initial_data (HTTP
         // h2 bidi B1 parity) — before any worker stream is opened. Dispatch

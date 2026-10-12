@@ -35,10 +35,9 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
     // `Connection: Upgrade` with `close` breaks the WS handshake (RFC 6455
     // §4.2.2 requires the Upgrade token in the 101 response).
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-        response.headers_mut().insert(
-            CONNECTION,
-            axum::http::HeaderValue::from_static("close"),
-        );
+        response
+            .headers_mut()
+            .insert(CONNECTION, axum::http::HeaderValue::from_static("close"));
     }
     response
 }
@@ -57,9 +56,8 @@ async fn request_body_timeout_middleware(
     if request.uri().path().ends_with("/bidi") {
         return next.run(request).await;
     }
-    let request = request.map(|body| {
-        axum::body::Body::new(tower_http::timeout::TimeoutBody::new(timeout, body))
-    });
+    let request = request
+        .map(|body| axum::body::Body::new(tower_http::timeout::TimeoutBody::new(timeout, body)));
     next.run(request).await
 }
 
@@ -92,9 +90,7 @@ pub(crate) async fn route_fallback(
     } else {
         crate::protocol::ApiProtocol::Legacy
     };
-    let fallback_err = move |e: AppError| {
-        ProtocolError { error: e, protocol }.into_response()
-    };
+    let fallback_err = move |e: AppError| ProtocolError { error: e, protocol }.into_response();
     // Only `/v2/models/<model>/<tail>` paths are candidates for custom routes.
     let path = request.uri().path();
     let Some(rest) = path.strip_prefix("/v2/models/") else {
@@ -133,7 +129,12 @@ pub(crate) async fn route_fallback(
     // tail is a 404 (and a wrong method a 405) regardless of body size, and
     // an oversized body must not be read for a request that will be rejected.
     let resolved = match crate::http::handlers::resolve_custom_route(
-        &state, &model, &tail, &method, &headers, &cx.client_ip,
+        &state,
+        &model,
+        &tail,
+        &method,
+        &headers,
+        &cx.client_ip,
     )
     .await
     {
@@ -148,7 +149,15 @@ pub(crate) async fn route_fallback(
     };
 
     match crate::http::handlers::dispatch_custom_route(
-        &state, &model, resolved, &method, query, &headers, body, &cx, admission_slot,
+        &state,
+        &model,
+        resolved,
+        &method,
+        query,
+        &headers,
+        body,
+        &cx,
+        admission_slot,
     )
     .await
     {
@@ -161,8 +170,7 @@ pub(crate) async fn route_fallback(
 /// over-limit body (`LengthLimitError` in the source chain) is
 /// `PayloadTooLarge` (413); anything else stays a 500.
 fn map_route_body_error(e: axum::Error) -> AppError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> =
-        std::error::Error::source(&e);
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
     while let Some(s) = source {
         if s.is::<http_body_util::LengthLimitError>() {
             return AppError::PayloadTooLarge {
@@ -210,7 +218,9 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    request.extensions_mut().insert(RequestId(request_id.clone()));
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
 
     // P-TRACE (蓝图 §4.2/§4.3): single-source OTel parent extraction (D21). The
     // extracted context is stashed for `context_middleware` → `trace_cx`, and links
@@ -240,7 +250,10 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
 
     let mut response = next.run(request).instrument(span).await;
 
-    span_for_status.record("http.response.status_code", response.status().as_u16() as i64);
+    span_for_status.record(
+        "http.response.status_code",
+        response.status().as_u16() as i64,
+    );
 
     // Overwrite headers — middleware is the authoritative source for these.
     if let Ok(v) = HeaderValue::from_str(&request_id) {
@@ -314,8 +327,10 @@ async fn admission_middleware(
                 "max_inflight capacity reached",
             )
                 .into_response();
-            resp.headers_mut()
-                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
             return resp;
         }
     };
@@ -342,11 +357,7 @@ async fn admission_middleware(
 /// /v2/health/* aliases) bypass the
 /// gate so they can report draining themselves. Placed inside observability so
 /// the 503 is logged with a request-id.
-async fn draining_gate(
-    state: State<Arc<AtomicBool>>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn draining_gate(state: State<Arc<AtomicBool>>, request: Request, next: Next) -> Response {
     use std::sync::atomic::Ordering;
     if state.load(Ordering::Relaxed) {
         let path = request.uri().path();
@@ -380,7 +391,12 @@ async fn access_control_middleware(
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().is_loopback())
         .unwrap_or(true);
-    if !ac.check(class, crate::callback::Protocol::Http, request.headers(), is_loopback) {
+    if !ac.check(
+        class,
+        crate::callback::Protocol::Http,
+        request.headers(),
+        is_loopback,
+    ) {
         return AppError::Unauthorized("access denied".into()).into_response();
     }
     next.run(request).await
@@ -400,7 +416,9 @@ impl tower_http::compression::predicate::Predicate for NotEventStream {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|ct| !ct.starts_with("text/event-stream") && !ct.starts_with("application/x-lite-bidi"))
+            .map(|ct| {
+                !ct.starts_with("text/event-stream") && !ct.starts_with("application/x-lite-bidi")
+            })
             .unwrap_or(true)
     }
 }
@@ -445,7 +463,16 @@ pub async fn start_http_server(
     } = options;
     let repo_path = PathBuf::from(&config.model_repository.path);
     // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
-    let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);
+    let mut state = AppState::new(
+        registry,
+        worker_manager,
+        inference_queue,
+        config.clone(),
+        repo_path,
+        callback_runner,
+        has_hot_reload,
+        rate_limiter,
+    );
     state.shutdown_state = shutdown_state.clone();
     state.draining = draining.clone();
     state.cli_overrides = cli_overrides;
@@ -453,19 +480,18 @@ pub async fn start_http_server(
 
     // P7-1: resolve endpoint-class access control (value_env/value_file read
     // here so a missing source fails fast at startup). Shared shape with gRPC.
-    let access_control = std::sync::Arc::new(
-        crate::access_control::AccessControl::build(&config.access_control)?,
-    );
+    let access_control = std::sync::Arc::new(crate::access_control::AccessControl::build(
+        &config.access_control,
+    )?);
     // D27: admin handlers 的审计 key 指纹经 AppState 消费（Arc 包装前注入）。
     state.access_control = access_control.clone();
 
     // openai-compact(/v1) 专属鉴权门:与 access_control 同模式,启动期解析
     // (value_env/value_file 缺源 fail-fast);None = 不启用(/v1 维持公开)。
     // 只被 openai_compact::mount 的 route_layer 消费。
-    state.openai_auth = crate::access_control::OpenaiAuthGate::build(
-        config.openai_compact.auth.as_ref(),
-    )?
-    .map(std::sync::Arc::new);
+    state.openai_auth =
+        crate::access_control::OpenaiAuthGate::build(config.openai_compact.auth.as_ref())?
+            .map(std::sync::Arc::new);
 
     // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Empty
     // → fail-safe (direct peer used, client proxy headers ignored).
@@ -480,7 +506,10 @@ pub async fn start_http_server(
     // P-FLOW (§4.0.9): per-request body cap (default 64 MiB). Oversized
     // bodies → 413. DefaultBodyLimit::max is infallible for non-zero values.
     let app = app.layer(axum::extract::DefaultBodyLimit::max(
-        config.server.max_request_body_bytes.unwrap_or(64 * 1024 * 1024),
+        config
+            .server
+            .max_request_body_bytes
+            .unwrap_or(64 * 1024 * 1024),
     ));
 
     // Request decompression (opt-in): gzip bodies decoded lazily before
@@ -490,7 +519,9 @@ pub async fn start_http_server(
     // reads RequestContext via rejection_protocol; outside it the envelope
     // silently degrades to Legacy shape.
     let app = if config.server.request_decompression {
-        app.layer(axum::middleware::from_fn(decompress::request_decompression_middleware))
+        app.layer(axum::middleware::from_fn(
+            decompress::request_decompression_middleware,
+        ))
     } else {
         app
     };
@@ -510,7 +541,9 @@ pub async fn start_http_server(
     // x-real-ip for direct (non-proxied) connections so client_ip is never
     // empty (0.7.x regression). No-op on the unix-socket path (no ConnectInfo)
     // and when a proxy header is already present.
-    let app = app.layer(axum::middleware::from_fn(crate::http::handlers::peer_ip_fallback));
+    let app = app.layer(axum::middleware::from_fn(
+        crate::http::handlers::peer_ip_fallback,
+    ));
 
     // Keepalive middleware (inner)
     let app = if config.server.keepalive_timeout <= 0.0 {
@@ -553,8 +586,10 @@ pub async fn start_http_server(
     // request-id) but outside context/compression so new work is rejected
     // before any handler runs. Respects D21: it neither consumes RequestContext
     // nor touches compression/observability semantics.
-    let app =
-        app.layer(axum::middleware::from_fn_with_state(draining.clone(), draining_gate));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        draining.clone(),
+        draining_gate,
+    ));
 
     // P-FLOW (§4.0.9): inference-only global admission cap. Inside
     // observability (503 carries x-request-id); health/admin exempt via
@@ -625,7 +660,11 @@ pub async fn start_http_server(
             // task-abort backstop in server/mod.rs still bounds the drain.
             let std_listener = std::net::TcpListener::bind(addr).map_err(AppError::Io)?;
             std_listener.set_nonblocking(true).map_err(AppError::Io)?;
-            info!("Starting HTTPS server on {} ({})", addr, tls_store.describe());
+            info!(
+                "Starting HTTPS server on {} ({})",
+                addr,
+                tls_store.describe()
+            );
             let handle = axum_server::Handle::new();
             tokio::spawn({
                 let handle = handle.clone();
@@ -682,8 +721,8 @@ async fn serve_unix(
     server_config: crate::config::ServerConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
-    use hyper_util::server::conn::auto::Builder;
     use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
 
     let listener = Arc::new(listener);
@@ -807,8 +846,8 @@ async fn serve_tcp(
     // lifetime.
     connection_tasks: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<(), AppError> {
-    use hyper_util::server::conn::auto::Builder;
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
     use std::future::poll_fn;
     use tower::ServiceExt as _;
@@ -1044,7 +1083,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
-        assert_eq!(connection, Some(&axum::http::HeaderValue::from_static("close")));
+        assert_eq!(
+            connection,
+            Some(&axum::http::HeaderValue::from_static("close"))
+        );
     }
 
     // ===== F-07: accept-error classification + injected-loop tests =====
@@ -1060,8 +1102,12 @@ mod tests {
                 "raw {raw} must be transient"
             );
         }
-        assert!(is_transient_accept_error(&std::io::Error::from(ErrorKind::Interrupted)));
-        assert!(is_transient_accept_error(&std::io::Error::from(ErrorKind::ConnectionAborted)));
+        assert!(is_transient_accept_error(&std::io::Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(is_transient_accept_error(&std::io::Error::from(
+            ErrorKind::ConnectionAborted
+        )));
         // Fatal: permission / address errors.
         for raw in [libc::EPERM, libc::EACCES, libc::EBADF] {
             assert!(
@@ -1094,7 +1140,10 @@ mod tests {
             .await
             .expect("accept loop must observe shutdown within 2s")
             .expect("accept loop task must not panic");
-        assert!(result.is_ok(), "shutdown after transient errors must be clean");
+        assert!(
+            result.is_ok(),
+            "shutdown after transient errors must be clean"
+        );
     }
 
     /// F-07: a non-transient accept error stays fatal.
@@ -1178,8 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_without_keepalive_disabled_no_connection_close() {
-        let app = axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "ok" }));
+        let app = axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
 
         let response = app
             .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
@@ -1188,7 +1236,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
-        assert!(connection.is_none() || connection != Some(&axum::http::HeaderValue::from_static("close")));
+        assert!(
+            connection.is_none()
+                || connection != Some(&axum::http::HeaderValue::from_static("close"))
+        );
     }
 
     // ===== L1 (memory-leak): connection-task JoinSet must not accumulate =====
@@ -1450,12 +1501,19 @@ mod tests {
             .with_state(test_state());
 
         let response = app
-            .oneshot(Request::builder().uri("/no-such-route").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/no-such-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "not_found_error");
         assert_eq!(body["error"]["code"], "route_not_found");
@@ -1469,12 +1527,20 @@ mod tests {
             .method_not_allowed_fallback(method_not_allowed_fallback);
 
         let response = app
-            .oneshot(Request::builder().uri("/test").method("POST").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "method_not_allowed");
         assert_eq!(body["error"]["code"], "method_not_allowed");
@@ -1495,10 +1561,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("x-request-id").is_some(),
-            "x-request-id should be present");
-        assert!(response.headers().get("x-processing-time-ms").is_some(),
-            "x-processing-time-ms should be present");
+        assert!(
+            response.headers().get("x-request-id").is_some(),
+            "x-request-id should be present"
+        );
+        assert!(
+            response.headers().get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms should be present"
+        );
     }
 
     #[tokio::test]
@@ -1542,8 +1612,16 @@ mod tests {
             .await
             .unwrap();
 
-        let returned = response.headers().get("x-request-id").unwrap().to_str().unwrap();
-        assert_ne!(returned, &long_id, "over-length client ID should be rejected");
+        let returned = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_ne!(
+            returned, &long_id,
+            "over-length client ID should be rejected"
+        );
         assert_eq!(returned.len(), 36, "should be UUID v4 (36 chars)");
     }
 
@@ -1564,7 +1642,12 @@ mod tests {
             .await
             .unwrap();
 
-        let returned = response.headers().get("x-request-id").unwrap().to_str().unwrap();
+        let returned = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(!returned.is_empty(), "empty client ID should be rejected");
         assert_eq!(returned.len(), 36, "should fall back to UUID v4 (36 chars)");
     }
@@ -1572,10 +1655,13 @@ mod tests {
     #[tokio::test]
     async fn test_observability_headers_on_error_responses() {
         let app = axum::Router::new()
-            .route("/test", axum::routing::get(|| async {
-                let err: AppError = AppError::ModelNotFound("test".into());
-                err.into_response()
-            }))
+            .route(
+                "/test",
+                axum::routing::get(|| async {
+                    let err: AppError = AppError::ModelNotFound("test".into());
+                    err.into_response()
+                }),
+            )
             .layer(axum::middleware::from_fn(observability_middleware));
 
         let response = app
@@ -1585,10 +1671,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         // Headers MUST be present even on error responses
-        assert!(response.headers().get("x-request-id").is_some(),
-            "x-request-id must be on error responses too");
-        assert!(response.headers().get("x-processing-time-ms").is_some(),
-            "x-processing-time-ms must be on error responses too");
+        assert!(
+            response.headers().get("x-request-id").is_some(),
+            "x-request-id must be on error responses too"
+        );
+        assert!(
+            response.headers().get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms must be on error responses too"
+        );
     }
 
     // ===== P-MW: production stack order (observability → context_middleware) =====
@@ -1631,10 +1721,15 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let body = String::from_utf8(body_bytes.to_vec()).unwrap();
-        assert_eq!(body, format!("{}|10.1.2.3", echoed),
-            "handler context must read the same request_id observability echoes");
+        assert_eq!(
+            body,
+            format!("{}|10.1.2.3", echoed),
+            "handler context must read the same request_id observability echoes"
+        );
     }
 }
 
@@ -1690,7 +1785,10 @@ mod audit_mw_order_tests {
         let admission = state.admission.clone();
         // 生产同序（外→内，修复后）：cors → admission → route。
         let app = Router::new()
-            .route("/v2/models/foo/infer", axum::routing::post(|| async { "unreached" }))
+            .route(
+                "/v2/models/foo/infer",
+                axum::routing::post(|| async { "unreached" }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 admission.clone(),
                 admission_middleware,
@@ -1728,8 +1826,14 @@ mod audit_mw_order_tests {
         let draining = Arc::new(AtomicBool::new(true));
         // 生产同序（外→内，修复后）：cors → draining_gate → route。
         let app = Router::new()
-            .route("/v2/models/foo/infer", axum::routing::post(|| async { "unreached" }))
-            .layer(axum::middleware::from_fn_with_state(draining, draining_gate))
+            .route(
+                "/v2/models/foo/infer",
+                axum::routing::post(|| async { "unreached" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                draining,
+                draining_gate,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 state,
                 crate::http::cors::cors_middleware,

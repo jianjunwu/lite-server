@@ -93,8 +93,16 @@ pub(super) async fn startup_tmp_cleanup(
                 }
                 continue;
             }
-            sweep_swap_backup(repo_path, &name, &path, now, max_age, &mut removed, &mut restored)
-                .await;
+            sweep_swap_backup(
+                repo_path,
+                &name,
+                &path,
+                now,
+                max_age,
+                &mut removed,
+                &mut restored,
+            )
+            .await;
         }
         for dir in model_dirs {
             if let Ok(mut ventries) = tokio::fs::read_dir(&dir).await {
@@ -226,7 +234,9 @@ async fn sweep_swap_backup(
                 *restored += 1;
                 info!(path = %path.display(), target = %target.display(), "startup cleanup: restored swap backup (target was missing)");
             }
-            Err(e) => warn!(path = %path.display(), error = %e, "startup cleanup: failed to restore swap backup"),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "startup cleanup: failed to restore swap backup")
+            }
         }
     }
 }
@@ -307,7 +317,11 @@ mod tests {
         let now = SystemTime::now();
         let (removed, restored) =
             startup_tmp_cleanup(&unique_tmp("repo"), &temp_root, now, Duration::ZERO).await;
-        assert_eq!((removed, restored), (1, 0), "stale dir removed, nothing restored");
+        assert_eq!(
+            (removed, restored),
+            (1, 0),
+            "stale dir removed, nothing restored"
+        );
         assert!(!stale.exists());
 
         // A fresh dir survives an ordinary (24h) sweep.
@@ -348,7 +362,10 @@ mod tests {
             DEFAULT_MAX_AGE,
         )
         .await;
-        assert_eq!(removed_active, 0, "an active upload session must not be swept");
+        assert_eq!(
+            removed_active, 0,
+            "an active upload session must not be swept"
+        );
         assert!(active.exists());
 
         // Once session.json ALSO ages out, the dir is swept.
@@ -528,7 +545,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        assert_eq!((removed, restored), (1, 0), "completed swap → backup is stale");
+        assert_eq!(
+            (removed, restored),
+            (1, 0),
+            "completed swap → backup is stale"
+        );
         assert!(repo.join("mymodel").exists());
         assert!(!backup.exists());
 

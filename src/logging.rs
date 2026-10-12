@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions, rename};
+use std::fs::{rename, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -243,7 +243,10 @@ fn create_writer(
                     rotation
                 );
             }
-            let file = OpenOptions::new().append(true).create(true).open(&final_path)?;
+            let file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&final_path)?;
             let (writer, guard) = tracing_appender::non_blocking(file);
             Ok((writer, guard))
         }
@@ -253,7 +256,9 @@ fn create_writer(
 /// Remove old rotated log files exceeding backup_count.
 /// Matches files like `<name>.2024-01-01` or `<name>.2024-01-01-12`.
 fn cleanup_old_logs(parent: &std::path::Path, file_name: &str, backup_count: usize) {
-    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
     let prefix = format!("{}.", file_name);
     let mut matches: Vec<std::path::PathBuf> = entries
         .filter_map(|e| e.ok())
@@ -296,11 +301,11 @@ fn spawn_log_cleanup(
         std::sync::Mutex<std::collections::HashSet<(PathBuf, String, std::time::Duration)>>,
     > = std::sync::OnceLock::new();
     let spawned = SPAWNED.get_or_init(Default::default);
-    if !spawned
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((dir.clone(), file_name.clone(), interval))
-    {
+    if !spawned.lock().unwrap_or_else(|e| e.into_inner()).insert((
+        dir.clone(),
+        file_name.clone(),
+        interval,
+    )) {
         return false;
     }
     let result = std::thread::Builder::new()
@@ -357,8 +362,18 @@ impl SizeRotatingAppender {
 
     fn rotate(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let ext = inner.path.extension().unwrap_or_default().to_string_lossy().to_string();
-        let stem = inner.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let ext = inner
+            .path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let stem = inner
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let parent = inner.path.parent().unwrap_or(std::path::Path::new("."));
 
         // Shift existing backups: .N -> .N+1, delete those beyond backup_count
@@ -405,7 +420,11 @@ impl Write for SizeRotatingAppender {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).file.flush()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .file
+            .flush()
     }
 }
 
@@ -482,10 +501,7 @@ mod tests {
 
     #[test]
     fn sanitize_hostname_keeps_alnum_dot_dash_underscore() {
-        assert_eq!(
-            sanitize_hostname("node_01.example-2"),
-            "node_01.example-2"
-        );
+        assert_eq!(sanitize_hostname("node_01.example-2"), "node_01.example-2");
     }
 
     // ===== defect reproduction tests =====
@@ -498,8 +514,8 @@ mod tests {
     /// a misconfiguration — it should be rejected at construction time.
     #[test]
     fn test_data_max_size_zero_should_be_rejected() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-maxsize-zero-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-server-maxsize-zero-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.log");
 
@@ -518,8 +534,8 @@ mod tests {
     /// is a misconfiguration and should be rejected at construction time.
     #[test]
     fn test_data_backup_count_zero_should_be_rejected() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-backup-zero-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-server-backup-zero-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.log");
 
@@ -537,8 +553,10 @@ mod tests {
     /// (release).
     #[test]
     fn test_data_max_size_overflow_should_be_rejected() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-maxsize-overflow-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "lite-server-maxsize-overflow-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.log");
 
@@ -553,8 +571,7 @@ mod tests {
 
     #[test]
     fn cleanup_old_logs_removes_oldest_beyond_backup_count() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-cleanup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lite-server-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for day in 1..=5 {
             std::fs::write(dir.join(format!("app.log.2024-01-0{}", day)), b"x").unwrap();
@@ -572,8 +589,8 @@ mod tests {
 
     #[test]
     fn cleanup_old_logs_keeps_all_when_within_backup_count() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-cleanup-keep-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-server-cleanup-keep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for day in 1..=3 {
             std::fs::write(dir.join(format!("app.log.2024-01-0{}", day)), b"x").unwrap();
@@ -589,13 +606,12 @@ mod tests {
 
     #[test]
     fn create_writer_includes_hostname_when_enabled() {
-        let dir = std::env::temp_dir()
-            .join(format!("lite-server-hostname-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-server-hostname-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("server.log");
 
-        let (_writer, _guard) =
-            create_writer(path.to_str().unwrap(), "none", 1, 1, true).unwrap();
+        let (_writer, _guard) = create_writer(path.to_str().unwrap(), "none", 1, 1, true).unwrap();
 
         match current_hostname() {
             Some(host) => {

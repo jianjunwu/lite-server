@@ -167,7 +167,9 @@ async fn bench_bidi_rtt(port: u16) -> Result<serde_json::Value, String> {
     let mut burst = Vec::with_capacity(BIDI_BURST_CHUNKS);
     for i in 0..BIDI_BURST_CHUNKS {
         let t = Instant::now();
-        tx.send(chunk_msg(i)).await.map_err(|e| format!("send burst {i}: {e}"))?;
+        tx.send(chunk_msg(i))
+            .await
+            .map_err(|e| format!("send burst {i}: {e}"))?;
         let _ = recv_echo(&mut resp).await?;
         burst.push(t.elapsed().as_secs_f64());
     }
@@ -185,7 +187,9 @@ async fn bench_bidi_rtt(port: u16) -> Result<serde_json::Value, String> {
             tokio::time::sleep(tick - now).await;
         }
         let t = Instant::now();
-        tx.send(chunk_msg(i)).await.map_err(|e| format!("send paced {i}: {e}"))?;
+        tx.send(chunk_msg(i))
+            .await
+            .map_err(|e| format!("send paced {i}: {e}"))?;
         let _ = recv_echo(&mut resp).await?;
         let rtt = t.elapsed();
         paced.push(rtt.as_secs_f64());
@@ -232,7 +236,9 @@ fn chunk_msg(i: usize) -> pb::BidiChunk {
 }
 
 /// 等一个回显帧;Close/超时视为异常。
-async fn recv_echo(resp: &mut tonic::Streaming<pb::BidiChunk>) -> Result<serde_json::Value, String> {
+async fn recv_echo(
+    resp: &mut tonic::Streaming<pb::BidiChunk>,
+) -> Result<serde_json::Value, String> {
     match tokio::time::timeout(CHUNK_TIMEOUT, resp.message()).await {
         Ok(Ok(Some(chunk))) => match chunk.payload {
             Some(pb::bidi_chunk::Payload::Data(d)) => {
@@ -241,9 +247,7 @@ async fn recv_echo(resp: &mut tonic::Streaming<pb::BidiChunk>) -> Result<serde_j
             Some(pb::bidi_chunk::Payload::Close(_)) => {
                 Err("stream closed early (Close before expected echo)".to_string())
             }
-            Some(pb::bidi_chunk::Payload::Open(_)) => {
-                Err("unexpected Open frame".to_string())
-            }
+            Some(pb::bidi_chunk::Payload::Open(_)) => Err("unexpected Open frame".to_string()),
             Some(pb::bidi_chunk::Payload::Error(e)) => {
                 Err(format!("bidi error frame: {}", e.message))
             }
@@ -314,7 +318,9 @@ async fn bench_sse(client: &reqwest::Client, port: u16) -> Result<serde_json::Va
         ok += 1;
     }
     if ok < SSE_STREAMS / 2 {
-        return Err(format!("sse_stream: only {ok}/{SSE_STREAMS} streams succeeded"));
+        return Err(format!(
+            "sse_stream: only {ok}/{SSE_STREAMS} streams succeeded"
+        ));
     }
     Ok(serde_json::json!({
         "streams": SSE_STREAMS,
@@ -336,9 +342,9 @@ async fn bench_ws(port: u16) -> Result<serde_json::Value, String> {
             let url = url.clone();
             async move {
                 let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.ok()?;
-                ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    format!("{{\"n\": {WS_CHUNKS}}}"),
-                ))
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(format!(
+                    "{{\"n\": {WS_CHUNKS}}}"
+                )))
                 .await
                 .ok()?;
                 let start = Instant::now();
@@ -387,7 +393,9 @@ async fn bench_ws(port: u16) -> Result<serde_json::Value, String> {
         ok += 1;
     }
     if ok < WS_STREAMS / 2 {
-        return Err(format!("ws_stream: only {ok}/{WS_STREAMS} streams succeeded"));
+        return Err(format!(
+            "ws_stream: only {ok}/{WS_STREAMS} streams succeeded"
+        ));
     }
     Ok(serde_json::json!({
         "streams": WS_STREAMS,
@@ -473,7 +481,11 @@ fn summarize(samples: &[f64], wall: Duration) -> serde_json::Value {
         let idx = ((s.len() as f64) * p).ceil() as usize;
         s[idx.saturating_sub(1).min(s.len() - 1)] * 1000.0
     };
-    let mean = if s.is_empty() { 0.0 } else { s.iter().sum::<f64>() / s.len() as f64 * 1000.0 };
+    let mean = if s.is_empty() {
+        0.0
+    } else {
+        s.iter().sum::<f64>() / s.len() as f64 * 1000.0
+    };
     serde_json::json!({
         "n": s.len(),
         "rps": (s.len() as f64 / wall.as_secs_f64()).round(),

@@ -41,7 +41,9 @@ impl EndpointClass {
 fn protocol_axis(protocol: Protocol) -> ProtocolAxis {
     match protocol {
         Protocol::Grpc => ProtocolAxis::Grpc,
-        Protocol::Http | Protocol::Sse | Protocol::WebSocket | Protocol::Http2 => ProtocolAxis::Http,
+        Protocol::Http | Protocol::Sse | Protocol::WebSocket | Protocol::Http2 => {
+            ProtocolAxis::Http
+        }
     }
 }
 
@@ -60,13 +62,17 @@ pub trait HeaderLookup {
 
 impl HeaderLookup for axum::http::HeaderMap {
     fn header(&self, name: &str) -> Option<String> {
-        self.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+        self.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
     }
 }
 
 impl HeaderLookup for tonic::metadata::MetadataMap {
     fn header(&self, name: &str) -> Option<String> {
-        self.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+        self.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
     }
 }
 
@@ -80,7 +86,11 @@ enum ResolvedControl {
     /// Require a key: compare the named header to `secret` in constant time.
     /// `fingerprint` = SHA-256 hex 前缀（12 字符）of `secret`——审计归因用
     /// （D27），日志不落密钥本体。
-    Key { header: String, secret: Vec<u8>, fingerprint: String },
+    Key {
+        header: String,
+        secret: Vec<u8>,
+        fingerprint: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +115,10 @@ impl AccessControl {
         Ok(Self {
             admin: resolve_cell(cfg.admin.http.as_ref(), cfg.admin.grpc.as_ref())?,
             inference: resolve_cell(cfg.inference.http.as_ref(), cfg.inference.grpc.as_ref())?,
-            health: CellPolicy { http: health.clone(), grpc: health },
+            health: CellPolicy {
+                http: health.clone(),
+                grpc: health,
+            },
         })
     }
 
@@ -183,14 +196,27 @@ fn resolve_one(ctrl: Option<&EndpointControl>) -> Result<ResolvedControl, AppErr
     Ok(match ctrl {
         None => ResolvedControl::Unconfigured,
         Some(EndpointControl::Public) => ResolvedControl::Public,
-        Some(EndpointControl::Key { key, value, value_env, value_file }) => {
+        Some(EndpointControl::Key {
+            key,
+            value,
+            value_env,
+            value_file,
+        }) => {
             if key.trim().is_empty() {
                 return Err(AppError::Config(
                     "access_control key mode requires a non-empty header name (`key`)".into(),
                 ));
             }
-            let secret = resolve_secret(value.as_deref(), value_env.as_deref(), value_file.as_deref())?;
-            ResolvedControl::Key { fingerprint: secret_fingerprint(&secret), header: key.clone(), secret }
+            let secret = resolve_secret(
+                value.as_deref(),
+                value_env.as_deref(),
+                value_file.as_deref(),
+            )?;
+            ResolvedControl::Key {
+                fingerprint: secret_fingerprint(&secret),
+                header: key.clone(),
+                secret,
+            }
         }
     })
 }
@@ -218,7 +244,9 @@ fn resolve_secret(
     }
     if let Some(path) = value_file {
         let bytes = std::fs::read(path).map_err(|e| {
-            AppError::Config(format!("access_control value_file '{path}' unreadable: {e}"))
+            AppError::Config(format!(
+                "access_control value_file '{path}' unreadable: {e}"
+            ))
         })?;
         let v = String::from_utf8_lossy(&bytes).trim().to_string();
         if v.is_empty() {
@@ -284,14 +312,27 @@ impl OpenaiAuthGate {
     pub fn build(ctrl: Option<&EndpointControl>) -> Result<Option<Self>, AppError> {
         match ctrl {
             None | Some(EndpointControl::Public) => Ok(None),
-            Some(EndpointControl::Key { key, value, value_env, value_file }) => {
+            Some(EndpointControl::Key {
+                key,
+                value,
+                value_env,
+                value_file,
+            }) => {
                 if key.trim().is_empty() {
                     return Err(AppError::Config(
-                        "openai_compact.auth key mode requires a non-empty header name (`key`)".into(),
+                        "openai_compact.auth key mode requires a non-empty header name (`key`)"
+                            .into(),
                     ));
                 }
-                let secret = resolve_secret(value.as_deref(), value_env.as_deref(), value_file.as_deref())?;
-                Ok(Some(Self { header: key.clone(), secret }))
+                let secret = resolve_secret(
+                    value.as_deref(),
+                    value_env.as_deref(),
+                    value_file.as_deref(),
+                )?;
+                Ok(Some(Self {
+                    header: key.clone(),
+                    secret,
+                }))
             }
         }
     }
@@ -382,11 +423,19 @@ mod tests {
     }
 
     fn hdrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn key_ctrl(header: &str, secret: &str) -> EndpointControl {
-        EndpointControl::Key { key: header.to_string(), value: Some(secret.to_string()), value_env: None, value_file: None }
+        EndpointControl::Key {
+            key: header.to_string(),
+            value: Some(secret.to_string()),
+            value_env: None,
+            value_file: None,
+        }
     }
 
     // ===== default semantics (D14 fail-closed admin) =====
@@ -395,11 +444,20 @@ mod tests {
     fn classify_http_path_v1_is_inference() {
         // 批次 5(openai-compact):/v1/* 归 inference 族——否则 fail-closed
         // 默认把 /v1 当 Admin,拒绝公共访问。
-        assert_eq!(classify_http_path("/v1/chat/completions"), EndpointClass::Inference);
+        assert_eq!(
+            classify_http_path("/v1/chat/completions"),
+            EndpointClass::Inference
+        );
         assert_eq!(classify_http_path("/v1/models"), EndpointClass::Inference);
-        assert_eq!(classify_http_path("/v1/models/foo"), EndpointClass::Inference);
+        assert_eq!(
+            classify_http_path("/v1/models/foo"),
+            EndpointClass::Inference
+        );
         assert_eq!(classify_http_path("/health"), EndpointClass::Health);
-        assert_eq!(classify_http_path("/v2/models/m/infer"), EndpointClass::Inference);
+        assert_eq!(
+            classify_http_path("/v2/models/m/infer"),
+            EndpointClass::Inference
+        );
     }
 
     /// /audit protocol-compat 举证(2026-08-08,当前 FAIL):
@@ -411,15 +469,24 @@ mod tests {
     #[test]
     fn test_audit_v2_health_aliases_classify_as_health() {
         assert_eq!(classify_http_path("/v2/health/live"), EndpointClass::Health);
-        assert_eq!(classify_http_path("/v2/health/ready"), EndpointClass::Health);
+        assert_eq!(
+            classify_http_path("/v2/health/ready"),
+            EndpointClass::Health
+        );
     }
 
     #[test]
     fn default_admin_loopback_passes_non_loopback_denies() {
         let ac = AccessControl::default();
         let h: HashMap<String, String> = HashMap::new();
-        assert!(ac.check(EndpointClass::Admin, Protocol::Http, &h, true), "loopback admin passes");
-        assert!(!ac.check(EndpointClass::Admin, Protocol::Http, &h, false), "non-loopback admin denied (fail-closed)");
+        assert!(
+            ac.check(EndpointClass::Admin, Protocol::Http, &h, true),
+            "loopback admin passes"
+        );
+        assert!(
+            !ac.check(EndpointClass::Admin, Protocol::Http, &h, false),
+            "non-loopback admin denied (fail-closed)"
+        );
     }
 
     #[test]
@@ -443,33 +510,80 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(ac.check(EndpointClass::Admin, Protocol::Http, &hdrs(&[("x-api-key", "s3cr3t")]), false));
-        assert!(!ac.check(EndpointClass::Admin, Protocol::Http, &hdrs(&[("x-api-key", "wrong")]), false));
-        assert!(!ac.check(EndpointClass::Admin, Protocol::Http, &HashMap::<String, String>::new(), false), "missing key denied");
+        assert!(ac.check(
+            EndpointClass::Admin,
+            Protocol::Http,
+            &hdrs(&[("x-api-key", "s3cr3t")]),
+            false
+        ));
+        assert!(!ac.check(
+            EndpointClass::Admin,
+            Protocol::Http,
+            &hdrs(&[("x-api-key", "wrong")]),
+            false
+        ));
+        assert!(
+            !ac.check(
+                EndpointClass::Admin,
+                Protocol::Http,
+                &HashMap::<String, String>::new(),
+                false
+            ),
+            "missing key denied"
+        );
         // gRPC uses its own header name.
-        assert!(ac.check(EndpointClass::Admin, Protocol::Grpc, &hdrs(&[("api-key", "s3cr3t")]), false));
-        assert!(!ac.check(EndpointClass::Admin, Protocol::Grpc, &hdrs(&[("api-key", "nope")]), false));
+        assert!(ac.check(
+            EndpointClass::Admin,
+            Protocol::Grpc,
+            &hdrs(&[("api-key", "s3cr3t")]),
+            false
+        ));
+        assert!(!ac.check(
+            EndpointClass::Admin,
+            Protocol::Grpc,
+            &hdrs(&[("api-key", "nope")]),
+            false
+        ));
     }
 
     #[test]
     fn key_mode_denies_loopback_without_key() {
         // Key mode requires the key regardless of loopback.
         let ac = AccessControl::build(&AccessControlConfig {
-            inference: ProtocolControl { http: Some(key_ctrl("x-api-key", "k")), grpc: None },
+            inference: ProtocolControl {
+                http: Some(key_ctrl("x-api-key", "k")),
+                grpc: None,
+            },
             ..Default::default()
         })
         .unwrap();
-        assert!(!ac.check(EndpointClass::Inference, Protocol::Http, &HashMap::<String, String>::new(), true));
+        assert!(!ac.check(
+            EndpointClass::Inference,
+            Protocol::Http,
+            &HashMap::<String, String>::new(),
+            true
+        ));
     }
 
     #[test]
     fn public_explicit_escape_hatch() {
         let ac = AccessControl::build(&AccessControlConfig {
-            admin: ProtocolControl { http: Some(EndpointControl::Public), grpc: Some(EndpointControl::Public) },
+            admin: ProtocolControl {
+                http: Some(EndpointControl::Public),
+                grpc: Some(EndpointControl::Public),
+            },
             ..Default::default()
         })
         .unwrap();
-        assert!(ac.check(EndpointClass::Admin, Protocol::Http, &HashMap::<String, String>::new(), false), "public admin open to non-loopback");
+        assert!(
+            ac.check(
+                EndpointClass::Admin,
+                Protocol::Http,
+                &HashMap::<String, String>::new(),
+                false
+            ),
+            "public admin open to non-loopback"
+        );
     }
 
     // ===== health shorthand applies to both protocols =====
@@ -481,9 +595,24 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(ac.check(EndpointClass::Health, Protocol::Http, &hdrs(&[("x-api-key", "h")]), false));
-        assert!(ac.check(EndpointClass::Health, Protocol::Grpc, &hdrs(&[("x-api-key", "h")]), false));
-        assert!(!ac.check(EndpointClass::Health, Protocol::Http, &HashMap::<String, String>::new(), false));
+        assert!(ac.check(
+            EndpointClass::Health,
+            Protocol::Http,
+            &hdrs(&[("x-api-key", "h")]),
+            false
+        ));
+        assert!(ac.check(
+            EndpointClass::Health,
+            Protocol::Grpc,
+            &hdrs(&[("x-api-key", "h")]),
+            false
+        ));
+        assert!(!ac.check(
+            EndpointClass::Health,
+            Protocol::Http,
+            &HashMap::<String, String>::new(),
+            false
+        ));
     }
 
     // ===== build-time resolution / fail-fast =====
@@ -492,12 +621,20 @@ mod tests {
     fn key_mode_without_secret_source_fails_build() {
         let ac = AccessControlConfig {
             admin: ProtocolControl {
-                http: Some(EndpointControl::Key { key: "x-api-key".to_string(), value: None, value_env: None, value_file: None }),
+                http: Some(EndpointControl::Key {
+                    key: "x-api-key".to_string(),
+                    value: None,
+                    value_env: None,
+                    value_file: None,
+                }),
                 grpc: None,
             },
             ..Default::default()
         };
-        assert!(AccessControl::build(&ac).is_err(), "Key mode with no secret source must fail fast");
+        assert!(
+            AccessControl::build(&ac).is_err(),
+            "Key mode with no secret source must fail fast"
+        );
     }
 
     #[test]
@@ -514,7 +651,10 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(AccessControl::build(&ac).is_err(), "unset value_env must fail fast");
+        assert!(
+            AccessControl::build(&ac).is_err(),
+            "unset value_env must fail fast"
+        );
     }
 
     // ===== constant-time compare sanity =====
@@ -534,15 +674,34 @@ mod tests {
         use crate::access_control::classify_http_path;
         assert_eq!(classify_http_path("/health"), EndpointClass::Health);
         assert_eq!(classify_http_path("/readyz"), EndpointClass::Health);
-        assert_eq!(classify_http_path("/v2/models/m/infer"), EndpointClass::Inference);
-        assert_eq!(classify_http_path("/v2/models/m/versions/2/events"), EndpointClass::Inference);
-        assert_eq!(classify_http_path("/v2/models/m/summarize"), EndpointClass::Inference, "custom @route → inference");
-        assert_eq!(classify_http_path("/v2/repository/models/m/versions/1/load"), EndpointClass::Admin);
+        assert_eq!(
+            classify_http_path("/v2/models/m/infer"),
+            EndpointClass::Inference
+        );
+        assert_eq!(
+            classify_http_path("/v2/models/m/versions/2/events"),
+            EndpointClass::Inference
+        );
+        assert_eq!(
+            classify_http_path("/v2/models/m/summarize"),
+            EndpointClass::Inference,
+            "custom @route → inference"
+        );
+        assert_eq!(
+            classify_http_path("/v2/repository/models/m/versions/1/load"),
+            EndpointClass::Admin
+        );
         assert_eq!(classify_http_path("/metrics"), EndpointClass::Admin);
         assert_eq!(classify_http_path("/info"), EndpointClass::Admin);
-        assert_eq!(classify_http_path("/v2/models/m/ready"), EndpointClass::Admin);
+        assert_eq!(
+            classify_http_path("/v2/models/m/ready"),
+            EndpointClass::Admin
+        );
         // M5: instance config read — admin class (fail-closed when unconfigured).
-        assert_eq!(classify_http_path("/v2/server/config"), EndpointClass::Admin);
+        assert_eq!(
+            classify_http_path("/v2/server/config"),
+            EndpointClass::Admin
+        );
     }
 
     // AUDIT (P0): bare `POST /v2/models/:m/reload` is a registered state-changing
@@ -578,7 +737,10 @@ mod tests {
     fn admin_denies_non_loopback_helper() {
         assert!(AccessControl::default().admin_denies_non_loopback());
         let ac = AccessControl::build(&AccessControlConfig {
-            admin: ProtocolControl { http: Some(EndpointControl::Public), grpc: Some(EndpointControl::Public) },
+            admin: ProtocolControl {
+                http: Some(EndpointControl::Public),
+                grpc: Some(EndpointControl::Public),
+            },
             ..Default::default()
         })
         .unwrap();
@@ -590,7 +752,10 @@ mod tests {
     #[test]
     fn key_fingerprint_is_sha256_prefix_of_configured_secret() {
         let ac = AccessControl::build(&AccessControlConfig {
-            admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", "secret-token-123")), grpc: None },
+            admin: ProtocolControl {
+                http: Some(key_ctrl("x-admin-key", "secret-token-123")),
+                grpc: None,
+            },
             ..Default::default()
         })
         .unwrap();
@@ -612,28 +777,46 @@ mod tests {
     fn key_fingerprint_none_for_public_and_unconfigured() {
         // public → None
         let ac = AccessControl::build(&AccessControlConfig {
-            admin: ProtocolControl { http: Some(EndpointControl::Public), grpc: None },
+            admin: ProtocolControl {
+                http: Some(EndpointControl::Public),
+                grpc: None,
+            },
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Http), None);
+        assert_eq!(
+            ac.key_fingerprint(EndpointClass::Admin, Protocol::Http),
+            None
+        );
         // 未配置 → None
         let ac = AccessControl::default();
-        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Http), None);
+        assert_eq!(
+            ac.key_fingerprint(EndpointClass::Admin, Protocol::Http),
+            None
+        );
         // key 只配在 http 轴时 grpc 轴 → None
         let ac = AccessControl::build(&AccessControlConfig {
-            admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", "tok")), grpc: None },
+            admin: ProtocolControl {
+                http: Some(key_ctrl("x-admin-key", "tok")),
+                grpc: None,
+            },
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Grpc), None);
+        assert_eq!(
+            ac.key_fingerprint(EndpointClass::Admin, Protocol::Grpc),
+            None
+        );
     }
 
     #[test]
     fn key_fingerprint_distinguishes_rotated_keys() {
         let build = |secret: &str| {
             AccessControl::build(&AccessControlConfig {
-                admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", secret)), grpc: None },
+                admin: ProtocolControl {
+                    http: Some(key_ctrl("x-admin-key", secret)),
+                    grpc: None,
+                },
                 ..Default::default()
             })
             .unwrap()
@@ -654,13 +837,20 @@ mod tests {
     // 无 loopback 豁免(配了就要 key),由 openai_compact::mount 独家挂载。
 
     fn gate_ctrl(header: &str, secret: &str) -> EndpointControl {
-        EndpointControl::Key { key: header.to_string(), value: Some(secret.to_string()), value_env: None, value_file: None }
+        EndpointControl::Key {
+            key: header.to_string(),
+            value: Some(secret.to_string()),
+            value_env: None,
+            value_file: None,
+        }
     }
 
     #[test]
     fn openai_gate_unconfigured_and_public_build_to_none() {
         assert!(OpenaiAuthGate::build(None).unwrap().is_none());
-        assert!(OpenaiAuthGate::build(Some(&EndpointControl::Public)).unwrap().is_none());
+        assert!(OpenaiAuthGate::build(Some(&EndpointControl::Public))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -718,7 +908,10 @@ mod tests {
             value_env: None,
             value_file: None,
         };
-        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "无 secret 源必须 fail-fast");
+        assert!(
+            OpenaiAuthGate::build(Some(&ctrl)).is_err(),
+            "无 secret 源必须 fail-fast"
+        );
     }
 
     #[test]
@@ -729,7 +922,10 @@ mod tests {
             value_env: Some("OAI_GATE_DEFINITELY_UNSET".to_string()),
             value_file: None,
         };
-        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "value_env 未设必须 fail-fast");
+        assert!(
+            OpenaiAuthGate::build(Some(&ctrl)).is_err(),
+            "value_env 未设必须 fail-fast"
+        );
     }
 
     #[test]
@@ -740,6 +936,9 @@ mod tests {
             value_env: None,
             value_file: None,
         };
-        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "空 header 名必须 fail-fast");
+        assert!(
+            OpenaiAuthGate::build(Some(&ctrl)).is_err(),
+            "空 header 名必须 fail-fast"
+        );
     }
 }

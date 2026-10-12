@@ -50,8 +50,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static TLS_VERSIONS_12_UP: &[&rustls::SupportedProtocolVersion] =
     &[&rustls::version::TLS12, &rustls::version::TLS13];
-static TLS_VERSIONS_13_ONLY: &[&rustls::SupportedProtocolVersion] =
-    &[&rustls::version::TLS13];
+static TLS_VERSIONS_13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Atomic (hash + config) pair so a rotation never exposes a mismatched view.
 struct TlsState {
@@ -196,7 +195,10 @@ fn build_server_config(
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &pem.cert[..])
         .collect::<Result<_, _>>()
         .map_err(|e| {
-            AppError::Config(format!("failed to parse TLS certificate {}: {}", settings.cert_path, e))
+            AppError::Config(format!(
+                "failed to parse TLS certificate {}: {}",
+                settings.cert_path, e
+            ))
         })?;
     if certs.is_empty() {
         return Err(AppError::Config(format!(
@@ -206,7 +208,10 @@ fn build_server_config(
     }
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &pem.key[..])
         .map_err(|e| {
-            AppError::Config(format!("failed to parse TLS private key {}: {}", settings.key_path, e))
+            AppError::Config(format!(
+                "failed to parse TLS private key {}: {}",
+                settings.key_path, e
+            ))
         })?
         .ok_or_else(|| {
             AppError::Config(format!(
@@ -219,9 +224,10 @@ fn build_server_config(
         "1.3" => TLS_VERSIONS_13_ONLY,
         _ => TLS_VERSIONS_12_UP, // values gated by Config::validate
     };
-    let builder = ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-        .with_protocol_versions(versions)
-        .map_err(|e| AppError::Config(format!("TLS protocol version setup failed: {}", e)))?;
+    let builder =
+        ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(versions)
+            .map_err(|e| AppError::Config(format!("TLS protocol version setup failed: {}", e)))?;
 
     let builder = match &pem.ca {
         Some(ca_pem) => {
@@ -489,7 +495,9 @@ where
         // D7: refuse over-cap connections at accept (no channel to answer on
         // before the connection exists).
         if self.max_connections > 0
-            && self.open_connections.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .open_connections
+                .load(std::sync::atomic::Ordering::Acquire)
                 >= self.max_connections
         {
             return Box::pin(async {
@@ -524,16 +532,16 @@ where
         };
         Box::pin(async move {
             let _permit = permit; // held for the handshake duration
-            let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
-            {
-                Ok(res) => res?,
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "TLS handshake timed out",
-                    ))
-                }
-            };
+            let tls =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TLS handshake timed out",
+                        ))
+                    }
+                };
             let principal = tls
                 .get_ref()
                 .1
@@ -543,7 +551,13 @@ where
             // Handshake succeeded: CountedTlsStream owns the decrement from
             // here (its Drop), so the guard must stand down.
             guard.disarm();
-            Ok((CountedTlsStream::new(tls, open_connections), InjectPrincipal { inner: service, principal }))
+            Ok((
+                CountedTlsStream::new(tls, open_connections),
+                InjectPrincipal {
+                    inner: service,
+                    principal,
+                },
+            ))
         })
     }
 }
@@ -635,9 +649,17 @@ pub fn tls_incoming(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let _permit = permit; // released when the task ends
-                let result = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                let result = match tokio::time::timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    acceptor.accept(stream),
+                )
+                .await
+                {
                     Ok(res) => res,
-                    Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    )),
                 };
                 match result {
                     Ok(tls) => {
@@ -674,7 +696,10 @@ pub fn spawn_cert_reloader(
         {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::warn!("failed to install SIGHUP handler; TLS reload is poll-only: {}", e);
+                tracing::warn!(
+                    "failed to install SIGHUP handler; TLS reload is poll-only: {}",
+                    e
+                );
                 None
             }
         };
@@ -743,8 +768,7 @@ mod tests {
         }
 
         fn sign_server(&self) -> (String, String) {
-            let mut params =
-                rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
             params.subject_alt_names = vec![
                 rcgen::SanType::DnsName("localhost".try_into().unwrap()),
                 rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -759,7 +783,9 @@ mod tests {
             let mut params = rcgen::CertificateParams::default();
             params.subject_alt_names = sans;
             if let Some(cn) = cn {
-                params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+                params
+                    .distinguished_name
+                    .push(rcgen::DnType::CommonName, cn);
             }
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
             let key = rcgen::KeyPair::generate().unwrap();
@@ -837,11 +863,12 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let builder =
-            rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-                .with_protocol_versions(versions)
-                .unwrap()
-                .with_root_certificates(roots);
+        let builder = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(versions)
+        .unwrap()
+        .with_root_certificates(roots);
         match client {
             Some((cert_pem, key_pem)) => {
                 let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
@@ -875,7 +902,10 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
         let client_stream = TcpStream::connect(addr).await.unwrap();
         let client_result = connector
-            .connect(ServerName::try_from(server_name.to_string()).unwrap(), client_stream)
+            .connect(
+                ServerName::try_from(server_name.to_string()).unwrap(),
+                client_stream,
+            )
             .await;
         let server_result = server_task.await.unwrap();
         (server_result, client_result)
@@ -885,18 +915,29 @@ mod tests {
     fn server_cert_seen_by_client(
         tls: &tokio_rustls::client::TlsStream<TcpStream>,
     ) -> Option<CertificateDer<'static>> {
-        tls.get_ref().1.peer_certificates().and_then(|c| c.first()).cloned()
+        tls.get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .cloned()
     }
 
     /// The certificate the *client* presented, as seen by the server (mTLS).
     fn client_cert_seen_by_server(
         tls: &tokio_rustls::server::TlsStream<TcpStream>,
     ) -> Option<CertificateDer<'static>> {
-        tls.get_ref().1.peer_certificates().and_then(|c| c.first()).cloned()
+        tls.get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .cloned()
     }
 
     fn pem_first_der(pem: &str) -> CertificateDer<'static> {
-        rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap()
+        rustls_pemfile::certs(&mut pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
     }
 
     // ----- store load validation -----
@@ -952,7 +993,10 @@ mod tests {
         let server = server.expect("server handshake");
         let client = client.expect("client handshake");
         assert_eq!(client.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
-        assert!(client_cert_seen_by_server(&server).is_none(), "one-way TLS has no client cert");
+        assert!(
+            client_cert_seen_by_server(&server).is_none(),
+            "one-way TLS has no client cert"
+        );
     }
 
     #[tokio::test]
@@ -964,7 +1008,10 @@ mod tests {
         let (server, client) = run_handshake(store, cfg, "localhost").await;
         server.expect("server handshake");
         let client = client.expect("client handshake");
-        assert_eq!(client.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+        assert_eq!(
+            client.get_ref().1.alpn_protocol(),
+            Some(b"http/1.1".as_slice())
+        );
     }
 
     #[tokio::test]
@@ -975,8 +1022,12 @@ mod tests {
             vec![rcgen::SanType::URI("spiffe://ns/svc".try_into().unwrap())],
             None,
         );
-        let (server, client) =
-            run_handshake(store, client_config(&pki, Some(client_cert.clone())), "localhost").await;
+        let (server, client) = run_handshake(
+            store,
+            client_config(&pki, Some(client_cert.clone())),
+            "localhost",
+        )
+        .await;
         let server = server.expect("server handshake");
         client.expect("client handshake");
         let peer = client_cert_seen_by_server(&server).expect("client cert must be presented");
@@ -989,7 +1040,10 @@ mod tests {
         let pki = TestPki::new("ca");
         let (store, _dir) = store_for(&pki, TlsProtocol::Grpc, true, "mtlsno");
         let (server, _client) = run_handshake(store, client_config(&pki, None), "localhost").await;
-        assert!(server.is_err(), "server must abort when the client sends no certificate");
+        assert!(
+            server.is_err(),
+            "server must abort when the client sends no certificate"
+        );
     }
 
     #[tokio::test]
@@ -1003,9 +1057,16 @@ mod tests {
         );
         // Client trusts our CA (so it completes its side), but presents a cert
         // signed by a foreign CA → server must reject.
-        let (server, _client) =
-            run_handshake(store, client_config(&pki, Some(foreign_client)), "localhost").await;
-        assert!(server.is_err(), "server must reject a client cert from an unknown CA");
+        let (server, _client) = run_handshake(
+            store,
+            client_config(&pki, Some(foreign_client)),
+            "localhost",
+        )
+        .await;
+        assert!(
+            server.is_err(),
+            "server must reject a client cert from an unknown CA"
+        );
     }
 
     #[tokio::test]
@@ -1022,7 +1083,10 @@ mod tests {
         // TLS 1.2-only client → version alert.
         let cfg12 = client_config_versions(&pki, None, &[&rustls::version::TLS12]);
         let (server, _c) = run_handshake(store.clone(), cfg12, "localhost").await;
-        assert!(server.is_err(), "TLS 1.2 client must be rejected by a 1.3-only server");
+        assert!(
+            server.is_err(),
+            "TLS 1.2 client must be rejected by a 1.3-only server"
+        );
 
         // TLS 1.3 client → ok.
         let cfg13 = client_config_versions(&pki, None, &[&rustls::version::TLS13]);
@@ -1043,21 +1107,32 @@ mod tests {
             ],
             Some("cn-client"),
         );
-        assert_eq!(principal_from_cert(&pem_first_der(&cert_pem)), "spiffe://ns/svc");
+        assert_eq!(
+            principal_from_cert(&pem_first_der(&cert_pem)),
+            "spiffe://ns/svc"
+        );
     }
 
     #[test]
     fn principal_falls_back_to_dns_san_then_dn() {
         let pki = TestPki::new("ca");
         let (dns_cert, _) = pki.sign_client(
-            vec![rcgen::SanType::DnsName("client.example".try_into().unwrap())],
+            vec![rcgen::SanType::DnsName(
+                "client.example".try_into().unwrap(),
+            )],
             Some("cn-client"),
         );
-        assert_eq!(principal_from_cert(&pem_first_der(&dns_cert)), "client.example");
+        assert_eq!(
+            principal_from_cert(&pem_first_der(&dns_cert)),
+            "client.example"
+        );
 
         let (dn_cert, _) = pki.sign_client(vec![], Some("dn-client"));
         let principal = principal_from_cert(&pem_first_der(&dn_cert));
-        assert!(principal.contains("CN=dn-client"), "DN principal: {principal}");
+        assert!(
+            principal.contains("CN=dn-client"),
+            "DN principal: {principal}"
+        );
     }
 
     // ----- hot rotation -----
@@ -1069,12 +1144,15 @@ mod tests {
         let (cert1_pem, key1_pem) = pki.sign_server();
         let cert = write_file(&dir, "server.crt", &cert1_pem);
         let key = write_file(&dir, "server.key", &key1_pem);
-        let store = Arc::new(TlsConfigStore::load(&settings(&cert, &key, None), TlsProtocol::Http).unwrap());
+        let store = Arc::new(
+            TlsConfigStore::load(&settings(&cert, &key, None), TlsProtocol::Http).unwrap(),
+        );
 
         // Unchanged files → no-op.
         assert!(!store.reload().unwrap());
 
-        let (_, client) = run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
+        let (_, client) =
+            run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
         assert_eq!(
             server_cert_seen_by_client(&client.unwrap()),
             Some(pem_first_der(&cert1_pem)),
@@ -1087,7 +1165,8 @@ mod tests {
         std::fs::write(&key, &key2_pem).unwrap();
         assert!(store.reload().unwrap(), "changed files must rotate");
 
-        let (_, client) = run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
+        let (_, client) =
+            run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
         assert_eq!(
             server_cert_seen_by_client(&client.unwrap()),
             Some(pem_first_der(&cert2_pem)),
@@ -1102,7 +1181,9 @@ mod tests {
         let (cert_pem, key_pem) = pki.sign_server();
         let cert = write_file(&dir, "server.crt", &cert_pem);
         let key = write_file(&dir, "server.key", &key_pem);
-        let store = Arc::new(TlsConfigStore::load(&settings(&cert, &key, None), TlsProtocol::Http).unwrap());
+        let store = Arc::new(
+            TlsConfigStore::load(&settings(&cert, &key, None), TlsProtocol::Http).unwrap(),
+        );
 
         // Corrupt the cert file mid-rotation → reload errors, old cert serves.
         std::fs::write(&cert, "garbage").unwrap();
@@ -1133,7 +1214,10 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let client_task = tokio::spawn(async move {
             connector
-                .connect(ServerName::try_from("localhost".to_string()).unwrap(), client)
+                .connect(
+                    ServerName::try_from("localhost".to_string()).unwrap(),
+                    client,
+                )
                 .await
         });
         let server_tls = incoming
@@ -1186,7 +1270,9 @@ mod tests {
         let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "rn1");
         let acceptor = RotatingTlsAcceptor::with_handshake_limit(store, 1);
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (s1, _) = listener.accept().await.unwrap();
@@ -1210,7 +1296,9 @@ mod tests {
         };
         assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
         assert!(
-            refused.to_string().contains("too many concurrent TLS handshakes"),
+            refused
+                .to_string()
+                .contains("too many concurrent TLS handshakes"),
             "unexpected refusal: {refused}"
         );
         drop(first);
@@ -1233,7 +1321,9 @@ mod tests {
         let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-gate");
         let acceptor = RotatingTlsAcceptor::with_handshake_limit(store, 1);
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (s1, _) = listener.accept().await.unwrap();
@@ -1273,7 +1363,9 @@ mod tests {
         let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-fail");
         let acceptor = RotatingTlsAcceptor::new(store);
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
@@ -1303,7 +1395,9 @@ mod tests {
         let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-timeout");
         let acceptor = RotatingTlsAcceptor::new(store);
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         // Client connects but never speaks TLS; paused time auto-advances to
         // the TLS_HANDSHAKE_TIMEOUT timer once the runtime idles.

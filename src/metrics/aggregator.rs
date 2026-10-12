@@ -163,13 +163,18 @@ impl TimelineAggregator {
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         self.max_points.store(max_points, Relaxed);
-        self.sample_interval_secs.store(sample_interval_secs, Relaxed);
+        self.sample_interval_secs
+            .store(sample_interval_secs, Relaxed);
         self.p99_max_samples.store(p99_max_samples, Relaxed);
-        self.p99_max_age_secs.store(p99_max_age_secs.to_bits(), Relaxed);
+        self.p99_max_age_secs
+            .store(p99_max_age_secs.to_bits(), Relaxed);
     }
 
     fn p99_max_age(&self) -> f64 {
-        f64::from_bits(self.p99_max_age_secs.load(std::sync::atomic::Ordering::Relaxed))
+        f64::from_bits(
+            self.p99_max_age_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// M3: retention window covered by the ring buffer, in seconds
@@ -275,7 +280,9 @@ impl TimelineAggregator {
         let now = now_secs();
 
         // Throttle to the configured sample interval (0 = no throttle).
-        let interval = self.sample_interval_secs.load(std::sync::atomic::Ordering::Relaxed);
+        let interval = self
+            .sample_interval_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
         {
             let last_map = self.last_sample.lock().await;
             if let Some(ts) = last_map.get(&key) {
@@ -308,8 +315,10 @@ impl TimelineAggregator {
         // 基数不符 panic,须遍历子序列过滤)。
         let active_streams = read_active_streams(families, model, version);
 
-        let in_flight = read_gauge(&super::prometheus::IN_FLIGHT_REQUESTS, &[model, version]) as i64;
-        let worker_saturation = read_gauge(&super::prometheus::WORKER_SATURATION, &[model, version]);
+        let in_flight =
+            read_gauge(&super::prometheus::IN_FLIGHT_REQUESTS, &[model, version]) as i64;
+        let worker_saturation =
+            read_gauge(&super::prometheus::WORKER_SATURATION, &[model, version]);
         let rss_mb = round(
             super::prometheus::WORKERS_RSS_BYTES
                 .with_label_values(&[model, version])
@@ -317,15 +326,33 @@ impl TimelineAggregator {
                 / 1_048_576.0,
             1,
         );
-        let ttft_p99_ms = histogram_p99_ms(families, "liteserver_streaming_ttft_seconds", model, version);
-        let tbt_p99_ms = histogram_p99_ms(families, "liteserver_streaming_tbt_seconds", model, version);
+        let ttft_p99_ms = histogram_p99_ms(
+            families,
+            "liteserver_streaming_ttft_seconds",
+            model,
+            version,
+        );
+        let tbt_p99_ms =
+            histogram_p99_ms(families, "liteserver_streaming_tbt_seconds", model, version);
 
-        let stream_bytes =
-            counter_family_sum(families, "liteserver_stream_output_bytes_total", model, version)
-                .unwrap_or(0.0);
-        let tokens = counter_family_sum(families, "lite_server_tokens_generated_total", model, version);
+        let stream_bytes = counter_family_sum(
+            families,
+            "liteserver_stream_output_bytes_total",
+            model,
+            version,
+        )
+        .unwrap_or(0.0);
+        let tokens = counter_family_sum(
+            families,
+            "lite_server_tokens_generated_total",
+            model,
+            version,
+        );
         let retries = read_counter(&super::prometheus::RETRIES_TOTAL, &[model, version]);
-        let ejections = read_counter(&super::prometheus::WORKER_EJECTIONS_TOTAL, &[model, version]);
+        let ejections = read_counter(
+            &super::prometheus::WORKER_EJECTIONS_TOTAL,
+            &[model, version],
+        );
 
         let (stream_bytes_per_s, tokens_per_s, retries_per_s, ejections_per_s) = {
             let mut last = self.last_counters.lock().await;
@@ -387,10 +414,13 @@ impl TimelineAggregator {
 
         {
             let mut data = self.data.lock().await;
-            let max_points = self.max_points.load(std::sync::atomic::Ordering::Relaxed).max(1);
-            let deque = data.entry(key.clone()).or_insert_with(|| {
-                VecDeque::with_capacity(max_points)
-            });
+            let max_points = self
+                .max_points
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
+            let deque = data
+                .entry(key.clone())
+                .or_insert_with(|| VecDeque::with_capacity(max_points));
             while deque.len() >= max_points {
                 deque.pop_front();
             }
@@ -407,7 +437,11 @@ impl TimelineAggregator {
     pub async fn get_timeline(&self, model: &str, version: &str) -> Vec<TimelineEntry> {
         let key = (model.to_string(), version.to_string());
         let data = self.data.lock().await;
-        data.get(&key).cloned().unwrap_or_default().into_iter().collect()
+        data.get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
     }
 
     /// Get all known (model, version) keys.
@@ -440,14 +474,21 @@ impl TimelineAggregator {
             .collect()
     }
 
-    async fn compute_qps(&self, key: &(String, String), model: &str, version: &str, now: f64) -> f64 {
+    async fn compute_qps(
+        &self,
+        key: &(String, String),
+        model: &str,
+        version: &str,
+        now: f64,
+    ) -> f64 {
         // Sum request counts across all status families — status_family()
         // (handlers.rs) labels 2xx/3xx/4xx/5xx, and 3xx/4xx requests are real
         // throughput that must count toward QPS.
-        let current_count = read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "2xx"])
-            + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "3xx"])
-            + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "4xx"])
-            + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "5xx"]);
+        let current_count =
+            read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "2xx"])
+                + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "3xx"])
+                + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "4xx"])
+                + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "5xx"]);
 
         let mut last_counts = self.last_counts.lock().await;
         let last_count = last_counts.get(key).copied().unwrap_or(current_count);
@@ -488,7 +529,11 @@ impl TimelineAggregator {
         if deque.len() < 2 {
             return 0.0;
         }
-        let mut samples: Vec<f64> = deque.iter().map(|(_, v)| *v).filter(|v| !v.is_nan()).collect();
+        let mut samples: Vec<f64> = deque
+            .iter()
+            .map(|(_, v)| *v)
+            .filter(|v| !v.is_nan())
+            .collect();
         if samples.len() < 2 {
             return 0.0;
         }
@@ -660,8 +705,18 @@ impl VersionComparator {
             let n = snap.entries.len() as f64;
             let avg_qps = snap.entries.iter().map(|e| e.qps).sum::<f64>() / n;
             let avg_p99 = snap.entries.iter().map(|e| e.p99_ms).sum::<f64>() / n;
-            let avg_queue = snap.entries.iter().map(|e| e.queue_depth as f64).sum::<f64>() / n;
-            let avg_workers = snap.entries.iter().map(|e| e.active_workers as f64).sum::<f64>() / n;
+            let avg_queue = snap
+                .entries
+                .iter()
+                .map(|e| e.queue_depth as f64)
+                .sum::<f64>()
+                / n;
+            let avg_workers = snap
+                .entries
+                .iter()
+                .map(|e| e.active_workers as f64)
+                .sum::<f64>()
+                / n;
             versions.push(VersionMetrics {
                 version: snap.version,
                 avg_qps: round(avg_qps, 2),
@@ -929,7 +984,11 @@ mod tests {
         agg.record_latency("m", "1", 0.10);
 
         let p99 = agg.compute_p99_ms(&k("m", "1"));
-        assert!((50.0..=110.0).contains(&p99), "p99 should be around 100ms, got {}", p99);
+        assert!(
+            (50.0..=110.0).contains(&p99),
+            "p99 should be around 100ms, got {}",
+            p99
+        );
     }
 
     #[test]
@@ -1021,10 +1080,18 @@ mod tests {
         let qps0 = agg.compute_qps(&key, model, version, 100.0).await;
         assert_eq!(qps0, 0.0);
 
-        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).inc_by(100.0);
-        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "3xx"]).inc_by(5.0);
-        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).inc_by(20.0);
-        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).inc_by(10.0);
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, "2xx"])
+            .inc_by(100.0);
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, "3xx"])
+            .inc_by(5.0);
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, "4xx"])
+            .inc_by(20.0);
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, "5xx"])
+            .inc_by(10.0);
 
         // 135 requests over 1 second — 3xx/4xx included
         let qps = agg.compute_qps(&key, model, version, 101.0).await;
@@ -1046,7 +1113,10 @@ mod tests {
 
         let snapshots = agg.all_snapshots().await;
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].model, "snap_model", "model name must not be split at `_`");
+        assert_eq!(
+            snapshots[0].model, "snap_model",
+            "model name must not be split at `_`"
+        );
         assert_eq!(snapshots[0].version, "1");
     }
 
@@ -1109,9 +1179,21 @@ mod tests {
         assert!(agg.get_timeline("rm_model", "1").await.is_empty());
         assert!(!agg.latency_samples.contains_key(&k("rm_model", "1")));
         assert!(!agg.keys().await.contains(&k("rm_model", "1")));
-        assert!(!agg.last_counts.lock().await.contains_key(&k("rm_model", "1")));
-        assert!(!agg.last_check.lock().await.contains_key(&k("rm_model", "1")));
-        assert!(!agg.last_sample.lock().await.contains_key(&k("rm_model", "1")));
+        assert!(!agg
+            .last_counts
+            .lock()
+            .await
+            .contains_key(&k("rm_model", "1")));
+        assert!(!agg
+            .last_check
+            .lock()
+            .await
+            .contains_key(&k("rm_model", "1")));
+        assert!(!agg
+            .last_sample
+            .lock()
+            .await
+            .contains_key(&k("rm_model", "1")));
     }
 
     // ===== Round2 B6: configurable windows =====
@@ -1227,7 +1309,10 @@ mod tests {
         let rate = entries[1]
             .tokens_per_s
             .expect("reported tokens must yield a rate");
-        assert!(rate > 0.0, "token rate must be positive after +10, got {rate}");
+        assert!(
+            rate > 0.0,
+            "token rate must be positive after +10, got {rate}"
+        );
     }
 
     /// retries / ejections are per-second rates over the existing counters.
@@ -1446,9 +1531,17 @@ mod tests {
         let _ = prometheus::register_metrics();
         let agg = TimelineAggregator::new();
         agg.sample("m3_rm", "1").await;
-        assert!(agg.last_counters.lock().await.contains_key(&k("m3_rm", "1")));
+        assert!(agg
+            .last_counters
+            .lock()
+            .await
+            .contains_key(&k("m3_rm", "1")));
         agg.remove("m3_rm", "1").await;
-        assert!(!agg.last_counters.lock().await.contains_key(&k("m3_rm", "1")));
+        assert!(!agg
+            .last_counters
+            .lock()
+            .await
+            .contains_key(&k("m3_rm", "1")));
     }
 
     /// With an age bound configured, stale samples are evicted on record.

@@ -96,16 +96,22 @@ impl Drop for ServerGuard {
 }
 
 fn kill_stale_on_port(port: u16) {
-    let output = Command::new("lsof").args(["-ti", &format!(":{}", port)]).output();
+    let output = Command::new("lsof")
+        .args(["-ti", &format!(":{}", port)])
+        .output();
     if let Ok(out) = output {
         let pids = String::from_utf8_lossy(&out.stdout);
         for pid_str in pids.lines() {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let ps = Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output();
+                let ps = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "comm="])
+                    .output();
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -118,7 +124,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64, log_path: &std::path::Pat
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -150,7 +161,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -248,7 +264,10 @@ async fn test_audit_data_server_timeout_fallback_truncates_long_stream() {
     )));
     wait_for_server(http_port, 30, &log_path).await;
     let base = format!("http://127.0.0.1:{}", http_port);
-    assert!(wait_model_ready(&base, "slowgen", 30).await, "slowgen must load");
+    assert!(
+        wait_model_ready(&base, "slowgen", 30).await,
+        "slowgen must load"
+    );
 
     // No x-lite-timeout header: the client specified NO deadline, so per
     // 方案 C the stream must not be overall-deadline-bounded at all.
@@ -297,7 +316,12 @@ const ENS_SLOW_YAML: &str = r#"ensemble:
         text: "$request.text"
 "#;
 
-fn write_server_yaml_multi(repo: &std::path::Path, http_port: u16, extra: &str, models: &str) -> std::path::PathBuf {
+fn write_server_yaml_multi(
+    repo: &std::path::Path,
+    http_port: u16,
+    extra: &str,
+    models: &str,
+) -> std::path::PathBuf {
     let path = repo.join("server.yaml");
     std::fs::write(
         &path,
@@ -351,7 +375,10 @@ async fn test_audit_guard_client_timeout_still_truncates_stream() {
     )));
     wait_for_server(http_port, 30, &log_path).await;
     let base = format!("http://127.0.0.1:{}", http_port);
-    assert!(wait_model_ready(&base, "slowgen", 30).await, "slowgen must load");
+    assert!(
+        wait_model_ready(&base, "slowgen", 30).await,
+        "slowgen must load"
+    );
 
     let start = std::time::Instant::now();
     let body = read_sse_body(&base, "slowgen", &[("x-lite-timeout", "1")]).await;
@@ -402,7 +429,10 @@ async fn test_audit_data_ensemble_tail_stream_not_truncated_by_fallback() {
     )));
     wait_for_server(http_port, 30, &log_path).await;
     let base = format!("http://127.0.0.1:{}", http_port);
-    assert!(wait_model_ready(&base, "ensslow", 30).await, "ensslow must load");
+    assert!(
+        wait_model_ready(&base, "ensslow", 30).await,
+        "ensslow must load"
+    );
 
     let body = read_sse_body(&base, "ensslow", &[]).await;
     let chunks = body.matches("\"token\"").count();
@@ -447,7 +477,10 @@ async fn test_audit_guard_ensemble_tail_client_timeout_still_truncates() {
     )));
     wait_for_server(http_port, 30, &log_path).await;
     let base = format!("http://127.0.0.1:{}", http_port);
-    assert!(wait_model_ready(&base, "ensslow", 30).await, "ensslow must load");
+    assert!(
+        wait_model_ready(&base, "ensslow", 30).await,
+        "ensslow must load"
+    );
 
     let body = read_sse_body(&base, "ensslow", &[("x-lite-timeout", "1")]).await;
     let chunks = body.matches("\"token\"").count();

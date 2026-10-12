@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::metrics::prometheus;
@@ -6,12 +5,13 @@ use crate::proto::liteserver as pb;
 use crate::registry::types::WorkerInfo;
 use crate::sequence::SequenceRegistry;
 use crate::transport::zmq::WorkerZmqClient;
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
@@ -86,7 +86,10 @@ pub struct QueueDepthGuard {
 impl QueueDepthGuard {
     fn new(model: &str, version: &str) -> Self {
         prometheus::inc_queue_depth(model, version);
-        Self { model: model.to_string(), version: version.to_string() }
+        Self {
+            model: model.to_string(),
+            version: version.to_string(),
+        }
     }
 }
 
@@ -278,7 +281,9 @@ impl OutlierState {
     /// 指数封顶 2^20——再高也被 max 截断，且避免 Duration::mul_f64 溢出 panic。
     fn backoff(&self, series: usize) -> Duration {
         let shift = series.saturating_sub(1).min(20) as i32;
-        self.base_ejection_time.mul_f64(2f64.powi(shift)).min(self.max_ejection_time)
+        self.base_ejection_time
+            .mul_f64(2f64.powi(shift))
+            .min(self.max_ejection_time)
     }
 
     /// Record a successful request — reset consecutive error count. A success
@@ -378,11 +383,11 @@ impl OutlierState {
         // Cross-slot gate AFTER the per-slot flag, rolled back on refusal: the
         // fetch_update is the single atomic decision point, so concurrent
         // claims on different slots cannot both win the ticket.
-        let ticket = self.recycling_claims.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |c| (c < self.max_recycling).then_some(c + 1),
-        );
+        let ticket = self
+            .recycling_claims
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                (c < self.max_recycling).then_some(c + 1)
+            });
         if ticket.is_err() {
             w.recycling.store(false, Ordering::Relaxed);
             return false;
@@ -426,11 +431,11 @@ impl OutlierState {
     /// never wrap the counter (that would block the recycle drain forever).
     pub fn stream_inflight_dec(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
-            let _ = w.stream_inflight.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |c| Some(c.saturating_sub(1)),
-            );
+            let _ = w
+                .stream_inflight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(1))
+                });
         }
     }
 
@@ -528,7 +533,10 @@ impl OutlierState {
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*guard, Some(ref e) if e.half_open) {
                 let series = w.ejection_series.fetch_add(1, Ordering::Relaxed) + 1;
-                *guard = Some(EjectedWorker { ejected_at: Instant::now(), half_open: false });
+                *guard = Some(EjectedWorker {
+                    ejected_at: Instant::now(),
+                    half_open: false,
+                });
                 w.consecutive_errors.store(0, Ordering::Relaxed);
                 info!(
                     "Worker {worker_idx} circuit re-opened after a failed half-open probe \
@@ -577,7 +585,10 @@ impl OutlierState {
         let max_ejected = (self.workers.len() * self.max_ejection_percent / 100).max(1);
         if ejected_count < max_ejected {
             let series = w.ejection_series.fetch_add(1, Ordering::Relaxed) + 1;
-            *guard = Some(EjectedWorker { ejected_at: Instant::now(), half_open: false });
+            *guard = Some(EjectedWorker {
+                ejected_at: Instant::now(),
+                half_open: false,
+            });
             info!(
                 "Worker {worker_idx} ejected after {} consecutive errors (series {series}, backoff {:?})",
                 self.consecutive_threshold,
@@ -605,7 +616,10 @@ impl OutlierState {
             Some(ref e) => {
                 let series = w.ejection_series.load(Ordering::Relaxed);
                 if e.ejected_at.elapsed() >= self.backoff(series) {
-                    *guard = Some(EjectedWorker { ejected_at: e.ejected_at, half_open: true });
+                    *guard = Some(EjectedWorker {
+                        ejected_at: e.ejected_at,
+                        half_open: true,
+                    });
                     w.consecutive_errors.store(0, Ordering::Relaxed);
                     false
                 } else {
@@ -768,7 +782,13 @@ impl PriorityReceiver {
             // Register interest BEFORE checking state so a push or close that
             // happens between the heap check and the await is not lost.
             let notified = self.inner.notify.notified();
-            if let Some(ord) = self.inner.heap.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            if let Some(ord) = self
+                .inner
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop()
+            {
                 return Some(ord.item);
             }
             if self.inner.senders.load(Ordering::Relaxed) == 0 {
@@ -779,7 +799,11 @@ impl PriorityReceiver {
     }
 
     fn len(&self) -> usize {
-        self.inner.heap.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -1145,10 +1169,7 @@ impl InferenceQueue {
     ) -> Result<(), QueueError> {
         let key = model_version_key(model_name, version);
         let (sender, counter) = {
-            let entry = self
-                .queues
-                .get(&key)
-                .ok_or(QueueError::NotFound)?;
+            let entry = self.queues.get(&key).ok_or(QueueError::NotFound)?;
             // B3 direct-mode (x-lite-worker-id): 提交即校验 pin——worker 不存在
             // 或已剔除 → fail-fast（HTTP 400 / gRPC InvalidArgument），不让坏 pin
             // 潜入 collector 静默改路由。校验在计数前，拒绝不占容量/指标。
@@ -1159,7 +1180,10 @@ impl InferenceQueue {
                         entry.worker_count
                     )));
                 }
-                if entry.outlier.is_ejected(w) || entry.outlier.is_dead(w) || entry.outlier.is_recycling(w) {
+                if entry.outlier.is_ejected(w)
+                    || entry.outlier.is_dead(w)
+                    || entry.outlier.is_recycling(w)
+                {
                     return Err(QueueError::InvalidWorker(format!(
                         "x-lite-worker-id {w} is ejected, dead or recycling for {model_name} {version}"
                     )));
@@ -1427,7 +1451,8 @@ fn batch_affinity(
     for item in batch {
         let meta = item.meta.as_ref();
         // P8-1 审计 B1：空串零值归一化为未携带（见 sequence::normalize_sequence_id）。
-        let seq = crate::sequence::normalize_sequence_id(meta.and_then(|m| m.sequence_id.as_deref()));
+        let seq =
+            crate::sequence::normalize_sequence_id(meta.and_then(|m| m.sequence_id.as_deref()));
         let key = seq.or_else(|| {
             meta.and_then(|m| m.headers.get("x-lite-affinity-key"))
                 .map(|s| s.as_str())
@@ -1504,7 +1529,12 @@ fn affinity_overloaded(
 ) -> bool {
     let mut min = usize::MAX;
     for (i, c) in inflight.iter().enumerate() {
-        if i == w || outlier.is_ejected(i) || outlier.is_dead(i) || outlier.is_recycling(i) || exclude.contains(&i) {
+        if i == w
+            || outlier.is_ejected(i)
+            || outlier.is_dead(i)
+            || outlier.is_recycling(i)
+            || exclude.contains(&i)
+        {
             continue;
         }
         let l = c.load(Ordering::Relaxed);
@@ -1516,9 +1546,7 @@ fn affinity_overloaded(
         return false; // no alternative live worker
     }
     let wload = inflight[w].load(Ordering::Relaxed);
-    if balance.abs_threshold > 0
-        && wload > min.saturating_add(balance.abs_threshold as usize)
-    {
+    if balance.abs_threshold > 0 && wload > min.saturating_add(balance.abs_threshold as usize) {
         return true;
     }
     if balance.rel_threshold > 0.0 && min > 0 {
@@ -1538,7 +1566,12 @@ fn power_of_two_pick(
     exclude: &[usize],
 ) -> usize {
     let live: Vec<usize> = (0..inflight.len())
-        .filter(|&i| !outlier.is_ejected(i) && !outlier.is_dead(i) && !outlier.is_recycling(i) && !exclude.contains(&i))
+        .filter(|&i| {
+            !outlier.is_ejected(i)
+                && !outlier.is_dead(i)
+                && !outlier.is_recycling(i)
+                && !exclude.contains(&i)
+        })
         .collect();
     if live.len() < 2 {
         return pick_worker_least_loaded(inflight, outlier, exclude);
@@ -1573,7 +1606,11 @@ pub(crate) fn rendezvous_pick(
     use std::hash::{Hash, Hasher};
     let mut best: Option<(u64, usize)> = None;
     for i in 0..num_workers {
-        if outlier.is_ejected(i) || outlier.is_dead(i) || outlier.is_recycling(i) || exclude.contains(&i) {
+        if outlier.is_ejected(i)
+            || outlier.is_dead(i)
+            || outlier.is_recycling(i)
+            || exclude.contains(&i)
+        {
             continue;
         }
         let mut h = DefaultHasher::new();
@@ -1977,7 +2014,11 @@ async fn do_send_batch(
         zmq_client.send(request).await
     };
     if !all_warmup {
-        prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
+        prometheus::observe_inference_duration(
+            model_name,
+            version,
+            send_start.elapsed().as_secs_f64(),
+        );
     }
 
     match result {
@@ -2021,8 +2062,8 @@ async fn do_send_batch(
                         Ok(worker_idx)
                     } else {
                         if outlier.record_error(worker_idx) {
-                    prometheus::inc_worker_ejection(model_name, version);
-                }
+                            prometheus::inc_worker_ejection(model_name, version);
+                        }
                         // Per-item responses (real errors included) were
                         // already delivered above — nothing left to retry.
                         Err(BatchError {
@@ -2034,7 +2075,8 @@ async fn do_send_batch(
                     }
                 }
                 Some(pb::response::Payload::Single(single_resp)) => {
-                    let is_error = single_resp.status.as_ref().map(|s| s.code.as_str()) == Some("Error");
+                    let is_error =
+                        single_resp.status.as_ref().map(|s| s.code.as_str()) == Some("Error");
                     if is_error && (400..500).contains(&single_resp.status_code) {
                         // Request-level error (e.g. BadRequestError) — deterministic,
                         // retrying on another worker can't help. Forward the
@@ -2049,8 +2091,8 @@ async fn do_send_batch(
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                         update_worker_saturation(model_name, version, inflight);
                         if outlier.record_error(worker_idx) {
-                    prometheus::inc_worker_ejection(model_name, version);
-                }
+                            prometheus::inc_worker_ejection(model_name, version);
+                        }
                         Err(BatchError {
                             worker_idx,
                             code: "Error".to_string(),
@@ -2065,8 +2107,8 @@ async fn do_send_batch(
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                         update_worker_saturation(model_name, version, inflight);
                         if outlier.record_error(worker_idx) {
-                    prometheus::inc_worker_ejection(model_name, version);
-                }
+                            prometheus::inc_worker_ejection(model_name, version);
+                        }
                         Err(BatchError {
                             worker_idx,
                             code: st.code,
@@ -2089,12 +2131,15 @@ async fn do_send_batch(
                     }
                 }
                 _ => {
-                    warn!("Unexpected response type from worker for {} {}", model_name, version);
+                    warn!(
+                        "Unexpected response type from worker for {} {}",
+                        model_name, version
+                    );
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                     update_worker_saturation(model_name, version, inflight);
                     if outlier.record_error(worker_idx) {
-                    prometheus::inc_worker_ejection(model_name, version);
-                }
+                        prometheus::inc_worker_ejection(model_name, version);
+                    }
                     Err(BatchError {
                         worker_idx,
                         code: "Error".to_string(),
@@ -2105,10 +2150,7 @@ async fn do_send_batch(
             }
         }
         Err(e) => {
-            error!(
-                "Batch request failed for {} {}: {}",
-                model_name, version, e
-            );
+            error!("Batch request failed for {} {}: {}", model_name, version, e);
             let (code, message) = if matches!(e, AppError::InferenceTimeout(_)) {
                 ("Timeout".to_string(), "request timeout".to_string())
             } else {
@@ -2165,7 +2207,11 @@ async fn send_batch_with_retry(
     // P2-1 扩缩指标：提交 → 首次派发（含攒批等待）采样一次；重试不重复采样。
     if !all_warmup {
         for item in &batch {
-            prometheus::observe_queue_wait(model_name, version, item.enqueued_at.elapsed().as_secs_f64());
+            prometheus::observe_queue_wait(
+                model_name,
+                version,
+                item.enqueued_at.elapsed().as_secs_f64(),
+            );
         }
     }
 
@@ -2325,10 +2371,8 @@ async fn recycle_worker(
         if dispatch.outlier.stream_inflight(worker_idx) > 0
             && dispatch.recycle_stream_grace > Duration::ZERO
         {
-            dispatch.zmq_clients[worker_idx].graceful_cancel_all(
-                "recycle",
-                dispatch.recycle_stream_grace.as_millis() as u32,
-            );
+            dispatch.zmq_clients[worker_idx]
+                .graceful_cancel_all("recycle", dispatch.recycle_stream_grace.as_millis() as u32);
             let grace_wait = async {
                 while dispatch.outlier.stream_inflight(worker_idx) > 0 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2351,7 +2395,8 @@ async fn recycle_worker(
             // bounded terminal Error frame (worker-side generators die with the
             // graceful stop that follows). Idempotent when the worker already
             // died (routes are gone).
-            dispatch.zmq_clients[worker_idx].fail_all("worker recycling: evicting in-flight streams");
+            dispatch.zmq_clients[worker_idx]
+                .fail_all("worker recycling: evicting in-flight streams");
         }
     }
     let Some(tx) = &dispatch.respawn_tx else {
@@ -2432,24 +2477,28 @@ async fn batch_collector(
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
         while let Some(mut item) = rx.recv().await {
-            item.queue_depth_guard =
-                Some(QueueDepthGuard::new(&dispatch.model_name, &dispatch.version));
-            let Some(item) = check_queue_timeout(
-                item,
-                queue_timeout,
-                queue_timeout_action,
-            ) else {
+            item.queue_depth_guard = Some(QueueDepthGuard::new(
+                &dispatch.model_name,
+                &dispatch.version,
+            ));
+            let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
                 continue;
             };
-            let Some(item) = drop_if_waiter_gone(item)
-            else {
+            let Some(item) = drop_if_waiter_gone(item) else {
                 continue;
             };
             let batch = vec![item];
             let dispatch = dispatch.clone();
             let worker_inflight = worker_inflight.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
+                send_batch_with_retry(
+                    batch,
+                    &dispatch,
+                    &worker_inflight,
+                    request_timeout,
+                    max_retries,
+                )
+                .await;
             });
         }
         return;
@@ -2548,7 +2597,14 @@ async fn batch_collector(
         let dispatch = dispatch.clone();
         let worker_inflight = worker_inflight.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, max_retries).await;
+            send_batch_with_retry(
+                current_batch,
+                &dispatch,
+                &worker_inflight,
+                request_timeout,
+                max_retries,
+            )
+            .await;
         });
     }
 }
@@ -2706,13 +2762,15 @@ async fn escalate_to_kill(
         kill_threshold,
         "Health probe failures reached kill threshold, respawning worker"
     );
-    let _ = tx.send(RespawnSignal {
-        model_name: model_name.to_string(),
-        version: version.to_string(),
-        worker_id: idx as u32,
-        reason: "health_check",
-        graceful: false,
-    }).await;
+    let _ = tx
+        .send(RespawnSignal {
+            model_name: model_name.to_string(),
+            version: version.to_string(),
+            worker_id: idx as u32,
+            reason: "health_check",
+            graceful: false,
+        })
+        .await;
     outlier.record_kill(idx);
     // Throttle re-sends while the respawn is in flight: the replacement must
     // accumulate kill_threshold fresh failures before the next escalation.
@@ -2738,7 +2796,10 @@ mod tests {
         for _ in 0..EjectionConfig::default().error_threshold {
             outlier.record_error(idx);
         }
-        assert!(outlier.is_ejected(idx), "test setup: worker {idx} should be ejected");
+        assert!(
+            outlier.is_ejected(idx),
+            "test setup: worker {idx} should be ejected"
+        );
     }
 
     /// Acceptance #1: with no `sequence_id`, `pick_worker` is byte-identical to
@@ -2752,7 +2813,10 @@ mod tests {
         for exclude in [vec![], vec![3usize], vec![1usize, 2]] {
             let got = pick_worker(&inflight, &outlier, &exclude, None, bal);
             let want = pick_worker_least_loaded(&inflight, &outlier, &exclude);
-            assert_eq!(got, want, "non-affinity must match least-loaded (exclude={exclude:?})");
+            assert_eq!(
+                got, want,
+                "non-affinity must match least-loaded (exclude={exclude:?})"
+            );
         }
         // with one ejected worker too
         let outlier2 = OutlierState::new(4);
@@ -2785,7 +2849,10 @@ mod tests {
             &inflight,
             &outlier,
             &[],
-            Some(Affinity { seq: "s1".to_string(), preferred: Some(1) }),
+            Some(Affinity {
+                seq: "s1".to_string(),
+                preferred: Some(1),
+            }),
             bal,
         );
         assert_ne!(chosen, 1, "must not route to an ejected preferred worker");
@@ -2794,7 +2861,10 @@ mod tests {
             &inflight,
             &outlier,
             &[],
-            Some(Affinity { seq: "s1".to_string(), preferred: Some(1) }),
+            Some(Affinity {
+                seq: "s1".to_string(),
+                preferred: Some(1),
+            }),
             bal,
         );
         assert_eq!(chosen, chosen2);
@@ -2813,10 +2883,16 @@ mod tests {
             &inflight,
             &outlier,
             &[],
-            Some(Affinity { seq: "s1".to_string(), preferred: Some(0) }),
+            Some(Affinity {
+                seq: "s1".to_string(),
+                preferred: Some(0),
+            }),
             bal,
         );
-        assert_ne!(chosen, 0, "an overloaded preferred worker must be abandoned");
+        assert_ne!(
+            chosen, 0,
+            "an overloaded preferred worker must be abandoned"
+        );
         assert!(chosen == 1 || chosen == 2);
     }
 
@@ -2868,11 +2944,16 @@ mod tests {
     #[test]
     fn batch_affinity_uses_affinity_key_when_no_sequence_id() {
         let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
-        let batch =
-            vec![hint_item("a", meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]))];
+        let batch = vec![hint_item(
+            "a",
+            meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]),
+        )];
         let aff = batch_affinity(&batch, &reg, "m", "1").expect("affinity from header key");
         assert_eq!(aff.seq, "tenant-42");
-        assert_eq!(aff.preferred, None, "affinity_key 无注册表跟踪 → 纯内容哈希路由");
+        assert_eq!(
+            aff.preferred, None,
+            "affinity_key 无注册表跟踪 → 纯内容哈希路由"
+        );
     }
 
     #[test]
@@ -2898,18 +2979,26 @@ mod tests {
         let inflight = mk_inflight(&[0; 4]);
         let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
         let pick = |uid: &str| {
-            let batch =
-                vec![hint_item(uid, meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]))];
+            let batch = vec![hint_item(
+                uid,
+                meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]),
+            )];
             let aff = batch_affinity(&batch, &reg, "m", "1");
             pick_worker(&inflight, &outlier, &[], aff, BalanceConfig::default())
         };
-        assert_eq!(pick("a"), pick("b"), "同一 affinity_key → 同一 worker（无状态确定性）");
+        assert_eq!(
+            pick("a"),
+            pick("b"),
+            "同一 affinity_key → 同一 worker（无状态确定性）"
+        );
     }
 
     #[test]
     fn batch_direct_pin_requires_unanimous() {
-        let single =
-            vec![hint_item("a", meta_with_headers(&[("x-lite-worker-id", "1")]))];
+        let single = vec![hint_item(
+            "a",
+            meta_with_headers(&[("x-lite-worker-id", "1")]),
+        )];
         assert_eq!(batch_direct_pin(&single), Some(1));
 
         let conflict = vec![
@@ -3021,7 +3110,10 @@ mod tests {
 
         let item = hint_item("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
         let err = queue.try_submit("m", "1", item).unwrap_err();
-        assert!(matches!(err, QueueError::InvalidWorker(_)), "pin 已剔除 worker → InvalidWorker");
+        assert!(
+            matches!(err, QueueError::InvalidWorker(_)),
+            "pin 已剔除 worker → InvalidWorker"
+        );
 
         // pin 健康 worker 仍放行。
         let ok = hint_item("ok", meta_with_headers(&[("x-lite-worker-id", "0")]));
@@ -3032,8 +3124,10 @@ mod tests {
     async fn dispatch_honors_direct_worker_pin() {
         let (queue, _outlier) = two_worker_queue("pin-dispatch").await;
         for (pin, want) in [(1u32, b"w1".as_slice()), (0, b"w0".as_slice())] {
-            let (item, rx) =
-                hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", &pin.to_string())]));
+            let (item, rx) = hint_item_rx(
+                "p",
+                meta_with_headers(&[("x-lite-worker-id", &pin.to_string())]),
+            );
             queue.try_submit("m", "1", item).unwrap();
             let resp = tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
@@ -3127,9 +3221,7 @@ mod tests {
                 rec.lock().unwrap().push(req.uid.clone());
                 let resp = pb::Response {
                     uid: req.uid,
-                    payload: Some(pb::response::Payload::Single(
-                        pb::SingleResponse::default(),
-                    )),
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse::default())),
                     ..Default::default()
                 };
                 if s.send(resp.encode_to_vec(), 0).is_err() {
@@ -3139,7 +3231,6 @@ mod tests {
         });
         received
     }
-
 
     #[test]
     fn model_version_key_format() {
@@ -3153,16 +3244,22 @@ mod tests {
         // Test roundtrip with underscores in both name and version
         let test_cases = vec![
             ("simple", "1"),
-            ("bert_base_2024", "03_v1"),   // underscored model & version
-            ("my-model", "1.0.0-beta"),    // semver-style version
+            ("bert_base_2024", "03_v1"), // underscored model & version
+            ("my-model", "1.0.0-beta"),  // semver-style version
         ];
         for (model, version) in test_cases {
             let key = model_version_key(model, version);
             let (parsed_model, parsed_version) = parse_model_version_key(&key);
-            assert_eq!(parsed_model, model,
-                "model_name roundtrip failed for '{}_{}'", model, version);
-            assert_eq!(parsed_version, version,
-                "version roundtrip failed for '{}_{}'", model, version);
+            assert_eq!(
+                parsed_model, model,
+                "model_name roundtrip failed for '{}_{}'",
+                model, version
+            );
+            assert_eq!(
+                parsed_version, version,
+                "version roundtrip failed for '{}_{}'",
+                model, version
+            );
         }
     }
 
@@ -3199,7 +3296,11 @@ mod tests {
         let base = Duration::from_millis(50);
         let min = Duration::from_millis(1);
         let result = compute_adaptive_timeout(8, 0, 8, base, min, 10);
-        assert_eq!(result, Duration::ZERO, "full batch should dispatch immediately");
+        assert_eq!(
+            result,
+            Duration::ZERO,
+            "full batch should dispatch immediately"
+        );
     }
 
     #[test]
@@ -3208,9 +3309,15 @@ mod tests {
         let min = Duration::from_millis(1);
         // Empty batch, no queue -> should use ~full timeout
         let result = compute_adaptive_timeout(0, 0, 8, base, min, 10);
-        assert!(result >= Duration::from_millis(49), "low load should use near-full timeout");
+        assert!(
+            result >= Duration::from_millis(49),
+            "low load should use near-full timeout"
+        );
         // Allow tiny floating-point drift from mul_f32
-        assert!(result <= base + Duration::from_micros(1), "should never exceed base timeout");
+        assert!(
+            result <= base + Duration::from_micros(1),
+            "should never exceed base timeout"
+        );
     }
 
     #[test]
@@ -3240,7 +3347,10 @@ mod tests {
         let result = compute_adaptive_timeout(7, 100, 8, base, min, 10);
         assert!(result >= min, "should never go below min_timeout");
         // At extreme pressure result should be close to min but not clamped unless scaled < min
-        assert!(result < base / 2, "extreme pressure should significantly reduce timeout");
+        assert!(
+            result < base / 2,
+            "extreme pressure should significantly reduce timeout"
+        );
     }
 
     #[test]
@@ -3279,17 +3389,33 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
-        let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
+        let first_handle = queue
+            .queues
+            .get(&model_version_key("test_model", "1"))
+            .unwrap()
+            .collector
+            .clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
-        let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
+        let second_handle = queue
+            .queues
+            .get(&model_version_key("test_model", "1"))
+            .unwrap()
+            .collector
+            .clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(first_handle.is_finished(), "old collector should be aborted");
-        assert!(!second_handle.is_finished(), "new collector should still be running");
+        assert!(
+            first_handle.is_finished(),
+            "old collector should be aborted"
+        );
+        assert!(
+            !second_handle.is_finished(),
+            "new collector should still be running"
+        );
     }
 
     // ===== Graceful drain tests (§4.2) =====
@@ -3300,7 +3426,11 @@ mod tests {
             format!(
                 "ipc://{}",
                 std::env::temp_dir()
-                    .join(format!("lite-server-dq-{}-{}.sock", name, std::process::id()))
+                    .join(format!(
+                        "lite-server-dq-{}-{}.sock",
+                        name,
+                        std::process::id()
+                    ))
                     .display()
             )
         }
@@ -3365,32 +3495,40 @@ mod tests {
         // Submit a request; the echo worker holds it ~300ms.
         let (resp_tx, resp_rx) = oneshot::channel();
         queue
-            .try_submit("m", "1", QueueItem {
-                uid: "inflight".to_string(),
-                data: Bytes::new(),
-                meta: None,
-                response_tx: resp_tx,
-                inflight_guard: None,
-                enqueued_at: Instant::now(),
-                is_warmup: false,
-                queue_depth_guard: None,
-            })
+            .try_submit(
+                "m",
+                "1",
+                QueueItem {
+                    uid: "inflight".to_string(),
+                    data: Bytes::new(),
+                    meta: None,
+                    response_tx: resp_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup: false,
+                    queue_depth_guard: None,
+                },
+            )
             .unwrap();
 
         // Drain: new submissions are rejected immediately...
         let drain = queue.begin_drain("m", "1").expect("queue must exist");
         let (late_tx, _late_rx) = oneshot::channel();
         let err = queue
-            .try_submit("m", "1", QueueItem {
-                uid: "late".to_string(),
-                data: Bytes::new(),
-                meta: None,
-                response_tx: late_tx,
-                inflight_guard: None,
-                enqueued_at: Instant::now(),
-                is_warmup: false,
-                queue_depth_guard: None,
-            })
+            .try_submit(
+                "m",
+                "1",
+                QueueItem {
+                    uid: "late".to_string(),
+                    data: Bytes::new(),
+                    meta: None,
+                    response_tx: late_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup: false,
+                    queue_depth_guard: None,
+                },
+            )
             .unwrap_err();
         assert!(matches!(err, QueueError::NotFound));
 
@@ -3402,7 +3540,10 @@ mod tests {
             .await
             .expect("response must arrive promptly after drain")
             .expect("in-flight response channel must not be dropped");
-        assert!(matches!(resp.payload, Some(pb::response::Payload::Single(_))));
+        assert!(matches!(
+            resp.payload,
+            Some(pb::response::Payload::Single(_))
+        ));
         drain.abort();
     }
 
@@ -3448,14 +3589,24 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], outlier, None);
-        let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
+        let handle = queue
+            .queues
+            .get(&model_version_key("test_model", "1"))
+            .unwrap()
+            .collector
+            .clone();
         assert!(!handle.is_finished());
 
-        let drain = queue.begin_drain("test_model", "1").expect("queue must exist");
+        let drain = queue
+            .begin_drain("test_model", "1")
+            .expect("queue must exist");
         drain.abort();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(handle.is_finished(), "collector should be aborted after drain abort");
+        assert!(
+            handle.is_finished(),
+            "collector should be aborted after drain abort"
+        );
     }
 
     // ===== Phase 1: Bytes-based zero-copy tests =====
@@ -3470,15 +3621,18 @@ mod tests {
             data: data.clone(),
             meta: None,
             response_tx: tx,
-                  inflight_guard: None,
-                enqueued_at: Instant::now(),
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
             is_warmup: false,
             queue_depth_guard: None,
         };
         // Bytes::clone shares the same underlying buffer
         let cloned_data = item.data.clone();
-        assert_eq!(item.data.as_ptr(), cloned_data.as_ptr(),
-            "Bytes::clone should share the same buffer (zero-copy)");
+        assert_eq!(
+            item.data.as_ptr(),
+            cloned_data.as_ptr(),
+            "Bytes::clone should share the same buffer (zero-copy)"
+        );
     }
 
     #[test]
@@ -3492,8 +3646,12 @@ mod tests {
         let clones: Vec<Bytes> = (0..10).map(|_| data.clone()).collect();
 
         for (i, clone) in clones.iter().enumerate() {
-            assert_eq!(clone.as_ptr(), ptr,
-                "clone[{}] should share the same buffer, not copy", i);
+            assert_eq!(
+                clone.as_ptr(),
+                ptr,
+                "clone[{}] should share the same buffer, not copy",
+                i
+            );
         }
         // All clones + original share the same refcount
         assert_eq!(data.as_ptr(), ptr);
@@ -3533,8 +3691,8 @@ mod tests {
             data: payload_bytes.clone(),
             meta: Some(meta),
             response_tx: tx,
-                  inflight_guard: None,
-                enqueued_at: Instant::now(),
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
             is_warmup: false,
             queue_depth_guard: None,
         };
@@ -3579,8 +3737,8 @@ mod tests {
             data: payload.clone(),
             meta: None,
             response_tx: resp_tx,
-                  inflight_guard: None,
-                enqueued_at: Instant::now(),
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
             is_warmup: false,
             queue_depth_guard: None,
         };
@@ -3594,7 +3752,10 @@ mod tests {
         // Build proto request from Bytes data (simulates send_batch logic)
         let proto_data = received.data.clone();
         let single = pb::SingleRequest { data: proto_data };
-        assert_eq!(single.data, Bytes::from_static(r#"{"input":"hello"}"#.as_bytes()));
+        assert_eq!(
+            single.data,
+            Bytes::from_static(r#"{"input":"hello"}"#.as_bytes())
+        );
 
         // Send a mock response
         let _ = received.response_tx.send(pb::Response {
@@ -3602,8 +3763,11 @@ mod tests {
             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                 data: Bytes::from_static(b"ok"),
                 headers: Default::default(),
-                status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
-            
+                status: Some(pb::Status {
+                    code: "Ok".to_string(),
+                    message: String::new(),
+                }),
+
                 ..Default::default()
             })),
             metrics: None,
@@ -3620,10 +3784,7 @@ mod tests {
         // A batch item carrying its own status_code / media_type / headers
         // (e.g. early 400 from before_decode_request, custom headers from after_encode_response)
         // must reach the caller's SingleResponse intact.
-        let headers = std::collections::HashMap::from([(
-            "x-item".to_string(),
-            "bad".to_string(),
-        )]);
+        let headers = std::collections::HashMap::from([("x-item".to_string(), "bad".to_string())]);
         let item = pb::BatchItemResponse {
             uid: "u1".to_string(),
             data: Bytes::from_static(b"{\"error\":\"bad\"}"),
@@ -3643,7 +3804,10 @@ mod tests {
         assert_eq!(single.status.unwrap().code, "Ok");
         assert_eq!(single.status_code, 400);
         assert_eq!(single.media_type, "text/html");
-        assert_eq!(single.headers.get("x-item").map(|s| s.as_str()), Some("bad"));
+        assert_eq!(
+            single.headers.get("x-item").map(|s| s.as_str()),
+            Some("bad")
+        );
         assert_eq!(single.data, Bytes::from_static(b"{\"error\":\"bad\"}"));
     }
 
@@ -3685,8 +3849,8 @@ mod tests {
             data: Bytes::new(),
             meta: Some(Arc::new(meta)),
             response_tx: tx,
-                  inflight_guard: None,
-                enqueued_at: Instant::now(),
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
             is_warmup: false,
             queue_depth_guard: None,
         };
@@ -3694,8 +3858,10 @@ mod tests {
         let meta_clone = item.meta.clone();
         let meta_ptr = item.meta.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
         let clone_ptr = meta_clone.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
-        assert_eq!(meta_ptr, clone_ptr,
-            "Arc<RequestMeta> clone should share the same allocation");
+        assert_eq!(
+            meta_ptr, clone_ptr,
+            "Arc<RequestMeta> clone should share the same allocation"
+        );
     }
 
     #[test]
@@ -3725,8 +3891,12 @@ mod tests {
         // All should share the same allocation
         let ptr = meta.as_ref() as *const pb::RequestMeta;
         for (uid, item_meta) in &items {
-            assert_eq!(item_meta.as_ref() as *const pb::RequestMeta, ptr,
-                "batch item {} should share meta via Arc", uid);
+            assert_eq!(
+                item_meta.as_ref() as *const pb::RequestMeta,
+                ptr,
+                "batch item {} should share meta via Arc",
+                uid
+            );
         }
     }
 
@@ -3821,7 +3991,10 @@ mod tests {
         assert!(outlier.is_ejected(0));
         outlier.reset_error_count(0);
         assert_eq!(outlier.consecutive_errors(0), 0);
-        assert!(outlier.is_ejected(0), "ejection must survive error-count reset");
+        assert!(
+            outlier.is_ejected(0),
+            "ejection must survive error-count reset"
+        );
     }
 
     // ===== 熔断器：指数退避 + 半开试探（B1 sgl-router 清单兑现）=====
@@ -3851,13 +4024,19 @@ mod tests {
         let outlier = OutlierState::with_config(1, &breaker_cfg());
         outlier.record_error(0); // threshold 1 → eject, series 1, backoff = base
         assert!(outlier.is_ejected(0));
-        assert_eq!(outlier.workers[0].ejection_series.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            outlier.workers[0].ejection_series.load(Ordering::Relaxed),
+            1
+        );
 
         std::thread::sleep(Duration::from_millis(300)); // > 200ms base → half-open
         assert!(!outlier.is_ejected(0), "退避期满 → 半开（可试探）");
 
         // 半开试探失败 → 立即重熔断（不等 threshold）；series 1→2，退避升为 2×base。
-        assert!(outlier.record_error(0), "half-open probe failure is a new ejection event");
+        assert!(
+            outlier.record_error(0),
+            "half-open probe failure is a new ejection event"
+        );
         assert!(outlier.is_ejected(0));
         assert_eq!(
             outlier.workers[0].ejection_series.load(Ordering::Relaxed),
@@ -3877,7 +4056,10 @@ mod tests {
         // wall-clock sleeps — see half_open_probe_failure_reopens_with_longer_backoff.
         let outlier = OutlierState::with_config(1, &breaker_cfg());
         outlier.record_error(0);
-        assert_eq!(outlier.workers[0].ejection_series.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            outlier.workers[0].ejection_series.load(Ordering::Relaxed),
+            1
+        );
         std::thread::sleep(Duration::from_millis(300));
         assert!(!outlier.is_ejected(0)); // 半开
 
@@ -3944,7 +4126,11 @@ mod tests {
             format!(
                 "ipc://{}",
                 std::env::temp_dir()
-                    .join(format!("lite-server-hc-{}-{}.sock", name, std::process::id()))
+                    .join(format!(
+                        "lite-server-hc-{}-{}.sock",
+                        name,
+                        std::process::id()
+                    ))
                     .display()
             )
         }
@@ -3978,7 +4164,12 @@ mod tests {
         let outlier_probe = outlier.clone();
         let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("kill")));
         queue.register_model(
-            "m", "1", &config, vec![], vec![client], outlier,
+            "m",
+            "1",
+            &config,
+            vec![],
+            vec![client],
+            outlier,
             Some(respawn_tx),
         );
 
@@ -3990,7 +4181,10 @@ mod tests {
         assert_eq!(sig.version, "1");
         assert_eq!(sig.worker_id, 0);
         assert_eq!(sig.reason, "health_check");
-        assert!(outlier_probe.is_ejected(0), "first failure must have ejected the worker");
+        assert!(
+            outlier_probe.is_ejected(0),
+            "first failure must have ejected the worker"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4013,12 +4207,20 @@ mod tests {
         let outlier_probe = outlier.clone();
         let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("recycling")));
         queue.register_model(
-            "m", "1", &config, vec![], vec![client], outlier,
+            "m",
+            "1",
+            &config,
+            vec![],
+            vec![client],
+            outlier,
             Some(respawn_tx),
         );
 
         let result = tokio::time::timeout(Duration::from_millis(500), respawn_rx.recv()).await;
-        assert!(result.is_err(), "a recycling slot must never escalate to kill");
+        assert!(
+            result.is_err(),
+            "a recycling slot must never escalate to kill"
+        );
         assert_eq!(
             outlier_probe.consecutive_errors(0),
             0,
@@ -4041,12 +4243,20 @@ mod tests {
         let outlier = Arc::new(OutlierState::new(1));
         let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("nokill")));
         queue.register_model(
-            "m", "1", &config, vec![], vec![client], outlier,
+            "m",
+            "1",
+            &config,
+            vec![],
+            vec![client],
+            outlier,
             Some(respawn_tx),
         );
 
         let result = tokio::time::timeout(Duration::from_millis(500), respawn_rx.recv()).await;
-        assert!(result.is_err(), "kill_threshold=0 must never signal respawn");
+        assert!(
+            result.is_err(),
+            "kill_threshold=0 must never signal respawn"
+        );
     }
 
     #[tokio::test]
@@ -4064,7 +4274,15 @@ mod tests {
             for _ in 0..KILL_THRESHOLD {
                 outlier.record_error(0);
             }
-            escalate_to_kill(&outlier, 0, KILL_THRESHOLD, &Some(respawn_tx.clone()), "m", "1").await;
+            escalate_to_kill(
+                &outlier,
+                0,
+                KILL_THRESHOLD,
+                &Some(respawn_tx.clone()),
+                "m",
+                "1",
+            )
+            .await;
             // Drain per round: channel capacity (8) is smaller than the 10
             // rounds, so an undrained send would block forever.
             while let Ok(sig) = respawn_rx.try_recv() {
@@ -4089,7 +4307,10 @@ mod tests {
         assert!(!outlier.record_error(0), "below threshold");
         assert!(!outlier.record_error(0), "below threshold");
         assert!(outlier.record_error(0), "third consecutive error ejects");
-        assert!(!outlier.record_error(0), "already ejected — not a new ejection");
+        assert!(
+            !outlier.record_error(0),
+            "already ejected — not a new ejection"
+        );
     }
 
     #[tokio::test]
@@ -4104,7 +4325,10 @@ mod tests {
         outlier.record_error(0);
         assert!(!outlier.is_ejected(0), "should not eject after reset");
         outlier.record_error(0);
-        assert!(outlier.is_ejected(0), "should eject after 3 consecutive errors post-reset");
+        assert!(
+            outlier.is_ejected(0),
+            "should eject after 3 consecutive errors post-reset"
+        );
     }
 
     #[tokio::test]
@@ -4137,7 +4361,10 @@ mod tests {
         for _ in 0..3 {
             outlier.record_error(2);
         }
-        assert!(!outlier.is_ejected(2), "should respect max_ejection_percent");
+        assert!(
+            !outlier.is_ejected(2),
+            "should respect max_ejection_percent"
+        );
     }
 
     #[test]
@@ -4151,7 +4378,10 @@ mod tests {
         assert!(result.is_err(), "should have panicked");
 
         // After poisoning, is_ejected should NOT panic
-        assert!(!outlier.is_ejected(0), "is_ejected should survive mutex poison");
+        assert!(
+            !outlier.is_ejected(0),
+            "is_ejected should survive mutex poison"
+        );
         // active_count should also not panic
         assert_eq!(outlier.active_count(), 1);
         // record_error -> maybe_eject should also not panic
@@ -4166,9 +4396,8 @@ mod tests {
     #[tokio::test]
     async fn test_pick_worker_skips_ejected() {
         let outlier = OutlierState::new(3);
-        let inflight: Vec<Arc<AtomicUsize>> = (0..3)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect();
+        let inflight: Vec<Arc<AtomicUsize>> =
+            (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
 
         // Eject worker 0
         for _ in 0..3 {
@@ -4177,7 +4406,11 @@ mod tests {
 
         // Should skip ejected worker 0, pick 1 or 2 (both load 0)
         let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
-        assert!(picked == 1 || picked == 2, "should skip ejected worker, got {}", picked);
+        assert!(
+            picked == 1 || picked == 2,
+            "should skip ejected worker, got {}",
+            picked
+        );
     }
 
     #[tokio::test]
@@ -4202,9 +4435,8 @@ mod tests {
     #[tokio::test]
     async fn test_pick_worker_all_ejected_falls_back() {
         let outlier = OutlierState::new(2);
-        let inflight: Vec<Arc<AtomicUsize>> = (0..2)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect();
+        let inflight: Vec<Arc<AtomicUsize>> =
+            (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
 
         // Eject both workers
         for i in 0..2 {
@@ -4261,9 +4493,13 @@ mod tests {
         let result = tokio::time::timeout(timeout, async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok::<_, ()>(())
-        }).await;
+        })
+        .await;
 
-        assert!(result.is_err(), "should timeout when response takes too long");
+        assert!(
+            result.is_err(),
+            "should timeout when response takes too long"
+        );
     }
 
     // ===== Per-slot rolling-recycle budget tests =====
@@ -4287,10 +4523,16 @@ mod tests {
         let (dispatch, outlier, inflight) = budget_dispatch("trig", 2, &[3, 3], Some(tx));
 
         check_worker_budget(&dispatch, &inflight, 0, 2); // 2 < 3: below
-        assert!(!outlier.is_recycling(0), "below threshold: no recycle claim");
+        assert!(
+            !outlier.is_recycling(0),
+            "below threshold: no recycle claim"
+        );
 
         check_worker_budget(&dispatch, &inflight, 0, 1); // 3 >= 3: crossing
-        assert!(outlier.is_recycling(0), "crossing claims the slot for recycle");
+        assert!(
+            outlier.is_recycling(0),
+            "crossing claims the slot for recycle"
+        );
         assert!(
             !outlier.is_ejected(0),
             "recycle never opens the circuit — the status coordinator keeps the version Ready"
@@ -4393,7 +4635,10 @@ mod tests {
         outlier.reset(recycling[0]);
         let next = (recycling[0] + 1) % 12;
         check_worker_budget(&dispatch, &inflight, next, 1); // already crossed: retry only
-        assert!(outlier.is_recycling(next), "freed ticket passes to a crossed sibling");
+        assert!(
+            outlier.is_recycling(next),
+            "freed ticket passes to a crossed sibling"
+        );
 
         // Exactly two recycle signals: the initial claim and the relay.
         for expected in [recycling[0], next] {
@@ -4492,7 +4737,10 @@ mod tests {
             "a second slot must not recycle while one is mid-recycle — \
              an unbounded herd leaves routing with no active worker"
         );
-        assert!(!outlier.is_recycling(1), "refused claim leaves no flag behind");
+        assert!(
+            !outlier.is_recycling(1),
+            "refused claim leaves no flag behind"
+        );
 
         // The freed ticket lets the crossed sibling claim on its retry.
         outlier.reset(0);
@@ -4518,7 +4766,10 @@ mod tests {
             !outlier.claim_recycle(3),
             "the percent cap refuses the 4th concurrent claim"
         );
-        assert!(!outlier.is_recycling(3), "refused claim leaves no flag behind");
+        assert!(
+            !outlier.is_recycling(3),
+            "refused claim leaves no flag behind"
+        );
         outlier.reset(0);
         assert!(
             outlier.claim_recycle(3),
@@ -4674,7 +4925,8 @@ mod tests {
         spawn_silent_worker(drain_test_endpoint("budget-streamto-0"));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let sid = "s-evict".to_string();
-        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let open =
+            crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
         let mut chunk_rx = dispatch.zmq_clients[0]
             .send_stream(open, sid.clone())
             .await
@@ -4736,7 +4988,10 @@ mod tests {
                 };
                 if let Some(pb::stream_request::Action::Cancel(c)) = st.action {
                     assert_eq!(c.reason.as_deref(), Some("recycle"));
-                    assert!(c.grace_ms.unwrap_or(0) > 0, "the grace window rides the cancel");
+                    assert!(
+                        c.grace_ms.unwrap_or(0) > 0,
+                        "the grace window rides the cancel"
+                    );
                     let mk = |payload: pb::stream_response::Payload, uid: &str| pb::Response {
                         uid: uid.to_string(),
                         payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
@@ -4763,7 +5018,8 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let sid = "s-grace".to_string();
-        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let open =
+            crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
         let mut chunk_rx = dispatch.zmq_clients[0]
             .send_stream(open, sid.clone())
             .await
@@ -4775,7 +5031,8 @@ mod tests {
         // The client sees the wrap-up chunk + Done; the (simulated) forwarder
         // guard releases the count on the terminal, unblocking the respawn.
         let mut got_done = false;
-        while let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv()).await {
+        while let Ok(Some(f)) = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv()).await
+        {
             match f.payload {
                 Some(pb::stream_response::Payload::Done(_)) => {
                     got_done = true;
@@ -4788,7 +5045,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(got_done, "the model's own Done reaches the client within grace");
+        assert!(
+            got_done,
+            "the model's own Done reaches the client within grace"
+        );
         let sig = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("respawn once the count drains")
@@ -4812,7 +5072,8 @@ mod tests {
         spawn_silent_worker(drain_test_endpoint("budget-streamignore-0"));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let sid = "s-ignore".to_string();
-        let open = crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
+        let open =
+            crate::streaming::build_stream_open(sid.clone(), bytes::Bytes::new(), None, false);
         let mut chunk_rx = dispatch.zmq_clients[0]
             .send_stream(open, sid.clone())
             .await
@@ -4848,7 +5109,10 @@ mod tests {
         queue.record_stream_served("m", "1", 0);
         assert!(!outlier.is_recycling(0), "first stream below threshold 2");
         queue.record_stream_served("m", "1", 0);
-        assert!(outlier.is_recycling(0), "second stream crosses max_requests=2");
+        assert!(
+            outlier.is_recycling(0),
+            "second stream crosses max_requests=2"
+        );
     }
 
     /// T4 (escape hatch): with the flag off, streams never touch the budget
@@ -4859,7 +5123,10 @@ mod tests {
         for _ in 0..5 {
             queue.record_stream_served("m", "1", 0);
         }
-        assert!(!outlier.is_recycling(0), "flag off: streams never cross the budget");
+        assert!(
+            !outlier.is_recycling(0),
+            "flag off: streams never cross the budget"
+        );
     }
 
     // ===== G4: max_concurrent_streams (per-version stream concurrency cap) =====
@@ -4907,7 +5174,11 @@ mod tests {
     async fn streaming_capped_queue(
         name: &str,
         max_concurrent_streams: usize,
-    ) -> (InferenceQueue, Arc<OutlierState>, mpsc::Receiver<RespawnSignal>) {
+    ) -> (
+        InferenceQueue,
+        Arc<OutlierState>,
+        mpsc::Receiver<RespawnSignal>,
+    ) {
         let queue = InferenceQueue::new();
         let config = ModelConfig {
             max_queue_size: 10,
@@ -4922,7 +5193,15 @@ mod tests {
         spawn_tagged_worker(endpoint.clone(), b"w".to_vec());
         let clients = vec![Arc::new(WorkerZmqClient::new(endpoint))];
         let (tx, rx) = mpsc::channel::<RespawnSignal>(8);
-        queue.register_model("m", "1", &config, vec![], clients, outlier.clone(), Some(tx));
+        queue.register_model(
+            "m",
+            "1",
+            &config,
+            vec![],
+            clients,
+            outlier.clone(),
+            Some(tx),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         (queue, outlier, rx)
     }
@@ -4932,7 +5211,11 @@ mod tests {
         name: &str,
         max_requests: usize,
         count_streams: bool,
-    ) -> (InferenceQueue, Arc<OutlierState>, mpsc::Receiver<RespawnSignal>) {
+    ) -> (
+        InferenceQueue,
+        Arc<OutlierState>,
+        mpsc::Receiver<RespawnSignal>,
+    ) {
         let queue = InferenceQueue::new();
         let config = ModelConfig {
             max_queue_size: 10,
@@ -4948,7 +5231,15 @@ mod tests {
         spawn_tagged_worker(endpoint.clone(), b"w".to_vec());
         let clients = vec![Arc::new(WorkerZmqClient::new(endpoint))];
         let (tx, rx) = mpsc::channel::<RespawnSignal>(8);
-        queue.register_model("m", "1", &config, vec![], clients, outlier.clone(), Some(tx));
+        queue.register_model(
+            "m",
+            "1",
+            &config,
+            vec![],
+            clients,
+            outlier.clone(),
+            Some(tx),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         (queue, outlier, rx)
     }
@@ -5107,10 +5398,16 @@ mod tests {
         ];
         let (item, rx) = hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
         let mut batch = vec![item];
-        let idx = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
-            .await
-            .map_err(|_| "send must succeed")
-            .unwrap();
+        let idx = do_send_batch(
+            &mut batch,
+            &dispatch,
+            &inflight,
+            Duration::from_secs(5),
+            &[],
+        )
+        .await
+        .map_err(|_| "send must succeed")
+        .unwrap();
         assert_eq!(idx, 1, "Ok carries the worker that actually served");
         let _ = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
@@ -5215,7 +5512,15 @@ mod tests {
         };
         let outlier = Arc::new(OutlierState::new(2));
 
-        queue.register_model("test_model", "1", &config, vec![], vec![], outlier.clone(), None);
+        queue.register_model(
+            "test_model",
+            "1",
+            &config,
+            vec![],
+            vec![],
+            outlier.clone(),
+            None,
+        );
 
         let retrieved = queue.get_outlier_state("test_model", "1").unwrap();
         // Must be the same Arc
@@ -5226,7 +5531,10 @@ mod tests {
         outlier.record_error(0);
         outlier.record_error(0);
         outlier.record_error(0);
-        assert!(retrieved.is_ejected(0), "worker should be ejected via shared state");
+        assert!(
+            retrieved.is_ejected(0),
+            "worker should be ejected via shared state"
+        );
         assert_eq!(outlier.active_count(), 1);
     }
 
@@ -5276,8 +5584,11 @@ mod tests {
         // With max_requests=100, jitter=10, result should be in [90, 110]
         for _ in 0..200 {
             let result = compute_jittered_max_requests(100, 10);
-            assert!((90..=110).contains(&result),
-                "jittered value {} out of expected range [90, 110]", result);
+            assert!(
+                (90..=110).contains(&result),
+                "jittered value {} out of expected range [90, 110]",
+                result
+            );
         }
     }
 
@@ -5398,24 +5709,33 @@ mod tests {
         let client0 = Arc::new(WorkerZmqClient::new(ep0));
         let client1 = Arc::new(WorkerZmqClient::new(ep1));
         queue.register_model(
-            "m", "1", &config, vec![],
-            vec![client0, client1], outlier, None,
+            "m",
+            "1",
+            &config,
+            vec![],
+            vec![client0, client1],
+            outlier,
+            None,
         );
         // Let both PAIR connections establish.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let (resp_tx, resp_rx) = oneshot::channel();
         queue
-            .try_submit("m", "1", QueueItem {
-                uid: "b1-test".to_string(),
-                data: Bytes::from_static(b"{}"),
-                meta: None,
-                response_tx: resp_tx,
-                inflight_guard: None,
-                enqueued_at: Instant::now(),
-                is_warmup: false,
-                queue_depth_guard: None,
-            })
+            .try_submit(
+                "m",
+                "1",
+                QueueItem {
+                    uid: "b1-test".to_string(),
+                    data: Bytes::from_static(b"{}"),
+                    meta: None,
+                    response_tx: resp_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup: false,
+                    queue_depth_guard: None,
+                },
+            )
             .unwrap();
 
         let resp = tokio::time::timeout(Duration::from_secs(10), resp_rx)
@@ -5489,7 +5809,11 @@ mod tests {
         for _ in 0..100 {
             seen.insert(compute_jittered_max_requests(100, 20));
         }
-        assert!(seen.len() > 1, "jitter should produce varied values, got {:?}", seen);
+        assert!(
+            seen.len() > 1,
+            "jitter should produce varied values, got {:?}",
+            seen
+        );
     }
 
     // ===== P2-1 扩展: 扩缩一等指标 =====
@@ -5516,19 +5840,27 @@ mod tests {
         queue
     }
 
-    fn submit_one(queue: &InferenceQueue, model: &str, uid: &str) -> oneshot::Receiver<pb::Response> {
+    fn submit_one(
+        queue: &InferenceQueue,
+        model: &str,
+        uid: &str,
+    ) -> oneshot::Receiver<pb::Response> {
         let (resp_tx, resp_rx) = oneshot::channel();
         queue
-            .try_submit(model, "1", QueueItem {
-                uid: uid.to_string(),
-                data: Bytes::new(),
-                meta: None,
-                response_tx: resp_tx,
-                inflight_guard: None,
-                enqueued_at: Instant::now(),
-                is_warmup: false,
-                queue_depth_guard: None,
-            })
+            .try_submit(
+                model,
+                "1",
+                QueueItem {
+                    uid: uid.to_string(),
+                    data: Bytes::new(),
+                    meta: None,
+                    response_tx: resp_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup: false,
+                    queue_depth_guard: None,
+                },
+            )
             .unwrap();
         resp_rx
     }
@@ -5548,7 +5880,7 @@ mod tests {
         let queue = InferenceQueue::new();
         let config = ModelConfig {
             max_queue_size: 10,
-            max_batch_size: 4, // batching: items park in the collector's Vec
+            max_batch_size: 4,   // batching: items park in the collector's Vec
             batch_timeout: 60.0, // never fires during the test
             adaptive_batching: false,
             min_batch_timeout: 0.0,
@@ -5568,7 +5900,10 @@ mod tests {
         // Wait until the collector has dequeued both (inc happens at recv).
         let deadline = Instant::now() + Duration::from_secs(3);
         while gauge.get() < 2.0 {
-            assert!(Instant::now() < deadline, "collector never dequeued the items");
+            assert!(
+                Instant::now() < deadline,
+                "collector never dequeued the items"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -5596,10 +5931,16 @@ mod tests {
 
         let resp_rx = submit_one(&queue, "ifm", "ifm-1");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(gauge.get() >= base + 1.0, "accepted request must count in-flight, got {}", gauge.get());
+        assert!(
+            gauge.get() >= base + 1.0,
+            "accepted request must count in-flight, got {}",
+            gauge.get()
+        );
 
         let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
-            .await.expect("response must arrive").expect("channel open");
+            .await
+            .expect("response must arrive")
+            .expect("channel open");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(gauge.get(), base, "completed request must leave the gauge");
     }
@@ -5610,14 +5951,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let before = prometheus::QUEUE_WAIT_SECONDS
-            .with_label_values(&["qwm", "1"]).get_sample_count();
+            .with_label_values(&["qwm", "1"])
+            .get_sample_count();
         let resp_rx = submit_one(&queue, "qwm", "qwm-1");
         let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
-            .await.expect("response must arrive").expect("channel open");
+            .await
+            .expect("response must arrive")
+            .expect("channel open");
 
         let after = prometheus::QUEUE_WAIT_SECONDS
-            .with_label_values(&["qwm", "1"]).get_sample_count();
-        assert_eq!(after, before + 1, "each dispatched item must observe one queue-wait sample");
+            .with_label_values(&["qwm", "1"])
+            .get_sample_count();
+        assert_eq!(
+            after,
+            before + 1,
+            "each dispatched item must observe one queue-wait sample"
+        );
     }
 
     #[tokio::test]
@@ -5628,12 +5977,22 @@ mod tests {
         let gauge = prometheus::WORKER_SATURATION.with_label_values(&["swm", "1"]);
         let resp_rx = submit_one(&queue, "swm", "swm-1");
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(gauge.get() >= 1.0, "hottest worker must report saturation >= 1 while in flight, got {}", gauge.get());
+        assert!(
+            gauge.get() >= 1.0,
+            "hottest worker must report saturation >= 1 while in flight, got {}",
+            gauge.get()
+        );
 
         let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
-            .await.expect("response must arrive").expect("channel open");
+            .await
+            .expect("response must arrive")
+            .expect("channel open");
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(gauge.get(), 0.0, "saturation must return to 0 after completion");
+        assert_eq!(
+            gauge.get(),
+            0.0,
+            "saturation must return to 0 after completion"
+        );
     }
 
     // ===== P-FLOW B1 (§4.0.9): priority queue + queue-timeout REJECT =====
@@ -5723,9 +6082,7 @@ mod tests {
             meta: None,
             response_tx,
             inflight_guard: None,
-            enqueued_at: Instant::now()
-                .checked_sub(ago)
-                .unwrap_or_else(Instant::now),
+            enqueued_at: Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
             is_warmup: false,
             queue_depth_guard: None,
         }
@@ -5740,9 +6097,7 @@ mod tests {
             meta: None,
             response_tx,
             inflight_guard: None,
-            enqueued_at: Instant::now()
-                .checked_sub(Duration::from_secs(2))
-                .unwrap(),
+            enqueued_at: Instant::now().checked_sub(Duration::from_secs(2)).unwrap(),
             is_warmup: false,
             queue_depth_guard: None,
         };
@@ -5778,7 +6133,10 @@ mod tests {
             Duration::from_millis(100),
             crate::config::QueueTimeoutAction::Delay,
         );
-        assert!(opt.is_some(), "Delay action must not reject even when expired");
+        assert!(
+            opt.is_some(),
+            "Delay action must not reject even when expired"
+        );
     }
 
     #[tokio::test]
@@ -5914,9 +6272,12 @@ mod tests {
             queue_depth_guard: None,
         };
         tx.try_send(item, 0).unwrap();
-        let collector = tokio::spawn(batch_collector(rx, tunables, dispatch, vec![
-            Arc::new(AtomicUsize::new(0)),
-        ]));
+        let collector = tokio::spawn(batch_collector(
+            rx,
+            tunables,
+            dispatch,
+            vec![Arc::new(AtomicUsize::new(0))],
+        ));
 
         // The reject path replies 503 to the client...
         let _resp = resp_rx.await.expect("queue-timeout reject must reply");
@@ -5959,10 +6320,8 @@ mod tests {
     #[test]
     fn pick_worker_least_loaded_skips_dead() {
         // The dead worker is the LEAST loaded — it must still lose.
-        let inflight: Vec<Arc<AtomicUsize>> = vec![
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(9)),
-        ];
+        let inflight: Vec<Arc<AtomicUsize>> =
+            vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(9))];
         let outlier = OutlierState::new(2);
         outlier.mark_dead(0);
         assert_eq!(
@@ -6103,11 +6462,7 @@ mod tests {
             before.2 + 1.0,
             "real request must record worker inference"
         );
-        assert_eq!(
-            after.3,
-            before.3 + 1,
-            "real request must record queue wait"
-        );
+        assert_eq!(after.3, before.3 + 1, "real request must record queue wait");
     }
 
     /// F2 (warmup-gaps audit): warmup traffic must NOT consume the
@@ -6139,14 +6494,24 @@ mod tests {
             spawn_tagged_worker(endpoint.clone(), tag.to_vec());
             clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
         }
-        queue.register_model(model, "1", &config, vec![], clients, outlier, Some(respawn_tx));
+        queue.register_model(
+            model,
+            "1",
+            &config,
+            vec![],
+            clients,
+            outlier,
+            Some(respawn_tx),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Three warmup items pinned to worker 0 — past its max_requests=2
         // threshold if counted.
         for i in 0..3 {
-            let (mut item, rx) =
-                hint_item_rx(&format!("warmup_{i}"), meta_with_headers(&[("x-lite-worker-id", "0")]));
+            let (mut item, rx) = hint_item_rx(
+                &format!("warmup_{i}"),
+                meta_with_headers(&[("x-lite-worker-id", "0")]),
+            );
             item.is_warmup = true;
             queue.try_submit(model, "1", item).unwrap();
             tokio::time::timeout(Duration::from_secs(5), rx)
@@ -6164,8 +6529,10 @@ mod tests {
         // Real traffic still counts: two real items on worker 0 cross its
         // per-slot threshold.
         for i in 0..2 {
-            let (item, rx) =
-                hint_item_rx(&format!("real_{i}"), meta_with_headers(&[("x-lite-worker-id", "0")]));
+            let (item, rx) = hint_item_rx(
+                &format!("real_{i}"),
+                meta_with_headers(&[("x-lite-worker-id", "0")]),
+            );
             queue.try_submit(model, "1", item).unwrap();
             tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
@@ -6177,7 +6544,10 @@ mod tests {
             .expect("real items crossing max_requests must trigger a recycle")
             .expect("respawn channel open");
         assert_eq!(signal.model_name, model);
-        assert_eq!(signal.worker_id, 0, "the slot that served the requests recycles");
+        assert_eq!(
+            signal.worker_id, 0,
+            "the slot that served the requests recycles"
+        );
         assert_eq!(signal.reason, "rolling_recycle");
         assert!(signal.graceful);
     }
@@ -6223,7 +6593,11 @@ mod tests {
             async move {
                 let (resp_tx, resp_rx) = oneshot::channel();
                 let batch = vec![QueueItem {
-                    uid: if is_warmup { "wu".to_string() } else { "ru".to_string() },
+                    uid: if is_warmup {
+                        "wu".to_string()
+                    } else {
+                        "ru".to_string()
+                    },
                     data: Bytes::from_static(b"{}"),
                     meta: None,
                     response_tx: resp_tx,
@@ -6232,14 +6606,8 @@ mod tests {
                     is_warmup,
                     queue_depth_guard: None,
                 }];
-                send_batch_with_retry(
-                    batch,
-                    dispatch,
-                    inflight,
-                    Duration::from_millis(150),
-                    2,
-                )
-                .await;
+                send_batch_with_retry(batch, dispatch, inflight, Duration::from_millis(150), 2)
+                    .await;
                 let resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
                     .await
                     .expect("response in time")
@@ -6302,7 +6670,8 @@ mod tests {
 
         // Live item pinned to worker 1, warmup item pinned to worker 0, both
         // inside the same batching window.
-        let (live_item, live_rx) = hint_item_rx("live", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        let (live_item, live_rx) =
+            hint_item_rx("live", meta_with_headers(&[("x-lite-worker-id", "1")]));
         queue.try_submit(model, "1", live_item).unwrap();
         let (mut warm_item, warm_rx) =
             hint_item_rx("warm", meta_with_headers(&[("x-lite-worker-id", "0")]));
@@ -6367,9 +6736,15 @@ mod tests {
             is_warmup: false,
             queue_depth_guard: None,
         }];
-        let err = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
-            .await
-            .expect_err("all-dead dispatch must fail, not send to a dead peer");
+        let err = do_send_batch(
+            &mut batch,
+            &dispatch,
+            &inflight,
+            Duration::from_secs(5),
+            &[],
+        )
+        .await
+        .expect_err("all-dead dispatch must fail, not send to a dead peer");
         let (single, _) = err.single.as_ref().expect("structured 503 single");
         assert_eq!(single.status_code, 503);
         fail_batch_items(&mut batch, &err);
@@ -6389,7 +6764,10 @@ mod tests {
         // Triton-style; the defect is the unbounded, client-controlled range.
         let (tx, rx) = priority_channel(8);
         let low = hint_item("default", meta_with_headers(&[]));
-        let high = hint_item("max-priority", meta_with_headers(&[("x-lite-priority", "2147483647")]));
+        let high = hint_item(
+            "max-priority",
+            meta_with_headers(&[("x-lite-priority", "2147483647")]),
+        );
         let low_p = item_priority(&low);
         let high_p = item_priority(&high);
         tx.try_send(low, low_p).unwrap();

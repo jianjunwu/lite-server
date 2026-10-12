@@ -10,12 +10,12 @@ use crate::grpc::error::{
 };
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
-use crate::registry::types::ModelType;
-use std::sync::Arc;
 use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -72,7 +72,12 @@ impl GrpcService {
                     .registry
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
-                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+                    .ok_or_else(|| {
+                        err(Status::not_found(format!(
+                            "{} has no active version",
+                            model_name
+                        )))
+                    })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
@@ -87,7 +92,12 @@ impl GrpcService {
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+            enforce_grpc_rate_limit(
+                &self.rate_limiter,
+                mv.policies.rate_limit.as_ref(),
+                model_name,
+                &client_ip,
+            )?;
         }
 
         // FD-1: gateway-side JSON validation (HTTP ApiBody/B1 parity) —
@@ -147,7 +157,8 @@ impl GrpcService {
         let mut ensemble_permit = None;
         // D18: chain handles + chain-tree abort held for the forward task's
         // cancellation (pipeline chains broadcast over every streaming step).
-        let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+        let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> =
+            None;
         let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
         // §4.1 指标行: streaming-step latency is recorded at stream close.
         let mut ensemble_tail: Option<(String, String, String)> = None;
@@ -156,15 +167,18 @@ impl GrpcService {
                 &req.data,
                 req.headers.get("content-type").cloned(),
             )
-            .map_err(|e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
+            .map_err(|e| {
+                crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e))
+            })?;
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,
                 deadline_client_specified: deadline.client_specified,
                 decoupled: false,
                 // E8-1 (D38): the dag selector rides the gRPC metadata.
-                dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
-                    .map_err(|e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)))?,
+                dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata).map_err(
+                    |e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)),
+                )?,
             };
             match crate::ensemble::execute_ensemble(
                 self.app_state.clone(),
@@ -180,11 +194,16 @@ impl GrpcService {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                     // D35 (E5): fold the tail step's timeout cap into the recv
                     // overall bound (min(client overall, step cap)).
-                    stream_deadline = crate::deadline::min_instant(stream_deadline, s.step_deadline);
+                    stream_deadline =
+                        crate::deadline::min_instant(stream_deadline, s.step_deadline);
                     ensemble_permit = s.permit.take();
                     ensemble_chain = Some(s.chain.clone());
                     ensemble_abort = Some(s.abort.clone());
-                    ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
+                    ensemble_tail = Some((
+                        s.tail_step.clone(),
+                        s.tail_model.clone(),
+                        s.tail_version.clone(),
+                    ));
                     // Ensemble streams are counted per DAG node at the worker
                     // open inside the executor; the guard rides EnsembleStream.
                     (s.stream_id, s.chunk_rx, s.cancel_client, s.inflight_guard)
@@ -224,9 +243,7 @@ impl GrpcService {
                 &resolved_version,
             )
             .map_err(|e| match e {
-                crate::worker::PickError::InvalidPin(msg) => {
-                    err(Status::invalid_argument(msg))
-                }
+                crate::worker::PickError::InvalidPin(msg) => err(Status::invalid_argument(msg)),
                 crate::worker::PickError::NoLiveWorkers(msg) => {
                     err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
                 }
@@ -242,8 +259,9 @@ impl GrpcService {
                 .map_err(|e| err(app_error_to_grpc_status(&e)))?;
             // G1/G3: count the in-flight stream on its slot; the guard moves
             // into the forward task below (see the guard's doc).
-            let inflight_guard = outlier
-                .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
+            let inflight_guard = outlier.map(|o| {
+                crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit)
+            });
             let client = clients[worker_id].clone();
             // P6 GetModelStats: one streaming inference dispatched to this worker.
             crate::metrics::prometheus::record_worker_inference(
@@ -253,19 +271,19 @@ impl GrpcService {
                 1,
             );
 
-            let open_req = streaming::build_stream_open(
-                stream_id.clone(),
-                req.data,
-                Some(meta),
-                false,
-            );
+            let open_req =
+                streaming::build_stream_open(stream_id.clone(), req.data, Some(meta), false);
 
             let chunk_rx = client
                 .send_stream(open_req, stream_id.clone())
                 .await
                 .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
             // G3: count the stream toward the slot's max_requests budget.
-            self.app_state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
+            self.app_state.inference_queue.record_stream_served(
+                model_name,
+                &resolved_version,
+                worker_id,
+            );
             (stream_id, chunk_rx, client.clone(), inflight_guard)
         };
         // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。
@@ -288,14 +306,19 @@ impl GrpcService {
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         // RN-14: per-stream channel depth is operator-tunable (default 64).
-        let (tx, rx) =
-            mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
+        let (tx, rx) = mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.to_string();
         let metrics_version = resolved_version.clone();
         if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, false);
+            crate::metrics::prometheus::record_stream_open(
+                &metrics_model,
+                &metrics_version,
+                "grpc",
+                &stream_id,
+                false,
+            );
         }
 
         // Panic收口 (detached spawn 无人 join):catch_forward_panic 保证 panic

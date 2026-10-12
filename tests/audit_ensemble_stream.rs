@@ -103,7 +103,9 @@ fn kill_stale_on_port(port: u16) {
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -116,7 +118,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64, log_path: &std::path::Pat
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -150,7 +157,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -1393,7 +1405,11 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_retry_off", ENS_RETRY_OFF_YAML);
     write_ensemble(repo, "ens_retry_exhaust", ENS_RETRY_EXHAUST_YAML);
     write_ensemble(repo, "ens_stream_retry", ENS_STREAM_RETRY_YAML);
-    write_ensemble(repo, "ens_stream_retry_exhaust", ENS_STREAM_RETRY_EXHAUST_YAML);
+    write_ensemble(
+        repo,
+        "ens_stream_retry_exhaust",
+        ENS_STREAM_RETRY_EXHAUST_YAML,
+    );
     write_ensemble(repo, "ens_stream_committed", ENS_STREAM_COMMITTED_YAML);
     // ===== batch 4 (MIMO①) fixtures =====
     write_vis_enc(repo);
@@ -1417,7 +1433,12 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_when_dag_obs", ENS_WHEN_DAG_OBS_YAML);
 }
 
-fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
+fn write_server_yaml(
+    repo: &std::path::Path,
+    http_port: u16,
+    extra: &str,
+    orch_extra: &str,
+) -> std::path::PathBuf {
     // Port-suffixed dir: tests run concurrently and must not share files.
     let dir = std::env::temp_dir().join(format!(
         "lite-server-ens-stream-yaml-{}-{}",
@@ -1457,12 +1478,18 @@ async fn boot_server(extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
 }
 
 /// boot_server + orchestration-scope extras (per-model strategies).
-async fn boot_server_orch(extra: &str, orch_extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
+async fn boot_server_orch(
+    extra: &str,
+    orch_extra: &str,
+) -> (String, ServerGuard, std::path::PathBuf) {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
     // Port-suffixed repo: tests run concurrently and must not share files.
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ens-stream-{}-{}", std::process::id(), http_port));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ens-stream-{}-{}",
+        std::process::id(),
+        http_port
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_all_fixtures(&repo);
     let server_yaml = write_server_yaml(&repo, http_port, extra, orch_extra);
@@ -1471,11 +1498,7 @@ async fn boot_server_orch(extra: &str, orch_extra: &str) -> (String, ServerGuard
     // 90s: a loaded machine (whole suite booting ~90 models per server)
     // regularly exceeded the old 30s budget.
     wait_for_server(http_port, 90, &log_path).await;
-    (
-        format!("http://127.0.0.1:{}", http_port),
-        guard,
-        repo,
-    )
+    (format!("http://127.0.0.1:{}", http_port), guard, repo)
 }
 
 /// Wait for all named models ready (ensemble models are loadable instantly).
@@ -1500,11 +1523,21 @@ async fn test_audit_stream_ensemble_sse_happy() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "hello world"}))
-        .await
-        .expect("SSE happy path must return 200");
-    assert!(body.contains(r#""token":"hello""#), "missing first chunk: {body}");
-    assert!(body.contains(r#""token":"world""#), "missing second chunk: {body}");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_stream/events",
+        json!({"text": "hello world"}),
+    )
+    .await
+    .expect("SSE happy path must return 200");
+    assert!(
+        body.contains(r#""token":"hello""#),
+        "missing first chunk: {body}"
+    );
+    assert!(
+        body.contains(r#""token":"world""#),
+        "missing second chunk: {body}"
+    );
     assert!(body.contains("[DONE]"), "missing [DONE] terminator: {body}");
     assert!(!body.contains("error"), "no error expected: {body}");
 }
@@ -1539,7 +1572,11 @@ async fn test_audit_stream_unary_endpoint_on_stream_dag_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "D1 must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "D1 must be 400"
+    );
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("streaming step"),
@@ -1560,9 +1597,13 @@ async fn test_audit_stream_pipeline_form_rejected_batch0() {
         !wait_model_ready(&base, "ens_pipeline", 5).await,
         "unary-consumer chain must be rejected at load time (D26)"
     );
-    let err = sse_post(&base, "/v2/models/ens_pipeline/events", json!({"text": "x"}))
-        .await
-        .expect_err("rejected pipeline DAG must not stream");
+    let err = sse_post(
+        &base,
+        "/v2/models/ens_pipeline/events",
+        json!({"text": "x"}),
+    )
+    .await
+    .expect_err("rejected pipeline DAG must not stream");
     assert_ne!(
         err,
         reqwest::StatusCode::OK,
@@ -1588,7 +1629,11 @@ async fn test_audit_stream_binary_output_flag_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "D7 must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "D7 must be 400"
+    );
 }
 
 /// m7: a binary chunk from the tail worker (model flag unset) on a text
@@ -1693,10 +1738,17 @@ async fn test_audit_stream_midstream_failure_error_frame() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_fail"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_fail/events", json!({"text": "a b c d"}))
-        .await
-        .expect("stream must open (200)");
-    assert!(body.contains(r#""token":"a""#), "first chunks must stream: {body}");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_fail/events",
+        json!({"text": "a b c d"}),
+    )
+    .await
+    .expect("stream must open (200)");
+    assert!(
+        body.contains(r#""token":"a""#),
+        "first chunks must stream: {body}"
+    );
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
         "mid-stream failure must close with an Error frame, no [DONE]: {body}"
@@ -1720,7 +1772,11 @@ async fn test_audit_stream_p10_capacity_429() {
         .send()
         .await
         .expect("first stream must open");
-    assert_eq!(first.status(), reqwest::StatusCode::OK, "first stream opens");
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::OK,
+        "first stream opens"
+    );
 
     // Give the first stream time to acquire the semaphore slot.
     sleep(Duration::from_millis(700)).await;
@@ -1765,7 +1821,11 @@ async fn test_audit_stream_p10_capacity_429() {
     assert!(
         rejected >= 1,
         "P10 429 must be recorded (record_stream_rejected); metrics:\n{}",
-        metrics.lines().filter(|l| l.contains("ens_slow")).collect::<Vec<_>>().join("\n")
+        metrics
+            .lines()
+            .filter(|l| l.contains("ens_slow"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     // First stream still completes with its chunks.
@@ -1785,9 +1845,13 @@ async fn test_audit_stream_p0_reload_uses_new_plan() {
     wait_ready_all(&base, &["ens_stream"]).await;
 
     // Baseline: tail (no suffix).
-    let before = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "hello world"}))
-        .await
-        .expect("baseline stream must open");
+    let before = sse_post(
+        &base,
+        "/v2/models/ens_stream/events",
+        json!({"text": "hello world"}),
+    )
+    .await
+    .expect("baseline stream must open");
     assert!(
         before.contains(r#""token":"hello""#) && !before.contains("_v2"),
         "baseline must use tail (no suffix): {before}"
@@ -1807,13 +1871,24 @@ async fn test_audit_stream_p0_reload_uses_new_plan() {
         .send()
         .await
         .expect("reload request");
-    assert_eq!(reload.status(), reqwest::StatusCode::OK, "reload must succeed");
-    assert!(wait_model_ready(&base, "ens_stream", 30).await, "ens_stream ready after reload");
+    assert_eq!(
+        reload.status(),
+        reqwest::StatusCode::OK,
+        "reload must succeed"
+    );
+    assert!(
+        wait_model_ready(&base, "ens_stream", 30).await,
+        "ens_stream ready after reload"
+    );
 
     // New request must use the NEW plan (tail_v2 chunks).
-    let after = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "hello world"}))
-        .await
-        .expect("post-reload stream must open");
+    let after = sse_post(
+        &base,
+        "/v2/models/ens_stream/events",
+        json!({"text": "hello world"}),
+    )
+    .await
+    .expect("post-reload stream must open");
     assert!(
         after.contains(r#""token":"hello_v2""#),
         "post-reload request must use the new plan (tail_v2): {after}"
@@ -1830,8 +1905,11 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-ens-stream-{}-{}", std::process::id(), http_port));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-ens-stream-{}-{}",
+        std::process::id(),
+        http_port
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_all_fixtures(&repo);
     let dir = std::env::temp_dir().join(format!(
@@ -1887,9 +1965,13 @@ async fn test_audit_stream_grpc_server_streaming_parity() {
     wait_ready_all(&base, &["ens_stream"]).await;
 
     // SSE reference sequence.
-    let sse = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "parity check"}))
-        .await
-        .expect("SSE must open");
+    let sse = sse_post(
+        &base,
+        "/v2/models/ens_stream/events",
+        json!({"text": "parity check"}),
+    )
+    .await
+    .expect("SSE must open");
     let sse_tokens: Vec<String> = sse
         .lines()
         .filter_map(|l| {
@@ -1965,7 +2047,9 @@ async fn test_audit_stream_grpc_bidi_json_aggregation() {
     drop(tx);
 
     let resp = client
-        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
         .await
         .expect("bidi must open");
     let mut out = resp.into_inner();
@@ -1973,19 +2057,17 @@ async fn test_audit_stream_grpc_bidi_json_aggregation() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), out.message()).await {
-            Ok(Ok(Some(chunk))) => {
-                match chunk.payload {
-                    Some(bidi_chunk::Payload::Data(d)) => {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
-                            if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
-                                tokens.push(t.to_string());
-                            }
+            Ok(Ok(Some(chunk))) => match chunk.payload {
+                Some(bidi_chunk::Payload::Data(d)) => {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
+                        if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
+                            tokens.push(t.to_string());
                         }
                     }
-                    Some(bidi_chunk::Payload::Close(_)) => break,
-                    _ => {}
                 }
-            }
+                Some(bidi_chunk::Payload::Close(_)) => break,
+                _ => {}
+            },
             Ok(Ok(None)) | Ok(Err(_)) => break,
             Err(_) => break,
         }
@@ -2004,10 +2086,15 @@ async fn test_audit_stream_grpc_bidi_json_aggregation() {
 async fn test_audit_stream_ws_bidi_aggregation() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_agg"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_agg/stream", http_port);
     use futures::{SinkExt, StreamExt};
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"via"}"#.into(),
     ))
@@ -2066,9 +2153,9 @@ async fn test_audit_stream_ws_bidi_aggregation() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_h2_bidi_aggregation() {
+    use futures::StreamExt;
     use lite_server::proto::liteserver as pb;
     use lite_server::streaming::lpm;
-    use futures::StreamExt;
 
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_agg"]).await;
@@ -2148,9 +2235,14 @@ async fn test_audit_stream_ws_bidi_multi_round_rejected() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"hello"}"#.into(),
     ))
@@ -2186,7 +2278,10 @@ async fn test_audit_stream_ws_bidi_multi_round_rejected() {
             _ => {}
         }
     }
-    assert!(got_chunk, "must receive a downstream chunk before multi-round check");
+    assert!(
+        got_chunk,
+        "must receive a downstream chunk before multi-round check"
+    );
 
     // A data frame after the trigger → error + close (multi-round rejected).
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2211,7 +2306,10 @@ async fn test_audit_stream_ws_bidi_multi_round_rejected() {
             _ => break,
         }
     }
-    assert!(saw_error, "multi-round frame must be rejected with an error/close");
+    assert!(
+        saw_error,
+        "multi-round frame must be rejected with an error/close"
+    );
 }
 
 /// WS mixed frames: JSON + Binary → 400 semantics (error frame + close, D17).
@@ -2221,17 +2319,24 @@ async fn test_audit_stream_ws_bidi_mixed_frames_rejected() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"hello"}"#.into(),
     ))
     .await
     .unwrap();
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2]))
-        .await
-        .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+        0u8, 1, 2,
+    ]))
+    .await
+    .unwrap();
 
     let mut saw_error = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2261,9 +2366,14 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
     wait_ready_all(&base, &["ens_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     // Send a first frame but never the close trigger.
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"stuck"}"#.into(),
@@ -2315,9 +2425,17 @@ async fn test_audit_stream_ws_decoupled_cancel_frame_is_not_multi_round() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_dslow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream",
+        http_port
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"one two three four"}"#.into(),
     ))
@@ -2376,9 +2494,17 @@ async fn test_audit_stream_ws_decoupled_close_frame_cancels_stream() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_dslow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream",
+        http_port
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"one two three four five six"}"#.into(),
     ))
@@ -2482,18 +2608,25 @@ async fn test_audit_stream_ws_bidi_error_close_code_is_contractual() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"hello"}"#.into(),
     ))
     .await
     .unwrap();
     // Mixed frames (JSON then Binary) → 400 semantics: close 1003 (D17/§4.4).
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2]))
-        .await
-        .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+        0u8, 1, 2,
+    ]))
+    .await
+    .unwrap();
 
     let mut close_code = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2523,13 +2656,20 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_despite_client_deadline() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
     wait_ready_all(&base, &["ens_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
     let req = tokio_tungstenite::tungstenite::client::ClientRequestBuilder::new(
-        ws_url.parse::<tokio_tungstenite::tungstenite::http::Uri>().unwrap(),
+        ws_url
+            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
+            .unwrap(),
     )
     .with_header("x-lite-timeout", "30");
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"stuck"}"#.into(),
     ))
@@ -2574,7 +2714,9 @@ async fn test_audit_stream_split_utf8_chunks_not_type_mismatch() {
         .await
         .expect("split-UTF8 text stream must open");
     assert!(
-        body.contains("[DONE]") && !body.contains("type_mismatch") && !body.contains("binary chunk"),
+        body.contains("[DONE]")
+            && !body.contains("type_mismatch")
+            && !body.contains("binary chunk"),
         "byte-split UTF-8 text chunks must stream to completion (direct-path parity), \
          not be killed as type_mismatch: {body}"
     );
@@ -2588,9 +2730,13 @@ async fn test_audit_stream_step_latency_covers_streaming_step() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
-    let _ = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "a b"}))
-        .await
-        .expect("SSE happy path");
+    let _ = sse_post(
+        &base,
+        "/v2/models/ens_stream/events",
+        json!({"text": "a b"}),
+    )
+    .await
+    .expect("SSE happy path");
     let metrics = reqwest::Client::new()
         .get(format!("{}/metrics", base))
         .send()
@@ -2848,7 +2994,6 @@ const ENS_CHAIN_DEADLINE_YAML: &str = r#"ensemble:
         prev: "$t1"
 "#;
 
-
 /// Head-fail chain: the HEAD worker errors on its 2nd chunk.
 const ENS_CHAIN_HEAD_FAIL_YAML: &str = r#"ensemble:
   steps:
@@ -2897,16 +3042,23 @@ async fn test_audit_stream_pipeline_chain_sse() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_chain"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_chain/events", json!({"text": "hello chain world"}))
-        .await
-        .expect("chain SSE must open");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_chain/events",
+        json!({"text": "hello chain world"}),
+    )
+    .await
+    .expect("chain SSE must open");
     assert!(
         body.contains(r#""final":"HELLO""#)
             && body.contains(r#""final":"CHAIN""#)
             && body.contains(r#""final":"WORLD""#),
         "chain must drive the tail per upstream chunk: {body}"
     );
-    assert!(body.contains("[DONE]"), "chain must terminate with [DONE]: {body}");
+    assert!(
+        body.contains("[DONE]"),
+        "chain must terminate with [DONE]: {body}"
+    );
     assert!(!body.contains("error"), "no error expected: {body}");
 }
 
@@ -2921,11 +3073,17 @@ async fn test_audit_stream_pipeline_three_node_chain_completes() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_chain3"]).await;
 
-    let fut = sse_post(&base, "/v2/models/ens_chain3/events", json!({"text": "hello chain world"}));
+    let fut = sse_post(
+        &base,
+        "/v2/models/ens_chain3/events",
+        json!({"text": "hello chain world"}),
+    );
     let body = tokio::time::timeout(Duration::from_secs(10), fut)
         .await
-        .expect("3-node chain must complete in bounded time — it hangs on the \
-                 root-held inter-hop sender until idle/deadline reclaim")
+        .expect(
+            "3-node chain must complete in bounded time — it hangs on the \
+                 root-held inter-hop sender until idle/deadline reclaim",
+        )
         .expect("SSE must open (200)");
     assert!(
         body.contains("[DONE]"),
@@ -2942,9 +3100,13 @@ async fn test_audit_stream_pipeline_midchain_failure() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_chain_fail"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_chain_fail/events", json!({"text": "hello chain world"}))
-        .await
-        .expect("chain must open (200)");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_chain_fail/events",
+        json!({"text": "hello chain world"}),
+    )
+    .await
+    .expect("chain must open (200)");
     assert!(
         body.contains(r#""final":"HELLO""#),
         "chunks before the failure must stream: {body}"
@@ -2966,9 +3128,13 @@ async fn test_audit_stream_pipeline_chain_tail_timeout() {
     wait_ready_all(&base, &["ens_chain_deadline"]).await;
 
     let start = std::time::Instant::now();
-    let body = sse_post(&base, "/v2/models/ens_chain_deadline/events", json!({"text": "hello chain world"}))
-        .await
-        .expect("chain SSE must open");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_chain_deadline/events",
+        json!({"text": "hello chain world"}),
+    )
+    .await
+    .expect("chain SSE must open");
     let elapsed = start.elapsed();
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
@@ -2979,7 +3145,6 @@ async fn test_audit_stream_pipeline_chain_tail_timeout() {
         "tail timeout_secs=1 must terminate the chain promptly; elapsed {elapsed:?}"
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // /audit 2026-08-13: batch-2 defect repros (read-only; no impl changes)
@@ -2997,11 +3162,23 @@ async fn test_audit_stream_ws_chain_disconnect_cancels_head_worker() {
 
     let (base, _guard, repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_chain_slow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_chain_slow/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
-    ws.send(Message::Text(r#"{"text":"a b c"}"#.into())).await.unwrap();
-    ws.send(Message::Text(r#"{"type":"close"}"#.into())).await.unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ens_chain_slow/stream",
+        http_port
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(r#"{"text":"a b c"}"#.into()))
+        .await
+        .unwrap();
+    ws.send(Message::Text(r#"{"type":"close"}"#.into()))
+        .await
+        .unwrap();
 
     // Two downstream chunks, then abrupt disconnect (no close frame).
     let mut chunks = 0;
@@ -3015,7 +3192,10 @@ async fn test_audit_stream_ws_chain_disconnect_cancels_head_worker() {
             }
         }
     }
-    assert_eq!(chunks, 2, "chain must deliver downstream chunks before disconnect");
+    assert_eq!(
+        chunks, 2,
+        "chain must deliver downstream chunks before disconnect"
+    );
     drop(ws);
 
     // D18: chain teardown must cancel EVERY streaming step's worker — the
@@ -3073,9 +3253,13 @@ async fn test_audit_stream_pipeline_same_layer_unary_sibling_runs() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_chain_sibling"]).await;
 
-    let _ = sse_post(&base, "/v2/models/ens_chain_sibling/events", json!({"text": "hello"}))
-        .await
-        .expect("chain SSE must open");
+    let _ = sse_post(
+        &base,
+        "/v2/models/ens_chain_sibling/events",
+        json!({"text": "hello"}),
+    )
+    .await
+    .expect("chain SSE must open");
     let metrics = reqwest::Client::new()
         .get(format!("{}/metrics", base))
         .send()
@@ -3473,9 +3657,17 @@ async fn test_audit_stream_e1_nested_happy() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "nested ensemble must succeed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "nested ensemble must succeed"
+    );
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({"echo": "hello"}), "nested output mismatch: {body}");
+    assert_eq!(
+        body,
+        json!({"echo": "hello"}),
+        "nested output mismatch: {body}"
+    );
 }
 
 /// R17 (MIMO × E1): a parent step's group object maps directly onto the
@@ -3494,9 +3686,17 @@ async fn test_audit_r17_nested_named_inputs_mapping() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "R17 nested mapping must succeed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "R17 nested mapping must succeed"
+    );
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({"echo": "hello r17"}), "child must see the named input: {body}");
+    assert_eq!(
+        body,
+        json!({"echo": "hello r17"}),
+        "child must see the named input: {body}"
+    );
 }
 
 /// R17 negative: an unknown key for the child's declared inputs → 400
@@ -3539,9 +3739,16 @@ async fn test_audit_stream_e1_self_loop_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "self-loop must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "self-loop must be 400"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("recursion"), "error must name the recursion: {body}");
+    assert!(
+        body.contains("recursion"),
+        "error must name the recursion: {body}"
+    );
 }
 
 /// E1: cross-model mutual recursion (A→B→A) — the ancestor chain catches it
@@ -3560,9 +3767,16 @@ async fn test_audit_stream_e1_mutual_recursion_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "mutual recursion must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "mutual recursion must be 400"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("recursion"), "error must name the recursion: {body}");
+    assert!(
+        body.contains("recursion"),
+        "error must name the recursion: {body}"
+    );
 }
 
 /// E1 × D4: a parent step pointing at a STREAMING child DAG is rejected
@@ -3581,9 +3795,16 @@ async fn test_audit_stream_e1_child_streaming_d4_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "D4 must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "D4 must be 400"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("streaming"), "error must name the streaming child: {body}");
+    assert!(
+        body.contains("streaming"),
+        "error must name the streaming child: {body}"
+    );
 }
 
 /// E2: explicit output — mid-DAG step selection and field projection.
@@ -3604,7 +3825,11 @@ async fn test_audit_stream_e2_output_mid_and_field() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({"pre": "hello"}), "output must select s1: {body}");
+    assert_eq!(
+        body,
+        json!({"pre": "hello"}),
+        "output must select s1: {body}"
+    );
 
     // output: "$s1.pre" — field projection.
     let resp = client
@@ -3635,7 +3860,11 @@ async fn test_audit_stream_e2_output_missing_field_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "missing field must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "missing field must be 400"
+    );
 }
 
 /// E3: params merge into the assembled payload (the reflect worker echoes
@@ -3656,8 +3885,16 @@ async fn test_audit_stream_e3_params_merged() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["got"]["data"], json!("hello"), "input must reach the worker: {body}");
-    assert_eq!(body["got"]["bias"], json!(2), "params must merge into the payload: {body}");
+    assert_eq!(
+        body["got"]["data"],
+        json!("hello"),
+        "input must reach the worker: {body}"
+    );
+    assert_eq!(
+        body["got"]["bias"],
+        json!(2),
+        "params must merge into the payload: {body}"
+    );
 }
 
 /// E3: params × Binary input → 400 (assembly-time rejection).
@@ -3675,7 +3912,11 @@ async fn test_audit_stream_e3_params_binary_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "params × Binary must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "params × Binary must be 400"
+    );
 }
 
 /// E4/D15: two steps of the same model (version omitted) share the FIRST
@@ -3691,7 +3932,10 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
     let client = reqwest::Client::new();
     // Pre-load drift v2 so the mid-request activation is instant.
     let resp = client
-        .post(format!("{}/v2/repository/models/drift/versions/2/load", base))
+        .post(format!(
+            "{}/v2/repository/models/drift/versions/2/load",
+            base
+        ))
         .send()
         .await
         .unwrap();
@@ -3707,7 +3951,10 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
         if v["ready"].as_bool() == Some(true) {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "drift v2 never became ready");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "drift v2 never became ready"
+        );
         sleep(Duration::from_millis(100)).await;
     }
 
@@ -3738,7 +3985,10 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
     let marker = _repo.join("drift").join("1").join("predict_started");
     let mark_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !marker.exists() {
-        assert!(tokio::time::Instant::now() < mark_deadline, "drift v1 predict never started");
+        assert!(
+            tokio::time::Instant::now() < mark_deadline,
+            "drift v1 predict never started"
+        );
         sleep(Duration::from_millis(50)).await;
     }
     let activate = client
@@ -3749,13 +3999,21 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
     assert_eq!(activate.status(), 200, "activate v2 must succeed");
 
     let start = std::time::Instant::now();
-    let resp = req_task.await.expect("request task must not panic").unwrap();
+    let resp = req_task
+        .await
+        .expect("request task must not panic")
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
     let got = &body["got"];
-    assert_eq!(got["a_ver"], json!("v1"), "step a must use the pre-drift v1: {body}");
     assert_eq!(
-        got["b_ver"], json!("v1"),
+        got["a_ver"],
+        json!("v1"),
+        "step a must use the pre-drift v1: {body}"
+    );
+    assert_eq!(
+        got["b_ver"],
+        json!("v1"),
         "step b must share step a's snapshot (same-request consistency, D15): {body}"
     );
     // Both steps ran drift v1 (2s predict each) — a wall-clock check proves
@@ -3776,7 +4034,8 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
         .unwrap();
     let body2: Value = resp.json().await.unwrap();
     assert_eq!(
-        body2["got"]["a_ver"], json!("v2"),
+        body2["got"]["a_ver"],
+        json!("v2"),
         "fresh request must see the new active v2: {body2}"
     );
 }
@@ -3791,7 +4050,10 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v2/repository/models/drift/versions/2/load", base))
+        .post(format!(
+            "{}/v2/repository/models/drift/versions/2/load",
+            base
+        ))
         .send()
         .await
         .unwrap();
@@ -3807,7 +4069,10 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
         if v["ready"].as_bool() == Some(true) {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "drift v2 never became ready");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "drift v2 never became ready"
+        );
         sleep(Duration::from_millis(100)).await;
     }
 
@@ -3834,7 +4099,10 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
     let marker = _repo.join("drift").join("1").join("predict_started");
     let mark_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !marker.exists() {
-        assert!(tokio::time::Instant::now() < mark_deadline, "drift v1 predict never started");
+        assert!(
+            tokio::time::Instant::now() < mark_deadline,
+            "drift v1 predict never started"
+        );
         sleep(Duration::from_millis(50)).await;
     }
     let activate = client
@@ -3844,13 +4112,21 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
         .unwrap();
     assert_eq!(activate.status(), 200);
 
-    let resp = req_task.await.expect("request task must not panic").unwrap();
+    let resp = req_task
+        .await
+        .expect("request task must not panic")
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
     let got = &body["got"];
-    assert_eq!(got["a_ver"], json!("v1"), "parent step a must use v1: {body}");
     assert_eq!(
-        got["c_ver"], json!("v1"),
+        got["a_ver"],
+        json!("v1"),
+        "parent step a must use v1: {body}"
+    );
+    assert_eq!(
+        got["c_ver"],
+        json!("v1"),
         "the nested child must share the parent's snapshot (D36): {body}"
     );
 }
@@ -3863,10 +4139,17 @@ async fn test_audit_stream_e5_stream_timeout_error_frame() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_e5_stream/events", json!({"text": "a b c d e f g h"}))
-        .await
-        .expect("stream must open (200) before the step cap fires");
-    assert!(body.contains("token"), "chunks before the cap must flow: {body}");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_e5_stream/events",
+        json!({"text": "a b c d e f g h"}),
+    )
+    .await
+    .expect("stream must open (200) before the step cap fires");
+    assert!(
+        body.contains("token"),
+        "chunks before the cap must flow: {body}"
+    );
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
         "step timeout must close with an Error frame, no [DONE]: {body}"
@@ -3882,10 +4165,18 @@ async fn test_audit_stream_e5_autoload_timeout_504() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_e5_autoload"]).await;
 
-    let err = sse_post(&base, "/v2/models/ens_e5_autoload/events", json!({"text": "hello"}))
-        .await
-        .expect_err("a step budget that cannot cover the autoload must fail");
-    assert_eq!(err, reqwest::StatusCode::GATEWAY_TIMEOUT, "must be 504 (deadline row)");
+    let err = sse_post(
+        &base,
+        "/v2/models/ens_e5_autoload/events",
+        json!({"text": "hello"}),
+    )
+    .await
+    .expect_err("a step budget that cannot cover the autoload must fail");
+    assert_eq!(
+        err,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "must be 504 (deadline row)"
+    );
 }
 
 /// D35 transport parity (gRPC server-streaming): the tail step's timeout
@@ -3948,9 +4239,17 @@ async fn test_audit_stream_e5_stream_timeout_ws_error_close() {
     use futures::{SinkExt, StreamExt};
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_e5_stream/stream", http_port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ens_e5_stream/stream",
+        http_port
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"text":"a b c d e f g h"}"#.into(),
     ))
@@ -3986,7 +4285,10 @@ async fn test_audit_stream_e5_stream_timeout_ws_error_close() {
         }
     }
     assert!(saw_token, "chunks must flow before the step cap fires");
-    assert!(saw_error, "mid-stream step timeout must close with an error message");
+    assert!(
+        saw_error,
+        "mid-stream step timeout must close with an error message"
+    );
 }
 
 /// D35 transport parity (h2 bidi): the tail step's timeout fires mid-stream
@@ -3995,9 +4297,9 @@ async fn test_audit_stream_e5_stream_timeout_ws_error_close() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_e5_stream_timeout_h2_bidi_error_frame() {
+    use futures::StreamExt;
     use lite_server::proto::liteserver as pb;
     use lite_server::streaming::lpm;
-    use futures::StreamExt;
 
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
@@ -4067,7 +4369,10 @@ async fn test_audit_stream_e5_stream_timeout_h2_bidi_error_frame() {
         }
     }
     assert!(saw_token, "chunks must flow before the step cap fires");
-    assert!(saw_error, "mid-stream step timeout must send an Error frame");
+    assert!(
+        saw_error,
+        "mid-stream step timeout must send an Error frame"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4178,7 +4483,10 @@ async fn test_audit_stream_e4_metric_version_label_normalized_to_latest() {
                 && l.contains(r#"model="drift""#)
         })
         .collect();
-    assert!(!drift_series.is_empty(), "ens_drift drift-step series must exist");
+    assert!(
+        !drift_series.is_empty(),
+        "ens_drift drift-step series must exist"
+    );
     for line in &drift_series {
         assert!(
             line.contains(r#"version="latest""#),
@@ -4207,7 +4515,11 @@ async fn test_audit_e6_skip_step_sibling_continues() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "skip must not fail the DAG");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "skip must not fail the DAG"
+    );
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("still works"),
@@ -4291,10 +4603,17 @@ async fn test_audit_e6_stream_build_retry_recovers() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream_retry"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_stream_retry/events", json!({"text": "hello world"}))
-        .await
-        .expect("stream must open (200)");
-    assert!(body.contains(r#""token":"hello""#), "chunks must arrive after rebuild: {body}");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_stream_retry/events",
+        json!({"text": "hello world"}),
+    )
+    .await
+    .expect("stream must open (200)");
+    assert!(
+        body.contains(r#""token":"hello""#),
+        "chunks must arrive after rebuild: {body}"
+    );
     assert!(body.contains(r#""token":"world""#), "second chunk: {body}");
     assert!(body.contains("[DONE]"), "clean [DONE]: {body}");
     assert!(!body.contains("error"), "no error frame expected: {body}");
@@ -4308,9 +4627,13 @@ async fn test_audit_e6_stream_retry_exhausted_error_frame() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream_retry_exhaust"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_stream_retry_exhaust/events", json!({"text": "hello"}))
-        .await
-        .expect("stream must open (200) — first-frame failure is in-stream");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_stream_retry_exhaust/events",
+        json!({"text": "hello"}),
+    )
+    .await
+    .expect("stream must open (200) — first-frame failure is in-stream");
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
         "exhausted build retries must close with an Error frame, no [DONE]: {body}"
@@ -4326,9 +4649,13 @@ async fn test_audit_e6_stream_committed_no_replay() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_stream_committed"]).await;
 
-    let body = sse_post(&base, "/v2/models/ens_stream_committed/events", json!({"text": "a b c d"}))
-        .await
-        .expect("stream must open (200)");
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_stream_committed/events",
+        json!({"text": "a b c d"}),
+    )
+    .await
+    .expect("stream must open (200)");
     assert_eq!(
         body.matches(r#""token":"a""#).count(),
         1,
@@ -4361,9 +4688,16 @@ async fn test_audit_mimo_envelope_happy_http_unary() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "envelope request must run the DAG");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "envelope request must run the DAG"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("hello envelope"), "DAG output must reflect the named input: {body}");
+    assert!(
+        body.contains("hello envelope"),
+        "DAG output must reflect the named input: {body}"
+    );
 }
 
 /// R18: a missing required input → 400 (named-input contract).
@@ -4381,7 +4715,11 @@ async fn test_audit_mimo_missing_required_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "missing required input must be 400 (R18)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "missing required input must be 400 (R18)"
+    );
 }
 
 /// R18: an unknown input name → 400.
@@ -4402,7 +4740,11 @@ async fn test_audit_mimo_unknown_input_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "unknown input must be 400 (R18)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "unknown input must be 400 (R18)"
+    );
 }
 
 /// D8: the binary passthrough chain — a TritonBinary envelope (JSON head +
@@ -4425,7 +4767,10 @@ async fn test_audit_mimo_binary_passthrough_chain() {
     let resp = client
         .post(format!("{}/v2/models/ens_mimo_bin/infer", base))
         .header("content-type", "application/octet-stream")
-        .header("inference-header-content-length", head_bytes.len().to_string())
+        .header(
+            "inference-header-content-length",
+            head_bytes.len().to_string(),
+        )
         .body(body)
         .send()
         .await
@@ -4443,14 +4788,21 @@ async fn test_audit_mimo_binary_passthrough_chain() {
     let resp2 = client
         .post(format!("{}/v2/models/ens_mimo_bin/infer", base))
         .header("content-type", "application/octet-stream")
-        .header("inference-header-content-length", head_bytes.len().to_string())
+        .header(
+            "inference-header-content-length",
+            head_bytes.len().to_string(),
+        )
         .body(body2)
         .send()
         .await
         .unwrap();
     let v: Value = resp2.json().await.unwrap();
     assert_eq!(v["label"], json!("cat"), "classifier output: {v}");
-    assert_eq!(v["bytes_in"], json!(3), "the original 3 bytes must reach the tail: {v}");
+    assert_eq!(
+        v["bytes_in"],
+        json!(3),
+        "the original 3 bytes must reach the tail: {v}"
+    );
 }
 
 /// R4/D13: the optional input absent → the conditional step (which would
@@ -4469,7 +4821,11 @@ async fn test_audit_mimo_conditional_skip() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "conditional skip must not fail the DAG");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "conditional skip must not fail the DAG"
+    );
     let body = resp.text().await.unwrap();
     assert!(body.contains("no opt today"), "sibling output: {body}");
 }
@@ -4513,7 +4869,8 @@ async fn test_audit_mimo_grpc_lsbe1_container() {
     let mut client = LiteServerClient::new(channel);
 
     // Happy: LSBE-1 container with a json-only envelope (no tail).
-    let head = serde_json::to_vec(&json!({"inputs": [{"name": "text", "data": "grpc envelope"}]})).unwrap();
+    let head = serde_json::to_vec(&json!({"inputs": [{"name": "text", "data": "grpc envelope"}]}))
+        .unwrap();
     let mut blob = Vec::new();
     blob.extend_from_slice(b"LSB1");
     blob.extend_from_slice(&(head.len() as u64).to_le_bytes());
@@ -4528,7 +4885,11 @@ async fn test_audit_mimo_grpc_lsbe1_container() {
         .await
         .expect("LSBE-1 gRPC unary must succeed");
     let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
-    assert_eq!(v["echo"], json!("grpc envelope"), "gRPC envelope output: {v}");
+    assert_eq!(
+        v["echo"],
+        json!("grpc envelope"),
+        "gRPC envelope output: {v}"
+    );
 
     // Malformed container (magic mismatch) → InvalidArgument.
     let resp = client
@@ -4559,9 +4920,14 @@ async fn test_audit_mimo_ws_bidi_envelope_frame_immediate() {
 
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_mimo_stream"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_mimo_stream/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     // Single envelope text frame — D33: executes immediately, no close frame.
     let envelope = json!({"inputs": [{"name": "text", "data": "hi ws"}]});
@@ -4614,9 +4980,16 @@ async fn test_audit_mimo2_json_alias_projection() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "json alias DAG must run");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "json alias DAG must run"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("via alias"), "projected alias must feed the tail: {body}");
+    assert!(
+        body.contains("via alias"),
+        "projected alias must feed the tail: {body}"
+    );
 }
 
 /// E7 (D31/D5): multi-sink response — the KServe envelope: JSON head
@@ -4642,12 +5015,19 @@ async fn test_audit_e7_multisink_envelope_response() {
     let resp = client
         .post(format!("{}/v2/models/ens_multisink/infer", base))
         .header("content-type", "application/octet-stream")
-        .header("inference-header-content-length", head_bytes.len().to_string())
+        .header(
+            "inference-header-content-length",
+            head_bytes.len().to_string(),
+        )
         .body(body)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "multi-sink must succeed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "multi-sink must succeed"
+    );
     let head_len: usize = resp
         .headers()
         .get("inference-header-content-length")
@@ -4659,17 +5039,27 @@ async fn test_audit_e7_multisink_envelope_response() {
     let full = resp.bytes().await.unwrap();
     let resp_head: Value = serde_json::from_slice(&full[..head_len]).unwrap();
     let tail = &full[head_len..];
-    assert_eq!(tail, image_bytes, "binary alias must land in the tail verbatim");
+    assert_eq!(
+        tail, image_bytes,
+        "binary alias must land in the tail verbatim"
+    );
     assert_eq!(resp_head["model_name"], json!("ens_multisink"));
     let outs = resp_head["outputs"].as_array().unwrap();
     assert_eq!(outs.len(), 3, "{outs:?}");
-    assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "multi sink"}}));
+    assert_eq!(
+        outs[0],
+        json!({"name": "answer", "data": {"pre": "multi sink"}})
+    );
     assert_eq!(
         outs[1],
         json!({"name": "thumb", "parameters": {"binary_data_size": 3}}),
         "thumb size = the input bytes (marker decode round-trip)"
     );
-    assert_eq!(outs[2], json!({"name": "score", "data": null}), "skip alias → null (D5)");
+    assert_eq!(
+        outs[2],
+        json!({"name": "score", "data": null}),
+        "skip alias → null (D5)"
+    );
 }
 
 /// E7 (D32): gRPC unary multi-sink — the LSBE-1 container carries the
@@ -4691,7 +5081,8 @@ async fn test_audit_e7_multisink_grpc_lsbe1_response() {
     let head = serde_json::to_vec(&json!({"inputs": [
         {"name": "text", "data": "grpc sink"},
         {"name": "image", "parameters": {"binary_data_size": 3}}
-    ]})).unwrap();
+    ]}))
+    .unwrap();
     let mut blob = Vec::new();
     blob.extend_from_slice(b"LSB1");
     blob.extend_from_slice(&(head.len() as u64).to_le_bytes());
@@ -4707,16 +5098,23 @@ async fn test_audit_e7_multisink_grpc_lsbe1_response() {
         .await
         .expect("gRPC multi-sink must succeed");
     let data = resp.into_inner().data;
-    let (resp_head, tail) = lite_server::ensemble::split_envelope(&data)
-        .expect("response must be an LSBE-1 container");
+    let (resp_head, tail) =
+        lite_server::ensemble::split_envelope(&data).expect("response must be an LSBE-1 container");
     assert_eq!(
         tail.as_deref(),
         Some(&b"\x01\x02\x03"[..]),
         "binary alias must land in the container tail verbatim"
     );
     let outs = resp_head["outputs"].as_array().unwrap();
-    assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "grpc sink"}}));
-    assert_eq!(outs[2], json!({"name": "score", "data": null}), "skip alias → null (D5)");
+    assert_eq!(
+        outs[0],
+        json!({"name": "answer", "data": {"pre": "grpc sink"}})
+    );
+    assert_eq!(
+        outs[2],
+        json!({"name": "score", "data": null}),
+        "skip alias → null (D5)"
+    );
 }
 
 /// E8-1 (D38/D22): x-lite-dag selects the DAG set over HTTP — no header =
@@ -4739,7 +5137,10 @@ async fn test_audit_e8_dag_selection_http_header() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""pre""#), "default set must run pre: {body}");
+    assert!(
+        body.contains(r#""pre""#),
+        "default set must run pre: {body}"
+    );
 
     // x-lite-dag: fast → the fast set.
     let resp = client
@@ -4763,7 +5164,11 @@ async fn test_audit_e8_dag_selection_http_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "unknown dag must be 400");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "unknown dag must be 400"
+    );
 
     // Malformed value → 400.
     let resp = client
@@ -4774,7 +5179,11 @@ async fn test_audit_e8_dag_selection_http_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "malformed selector must be 400 (D22)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "malformed selector must be 400 (D22)"
+    );
 }
 
 /// E8-1 (D38): the gRPC metadata channel carries the same `x-lite-dag` key.
@@ -4797,10 +5206,17 @@ async fn test_audit_e8_dag_selection_grpc_metadata() {
         data: bytes::Bytes::from_static(br#"{"text": "x"}"#),
         ..Default::default()
     });
-    req.metadata_mut().insert("x-lite-dag", "fast".parse().unwrap());
-    let resp = client.infer(req).await.expect("dag-selected gRPC unary must succeed");
+    req.metadata_mut()
+        .insert("x-lite-dag", "fast".parse().unwrap());
+    let resp = client
+        .infer(req)
+        .await
+        .expect("dag-selected gRPC unary must succeed");
     let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
-    assert!(v.get("echo").is_some(), "fast set must run echo over gRPC: {v}");
+    assert!(
+        v.get("echo").is_some(),
+        "fast set must run echo over gRPC: {v}"
+    );
 }
 
 /// D41: the body field selects the set when no header/metadata is present —
@@ -4825,47 +5241,82 @@ async fn test_audit_d41_body_routing() {
     };
 
     // Body selector → the fast set (echo).
-    let resp = post(json!({"modelName": "fast", "text": "x"}), None).send().await.unwrap();
+    let resp = post(json!({"modelName": "fast", "text": "x"}), None)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""echo""#), "body selector must run fast/echo: {body}");
+    assert!(
+        body.contains(r#""echo""#),
+        "body selector must run fast/echo: {body}"
+    );
 
     // Missing field → default set (pre).
     let resp = post(json!({"text": "x"}), None).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""pre""#), "missing field must fall to default: {body}");
+    assert!(
+        body.contains(r#""pre""#),
+        "missing field must fall to default: {body}"
+    );
 
     // Null field → default set.
-    let resp = post(json!({"modelName": null, "text": "x"}), None).send().await.unwrap();
+    let resp = post(json!({"modelName": null, "text": "x"}), None)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""pre""#), "null field must fall to default: {body}");
+    assert!(
+        body.contains(r#""pre""#),
+        "null field must fall to default: {body}"
+    );
 
     // Unknown name → 400, and the message names the unknown set (D22) and
     // the body source ref (D41 debuggability).
-    let resp = post(json!({"modelName": "nope", "text": "x"}), None).send().await.unwrap();
+    let resp = post(json!({"modelName": "nope", "text": "x"}), None)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body = resp.text().await.unwrap();
     assert!(body.contains("nope"), "must name the unknown set: {body}");
-    assert!(body.contains("$request.modelName"), "must name the source ref: {body}");
+    assert!(
+        body.contains("$request.modelName"),
+        "must name the source ref: {body}"
+    );
 
     // Invalid charset → 400 (D22 validation reused).
-    let resp = post(json!({"modelName": "bad!", "text": "x"}), None).send().await.unwrap();
+    let resp = post(json!({"modelName": "bad!", "text": "x"}), None)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // Non-string → 400 (D41), message names the source ref.
-    let resp = post(json!({"modelName": 123, "text": "x"}), None).send().await.unwrap();
+    let resp = post(json!({"modelName": 123, "text": "x"}), None)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("$request.modelName"), "must name the source ref: {body}");
+    assert!(
+        body.contains("$request.modelName"),
+        "must name the source ref: {body}"
+    );
 
     // Header wins over the body field (D38 precedence).
     let resp = post(json!({"modelName": "fast", "text": "x"}), Some("default"))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""pre""#), "header must override the body field: {body}");
+    assert!(
+        body.contains(r#""pre""#),
+        "header must override the body field: {body}"
+    );
 }
 
 /// D41: `$request.dag` mirrors the BODY-RESOLVED set name — the guard step's
@@ -4890,11 +5341,18 @@ async fn test_audit_d41_request_dag_visibility() {
     let v: Value = resp.json().await.unwrap();
     let outs = v["outputs"].as_array().unwrap();
     assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "x"}}));
-    assert_eq!(outs[1], json!({"name": "dag_seen", "data": null}), "guard must skip on default");
+    assert_eq!(
+        outs[1],
+        json!({"name": "dag_seen", "data": null}),
+        "guard must skip on default"
+    );
 
     // Body selects fast → guard runs ($request.dag == 'fast' sees the
     // body-resolved name), main answers with echo.
-    let resp = post(json!({"modelName": "fast", "text": "x"})).send().await.unwrap();
+    let resp = post(json!({"modelName": "fast", "text": "x"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let v: Value = resp.json().await.unwrap();
     let outs = v["outputs"].as_array().unwrap();
@@ -4923,19 +5381,31 @@ async fn test_audit_d41_nested_child() {
     };
 
     // The parent maps modelName through — the child runs its fast set.
-    let resp = post(json!({"modelName": "fast", "text": "x"})).send().await.unwrap();
+    let resp = post(json!({"modelName": "fast", "text": "x"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""echo""#), "nested child must select fast from the payload: {body}");
+    assert!(
+        body.contains(r#""echo""#),
+        "nested child must select fast from the payload: {body}"
+    );
 
     // Explicit "default" through nesting → the child's default set. (A
     // missing modelName at the PARENT mapping is a plain missing-ref 400 —
     // absence fallthrough at the child level is covered by the direct
     // routing test above.)
-    let resp = post(json!({"modelName": "default", "text": "x"})).send().await.unwrap();
+    let resp = post(json!({"modelName": "default", "text": "x"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.text().await.unwrap();
-    assert!(body.contains(r#""pre""#), "nested child must run its default set: {body}");
+    assert!(
+        body.contains(r#""pre""#),
+        "nested child must run its default set: {body}"
+    );
 }
 
 /// D41 debuggability parity: a body-resolved UNKNOWN set name at a NESTED
@@ -4986,9 +5456,15 @@ async fn test_audit_d41_grpc_body_selection() {
         data: bytes::Bytes::from_static(br#"{"modelName": "fast", "text": "x"}"#),
         ..Default::default()
     });
-    let resp = client.infer(req).await.expect("body-selected gRPC unary must succeed");
+    let resp = client
+        .infer(req)
+        .await
+        .expect("body-selected gRPC unary must succeed");
     let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
-    assert!(v.get("echo").is_some(), "body selector must run fast/echo over gRPC: {v}");
+    assert!(
+        v.get("echo").is_some(),
+        "body selector must run fast/echo over gRPC: {v}"
+    );
 }
 
 /// D41/D30: gRPC batch × dags-form ensemble — the streaming pre-check must
@@ -5015,10 +5491,17 @@ async fn test_audit_d41_batch_dags_form() {
         items: vec![br#"{"text":"a"}"#.to_vec().into()],
         headers: Default::default(),
     });
-    let resp = client.batch_infer(req).await.expect("batch on dags-form must not panic");
+    let resp = client
+        .batch_infer(req)
+        .await
+        .expect("batch on dags-form must not panic");
     let items = resp.into_inner().items;
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].status.as_ref().unwrap().code, "Ok", "element must succeed");
+    assert_eq!(
+        items[0].status.as_ref().unwrap().code,
+        "Ok",
+        "element must succeed"
+    );
     assert!(String::from_utf8_lossy(&items[0].data).contains(r#""pre""#));
 
     // Per-element body routing: element 0 → fast (echo), element 1 → default (pre).
@@ -5031,7 +5514,10 @@ async fn test_audit_d41_batch_dags_form() {
         ],
         headers: Default::default(),
     });
-    let resp = client.batch_infer(req).await.expect("per-element body routing must succeed");
+    let resp = client
+        .batch_infer(req)
+        .await
+        .expect("per-element body routing must succeed");
     let items = resp.into_inner().items;
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].status.as_ref().unwrap().code, "Ok");
@@ -5059,7 +5545,10 @@ async fn test_audit_d41_batch_dags_form() {
         ],
         headers: Default::default(),
     });
-    let resp = client.batch_infer(req).await.expect("array element must fail per-element, not the batch");
+    let resp = client
+        .batch_infer(req)
+        .await
+        .expect("array element must fail per-element, not the batch");
     let items = resp.into_inner().items;
     assert_eq!(items.len(), 2);
     let st = items[0].status.as_ref().unwrap();
@@ -5081,10 +5570,18 @@ async fn test_audit_d41_batch_dags_form() {
 async fn test_audit_d41_ws_body_routing() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_dags_stream_sel"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
-    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dags_stream_sel/stream", http_port);
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ens_dags_stream_sel/stream",
+        http_port
+    );
     use futures::{SinkExt, StreamExt};
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"modelName":"fast","text":"hello world"}"#.into(),
     ))
@@ -5142,10 +5639,15 @@ async fn test_audit_d41_ws_body_routing() {
 async fn test_audit_d41_ws_multi_frame_array_root_rejected() {
     let (base, _guard, _repo) = boot_server("").await;
     wait_ready_all(&base, &["ens_dags_sel"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dags_sel/stream", http_port);
     use futures::{SinkExt, StreamExt};
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         r#"{"modelName":"fast","text":"a"}"#.into(),
     ))
@@ -5188,7 +5690,11 @@ async fn test_audit_d41_ws_multi_frame_array_root_rejected() {
         saw_selector_error,
         "multi-frame WS upload must fail naming the selector ref (D41)"
     );
-    assert_eq!(close_code, Some(1003), "a 4xx selector error closes with 1003");
+    assert_eq!(
+        close_code,
+        Some(1003),
+        "a 4xx selector error closes with 1003"
+    );
 }
 
 /// D41: gRPC bidi body routing — the Open frame's initial_data carries the
@@ -5221,7 +5727,9 @@ async fn test_audit_d41_grpc_bidi_body_routing() {
     drop(tx);
 
     let resp = client
-        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
         .await
         .expect("bidi body routing must open");
     let mut out = resp.into_inner();
@@ -5288,7 +5796,9 @@ async fn test_audit_d41_grpc_bidi_multi_frame_array_root_rejected() {
     drop(tx);
 
     let err = client
-        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
         .await
         .expect_err("multi-frame bidi upload with a selector must fail (D41)");
     assert!(
@@ -5321,11 +5831,22 @@ async fn test_audit_e8_when_skip_and_dag_condition() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "when-false steps must skip cleanly");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "when-false steps must skip cleanly"
+    );
     let v: Value = resp.json().await.unwrap();
     let outs = v["outputs"].as_array().unwrap();
-    assert_eq!(outs[0], json!({"name": "answer", "data": {"echo": "hello when"}}));
-    assert_eq!(outs[1], json!({"name": "maybe_score", "data": null}), "when-false alias → null (D5)");
+    assert_eq!(
+        outs[0],
+        json!({"name": "answer", "data": {"echo": "hello when"}})
+    );
+    assert_eq!(
+        outs[1],
+        json!({"name": "maybe_score", "data": null}),
+        "when-false alias → null (D5)"
+    );
     assert_eq!(
         outs[2],
         json!({"name": "dag_path_out", "data": {"pre": "hello when"}}),
@@ -5343,7 +5864,11 @@ async fn test_audit_e8_when_skip_and_dag_condition() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "fast set must run");
     let v: Value = resp.json().await.unwrap();
-    assert_eq!(v, json!({"pre": "hello when"}), "fast set answers with pre: {v}");
+    assert_eq!(
+        v,
+        json!({"pre": "hello when"}),
+        "fast set answers with pre: {v}"
+    );
 
     // opt present → `maybe` RUNS → pre_5xx 500 (observable run proof).
     let with_opt = json!({"inputs": [
@@ -5454,7 +5979,11 @@ async fn test_audit_nested_dags_child_executes_default_set() {
         "a nested dags-form child must execute its default set, not panic"
     );
     let v: Value = resp.json().await.unwrap();
-    assert_eq!(v, json!({"pre": "hi nested"}), "child default set answers: {v}");
+    assert_eq!(
+        v,
+        json!({"pre": "hi nested"}),
+        "child default set answers: {v}"
+    );
 }
 
 /// Audit (batch 4/5 review): §5.5.8 R15 superset tolerance — a shared
@@ -5484,7 +6013,11 @@ async fn test_audit_dags_superset_envelope_tolerated() {
         "names not declared by the SELECTED set must be tolerated (superset client, §5.5.8)"
     );
     let v: Value = resp.json().await.unwrap();
-    assert_eq!(v, json!({"echo": "superset ok"}), "fast set answers with its own input: {v}");
+    assert_eq!(
+        v,
+        json!({"echo": "superset ok"}),
+        "fast set answers with its own input: {v}"
+    );
 }
 
 /// Audit (batch 4/5 review): `$request.dag` in a when condition must see

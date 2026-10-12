@@ -144,15 +144,17 @@ mod tests {
     #[test]
     fn test_proto_headers_fallback_passes() {
         let headers = HashMap::from([("X-API-Key".to_string(), "sk-a".to_string())]);
-        assert!(
-            enforce_auth_grpc(Some(&policy(&["sk-a"])), &MetadataMap::new(), &headers).is_ok()
-        );
+        assert!(enforce_auth_grpc(Some(&policy(&["sk-a"])), &MetadataMap::new(), &headers).is_ok());
     }
 
     #[test]
     fn test_missing_key_unauthenticated() {
-        let err = enforce_auth_grpc(Some(&policy(&["sk-a"])), &MetadataMap::new(), &HashMap::new())
-            .unwrap_err();
+        let err = enforce_auth_grpc(
+            Some(&policy(&["sk-a"])),
+            &MetadataMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -194,10 +196,9 @@ mod tests {
     fn rate_limit_over_limit_returns_resource_exhausted_with_retry_after() {
         let limiter = crate::rate_limit::RateLimiter::default();
         let policy = rl(1.0, "ip", None); // 极低配额
-        // 首个请求耗尽配额，第二个被拒。
+                                          // 首个请求耗尽配额，第二个被拒。
         let _ = enforce_grpc_rate_limit(&limiter, Some(&policy), "rlm", "9.9.9.9");
-        let err = enforce_grpc_rate_limit(&limiter, Some(&policy), "rlm", "9.9.9.9")
-            .unwrap_err();
+        let err = enforce_grpc_rate_limit(&limiter, Some(&policy), "rlm", "9.9.9.9").unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(
             err.metadata().get("retry-after").is_some(),

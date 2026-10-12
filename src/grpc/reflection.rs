@@ -28,8 +28,7 @@ mod tests {
     #[test]
     fn reflection_config_defaults_off_and_parses() {
         assert!(!crate::config::GrpcConfig::default().reflection);
-        let parsed: crate::config::GrpcConfig =
-            serde_yaml::from_str("reflection: true").unwrap();
+        let parsed: crate::config::GrpcConfig = serde_yaml::from_str("reflection: true").unwrap();
         assert!(parsed.reflection);
     }
 
@@ -44,12 +43,11 @@ mod tests {
     /// 向 `port` 发一次 ListServices 反射查询。服务未挂载 → Err(Unimplemented)；
     /// 端口尚未就绪 → Err(Unavailable)（调用方据此重试）。
     async fn list_services(port: u16) -> Result<Vec<String>, Status> {
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-                .expect("valid endpoint")
-                .connect()
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
         let mut client = ServerReflectionClient::new(channel);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(ServerReflectionRequest {
@@ -128,7 +126,11 @@ mod tests {
             }
         }
         let names = names.expect("reflection service must respond when enabled");
-        for expected in ["liteserver.LiteServer", "liteserver.Admin", "grpc.health.v1.Health"] {
+        for expected in [
+            "liteserver.LiteServer",
+            "liteserver.Admin",
+            "grpc.health.v1.Health",
+        ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "{expected} must be listed; got {names:?}"

@@ -13,10 +13,10 @@ use crate::worker::WorkerManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::warn;
-use tracing::Instrument;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::warn;
+use tracing::Instrument;
 
 pub mod admin;
 pub mod interceptor;
@@ -29,10 +29,10 @@ mod payload;
 mod reflection;
 mod rpc;
 
-pub use pb::lite_server_server::{LiteServer, LiteServerServer};
-pub(crate) use error::{app_error_to_grpc_status, err, with_retry_after};
 use error::grpc_code_to_status_family;
+pub(crate) use error::{app_error_to_grpc_status, err, with_retry_after};
 use metadata::{echo_grpc_response_headers, metadata_request_id, record_grpc_request_end};
+pub use pb::lite_server_server::{LiteServer, LiteServerServer};
 
 /// Shared state for the gRPC service.
 #[derive(Clone)]
@@ -155,9 +155,7 @@ impl GrpcService {
     /// for the STREAM's lifetime (RN-13 O2, HTTP SSE/WS parity). Rejects with
     /// Unavailable + retry-after at cap; no-op when `max_inflight` is 0
     /// (unlimited).
-    fn acquire_admission(
-        &self,
-    ) -> Result<crate::admission::AdmissionGuard, Status> {
+    fn acquire_admission(&self) -> Result<crate::admission::AdmissionGuard, Status> {
         match self.app_state.admission.try_acquire() {
             Some(g) => Ok(g),
             None => {
@@ -227,7 +225,10 @@ impl LiteServer for GrpcService {
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
-        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+        if let Some(rc) = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+        {
             crate::telemetry::link_parent(&span, &rc.trace_cx);
         }
         let mut version_label = request.get_ref().version.clone();
@@ -277,7 +278,12 @@ impl LiteServer for GrpcService {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| metadata_request_id(request.metadata()));
         // FD-2: D11 body fields (batch body size = Σ items).
-        let body_bytes = request.get_ref().items.iter().map(|i| i.len()).sum::<usize>() as i64;
+        let body_bytes = request
+            .get_ref()
+            .items
+            .iter()
+            .map(|i| i.len())
+            .sum::<usize>() as i64;
         let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
         let span = tracing::info_span!(
             "inference",
@@ -293,7 +299,10 @@ impl LiteServer for GrpcService {
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
-        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+        if let Some(rc) = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+        {
             crate::telemetry::link_parent(&span, &rc.trace_cx);
         }
         let mut version_label = request.get_ref().version.clone();
@@ -371,13 +380,23 @@ impl LiteServer for GrpcService {
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
-        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+        if let Some(rc) = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+        {
             crate::telemetry::link_parent(&span, &rc.trace_cx);
         }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .stream_infer_impl(request, &mut version_label, &mut request_id, start, span.clone(), admission)
+            .stream_infer_impl(
+                request,
+                &mut version_label,
+                &mut request_id,
+                start,
+                span.clone(),
+                admission,
+            )
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -388,11 +407,8 @@ impl LiteServer for GrpcService {
                 .registry
                 .get(&model_label, Some(&version_label))
                 .is_some();
-            let (m, v) = crate::metrics::prometheus::reject_labels(
-                registered,
-                &model_label,
-                &version_label,
-            );
+            let (m, v) =
+                crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
             crate::metrics::prometheus::record_request_end(
                 m,
                 v,
@@ -460,13 +476,23 @@ impl LiteServer for GrpcService {
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
-        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+        if let Some(rc) = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+        {
             crate::telemetry::link_parent(&span, &rc.trace_cx);
         }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start, span.clone(), admission)
+            .decoupled_infer_impl(
+                request,
+                &mut version_label,
+                &mut request_id,
+                start,
+                span.clone(),
+                admission,
+            )
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -477,11 +503,8 @@ impl LiteServer for GrpcService {
                 .registry
                 .get(&model_label, Some(&version_label))
                 .is_some();
-            let (m, v) = crate::metrics::prometheus::reject_labels(
-                registered,
-                &model_label,
-                &version_label,
-            );
+            let (m, v) =
+                crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
             crate::metrics::prometheus::record_request_end(
                 m,
                 v,
@@ -534,11 +557,8 @@ impl LiteServer for GrpcService {
                 .registry
                 .get(&model_label, Some(&version_label))
                 .is_some();
-            let (m, v) = crate::metrics::prometheus::reject_labels(
-                registered,
-                &model_label,
-                &version_label,
-            );
+            let (m, v) =
+                crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
             crate::metrics::prometheus::record_request_end(
                 m,
                 v,
@@ -633,9 +653,9 @@ pub async fn start_grpc_server(
     // P7-1 (蓝图 §4.2): endpoint-class access control — value_env/value_file
     // resolved here so a missing source fails fast at startup. Each service
     // mounts the interceptor with its own class (挂载矩阵 §4.0.3).
-    let access_control = Arc::new(
-        crate::access_control::AccessControl::build(&config.access_control)?,
-    );
+    let access_control = Arc::new(crate::access_control::AccessControl::build(
+        &config.access_control,
+    )?);
 
     // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Shared
     // by the service interceptors and the handler-side `finalize_context`.
@@ -653,7 +673,9 @@ pub async fn start_grpc_server(
         rate_limiter,
         // P9-1: decoupled stream idle timeout (0 → disabled / None).
         decoupled_idle_timeout: if config.server.decoupled_idle_timeout_secs > 0.0 {
-            Some(Duration::from_secs_f32(config.server.decoupled_idle_timeout_secs))
+            Some(Duration::from_secs_f32(
+                config.server.decoupled_idle_timeout_secs,
+            ))
         } else {
             None
         },
@@ -686,18 +708,28 @@ pub async fn start_grpc_server(
     // (P1-1) stay in handlers. Transparent to unary/stream/bidi.
     let server = tonic::codegen::InterceptedService::new(
         server,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Inference, trusted.clone()),
+        interceptor::service_interceptor(
+            access_control.clone(),
+            EndpointClass::Inference,
+            trusted.clone(),
+        ),
     );
 
     // Standard gRPC health checking (grpc.health.v1): the reporter lives in
     // the WorkerManager, which syncs "" and per-model services on every
     // status transition and coordinator tick (phase 3).
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    worker_manager.set_grpc_health_reporter(health_reporter).await;
+    worker_manager
+        .set_grpc_health_reporter(health_reporter)
+        .await;
     worker_manager.sync_grpc_health().await;
     let health_service = tonic::codegen::InterceptedService::new(
         health_service,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Health, trusted.clone()),
+        interceptor::service_interceptor(
+            access_control.clone(),
+            EndpointClass::Health,
+            trusted.clone(),
+        ),
     );
 
     // RN-2 (resource-leak-plan): gRPC concurrency bounds. tonic spawns a task
@@ -741,10 +773,8 @@ pub async fn start_grpc_server(
     // Built from the same AppState as the inference service above — the
     // repository RPCs (delete/drift/upload/download/list) reuse the HTTP
     // handlers' shared cores through it.
-    let admin_service = crate::grpc::admin::GrpcAdminService::new(
-        app_state.clone(),
-        access_control.clone(),
-    );
+    let admin_service =
+        crate::grpc::admin::GrpcAdminService::new(app_state.clone(), access_control.clone());
     let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
     // P-FLOW (§4.0.9): same per-request decode cap as inference.
     let admin_server = if let Some(n) = max_request_body_bytes {
@@ -757,7 +787,11 @@ pub async fn start_grpc_server(
     // fail-closed（未配置仅 loopback；D14）。
     let admin_server = tonic::codegen::InterceptedService::new(
         admin_server,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Admin, trusted.clone()),
+        interceptor::service_interceptor(
+            access_control.clone(),
+            EndpointClass::Admin,
+            trusted.clone(),
+        ),
     );
 
     // P7-2 admin_bind (蓝图 §4.2): when unset, a single server serves all three
@@ -771,7 +805,9 @@ pub async fn start_grpc_server(
     let admin_bind = grpc_config.admin_bind.clone();
     let mut admin_server_opt = Some(admin_server);
     let main_router = make_builder()
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(GRPC_GLOBAL_CONCURRENCY_LIMIT))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            GRPC_GLOBAL_CONCURRENCY_LIMIT,
+        ))
         .add_service(server)
         .add_service(health_service.clone());
     let main_router = if admin_bind.is_none() {
@@ -826,7 +862,9 @@ pub async fn start_grpc_server(
         // the main port's concern). Admin UDS is forced owner-only 0o600 so a
         // world-writable admin socket cannot let any local user bypass fail-closed.
         let admin_router = make_builder()
-            .layer(tower::limit::GlobalConcurrencyLimitLayer::new(GRPC_GLOBAL_CONCURRENCY_LIMIT))
+            .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+                GRPC_GLOBAL_CONCURRENCY_LIMIT,
+            ))
             .add_service(admin_server_opt.take().expect("admin_server staged"))
             .add_service(health_service);
         // admin_bind 分离时 admin 面独立成服务组——reflection 同样挂载在此，
@@ -880,7 +918,10 @@ fn resolve_admin_bind(admin_bind: &str) -> Result<(String, u16, u32), AppError> 
         ))
     })?;
     let port: u16 = port_s.parse().map_err(|_| {
-        AppError::Config(format!("grpc.admin_bind '{}' has an invalid port", admin_bind))
+        AppError::Config(format!(
+            "grpc.admin_bind '{}' has an invalid port",
+            admin_bind
+        ))
     })?;
     Ok((host.to_string(), port, 0o600))
 }
@@ -949,8 +990,15 @@ async fn serve_grpc_router(
         let addr: std::net::SocketAddr = format!("{}:{}", host, port)
             .parse()
             .map_err(|e| AppError::Config(format!("invalid {} address: {}", label, e)))?;
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(AppError::Io)?;
-        tracing::info!("Starting {} on {} (TLS, {})", label, addr, tls_store.describe());
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(AppError::Io)?;
+        tracing::info!(
+            "Starting {} on {} (TLS, {})",
+            label,
+            addr,
+            tls_store.describe()
+        );
         let incoming = crate::tls::tls_incoming(listener, tls_store, shutdown.clone());
         router
             .serve_with_incoming_shutdown(incoming, shutdown)
@@ -1028,7 +1076,12 @@ fn enforce_owner_only_uds(path: &str, label: &str) -> Result<(), AppError> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let metadata = std::fs::metadata(path).map_err(|e| {
-        AppError::Config(format!("failed to stat {} UDS {}: {}", label, path.display(), e))
+        AppError::Config(format!(
+            "failed to stat {} UDS {}: {}",
+            label,
+            path.display(),
+            e
+        ))
     })?;
     let mode = metadata.permissions().mode();
     let me = current_uid();
@@ -1107,8 +1160,14 @@ mod tests {
 
     #[test]
     fn resolve_admin_bind_rejects_missing_port_and_garbage() {
-        assert!(resolve_admin_bind("127.0.0.1").is_err(), "bare host without :port is invalid");
-        assert!(resolve_admin_bind("127.0.0.1:notaport").is_err(), "non-numeric port is invalid");
+        assert!(
+            resolve_admin_bind("127.0.0.1").is_err(),
+            "bare host without :port is invalid"
+        );
+        assert!(
+            resolve_admin_bind("127.0.0.1:notaport").is_err(),
+            "non-numeric port is invalid"
+        );
     }
 
     // --- P1-2: HTTP/2 keepalive params ---
@@ -1190,10 +1249,7 @@ mod tests {
     #[test]
     fn resolve_grpc_host_follows_server_host_when_unset() {
         // grpc.host None + server.host TCP → follow server.host.
-        assert_eq!(
-            resolve_grpc_host(None, "0.0.0.0"),
-            "0.0.0.0".to_string()
-        );
+        assert_eq!(resolve_grpc_host(None, "0.0.0.0"), "0.0.0.0".to_string());
     }
 
     #[test]
@@ -1306,7 +1362,11 @@ mod request_metrics_tests {
             format!(
                 "ipc://{}",
                 std::env::temp_dir()
-                    .join(format!("lite-server-grpc-met-{}-{}.sock", name, std::process::id()))
+                    .join(format!(
+                        "lite-server-grpc-met-{}-{}.sock",
+                        name,
+                        std::process::id()
+                    ))
                     .display()
             )
         }
@@ -1332,7 +1392,10 @@ mod request_metrics_tests {
                     uid: req.uid,
                     payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                         data: Bytes::from_static(b"{\"ok\":true}"),
-                        status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                        status: Some(pb::Status {
+                            code: "Ok".to_string(),
+                            message: String::new(),
+                        }),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -1374,7 +1437,9 @@ mod request_metrics_tests {
                     let _ = s.send(ack.encode_to_vec(), 0);
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let mk = |payload| pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -1382,17 +1447,30 @@ mod request_metrics_tests {
                     })),
                     ..Default::default()
                 };
-                let _ = s.send(mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                    data: Bytes::from_static(b"{}"),
-                    is_final: false,
-                })).encode_to_vec(), 0);
-                let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
-                    .encode_to_vec(), 0);
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Chunk(
+                        pb::StreamChunkResponse {
+                            data: Bytes::from_static(b"{}"),
+                            is_final: false,
+                        },
+                    ))
+                    .encode_to_vec(),
+                    0,
+                );
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                        .encode_to_vec(),
+                    0,
+                );
             }
         })
     }
 
-    fn test_config(max_batch_size: usize, batch_timeout: f32, max_queue_size: usize) -> ModelConfig {
+    fn test_config(
+        max_batch_size: usize,
+        batch_timeout: f32,
+        max_queue_size: usize,
+    ) -> ModelConfig {
         ModelConfig {
             max_batch_size,
             batch_timeout,
@@ -1467,14 +1545,25 @@ mod request_metrics_tests {
     async fn ready_service_with_worker(model: &str, endpoint: String) -> GrpcService {
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
         queue.register_model(
-            model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
+            model,
+            "1",
+            &test_config(1, 0.0, 10),
+            vec![],
+            vec![client.clone()],
+            Arc::new(OutlierState::new(1)),
+            None,
         );
         let service = build_service(registry, queue);
         // stream/bidi 走 worker_manager.get_zmq_clients（不经 queue）——
@@ -1509,23 +1598,36 @@ mod request_metrics_tests {
 
         let resp = service.infer(infer_request(model, "1")).await;
         assert!(resp.is_ok(), "infer must succeed: {:?}", resp.err());
-        assert_eq!(counter.get(), before + 1.0, "successful infer must record one 2xx request");
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "successful infer must record one 2xx request"
+        );
     }
 
     #[tokio::test]
     async fn should_record_4xx_when_model_not_found() {
-        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
+        let service = build_service(
+            Arc::new(ModelRegistry::new()),
+            Arc::new(InferenceQueue::new()),
+        );
 
         // A2: model-not-found records under the constant ~unknown~ label
         // (shared across tests → assert at-least-one); the requested name
         // must NOT get its own series.
-        let counter = REQUESTS_TOTAL
-            .with_label_values(&[crate::metrics::prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
+        let counter = REQUESTS_TOTAL.with_label_values(&[
+            crate::metrics::prometheus::UNKNOWN_MODEL_LABEL,
+            "",
+            "4xx",
+        ]);
         let raw_counter = REQUESTS_TOTAL.with_label_values(&["met_404", "", "4xx"]);
         let before = counter.get();
         let before_raw = raw_counter.get();
 
-        let err = service.infer(infer_request("met_404", "")).await.unwrap_err();
+        let err = service
+            .infer(infer_request("met_404", ""))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(
             counter.get() >= before + 1.0,
@@ -1547,15 +1649,26 @@ mod request_metrics_tests {
         let queue = Arc::new(InferenceQueue::new());
         for v in ["1", "2"] {
             registry
-                .register(model, v, test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+                .register(
+                    model,
+                    v,
+                    test_config(1, 0.0, 10),
+                    ModelType::LitAPI,
+                    std::env::temp_dir(),
+                )
                 .unwrap();
             registry.mark_ready(model, v).unwrap();
             let endpoint = metric_test_endpoint(&format!("{}-v{}", model, v));
             spawn_ok_worker(endpoint.clone());
             let client = Arc::new(WorkerZmqClient::new(endpoint));
             queue.register_model(
-                model, v, &test_config(1, 0.0, 10), vec![],
-                vec![client], Arc::new(OutlierState::new(1)), None,
+                model,
+                v,
+                &test_config(1, 0.0, 10),
+                vec![],
+                vec![client],
+                Arc::new(OutlierState::new(1)),
+                None,
             );
         }
         // activate = hard cutover（§4.3）：active=v1 且权重 100/0。
@@ -1573,10 +1686,15 @@ mod request_metrics_tests {
         let before = pinned.get();
 
         let mut req = infer_request(model, "");
-        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-lite-version", "2".parse().unwrap());
         let resp = service.infer(req).await;
         assert!(resp.is_ok(), "pinned infer must succeed: {:?}", resp.err());
-        assert_eq!(pinned.get(), before + 1.0, "pin must route to v2 despite weights 100→v1");
+        assert_eq!(
+            pinned.get(),
+            before + 1.0,
+            "pin must route to v2 despite weights 100→v1"
+        );
     }
 
     #[tokio::test]
@@ -1589,10 +1707,15 @@ mod request_metrics_tests {
         let before = weighted.get();
 
         let mut req = infer_request(model, "");
-        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-lite-version", "2".parse().unwrap());
         let resp = service.infer(req).await;
         assert!(resp.is_ok(), "infer must succeed: {:?}", resp.err());
-        assert_eq!(weighted.get(), before + 1.0, "switch off → weights (v1) serve, pin ignored");
+        assert_eq!(
+            weighted.get(),
+            before + 1.0,
+            "switch off → weights (v1) serve, pin ignored"
+        );
     }
 
     #[tokio::test]
@@ -1605,10 +1728,16 @@ mod request_metrics_tests {
         let before = pinned.get();
 
         let mut req = infer_request(model, "");
-        req.get_mut().headers.insert("x-lite-version".to_string(), "2".to_string());
+        req.get_mut()
+            .headers
+            .insert("x-lite-version".to_string(), "2".to_string());
         let resp = service.infer(req).await;
         assert!(resp.is_ok(), "pinned infer must succeed: {:?}", resp.err());
-        assert_eq!(pinned.get(), before + 1.0, "proto headers map pin must route to v2");
+        assert_eq!(
+            pinned.get(),
+            before + 1.0,
+            "proto headers map pin must route to v2"
+        );
     }
 
     #[tokio::test]
@@ -1617,9 +1746,14 @@ mod request_metrics_tests {
         let service = two_version_canary_service(model, true).await;
 
         let mut req = infer_request(model, "");
-        req.metadata_mut().insert("x-lite-version", "9".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-lite-version", "9".parse().unwrap());
         let err = service.infer(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound, "pin 版本不存在 → NotFound（蓝图 §4.4）");
+        assert_eq!(
+            err.code(),
+            tonic::Code::NotFound,
+            "pin 版本不存在 → NotFound（蓝图 §4.4）"
+        );
     }
 
     // --- B1: readiness gate must check the RESOLVED version, not the raw
@@ -1637,14 +1771,25 @@ mod request_metrics_tests {
         let registry = Arc::new(ModelRegistry::new());
         for v in ["1", "2"] {
             registry
-                .register(model, v, test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+                .register(
+                    model,
+                    v,
+                    test_config(1, 0.0, 10),
+                    ModelType::LitAPI,
+                    std::env::temp_dir(),
+                )
                 .unwrap();
             registry.mark_ready(model, v).unwrap();
         }
         registry.activate_version(model, "1").unwrap();
-        registry.set_status(model, "2", VersionStatus::Degraded).unwrap();
         registry
-            .set_weights(model, &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]))
+            .set_status(model, "2", VersionStatus::Degraded)
+            .unwrap();
+        registry
+            .set_weights(
+                model,
+                &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]),
+            )
             .unwrap();
         build_service_with_canary(registry, Arc::new(InferenceQueue::new()), false)
     }
@@ -1656,22 +1801,38 @@ mod request_metrics_tests {
         let model = "gate_pin";
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         registry.activate_version(model, "1").unwrap();
         // v2 registered (exists for canary_pin) but deliberately NOT marked ready.
         registry
-            .register(model, "2", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "2",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         let service = build_service_with_canary(registry, Arc::new(InferenceQueue::new()), true);
 
         let mut req = infer_request(model, "");
-        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-lite-version", "2".parse().unwrap());
         let err = service.infer(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert!(err.message().contains("not ready"),
-            "resolved v2 is not Ready → gate must 503; got: {}", err.message());
+        assert!(
+            err.message().contains("not ready"),
+            "resolved v2 is not Ready → gate must 503; got: {}",
+            err.message()
+        );
     }
 
     /// Same root cause without any opt-in flag: a weighted rollout whose
@@ -1681,10 +1842,16 @@ mod request_metrics_tests {
     async fn grpc_readiness_gate_bypasses_degraded_weighted_version() {
         let service = degraded_weighted_service("gate_degraded");
 
-        let err = service.infer(infer_request("gate_degraded", "")).await.unwrap_err();
+        let err = service
+            .infer(infer_request("gate_degraded", ""))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert!(err.message().contains("not ready"),
-            "resolved Degraded v2 → gate must 503; got: {}", err.message());
+        assert!(
+            err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -1701,8 +1868,11 @@ mod request_metrics_tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert!(err.message().contains("not ready"),
-            "resolved Degraded v2 → gate must 503; got: {}", err.message());
+        assert!(
+            err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -1720,8 +1890,11 @@ mod request_metrics_tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert!(err.message().contains("not ready"),
-            "resolved Degraded v2 → gate must 503; got: {}", err.message());
+        assert!(
+            err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}",
+            err.message()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1729,12 +1902,24 @@ mod request_metrics_tests {
         let model = "met_full";
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(2, 3600.0, 1), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(2, 3600.0, 1),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         queue.register_model(
-            model, "1", &test_config(2, 3600.0, 1), vec![], vec![], Arc::new(OutlierState::new(0)), None,
+            model,
+            "1",
+            &test_config(2, 3600.0, 1),
+            vec![],
+            vec![],
+            Arc::new(OutlierState::new(0)),
+            None,
         );
         let service = build_service(registry, queue.clone());
 
@@ -1743,27 +1928,40 @@ mod request_metrics_tests {
         // stays full and the next submit deterministically gets Full.
         let (filler_tx, _filler_rx) = oneshot::channel();
         queue
-            .try_submit(model, "1", crate::inference_queue::QueueItem {
-                uid: "filler".to_string(),
-                data: Bytes::new(),
-                meta: None,
-                response_tx: filler_tx,
-                inflight_guard: None,
-                enqueued_at: Instant::now(),
-                is_warmup: false,
-                queue_depth_guard: None,
-            })
+            .try_submit(
+                model,
+                "1",
+                crate::inference_queue::QueueItem {
+                    uid: "filler".to_string(),
+                    data: Bytes::new(),
+                    meta: None,
+                    response_tx: filler_tx,
+                    inflight_guard: None,
+                    enqueued_at: Instant::now(),
+                    is_warmup: false,
+                    queue_depth_guard: None,
+                },
+            )
             .unwrap();
 
         let counter = REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
         let before = counter.get();
 
         let err = service.infer(infer_request(model, "1")).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unavailable,
-            "§4.0.9: queue-full must be Unavailable (ResourceExhausted 专给限流)");
-        assert_eq!(counter.get(), before + 1.0, "queue-full must record one 5xx request");
         assert_eq!(
-            err.metadata().get("retry-after").and_then(|v| v.to_str().ok()),
+            err.code(),
+            tonic::Code::Unavailable,
+            "§4.0.9: queue-full must be Unavailable (ResourceExhausted 专给限流)"
+        );
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "queue-full must record one 5xx request"
+        );
+        assert_eq!(
+            err.metadata()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("1"),
             "§4.0.9: queue-full/load-shedding must carry retry-after metadata"
         );
@@ -1825,7 +2023,9 @@ mod request_metrics_tests {
             "admission over cap must be Unavailable"
         );
         assert_eq!(
-            err.metadata().get("retry-after").and_then(|v| v.to_str().ok()),
+            err.metadata()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("1"),
             "admission rejection must carry retry-after metadata"
         );
@@ -1871,14 +2071,25 @@ mod request_metrics_tests {
 
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
         queue.register_model(
-            model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
+            model,
+            "1",
+            &test_config(1, 0.0, 10),
+            vec![],
+            vec![client.clone()],
+            Arc::new(OutlierState::new(1)),
+            None,
         );
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
@@ -1988,8 +2199,11 @@ mod request_metrics_tests {
         while let Some(chunk) = stream.next().await {
             chunk.expect("chunk must be Ok");
         }
-        assert_eq!(counter.get(), before + 1.0,
-            "stream close must record exactly one 2xx request (overall duration)");
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "stream close must record exactly one 2xx request (overall duration)"
+        );
     }
 
     // ===== P2-2: x-request-id / x-processing-time-ms 回显 =====
@@ -2024,7 +2238,10 @@ mod request_metrics_tests {
     /// 错误路径同样回显（对齐 HTTP observability 错误路径）。
     #[tokio::test]
     async fn should_echo_request_id_on_error_path() {
-        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
+        let service = build_service(
+            Arc::new(ModelRegistry::new()),
+            Arc::new(InferenceQueue::new()),
+        );
 
         let mut req = infer_request("echo_404", "");
         req.metadata_mut()
@@ -2071,7 +2288,8 @@ mod request_metrics_tests {
         struct FieldCollector(Vec<(String, String)>);
         impl Visit for FieldCollector {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push((field.name().to_string(), format!("{:?}", value)));
+                self.0
+                    .push((field.name().to_string(), format!("{:?}", value)));
             }
         }
 
@@ -2100,9 +2318,8 @@ mod request_metrics_tests {
         let _anchor = tracing::Dispatch::new(
             tracing_subscriber::registry().with(SpanLayer(Arc::new(Mutex::new(Vec::new())))),
         );
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
-        );
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(SpanLayer(recorded_thread)));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
@@ -2136,8 +2353,16 @@ mod request_metrics_tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
-        assert!(field("model").contains("span_404"), "span model field: {:?}", inference.1);
-        assert!(field("request_id").contains("span-rid"), "span request_id field: {:?}", inference.1);
+        assert!(
+            field("model").contains("span_404"),
+            "span model field: {:?}",
+            inference.1
+        );
+        assert!(
+            field("request_id").contains("span-rid"),
+            "span request_id field: {:?}",
+            inference.1
+        );
     }
 
     // ===== Task A: gRPC worker metrics (infer / stream / decoupled / batch) =====
@@ -2149,7 +2374,10 @@ mod request_metrics_tests {
 
     /// PAIR worker answering every unary request with Ok Single + top-level
     /// Response.metrics (proto field 40) — drives the unary `infer` record.
-    fn spawn_ok_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+    fn spawn_ok_worker_with_metrics(
+        endpoint: String,
+        m: pb::Metrics,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let ctx = zmq::Context::new();
             let s = ctx.socket(zmq::PAIR).expect("worker socket");
@@ -2165,7 +2393,10 @@ mod request_metrics_tests {
                     metrics: Some(m.clone()),
                     payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                         data: Bytes::from_static(b"{\"ok\":true}"),
-                        status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                        status: Some(pb::Status {
+                            code: "Ok".to_string(),
+                            message: String::new(),
+                        }),
                         ..Default::default()
                     })),
                 };
@@ -2178,7 +2409,10 @@ mod request_metrics_tests {
 
     /// PAIR worker answering a stream Open with one Chunk + a Done carrying
     /// Metrics (proto StreamDone.metrics = 1) — drives stream/decoupled record.
-    fn spawn_stream_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+    fn spawn_stream_worker_with_metrics(
+        endpoint: String,
+        m: pb::Metrics,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let ctx = zmq::Context::new();
             let s = ctx.socket(zmq::PAIR).expect("worker socket");
@@ -2197,11 +2431,16 @@ mod request_metrics_tests {
                     }))
                 );
                 if !is_open {
-                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let ack = pb::Response {
+                        uid: req.uid,
+                        ..Default::default()
+                    };
                     let _ = s.send(ack.encode_to_vec(), 0);
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let mk = |payload| pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -2209,13 +2448,21 @@ mod request_metrics_tests {
                     })),
                     ..Default::default()
                 };
-                let _ = s.send(mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                    data: Bytes::from_static(b"{}"),
-                    is_final: false,
-                })).encode_to_vec(), 0);
                 let _ = s.send(
-                    mk(pb::stream_response::Payload::Done(pb::StreamDone { metrics: Some(m.clone()) }))
-                        .encode_to_vec(),
+                    mk(pb::stream_response::Payload::Chunk(
+                        pb::StreamChunkResponse {
+                            data: Bytes::from_static(b"{}"),
+                            is_final: false,
+                        },
+                    ))
+                    .encode_to_vec(),
+                    0,
+                );
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone {
+                        metrics: Some(m.clone()),
+                    }))
+                    .encode_to_vec(),
                     0,
                 );
             }
@@ -2224,7 +2471,10 @@ mod request_metrics_tests {
 
     /// PAIR worker answering a Batch request by echoing each item back as a
     /// BatchItemResponse, with top-level Response.metrics — drives batch record.
-    fn spawn_batch_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+    fn spawn_batch_worker_with_metrics(
+        endpoint: String,
+        m: pb::Metrics,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let ctx = zmq::Context::new();
             let s = ctx.socket(zmq::PAIR).expect("worker socket");
@@ -2242,7 +2492,10 @@ mod request_metrics_tests {
                         .map(|it| pb::BatchItemResponse {
                             uid: it.uid,
                             data: it.data,
-                            status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                            status: Some(pb::Status {
+                                code: "Ok".to_string(),
+                                message: String::new(),
+                            }),
                             ..Default::default()
                         })
                         .collect(),
@@ -2269,7 +2522,11 @@ mod request_metrics_tests {
         let endpoint = metric_test_endpoint(model);
         let _w = spawn_ok_worker_with_metrics(
             endpoint.clone(),
-            pb::Metrics { prefill_ms: 12.5, tokens_generated: 3, ..Default::default() },
+            pb::Metrics {
+                prefill_ms: 12.5,
+                tokens_generated: 3,
+                ..Default::default()
+            },
         );
         let service = ready_service_with_worker(model, endpoint).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2294,7 +2551,11 @@ mod request_metrics_tests {
         let endpoint = metric_test_endpoint(model);
         let _w = spawn_stream_worker_with_metrics(
             endpoint.clone(),
-            pb::Metrics { prefill_ms: 9.5, tokens_generated: 2, ..Default::default() },
+            pb::Metrics {
+                prefill_ms: 9.5,
+                tokens_generated: 2,
+                ..Default::default()
+            },
         );
         let service = ready_service_with_worker(model, endpoint).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2332,7 +2593,11 @@ mod request_metrics_tests {
         let endpoint = metric_test_endpoint(model);
         let _w = spawn_stream_worker_with_metrics(
             endpoint.clone(),
-            pb::Metrics { prefill_ms: 5.5, tokens_generated: 4, ..Default::default() },
+            pb::Metrics {
+                prefill_ms: 5.5,
+                tokens_generated: 4,
+                ..Default::default()
+            },
         );
         let service = ready_service_with_worker(model, endpoint).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2370,7 +2635,11 @@ mod request_metrics_tests {
         let endpoint = metric_test_endpoint(model);
         let _w = spawn_batch_worker_with_metrics(
             endpoint.clone(),
-            pb::Metrics { prefill_ms: 7.5, tokens_generated: 1, ..Default::default() },
+            pb::Metrics {
+                prefill_ms: 7.5,
+                tokens_generated: 1,
+                ..Default::default()
+            },
         );
         let service = ready_service_with_worker(model, endpoint).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2425,11 +2694,16 @@ mod request_metrics_tests {
                     }))
                 );
                 if !is_open {
-                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let ack = pb::Response {
+                        uid: req.uid,
+                        ..Default::default()
+                    };
                     let _ = s.send(ack.encode_to_vec(), 0);
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let resp = pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -2521,14 +2795,25 @@ mod request_metrics_tests {
     ) -> GrpcService {
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
         queue.register_model(
-            model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
+            model,
+            "1",
+            &test_config(1, 0.0, 10),
+            vec![],
+            vec![client.clone()],
+            Arc::new(OutlierState::new(1)),
+            None,
         );
         let service = build_service_with_callback(registry, queue, cb);
         service
@@ -2575,10 +2860,26 @@ mod request_metrics_tests {
             c.expect("chunk must be Ok");
         }
 
-        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
-        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
-        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1, "request fires once");
-        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "response fires once");
+        wait_for(
+            || cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "req>=1",
+        )
+        .await;
+        wait_for(
+            || cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "resp>=1",
+        )
+        .await;
+        assert_eq!(
+            cb.req.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "request fires once"
+        );
+        assert_eq!(
+            cb.resp.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "response fires once"
+        );
         let elapsed_set = cb
             .last_resp
             .lock()
@@ -2615,9 +2916,17 @@ mod request_metrics_tests {
         // Drain ignoring the terminal Err chunk.
         while s.next().await.is_some() {}
 
-        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
+        wait_for(
+            || cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "resp>=1",
+        )
+        .await;
         assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "Error frame fires response");
+        assert_eq!(
+            cb.resp.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Error frame fires response"
+        );
     }
 
     /// Build an in-process client bidi request stream carrying one
@@ -2647,7 +2956,9 @@ mod request_metrics_tests {
         framed.put_u32(msg.len() as u32);
         framed.extend_from_slice(&msg);
         let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
-        body_tx.try_send(Ok(framed.freeze())).expect("send open frame");
+        body_tx
+            .try_send(Ok(framed.freeze()))
+            .expect("send open frame");
         drop(body_tx);
         let body = axum::body::Body::from_stream(ReceiverStream::new(body_rx));
         let mut codec = tonic::codec::ProstCodec::<pb::BidiChunk, pb::BidiChunk>::default();
@@ -2764,7 +3075,10 @@ mod request_metrics_tests {
             .await
             .expect("chunk within 3s")
             .expect("stream yields a chunk");
-        assert!(first.is_ok(), "raw payload must reach the worker, got {first:?}");
+        assert!(
+            first.is_ok(),
+            "raw payload must reach the worker, got {first:?}"
+        );
     }
 
     #[tokio::test]
@@ -2791,7 +3105,12 @@ mod request_metrics_tests {
         let endpoint = metric_test_endpoint(model);
         let service = ready_service_with_worker(model, endpoint).await;
         let err = service
-            .bidi_stream(bidi_open_request(model, "1", b"not-json{", json_ct_headers()))
+            .bidi_stream(bidi_open_request(
+                model,
+                "1",
+                b"not-json{",
+                json_ct_headers(),
+            ))
             .await
             .expect_err("malformed JSON initial_data must be rejected at the gateway");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -2867,7 +3186,8 @@ mod request_metrics_tests {
             self.0.push((field.name().to_string(), value.to_string()));
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.push((field.name().to_string(), format!("{:?}", value)));
+            self.0
+                .push((field.name().to_string(), format!("{:?}", value)));
         }
     }
     type SpanRecorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>;
@@ -2897,11 +3217,9 @@ mod request_metrics_tests {
         use tracing_subscriber::layer::SubscriberExt;
         let recorded: SpanRecorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_thread = recorded.clone();
-        let _anchor = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(SpanRecLayer(std::sync::Arc::new(
-                std::sync::Mutex::new(Vec::new()),
-            ))),
-        );
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::registry().with(SpanRecLayer(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )));
         let recording = tracing::Dispatch::new(
             tracing_subscriber::registry().with(SpanRecLayer(recorded_thread)),
         );
@@ -2965,10 +3283,7 @@ mod request_metrics_tests {
                     .batch_infer(Request::new(pb::BatchInferRequest {
                         model_name: "m".into(),
                         version: "1".into(),
-                        items: vec![
-                            Bytes::from_static(b"\x00\x01"),
-                            Bytes::from_static(b"\x02"),
-                        ],
+                        items: vec![Bytes::from_static(b"\x00\x01"), Bytes::from_static(b"\x02")],
                         headers: h.clone(),
                     }))
                     .await;
@@ -3103,11 +3418,23 @@ mod request_metrics_tests {
         // first chunk, so it breaks before the Done frame: no response callback.
         drop(resp.into_inner());
 
-        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
+        wait_for(
+            || cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "req>=1",
+        )
+        .await;
         // Give the forwarder a moment to observe the dropped rx and break.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1, "request still fires on cancel");
-        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 0, "cancel must NOT fire response");
+        assert_eq!(
+            cb.req.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "request still fires on cancel"
+        );
+        assert_eq!(
+            cb.resp.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "cancel must NOT fire response"
+        );
     }
 
     #[tokio::test]
@@ -3137,9 +3464,17 @@ mod request_metrics_tests {
             c.expect("decoupled chunk must be Ok");
         }
 
-        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
+        wait_for(
+            || cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "resp>=1",
+        )
+        .await;
         assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "decoupled Done fires response");
+        assert_eq!(
+            cb.resp.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "decoupled Done fires response"
+        );
     }
 
     #[tokio::test]
@@ -3165,10 +3500,18 @@ mod request_metrics_tests {
             .expect("decoupled must open");
         drop(resp.into_inner());
 
-        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
+        wait_for(
+            || cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "req>=1",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 0, "cancel must NOT fire response");
+        assert_eq!(
+            cb.resp.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "cancel must NOT fire response"
+        );
     }
 
     // ===== Task E: always-on chunk-idle reclaim (方案 C) =====
@@ -3199,18 +3542,25 @@ mod request_metrics_tests {
                     }))
                 );
                 if !is_open {
-                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let ack = pb::Response {
+                        uid: req.uid,
+                        ..Default::default()
+                    };
                     let _ = s.send(ack.encode_to_vec(), 0);
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let chunk = pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
-                        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                            data: Bytes::from_static(b"{}"),
-                            is_final: false,
-                        })),
+                        payload: Some(pb::stream_response::Payload::Chunk(
+                            pb::StreamChunkResponse {
+                                data: Bytes::from_static(b"{}"),
+                                is_final: false,
+                            },
+                        )),
                     })),
                     ..Default::default()
                 };
@@ -3265,14 +3615,25 @@ mod request_metrics_tests {
     ) -> GrpcService {
         let registry = Arc::new(ModelRegistry::new());
         registry
-            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .register(
+                model,
+                "1",
+                test_config(1, 0.0, 10),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
             .unwrap();
         registry.mark_ready(model, "1").unwrap();
         let queue = Arc::new(InferenceQueue::new());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
         queue.register_model(
-            model, "1", &test_config(1, 0.0, 10), vec![],
-            vec![client.clone()], Arc::new(OutlierState::new(1)), None,
+            model,
+            "1",
+            &test_config(1, 0.0, 10),
+            vec![],
+            vec![client.clone()],
+            Arc::new(OutlierState::new(1)),
+            None,
         );
         let service = build_service_with_idle(registry, queue, idle);
         service
@@ -3319,8 +3680,12 @@ mod request_metrics_tests {
         // S4/S5:idle 回收 → kind=idle,stream_kind=grpc_stream。
         // (测试 service streaming_metrics=false —— errors 随门控,此处断言
         // 零记录,门控矩阵由 prometheus 单测覆盖;门控开的行为见 SSE idle 用例。)
-        let errs = crate::metrics::prometheus::STREAM_ERRORS_TOTAL
-            .with_label_values(&[model, "1", "grpc_stream", "idle"]);
+        let errs = crate::metrics::prometheus::STREAM_ERRORS_TOTAL.with_label_values(&[
+            model,
+            "1",
+            "grpc_stream",
+            "idle",
+        ]);
         assert_eq!(errs.get(), 0.0, "D9: errors gated off in this test service");
     }
 
@@ -3370,7 +3735,6 @@ mod request_metrics_tests {
         );
     }
 
-
     // ===== G3 (批次 4):gRPC 流式 span 覆盖全流 + stream_id =====
 
     /// 捕获 on_new_span/on_record 字段与 on_enter 顺序,验证转发 task 在
@@ -3386,7 +3750,8 @@ mod request_metrics_tests {
     struct G3Collector(Vec<(String, String)>);
     impl tracing::field::Visit for G3Collector {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.push((field.name().to_string(), format!("{value:?}")));
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
         }
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             self.0.push((field.name().to_string(), value.to_string()));
@@ -3411,8 +3776,12 @@ mod request_metrics_tests {
             let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let mut collector = G3Collector::default();
             attrs.record(&mut collector);
-            rec.names.insert(id.clone(), attrs.metadata().name().to_string());
-            rec.fields.entry(id.clone()).or_default().extend(collector.0);
+            rec.names
+                .insert(id.clone(), attrs.metadata().name().to_string());
+            rec.fields
+                .entry(id.clone())
+                .or_default()
+                .extend(collector.0);
         }
         fn on_record(
             &self,
@@ -3423,10 +3792,21 @@ mod request_metrics_tests {
             let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let mut collector = G3Collector::default();
             values.record(&mut collector);
-            rec.fields.entry(id.clone()).or_default().extend(collector.0);
+            rec.fields
+                .entry(id.clone())
+                .or_default()
+                .extend(collector.0);
         }
-        fn on_enter(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-            self.0.lock().unwrap_or_else(|e| e.into_inner()).enters.push(id.clone());
+        fn on_enter(
+            &self,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .enters
+                .push(id.clone());
         }
     }
 
@@ -3448,7 +3828,10 @@ mod request_metrics_tests {
         }
         let id = inf_id.expect("inference span must exist");
         let sid = stream_id.expect("stream_id must be recorded on the inference span");
-        assert!(!sid.is_empty() && sid != "Empty", "stream_id must be non-empty, got {sid:?}");
+        assert!(
+            !sid.is_empty() && sid != "Empty",
+            "stream_id must be non-empty, got {sid:?}"
+        );
         assert!(
             rec.enters.contains(&id),
             "forwarder task must run inside the inference span (instrument)"
@@ -3459,9 +3842,8 @@ mod request_metrics_tests {
     fn grpc_stream_span_covers_forwarder_with_stream_id() {
         use tracing_subscriber::layer::SubscriberExt;
         let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
-        );
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(G3Layer(recorded.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
@@ -3504,9 +3886,8 @@ mod request_metrics_tests {
     fn grpc_decoupled_span_covers_forwarder_with_stream_id() {
         use tracing_subscriber::layer::SubscriberExt;
         let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
-        );
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(G3Layer(recorded.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
@@ -3549,9 +3930,8 @@ mod request_metrics_tests {
     fn grpc_bidi_span_covers_forwarder_with_stream_id() {
         use tracing_subscriber::layer::SubscriberExt;
         let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
-        );
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(G3Layer(recorded.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);

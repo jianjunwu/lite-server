@@ -1,5 +1,5 @@
-use super::*;
 use super::inference::{build_request_meta, resolve_version};
+use super::*;
 use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
@@ -7,13 +7,13 @@ use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use crate::transport::zmq::WorkerZmqClient;
+use axum::extract::ws::{Message, WebSocket};
+use axum::response::sse::{Event, Sse};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
     response::{IntoResponse, Json, Response},
 };
-use axum::extract::ws::{Message, WebSocket};
-use axum::response::sse::{Event, Sse};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -42,23 +42,36 @@ async fn open_worker_stream(
     let mv = state
         .registry
         .get(model_name, Some(resolved_version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+        .ok_or_else(|| {
+            AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version))
+        })?;
 
     let num_workers = mv.workers.len();
     if num_workers == 0 {
-        return Err(AppError::WorkerCrashed(format!("{} has no workers", model_name)));
+        return Err(AppError::WorkerCrashed(format!(
+            "{} has no workers",
+            model_name
+        )));
     }
 
     let clients = state
         .worker_manager
         .get_zmq_clients(model_name, resolved_version)
         .await
-        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", model_name, resolved_version)))?;
+        .ok_or_else(|| {
+            AppError::WorkerCrashed(format!(
+                "{} {} has no ZMQ clients",
+                model_name, resolved_version
+            ))
+        })?;
 
     // Skip ejected workers for streaming requests. P8-1: when the request
     // carries a sequence_id already mapped to a registered, non-ejected worker,
     // connect directly to it (sticky); otherwise the normal pick, then record.
-    let outlier = state.worker_manager.get_outlier_state(model_name, resolved_version).await;
+    let outlier = state
+        .worker_manager
+        .get_outlier_state(model_name, resolved_version)
+        .await;
     let seq_registry = state.inference_queue.sequence_registry();
     let worker_id = crate::worker::pick_streaming_worker(
         &meta,
@@ -77,7 +90,9 @@ async fn open_worker_stream(
     // G4: stream concurrency cap — rejected pre-open (429 / ResourceExhausted).
     // Production invariant: a registered version has both the queue entry and
     // the outlier state, so the permit always lands inside the guard below.
-    let permit = state.inference_queue.try_acquire_stream_permit(model_name, resolved_version)?;
+    let permit = state
+        .inference_queue
+        .try_acquire_stream_permit(model_name, resolved_version)?;
     // G1/G3: count the in-flight stream on its slot from open until the
     // consumer drops the guard — the recycle drain waits on this. The caller
     // must move the guard into the chunk-consuming task (see the guard's doc).
@@ -94,12 +109,15 @@ async fn open_worker_stream(
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
-    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
+    let open_req =
+        streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
     // G3: count the stream toward the slot's max_requests budget (no-op when
     // the escape-hatch flag is off or the budget is disabled).
-    state.inference_queue.record_stream_served(model_name, resolved_version, worker_id);
+    state
+        .inference_queue
+        .record_stream_served(model_name, resolved_version, worker_id);
     Ok((stream_id, Arc::clone(client), chunk_rx, inflight_guard))
 }
 
@@ -115,7 +133,9 @@ pub async fn sse_infer_handler(
 ) -> Result<Response, ProtocolError> {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
     // D11 P2.1:错误按 T1 预筛协议渲染(SSE 客户端不发 IHCL → Legacy,byte-identical)。
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(&state, &model_name, None, headers, body, cx, slot, false)
         .await
         .map_err(|error| ProtocolError { error, protocol })
@@ -129,9 +149,18 @@ pub async fn sse_infer_version_handler(
     slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(
-        &state, &model_name, Some(version), headers, body, cx, slot, false,
+        &state,
+        &model_name,
+        Some(version),
+        headers,
+        body,
+        cx,
+        slot,
+        false,
     )
     .await
     .map_err(|error| ProtocolError { error, protocol })
@@ -147,7 +176,9 @@ pub async fn sse_decoupled_handler(
     slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(&state, &model_name, None, headers, body, cx, slot, true)
         .await
         .map_err(|error| ProtocolError { error, protocol })
@@ -161,10 +192,21 @@ pub async fn sse_decoupled_version_handler(
     slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    sse_infer_entry(&state, &model_name, Some(version), headers, body, cx, slot, true)
-        .await
-        .map_err(|error| ProtocolError { error, protocol })
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    sse_infer_entry(
+        &state,
+        &model_name,
+        Some(version),
+        headers,
+        body,
+        cx,
+        slot,
+        true,
+    )
+    .await
+    .map_err(|error| ProtocolError { error, protocol })
 }
 
 /// SSE 帧风格(批次 4,D9):Legacy = /events 自有格式(`data: <chunk>` +
@@ -236,7 +278,9 @@ pub async fn generate_stream_handler(
     slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     generate_stream_entry(&state, &model_name, None, headers, body, cx, slot)
         .await
         .map_err(|error| ProtocolError { error, protocol })
@@ -250,7 +294,9 @@ pub async fn generate_stream_version_handler(
     slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     generate_stream_entry(&state, &model_name, Some(version), headers, body, cx, slot)
         .await
         .map_err(|error| ProtocolError { error, protocol })
@@ -391,7 +437,13 @@ async fn sse_infer_entry_impl(
     // Auth + rate limit (rate limit shares the /predict bucket with unary infer).
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
         enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-        enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, &cx.client_ip).await?;
+        enforce_rate_limit(
+            state,
+            mv.policies.rate_limit.as_ref(),
+            model_name,
+            &cx.client_ip,
+        )
+        .await?;
     }
     let sse = sse_infer_impl(
         state.clone(),
@@ -422,7 +474,6 @@ async fn sse_infer_impl(
     decoupled: bool,
     frame: SseFrameStyle,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
-
     // Task B: inference span (parity with gRPC + unary HTTP). Created before
     // build_request_meta and entered around it via in_scope so telemetry::inject
     // (Context::current()) picks up THIS span, not the ambient http.server span
@@ -459,7 +510,15 @@ async fn sse_infer_impl(
     span.record("body_kind", body.kind());
     // B1 (cluster A): only a client-specified deadline rides the stream meta
     // — the server.timeout fallback must not truncate streams worker-side.
-    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.stream_meta_unix_ns()));
+    let meta = span.in_scope(|| {
+        build_request_meta(
+            &headers,
+            payload_bytes.clone(),
+            "/predict",
+            &cx,
+            deadline.stream_meta_unix_ns(),
+        )
+    });
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -490,7 +549,8 @@ async fn sse_infer_impl(
     let mut ensemble_permit = None;
     // D18: chain handles + chain-tree abort held for the forward task's
     // cancellation (pipeline chains broadcast over every streaming step).
-    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> =
+        None;
     let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: the streaming step's latency is recorded at stream close
     // (record_ensemble_step_latency); the tail labels ride the forward task.
@@ -506,8 +566,15 @@ async fn sse_infer_impl(
             dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };
         match crate::ensemble::execute_ensemble(
-            state.clone(), &model_name, &resolved_version, ensemble_input, &cx.request_id, opts,
-        ).await? {
+            state.clone(),
+            &model_name,
+            &resolved_version,
+            ensemble_input,
+            &cx.request_id,
+            opts,
+        )
+        .await?
+        {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                 // D35 (E5): fold the tail step's timeout cap into the recv
                 // overall bound (min(client overall, step cap)).
@@ -515,7 +582,11 @@ async fn sse_infer_impl(
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
-                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
+                ensemble_tail = Some((
+                    s.tail_step.clone(),
+                    s.tail_model.clone(),
+                    s.tail_version.clone(),
+                ));
                 // Ensemble streams are counted per DAG node at the worker
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
@@ -527,7 +598,15 @@ async fn sse_infer_impl(
             }
         }
     } else {
-        open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await?
+        open_worker_stream(
+            &state,
+            &model_name,
+            &resolved_version,
+            meta,
+            payload_bytes,
+            decoupled,
+        )
+        .await?
     };
 
     // Task D: fire InferenceRequest once the worker stream opened and arm the
@@ -548,7 +627,13 @@ async fn sse_infer_impl(
 
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
-        prometheus::record_stream_open(&model_name, &resolved_version, "sse", &stream_id, decoupled);
+        prometheus::record_stream_open(
+            &model_name,
+            &resolved_version,
+            "sse",
+            &stream_id,
+            decoupled,
+        );
     }
 
     // RN-14: channel depth is operator-tunable (default 64). A consumer
@@ -967,12 +1052,20 @@ pub async fn ws_stream_handler(
     slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     // P-CORS (评审 1.3): browsers send no preflight for WS, so the CORS
     // middleware can't stop cross-site WS hijacking — check Origin at upgrade.
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "WebSocket Origin not allowed",
+        )
+            .into_response();
     }
     // RN-13 (D9-A): take the guard BEFORE the upgrade response is produced —
     // the on_upgrade future runs after the middleware's post-next.run
@@ -980,7 +1073,18 @@ pub async fn ws_stream_handler(
     // the guard (the 21908c0 regression). Early rejects above leave the
     // guard in the cell for the middleware to reclaim.
     let admission_guard = slot.take();
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, admission_guard, false))
+    ws.on_upgrade(move |socket| {
+        handle_ws_stream(
+            state,
+            model_name,
+            None,
+            headers,
+            socket,
+            cx,
+            admission_guard,
+            false,
+        )
+    })
 }
 
 pub async fn ws_stream_version_handler(
@@ -992,18 +1096,41 @@ pub async fn ws_stream_version_handler(
     slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     if let Err(e) = crate::validation::validate_version(&version) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "WebSocket Origin not allowed",
+        )
+            .into_response();
     }
     // RN-13 (D9-A): take the guard before the upgrade response (see
     // ws_stream_handler).
     let admission_guard = slot.take();
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, admission_guard, false))
+    ws.on_upgrade(move |socket| {
+        handle_ws_stream(
+            state,
+            model_name,
+            Some(version),
+            headers,
+            socket,
+            cx,
+            admission_guard,
+            false,
+        )
+    })
 }
 
 // ===== WS Decoupled =====
@@ -1017,15 +1144,34 @@ pub async fn ws_decoupled_handler(
     slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "WebSocket Origin not allowed",
+        )
+            .into_response();
     }
     // RN-13 (D9-A): take the guard before the upgrade response (see
     // ws_stream_handler).
     let admission_guard = slot.take();
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, admission_guard, true))
+    ws.on_upgrade(move |socket| {
+        handle_ws_stream(
+            state,
+            model_name,
+            None,
+            headers,
+            socket,
+            cx,
+            admission_guard,
+            true,
+        )
+    })
 }
 
 pub async fn ws_decoupled_version_handler(
@@ -1037,28 +1183,48 @@ pub async fn ws_decoupled_version_handler(
     slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     if let Err(e) = crate::validation::validate_version(&version) {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "WebSocket Origin not allowed",
+        )
+            .into_response();
     }
     // RN-13 (D9-A): take the guard before the upgrade response (see
     // ws_stream_handler).
     let admission_guard = slot.take();
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, admission_guard, true))
+    ws.on_upgrade(move |socket| {
+        handle_ws_stream(
+            state,
+            model_name,
+            Some(version),
+            headers,
+            socket,
+            cx,
+            admission_guard,
+            true,
+        )
+    })
 }
 
 /// §4.4: WS error frame + close (the connection already upgraded — there is
 /// no HTTP status code; the error JSON is the client contract). Contractual
 /// close codes (D21): unsupported-combination/protocol 1003, over-limit 1009,
 /// server-side 1011; the error JSON is `{error:{code,message}}`.
-async fn ws_send_error(
-    sink: &mut futures::stream::SplitSink<WebSocket, Message>,
-    e: &AppError,
-) {
+async fn ws_send_error(sink: &mut futures::stream::SplitSink<WebSocket, Message>, e: &AppError) {
     let code: u16 = match e {
         AppError::PayloadTooLarge { .. } => 1009,
         AppError::InvalidRequestBody(_)
@@ -1147,7 +1313,9 @@ fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<Str
                 if valid == 0 {
                     Ok(None)
                 } else {
-                    Ok(Some(std::str::from_utf8(&chunk[..valid]).unwrap().to_string()))
+                    Ok(Some(
+                        std::str::from_utf8(&chunk[..valid]).unwrap().to_string(),
+                    ))
                 }
             }
             Err(_) => Err(()),
@@ -1230,11 +1398,7 @@ pub fn direct_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Option<String> 
 fn is_close_frame(text: &str) -> bool {
     serde_json::from_str::<Value>(text)
         .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(|s| s == "close")
-        })
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "close"))
         .unwrap_or(false)
 }
 
@@ -1319,11 +1483,11 @@ fn normalize_binary_first_frame_ct(headers: &mut HeaderMap, model_name: &str) {
                 axum::http::HeaderValue::from_static("application/octet-stream"),
             );
         }
-        Some(ref ct) if is_json_content_type(
-            &axum::http::HeaderValue::from_str(ct).unwrap_or_else(|_| {
-                axum::http::HeaderValue::from_static("application/octet-stream")
-            }),
-        ) => {
+        Some(ref ct)
+            if is_json_content_type(&axum::http::HeaderValue::from_str(ct).unwrap_or_else(
+                |_| axum::http::HeaderValue::from_static("application/octet-stream"),
+            )) =>
+        {
             tracing::warn!(
                 model = %model_name,
                 content_type = %ct,
@@ -1357,27 +1521,31 @@ async fn handle_ws_stream(
     let ws_start = std::time::Instant::now();
     // resolve_version 按值消费 version——先提取请求原值 label 供失败分支使用。
     let request_version_label = version.as_deref().unwrap_or("").to_string();
-    let (resolved_version, pinned) = match resolve_version(&state, &model_name, version, &headers).await {
-        Ok(v) => v,
-        Err(e) => {
-            // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
-            // A2: 未解析的 (model, version) 用常量 label——其 series 永不随
-            // unload 清除,原始 label 会被模型名枚举无限放大。
-            let (m, v) = prometheus::reject_labels(false, &model_name, &request_version_label);
-            prometheus::record_stream_rejected(
-                m,
-                v,
-                "4xx",
-                ws_start.elapsed().as_secs_f64(),
-                "early_reject",
-            );
-            // §4.4 note ② (B3): error JSON + coded close, never a bare close.
-            ws_early_reject(&mut socket, &e).await;
-            return;
-        }
-    };
+    let (resolved_version, pinned) =
+        match resolve_version(&state, &model_name, version, &headers).await {
+            Ok(v) => v,
+            Err(e) => {
+                // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
+                // A2: 未解析的 (model, version) 用常量 label——其 series 永不随
+                // unload 清除,原始 label 会被模型名枚举无限放大。
+                let (m, v) = prometheus::reject_labels(false, &model_name, &request_version_label);
+                prometheus::record_stream_rejected(
+                    m,
+                    v,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
+                // §4.4 note ② (B3): error JSON + coded close, never a bare close.
+                ws_early_reject(&mut socket, &e).await;
+                return;
+            }
+        };
 
-    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
+    if !state
+        .registry
+        .is_ready(&model_name, Some(&resolved_version))
+    {
         // 未就绪 → 5xx。
         prometheus::record_stream_rejected(
             &model_name,
@@ -1436,8 +1604,10 @@ async fn handle_ws_stream(
     // B2 (E3): Text → JSON (RawValue validation, legacy path); Binary →
     // opaque bytes (skip validation). See FirstFrame / E4 normalization.
     let first_frame = {
-        let first_frame_budget = crate::deadline::idle_budget(state.config.server.timeout)
-            .or_else(|| crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs));
+        let first_frame_budget =
+            crate::deadline::idle_budget(state.config.server.timeout).or_else(|| {
+                crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs)
+            });
         let recv = match first_frame_budget {
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
                 Ok(r) => r,
@@ -1490,7 +1660,8 @@ async fn handle_ws_stream(
     // Binary first frames skip validation entirely (E3, frame type wins).
     match &first_frame {
         FirstFrame::Json(text) => {
-            if let Err(e) = serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes()) {
+            if let Err(e) = serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes())
+            {
                 // 非法 JSON → 4xx。
                 prometheus::record_stream_rejected(
                     &model_name,
@@ -1551,7 +1722,15 @@ async fn handle_ws_stream(
     span.record("body_kind", body_kind);
     // B1 (cluster A): only a client-specified deadline rides the stream meta
     // — the server.timeout fallback must not truncate streams worker-side.
-    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.stream_meta_unix_ns()));
+    let meta = span.in_scope(|| {
+        build_request_meta(
+            &headers,
+            payload_bytes.clone(),
+            "/predict",
+            &cx,
+            deadline.stream_meta_unix_ns(),
+        )
+    });
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -1586,7 +1765,8 @@ async fn handle_ws_stream(
     let mut ensemble_permit = None;
     // D18: chain handles + chain-tree abort held for the writer task's
     // cancellation (pipeline chains broadcast over every streaming step).
-    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> =
+        None;
     let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
@@ -1605,7 +1785,13 @@ async fn handle_ws_stream(
         let dag_selector = match crate::ensemble::dag_selector_from_http(&headers) {
             Ok(s) => s,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1614,13 +1800,22 @@ async fn handle_ws_stream(
         // one complete envelope frame executes immediately (no close frame
         // needed; later frames hit the existing multi-round rejection).
         let declared = match crate::ensemble::ensemble_declares_inputs(
-            &state, &model_name, &resolved_version, dag_selector.as_deref(),
+            &state,
+            &model_name,
+            &resolved_version,
+            dag_selector.as_deref(),
         )
         .await
         {
             Ok(d) => d,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "5xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1628,7 +1823,9 @@ async fn handle_ws_stream(
         let value = if declared {
             match &first_frame {
                 FirstFrame::Json(text) => crate::ensemble::bidi_envelope_frame(
-                    &bytes::Bytes::from(text.clone().into_bytes()), true, None,
+                    &bytes::Bytes::from(text.clone().into_bytes()),
+                    true,
+                    None,
                 ),
                 FirstFrame::Raw(bin) => {
                     crate::ensemble::bidi_envelope_frame(bin, false, ct.clone())
@@ -1643,107 +1840,146 @@ async fn handle_ws_stream(
                 FirstFrame::Raw(bin) => aggregator.push(bin.clone(), false, ct.as_deref()),
             };
             if let Err(e) = push_first {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
             if !decoupled {
-            // D33: aggregate until the app-level close frame. The loop reuses
-            // the two-stage bound — chunk-idle ALWAYS on (reclaims an
-            // abandoned aggregating client), overall deadline since the FIRST
-            // frame (aggregation eats the DAG budget).
-            let agg_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
-            let agg_deadline = if deadline.client_specified {
-                crate::deadline::to_instant(deadline.unix_ns)
-            } else {
-                None
-            };
-            // B4 (cluster B): the idle clock starts at the last DATA frame —
-            // Ping/Pong/Close control frames are transport liveness, not
-            // aggregation activity (h2 bidi.rs parity), so a keep-pinging
-            // client cannot pin the aggregation buffer past the idle budget.
-            let mut last_data_activity = std::time::Instant::now();
-            loop {
-                // Two-stage bound (D17): chunk-idle ALWAYS on (reclaims an
-                // abandoned aggregating client), overall deadline since the
-                // first frame. The recv itself is timeout-wrapped — an idle
-                // check between blocking recvs would never fire. Per-recv
-                // bound = min(overall remaining, idle remaining) — recv_chunk's
-                // semantics; a client-specified deadline must NOT disable
-                // the always-on idle reclaim.
-                let now = std::time::Instant::now();
-                let idle_remaining = agg_idle
-                    .map(|i| i.saturating_sub(last_data_activity.elapsed()));
-                let bound = match (agg_deadline, idle_remaining) {
-                    (Some(d), Some(i)) => Some(d.saturating_duration_since(now).min(i)),
-                    (Some(d), None) => Some(d.saturating_duration_since(now)),
-                    (None, i) => i,
+                // D33: aggregate until the app-level close frame. The loop reuses
+                // the two-stage bound — chunk-idle ALWAYS on (reclaims an
+                // abandoned aggregating client), overall deadline since the FIRST
+                // frame (aggregation eats the DAG budget).
+                let agg_idle =
+                    crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+                let agg_deadline = if deadline.client_specified {
+                    crate::deadline::to_instant(deadline.unix_ns)
+                } else {
+                    None
                 };
-                let next = match bound {
-                    Some(b) => tokio::time::timeout(b, ws_stream.next()).await,
-                    None => Ok(ws_stream.next().await),
-                };
-                match next {
-                    Ok(Some(Ok(Message::Text(t)))) if is_close_frame(&t) => break,
-                    // A cancel control frame mid-aggregation abandons the
-                    // execution (the client gave up) — it must NOT be
-                    // aggregated into the DAG input as a data frame.
-                    // S1(b): client-abandoned sessions still record once
-                    // (client-class family), like every other early exit.
-                    Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => {
-                        prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
-                        return;
-                    }
-                    Ok(Some(Ok(Message::Text(t)))) => {
-                        if let Err(e) = aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None) {
-                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                // B4 (cluster B): the idle clock starts at the last DATA frame —
+                // Ping/Pong/Close control frames are transport liveness, not
+                // aggregation activity (h2 bidi.rs parity), so a keep-pinging
+                // client cannot pin the aggregation buffer past the idle budget.
+                let mut last_data_activity = std::time::Instant::now();
+                loop {
+                    // Two-stage bound (D17): chunk-idle ALWAYS on (reclaims an
+                    // abandoned aggregating client), overall deadline since the
+                    // first frame. The recv itself is timeout-wrapped — an idle
+                    // check between blocking recvs would never fire. Per-recv
+                    // bound = min(overall remaining, idle remaining) — recv_chunk's
+                    // semantics; a client-specified deadline must NOT disable
+                    // the always-on idle reclaim.
+                    let now = std::time::Instant::now();
+                    let idle_remaining =
+                        agg_idle.map(|i| i.saturating_sub(last_data_activity.elapsed()));
+                    let bound = match (agg_deadline, idle_remaining) {
+                        (Some(d), Some(i)) => Some(d.saturating_duration_since(now).min(i)),
+                        (Some(d), None) => Some(d.saturating_duration_since(now)),
+                        (None, i) => i,
+                    };
+                    let next = match bound {
+                        Some(b) => tokio::time::timeout(b, ws_stream.next()).await,
+                        None => Ok(ws_stream.next().await),
+                    };
+                    match next {
+                        Ok(Some(Ok(Message::Text(t)))) if is_close_frame(&t) => break,
+                        // A cancel control frame mid-aggregation abandons the
+                        // execution (the client gave up) — it must NOT be
+                        // aggregated into the DAG input as a data frame.
+                        // S1(b): client-abandoned sessions still record once
+                        // (client-class family), like every other early exit.
+                        Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => {
+                            prometheus::record_stream_rejected(
+                                &model_name,
+                                &resolved_version,
+                                "4xx",
+                                ws_start.elapsed().as_secs_f64(),
+                                "early_reject",
+                            );
+                            return;
+                        }
+                        Ok(Some(Ok(Message::Text(t)))) => {
+                            if let Err(e) =
+                                aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None)
+                            {
+                                prometheus::record_stream_rejected(
+                                    &model_name,
+                                    &resolved_version,
+                                    "4xx",
+                                    ws_start.elapsed().as_secs_f64(),
+                                    "early_reject",
+                                );
+                                ws_send_error(&mut ws_sink, &e).await;
+                                return;
+                            }
+                            last_data_activity = std::time::Instant::now();
+                        }
+                        Ok(Some(Ok(Message::Binary(b)))) => {
+                            if let Err(e) =
+                                aggregator.push(bytes::Bytes::from(b), false, ct.as_deref())
+                            {
+                                prometheus::record_stream_rejected(
+                                    &model_name,
+                                    &resolved_version,
+                                    "4xx",
+                                    ws_start.elapsed().as_secs_f64(),
+                                    "early_reject",
+                                );
+                                ws_send_error(&mut ws_sink, &e).await;
+                                return;
+                            }
+                            last_data_activity = std::time::Instant::now();
+                        }
+                        // WS transport close / disconnect mid-aggregation →
+                        // abandon the execution (§4.4: connection gone, no
+                        // response object). S1(b): record once (client-class).
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                            prometheus::record_stream_rejected(
+                                &model_name,
+                                &resolved_version,
+                                "4xx",
+                                ws_start.elapsed().as_secs_f64(),
+                                "early_reject",
+                            );
+                            return;
+                        }
+                        Ok(_) => {} // Ping/Pong ignored — NOT data activity (B4)
+                        // Idle/deadline fired with no close trigger.
+                        Err(_) => {
+                            prometheus::record_stream_rejected(
+                                &model_name,
+                                &resolved_version,
+                                "5xx",
+                                ws_start.elapsed().as_secs_f64(),
+                                "early_reject",
+                            );
+                            let deadline_fired = agg_deadline
+                                .map(|d| d <= std::time::Instant::now())
+                                .unwrap_or(false);
+                            // §4.4: aggregation idle/deadline timeout closes
+                            // with 1011 + {error:{code,message}} — route through
+                            // ws_send_error like every other error path. B9:
+                            // idle constructs IdleTimeout so the close reason
+                            // (idle_timeout) is distinguishable from deadline.
+                            let e = if deadline_fired {
+                                AppError::InferenceTimeout(
+                                    "bidi aggregation exceeded the overall deadline".to_string(),
+                                )
+                            } else {
+                                AppError::IdleTimeout("bidi aggregation idle timeout".to_string())
+                            };
                             ws_send_error(&mut ws_sink, &e).await;
                             return;
                         }
-                        last_data_activity = std::time::Instant::now();
-                    }
-                    Ok(Some(Ok(Message::Binary(b)))) => {
-                        if let Err(e) = aggregator.push(bytes::Bytes::from(b), false, ct.as_deref()) {
-                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
-                            ws_send_error(&mut ws_sink, &e).await;
-                            return;
-                        }
-                        last_data_activity = std::time::Instant::now();
-                    }
-                    // WS transport close / disconnect mid-aggregation →
-                    // abandon the execution (§4.4: connection gone, no
-                    // response object). S1(b): record once (client-class).
-                    Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
-                        prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
-                        return;
-                    }
-                    Ok(_) => {} // Ping/Pong ignored — NOT data activity (B4)
-                    // Idle/deadline fired with no close trigger.
-                    Err(_) => {
-                        prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64(), "early_reject");
-                        let deadline_fired = agg_deadline
-                            .map(|d| d <= std::time::Instant::now())
-                            .unwrap_or(false);
-                        // §4.4: aggregation idle/deadline timeout closes
-                        // with 1011 + {error:{code,message}} — route through
-                        // ws_send_error like every other error path. B9:
-                        // idle constructs IdleTimeout so the close reason
-                        // (idle_timeout) is distinguishable from deadline.
-                        let e = if deadline_fired {
-                            AppError::InferenceTimeout(
-                                "bidi aggregation exceeded the overall deadline".to_string(),
-                            )
-                        } else {
-                            AppError::IdleTimeout(
-                                "bidi aggregation idle timeout".to_string(),
-                            )
-                        };
-                        ws_send_error(&mut ws_sink, &e).await;
-                        return;
                     }
                 }
             }
-        }
             crate::metrics::prometheus::record_ensemble_bidi_aggregate(
                 aggregator.total_bytes(),
                 ws_start.elapsed().as_secs_f64(),
@@ -1753,7 +1989,13 @@ async fn handle_ws_stream(
         let value = match value {
             Ok(v) => v,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1766,7 +2008,12 @@ async fn handle_ws_stream(
             dag_selector,
         };
         match crate::ensemble::execute_ensemble(
-            state.clone(), &model_name, &resolved_version, value, &cx.request_id, opts,
+            state.clone(),
+            &model_name,
+            &resolved_version,
+            value,
+            &cx.request_id,
+            opts,
         )
         .await
         {
@@ -1777,13 +2024,23 @@ async fn handle_ws_stream(
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
-                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
+                ensemble_tail = Some((
+                    s.tail_step.clone(),
+                    s.tail_model.clone(),
+                    s.tail_version.clone(),
+                ));
                 // Ensemble streams are counted per DAG node at the worker
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
             }
             Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
+                );
                 let err = AppError::InvalidRequestBody(
                     "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
                 );
@@ -1803,7 +2060,16 @@ async fn handle_ws_stream(
             }
         }
     } else {
-        match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await {
+        match open_worker_stream(
+            &state,
+            &model_name,
+            &resolved_version,
+            meta,
+            payload_bytes,
+            decoupled,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // open 失败 → 5xx。
@@ -1838,7 +2104,13 @@ async fn handle_ws_stream(
 
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
-        prometheus::record_stream_open(&model_name, &resolved_version, "websocket", &stream_id, decoupled);
+        prometheus::record_stream_open(
+            &model_name,
+            &resolved_version,
+            "websocket",
+            &stream_id,
+            decoupled,
+        );
     }
 
     // gone_tx: carries an optional error message from the reader to the writer.
@@ -1908,9 +2180,8 @@ async fn handle_ws_stream(
                 match msg {
                     // D1: decoupled stream accepts no data frames after the first.
                     Ok(Message::Binary(_bin)) if decoupled => {
-                        let _ = gone_tx_reader.send(Some(
-                            "decoupled stream accepts no data frames".to_string(),
-                        ));
+                        let _ = gone_tx_reader
+                            .send(Some("decoupled stream accepts no data frames".to_string()));
                         break;
                     }
                     // Coupled: forward Binary as stream chunk (existing behavior).
@@ -1923,16 +2194,14 @@ async fn handle_ws_stream(
                     }
                     // D1: decoupled cancel/close are aliases → cancel worker, signal gone.
                     Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
-                        let cancel_req =
-                            streaming::build_stream_cancel(reader_stream_id.clone());
+                        let cancel_req = streaming::build_stream_cancel(reader_stream_id.clone());
                         let _ = reader_client.send_raw(cancel_req).await;
                         let _ = gone_tx_reader.send(Some(String::new()));
                         break;
                     }
                     // Coupled: app-level close → send close to worker (existing).
                     Ok(Message::Text(t)) if !decoupled && is_close_frame(&t) => {
-                        let close_req =
-                            streaming::build_stream_close(reader_stream_id.clone());
+                        let close_req = streaming::build_stream_close(reader_stream_id.clone());
                         let _ = reader_client.send_raw(close_req).await;
                         return; // graceful: don't signal gone, writer continues
                     }
@@ -2331,7 +2600,13 @@ mod tests {
         let state = make_state(cb);
         state
             .registry
-            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         state.registry.mark_ready(model, "1").unwrap();
         // open_worker_stream checks mv.workers.len() > 0.
@@ -2378,10 +2653,19 @@ mod tests {
                     }))
                 );
                 if !is_open {
-                    let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                    let _ = s.send(
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                        0,
+                    );
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let mk = |payload| pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -2390,14 +2674,20 @@ mod tests {
                     ..Default::default()
                 };
                 let _ = s.send(
-                    mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                        data: Bytes::from_static(b"{}"),
-                        is_final: false,
-                    }))
+                    mk(pb::stream_response::Payload::Chunk(
+                        pb::StreamChunkResponse {
+                            data: Bytes::from_static(b"{}"),
+                            is_final: false,
+                        },
+                    ))
                     .encode_to_vec(),
                     0,
                 );
-                let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(), 0);
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                        .encode_to_vec(),
+                    0,
+                );
             }
         })
     }
@@ -2425,7 +2715,9 @@ mod tests {
                 if !is_open {
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let resp = pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -2466,7 +2758,9 @@ mod tests {
                 if !is_open {
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let mk = |payload| pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
@@ -2573,9 +2867,19 @@ mod tests {
             .as_ref()
             .map(|c| c.protocol)
             .unwrap_or(Protocol::Http);
-        assert_eq!(protocol, Protocol::Sse, "response ctx must carry the Sse protocol");
+        assert_eq!(
+            protocol,
+            Protocol::Sse,
+            "response ctx must carry the Sse protocol"
+        );
         assert!(
-            cb.last.lock().unwrap().as_ref().unwrap().elapsed_us.is_some(),
+            cb.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .elapsed_us
+                .is_some(),
             "response elapsed_us must be set"
         );
     }
@@ -2714,7 +3018,11 @@ mod tests {
         drop(sse);
 
         assert_eq!(cb.req.load(Ordering::Relaxed), 1);
-        assert_eq!(cb.resp.load(Ordering::Relaxed), 1, "Error frame fires response");
+        assert_eq!(
+            cb.resp.load(Ordering::Relaxed),
+            1,
+            "Error frame fires response"
+        );
     }
 
     #[tokio::test]
@@ -2804,8 +3112,16 @@ mod tests {
 
         wait_for(|| cb.req.load(Ordering::Relaxed) >= 1, "req>=1").await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request still fires on cancel");
-        assert_eq!(cb.resp.load(Ordering::Relaxed), 0, "cancel must NOT fire response");
+        assert_eq!(
+            cb.req.load(Ordering::Relaxed),
+            1,
+            "request still fires on cancel"
+        );
+        assert_eq!(
+            cb.resp.load(Ordering::Relaxed),
+            0,
+            "cancel must NOT fire response"
+        );
     }
 
     /// Task B: SSE creates an `inference` span with model/version/request_id
@@ -2824,7 +3140,8 @@ mod tests {
         struct FieldCollector(Vec<(String, String)>);
         impl Visit for FieldCollector {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push((field.name().to_string(), format!("{:?}", value)));
+                self.0
+                    .push((field.name().to_string(), format!("{:?}", value)));
             }
         }
 
@@ -2848,14 +3165,11 @@ mod tests {
 
         let recorded: Recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_thread = recorded.clone();
-        let _anchor = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(SpanLayer(std::sync::Arc::new(std::sync::Mutex::new(
-                Vec::new(),
-            )))),
-        );
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
-        );
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::registry().with(SpanLayer(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )));
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(SpanLayer(recorded_thread)));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
@@ -2867,13 +3181,29 @@ mod tests {
                 let state = make_state(Arc::new(CallbackRunner::new()));
                 state
                     .registry
-                    .register("span_model", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                    .register(
+                        "span_model",
+                        "1",
+                        ModelConfig::default(),
+                        ModelType::LitAPI,
+                        std::path::PathBuf::new(),
+                    )
                     .unwrap();
                 state.registry.mark_ready("span_model", "1").unwrap();
                 // No ZMQ client / workers → open_worker_stream fails, but the
                 // span is built before that. Explicit version so resolve
                 // succeeds without an active-version cutover.
-                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json_body(json!({})), test_cx(), crate::admission::AdmissionSlot::default(), false).await;
+                let _ = sse_infer_entry(
+                    &state,
+                    "span_model",
+                    Some("1".to_string()),
+                    HeaderMap::new(),
+                    json_body(json!({})),
+                    test_cx(),
+                    crate::admission::AdmissionSlot::default(),
+                    false,
+                )
+                .await;
             });
         });
         handle.join().expect("span test thread must not panic");
@@ -2891,9 +3221,21 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
-        assert!(field("model").contains("span_model"), "span model field: {:?}", inference.1);
-        assert!(field("version").contains("1"), "span version field: {:?}", inference.1);
-        assert!(field("request_id").contains("sse-rid"), "span request_id field: {:?}", inference.1);
+        assert!(
+            field("model").contains("span_model"),
+            "span model field: {:?}",
+            inference.1
+        );
+        assert!(
+            field("version").contains("1"),
+            "span version field: {:?}",
+            inference.1
+        );
+        assert!(
+            field("request_id").contains("sse-rid"),
+            "span request_id field: {:?}",
+            inference.1
+        );
     }
 
     /// /audit fdbd1c9 (D11): the SSE inference span must carry body_bytes /
@@ -2922,7 +3264,8 @@ mod tests {
                 self.0.push((field.name().to_string(), value.to_string()));
             }
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push((field.name().to_string(), format!("{:?}", value)));
+                self.0
+                    .push((field.name().to_string(), format!("{:?}", value)));
             }
         }
         impl<S: tracing::Subscriber> Layer<S> for RecLayer {
@@ -2960,14 +3303,11 @@ mod tests {
         let rec_thread = rec.clone();
         // Same double-dispatch anti-poisoning trick as
         // sse_creates_inference_span_with_fields.
-        let _anchor = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(RecLayer(std::sync::Arc::new(
-                std::sync::Mutex::new(Rec::default()),
-            ))),
-        );
-        let recording = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(RecLayer(rec_thread)),
-        );
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::registry().with(RecLayer(
+            std::sync::Arc::new(std::sync::Mutex::new(Rec::default())),
+        )));
+        let recording =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(RecLayer(rec_thread)));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
@@ -2979,7 +3319,13 @@ mod tests {
                 let state = make_state(Arc::new(CallbackRunner::new()));
                 state
                     .registry
-                    .register("span_body_model", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                    .register(
+                        "span_body_model",
+                        "1",
+                        ModelConfig::default(),
+                        ModelType::LitAPI,
+                        std::path::PathBuf::new(),
+                    )
                     .unwrap();
                 state.registry.mark_ready("span_body_model", "1").unwrap();
                 // No workers/ZMQ → open_worker_stream fails AFTER the
@@ -3076,7 +3422,13 @@ mod tests {
         let state = make_state_with_idle_and_server_timeout(cb, idle_secs, server_timeout);
         state
             .registry
-            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         state.registry.mark_ready(model, "1").unwrap();
         state
@@ -3122,17 +3474,28 @@ mod tests {
                     }))
                 );
                 if !is_open {
-                    let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                    let _ = s.send(
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                        0,
+                    );
                     continue;
                 }
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 let chunk = pb::Response {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
-                        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                            data: Bytes::from_static(b"{}"),
-                            is_final: false,
-                        })),
+                        payload: Some(pb::stream_response::Payload::Chunk(
+                            pb::StreamChunkResponse {
+                                data: Bytes::from_static(b"{}"),
+                                is_final: false,
+                            },
+                        )),
                     })),
                     ..Default::default()
                 };
@@ -3173,7 +3536,10 @@ mod tests {
         let elapsed = start.elapsed();
 
         let body = String::from_utf8_lossy(&bytes);
-        assert!(!body.contains("[DONE]"), "stalled stream must not reach Done: {body}");
+        assert!(
+            !body.contains("[DONE]"),
+            "stalled stream must not reach Done: {body}"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "stalled stream must be reclaimed by the always-on idle (~200ms), not hang; took {elapsed:?}"
@@ -3226,7 +3592,11 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -3283,12 +3653,16 @@ mod tests {
         ))
         .await
         .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![1, 2, 3]))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![4, 5, 6]))
-            .await
-            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+            1, 2, 3,
+        ]))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+            4, 5, 6,
+        ]))
+        .await
+        .unwrap();
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"close"}"#.to_string(),
         ))
@@ -3322,7 +3696,10 @@ mod tests {
                 }
             }
         }
-        assert!(got_done, "terminal Done frame must arrive after app-level close");
+        assert!(
+            got_done,
+            "terminal Done frame must arrive after app-level close"
+        );
     }
 
     /// §5.5-4: an unknown Text control frame → client gets the protocol error
@@ -3373,7 +3750,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got_cancel, "worker must receive Cancel after protocol error");
+        assert!(
+            got_cancel,
+            "worker must receive Cancel after protocol error"
+        );
     }
 
     /// §5.5-5: hard client disconnect → the gone signal terminates the writer
@@ -3466,13 +3846,22 @@ mod tests {
         ));
         state
             .registry
-            .register(model, "1", ModelConfig::default(), crate::registry::types::ModelType::Ensemble, model_dir)
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                crate::registry::types::ModelType::Ensemble,
+                model_dir,
+            )
             .unwrap();
         state.registry.mark_ready(model, "1").unwrap();
         state.registry.activate_version(model, "1").unwrap();
 
-        let counter = crate::metrics::prometheus::STREAM_REJECTED_TOTAL
-            .with_label_values(&[model, "1", "early_reject"]);
+        let counter = crate::metrics::prometheus::STREAM_REJECTED_TOTAL.with_label_values(&[
+            model,
+            "1",
+            "early_reject",
+        ]);
         let base = spawn_ws_server(state).await;
 
         // Path 1: cancel control frame mid-aggregation.
@@ -3717,7 +4106,11 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -3735,20 +4128,20 @@ mod tests {
                         };
                         for i in 0..respond_chunks {
                             let _ = s.send(
-                                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                                    data: bytes::Bytes::from(format!("chunk-{}", i)),
-                                    is_final: false,
-                                }))
+                                mk(pb::stream_response::Payload::Chunk(
+                                    pb::StreamChunkResponse {
+                                        data: bytes::Bytes::from(format!("chunk-{}", i)),
+                                        is_final: false,
+                                    },
+                                ))
                                 .encode_to_vec(),
                                 0,
                             );
                         }
                         if respond_chunks > 0 {
                             let _ = s.send(
-                                mk(pb::stream_response::Payload::Done(
-                                    pb::StreamDone::default(),
-                                ))
-                                .encode_to_vec(),
+                                mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                                    .encode_to_vec(),
                                 0,
                             );
                         }
@@ -3784,7 +4177,9 @@ mod tests {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 match st.action {
                     Some(pb::stream_request::Action::Open(_)) => {
                         let _ = tx.send("open".to_string());
@@ -3810,7 +4205,10 @@ mod tests {
         state
             .registry
             .register(
-                model, "1", ModelConfig::default(), ModelType::LitAPI,
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
                 std::path::PathBuf::new(),
             )
             .unwrap();
@@ -3818,17 +4216,24 @@ mod tests {
         state
             .registry
             .set_workers(
-                model, "1",
+                model,
+                "1",
                 vec![
                     WorkerInfo {
-                        worker_id: 0, device: "cpu:0".to_string(),
-                        endpoint: String::new(), pid: None,
-                        status: WorkerStatus::Ready, capacity: None,
+                        worker_id: 0,
+                        device: "cpu:0".to_string(),
+                        endpoint: String::new(),
+                        pid: None,
+                        status: WorkerStatus::Ready,
+                        capacity: None,
                     },
                     WorkerInfo {
-                        worker_id: 1, device: "cpu:1".to_string(),
-                        endpoint: String::new(), pid: None,
-                        status: WorkerStatus::Ready, capacity: None,
+                        worker_id: 1,
+                        device: "cpu:1".to_string(),
+                        endpoint: String::new(),
+                        pid: None,
+                        status: WorkerStatus::Ready,
+                        capacity: None,
                     },
                 ],
             )
@@ -3974,11 +4379,18 @@ mod tests {
             .map(|c| c.protocol)
             .unwrap_or(Protocol::Http);
         assert_eq!(
-            protocol, Protocol::Sse,
+            protocol,
+            Protocol::Sse,
             "response ctx must carry the Sse protocol"
         );
         assert!(
-            cb.last.lock().unwrap().as_ref().unwrap().elapsed_us.is_some(),
+            cb.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .elapsed_us
+                .is_some(),
             "response elapsed_us must be set"
         );
     }
@@ -4115,7 +4527,10 @@ mod tests {
         state
             .registry
             .register(
-                "m", "1", ModelConfig::default(), ModelType::LitAPI,
+                "m",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
                 std::path::PathBuf::new(),
             )
             .unwrap();
@@ -4357,10 +4772,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
         {
             if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
-                assert!(
-                    t.contains("no data frames"),
-                    "unexpected text frame: {t}"
-                );
+                assert!(t.contains("no data frames"), "unexpected text frame: {t}");
                 got_error = true;
             }
         }
@@ -4374,7 +4786,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got_cancel, "worker must receive Cancel after protocol error");
+        assert!(
+            got_cancel,
+            "worker must receive Cancel after protocol error"
+        );
     }
 
     /// PR-2 test 5 (D1): hard client disconnect → gone signal →
@@ -4591,7 +5006,13 @@ mod tests {
         let state = make_state(Arc::new(CallbackRunner::new()));
         state
             .registry
-            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         // 未 mark_ready
         let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
@@ -4605,7 +5026,10 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.into_response().status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.into_response().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             counter.get(),
             before + 1.0,
@@ -4620,8 +5044,11 @@ mod tests {
     async fn sse_rejects_missing_model_records_4xx() {
         let model = "sse_early_4xx";
         let state = make_state(Arc::new(CallbackRunner::new()));
-        let counter = prometheus::REQUESTS_TOTAL
-            .with_label_values(&[prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[
+            prometheus::UNKNOWN_MODEL_LABEL,
+            "",
+            "4xx",
+        ]);
         let raw_counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "", "4xx"]);
         let before = counter.get();
         let before_raw = raw_counter.get();
@@ -4634,7 +5061,10 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.into_response().status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
         assert!(
             counter.get() >= before + 1.0,
             "unresolved-model rejection must record 4xx under the constant label"
@@ -4653,7 +5083,13 @@ mod tests {
         let state = make_state(Arc::new(CallbackRunner::new()));
         state
             .registry
-            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         // register 不携带 policies(独立字段)——用 set_policies 配置 auth。
         state.registry.set_policies(
@@ -4681,8 +5117,15 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.into_response().status(), axum::http::StatusCode::UNAUTHORIZED);
-        assert_eq!(counter.get(), before + 1.0, "auth rejection must record 4xx");
+        assert_eq!(
+            resp.into_response().status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "auth rejection must record 4xx"
+        );
     }
 
     /// S8:SSE open 成功后 per-worker dispatch 计数 +1。
@@ -4729,8 +5172,8 @@ mod tests {
         let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let errs = prometheus::STREAM_ERRORS_TOTAL
-            .with_label_values(&[model, "1", "sse", "worker_error"]);
+        let errs =
+            prometheus::STREAM_ERRORS_TOTAL.with_label_values(&[model, "1", "sse", "worker_error"]);
         let before = errs.get();
         let sse = sse_infer_impl(
             state,
@@ -4746,7 +5189,11 @@ mod tests {
         )
         .await
         .expect("sse must open");
-        wait_for(|| errs.get() >= before + 1.0, "sse errors kind=worker_error").await;
+        wait_for(
+            || errs.get() >= before + 1.0,
+            "sse errors kind=worker_error",
+        )
+        .await;
         drop(sse);
     }
 
@@ -4760,8 +5207,7 @@ mod tests {
             ready_state_with_idle(model, endpoint, Arc::new(CallbackRunner::new()), 0.2).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let errs = prometheus::STREAM_ERRORS_TOTAL
-            .with_label_values(&[model, "1", "sse", "idle"]);
+        let errs = prometheus::STREAM_ERRORS_TOTAL.with_label_values(&[model, "1", "sse", "idle"]);
         let before = errs.get();
         let sse = sse_infer_impl(
             state,
@@ -4792,10 +5238,8 @@ mod tests {
         let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let dur = prometheus::STREAM_DURATION_SECONDS
-            .with_label_values(&[model, "1", "sse"]);
-        let bytes = prometheus::STREAM_OUTPUT_BYTES_TOTAL
-            .with_label_values(&[model, "1", "sse"]);
+        let dur = prometheus::STREAM_DURATION_SECONDS.with_label_values(&[model, "1", "sse"]);
+        let bytes = prometheus::STREAM_OUTPUT_BYTES_TOTAL.with_label_values(&[model, "1", "sse"]);
         let dur_before = dur.get_sample_count();
         let bytes_before = bytes.get();
         let sse = sse_infer_impl(
@@ -4838,12 +5282,16 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
             .await
             .expect("WS connect failed");
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"type":"close"}"#.to_string()))
-            .await
-            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"close"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
         // 等 writer 处理 close → worker 回 Done → 收口记录 2xx。
         wait_for(|| counter.get() >= before + 1.0, "ws requests_total 2xx").await;
         let _ = ws.close(None).await;
@@ -4863,20 +5311,28 @@ mod tests {
         let before = counter.get();
         // S4:协议违规 → kind=protocol(stream_kind=ws)。before 在流开始前取
         // (errors 与 4xx 同一次收口原子记录)。
-        let errs = prometheus::STREAM_ERRORS_TOTAL
-            .with_label_values(&[model, "1", "ws", "protocol"]);
+        let errs =
+            prometheus::STREAM_ERRORS_TOTAL.with_label_values(&[model, "1", "ws", "protocol"]);
         let e_before = errs.get();
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
             .await
             .expect("WS connect failed");
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"type":"bogus"}"#.to_string()))
-            .await
-            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"bogus"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
         wait_for(|| counter.get() >= before + 1.0, "ws requests_total 4xx").await;
-        assert_eq!(errs.get(), e_before + 1.0, "S4: protocol violation must count kind=protocol");
+        assert_eq!(
+            errs.get(),
+            e_before + 1.0,
+            "S4: protocol violation must count kind=protocol"
+        );
         let _ = ws.close(None).await;
     }
 
@@ -4895,9 +5351,11 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
             .await
             .expect("WS connect failed");
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
-            .await
-            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
         // 直接断开:writer 的 gone_rx 收到 Some("") → break(cancel)。
         let _ = ws.close(None).await;
         wait_for(|| canc.get() >= before + 1.0, "ws cancelled").await;
@@ -4912,7 +5370,13 @@ mod tests {
         let state = make_state(Arc::new(CallbackRunner::new()));
         state
             .registry
-            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         // 未 mark_ready
         let base = spawn_ws_server(state).await;
@@ -4923,7 +5387,11 @@ mod tests {
             .await
             .expect("WS connect failed");
         // 服务器升级 101 后立即 close(未就绪早退)。
-        let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string())).await;
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"input": 1}"#.to_string(),
+            ))
+            .await;
         wait_for(|| counter.get() >= before + 1.0, "ws early 5xx").await;
         let _ = ws.close(None).await;
     }
@@ -5005,4 +5473,3 @@ mod tests {
         );
     }
 }
-

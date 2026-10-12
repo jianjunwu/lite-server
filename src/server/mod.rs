@@ -8,12 +8,12 @@ use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 mod reconcile;
 mod scanner;
@@ -125,10 +125,8 @@ pub(crate) fn parse_lenient_semver(v: &str) -> Option<semver::Version> {
 /// `"v10" < "v2"` bug); any unparseable candidate falls the whole set back
 /// to lexicographic order — predictable for mixed naming schemes.
 pub(crate) fn pick_latest_version(versions: &[String]) -> Option<String> {
-    let parsed: Option<Vec<semver::Version>> = versions
-        .iter()
-        .map(|v| parse_lenient_semver(v))
-        .collect();
+    let parsed: Option<Vec<semver::Version>> =
+        versions.iter().map(|v| parse_lenient_semver(v)).collect();
     match parsed {
         Some(sems) => versions
             .iter()
@@ -161,9 +159,7 @@ impl LiteServer {
         let callback_runner = Arc::new({
             // C1: per-callback timeout from config (0 = off).
             let mut r = CallbackRunner::new();
-            r.set_dispatch_timeout(
-                crate::deadline::idle_budget(config.callbacks.timeout_secs),
-            );
+            r.set_dispatch_timeout(crate::deadline::idle_budget(config.callbacks.timeout_secs));
             r
         });
         // P0 (D6): install the ensemble plan cache on the production path;
@@ -181,13 +177,14 @@ impl LiteServer {
             inference_queue.clone(),
             config.logging.level.clone(),
             callback_runner.clone(),
-        ).with_server_http(Self::loopback_http_base(&config))
-         .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
-         .with_server_tunables(config.tunables.clone())
-         .with_custom_metrics(config.features.custom_metrics)
-         .with_model_defaults(config.model_defaults.clone())
-         .with_stream_channel_size(config.server.stream_channel_size)
-         .with_ensemble_plans(ensemble_plans);
+        )
+        .with_server_http(Self::loopback_http_base(&config))
+        .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
+        .with_server_tunables(config.tunables.clone())
+        .with_custom_metrics(config.features.custom_metrics)
+        .with_model_defaults(config.model_defaults.clone())
+        .with_stream_channel_size(config.server.stream_channel_size)
+        .with_ensemble_plans(ensemble_plans);
         if let Some(capacity) = streaming_capacity {
             wm = wm.with_streaming_capacity(capacity);
         }
@@ -268,7 +265,10 @@ impl LiteServer {
                     tick.tick().await;
                     let removed = seq_reg.cleanup();
                     if removed > 0 {
-                        tracing::debug!(removed, "sequence registry: reaped stale affinity entries");
+                        tracing::debug!(
+                            removed,
+                            "sequence registry: reaped stale affinity entries"
+                        );
                     }
                 }
             })
@@ -315,7 +315,10 @@ impl LiteServer {
         )
         .await;
         if cleaned > 0 || restored > 0 {
-            info!(removed = cleaned, restored, "startup tmp cleanup swept crash residue");
+            info!(
+                removed = cleaned,
+                restored, "startup tmp cleanup swept crash residue"
+            );
         }
 
         // Load initial models; the returned seen_lma set is handed to the
@@ -363,11 +366,13 @@ impl LiteServer {
         };
 
         // Fire ServerStart callbacks
-        self.callback_runner.on_server_start(&ServerContext {
-            http_port: self.config.server.http_port,
-            grpc_port: self.config.server.grpc_port,
-            metrics_port: self.config.server.metrics_port,
-        }).await;
+        self.callback_runner
+            .on_server_start(&ServerContext {
+                http_port: self.config.server.http_port,
+                grpc_port: self.config.server.grpc_port,
+                metrics_port: self.config.server.metrics_port,
+            })
+            .await;
 
         // P2: Check if any loaded model has hot_reload enabled
         let has_hot_reload = Arc::new(AtomicBool::new(self.registry_has_hot_reload_models()));
@@ -528,7 +533,9 @@ impl LiteServer {
                 let models = registry_for_timeline.list_loaded_keys();
                 // M2/L1: one tick-level gather/refresh/CPU window shared by
                 // all loaded keys, instead of per-key repetition.
-                crate::metrics::aggregator::TIMELINE.sample_tick(&models).await;
+                crate::metrics::aggregator::TIMELINE
+                    .sample_tick(&models)
+                    .await;
             }
         });
 
@@ -576,7 +583,8 @@ impl LiteServer {
         let server_tunables = self.config.tunables.clone();
         let has_hot_reload_for_reload = has_hot_reload.clone();
         let reload_handle = tokio::spawn(async move {
-            let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
+            let mut last_reload: std::collections::HashMap<(String, String), Instant> =
+                std::collections::HashMap::new();
             while let Some(events) = watch_rx.recv().await {
                 if let Err(e) = process_watch_events(
                     events,
@@ -587,7 +595,9 @@ impl LiteServer {
                     &server_tunables,
                     &has_hot_reload_for_reload,
                     &reconcile_tx,
-                ).await {
+                )
+                .await
+                {
                     warn!("Hot reload processing error: {}", e);
                 }
             }
@@ -694,11 +704,13 @@ impl LiteServer {
         });
 
         // Fire ServerEnd callbacks
-        self.callback_runner.on_server_end(&ServerContext {
-            http_port: self.config.server.http_port,
-            grpc_port: self.config.server.grpc_port,
-            metrics_port: self.config.server.metrics_port,
-        }).await;
+        self.callback_runner
+            .on_server_end(&ServerContext {
+                http_port: self.config.server.http_port,
+                grpc_port: self.config.server.grpc_port,
+                metrics_port: self.config.server.metrics_port,
+            })
+            .await;
 
         // Mark shutdown start for pending request tracking
         shutdown_state.mark_start();
@@ -752,10 +764,7 @@ impl LiteServer {
                         .elapsed()
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    info!(
-                        "Graceful shutdown: all requests drained after {}s",
-                        elapsed
-                    );
+                    info!("Graceful shutdown: all requests drained after {}s", elapsed);
                     break;
                 }
                 let elapsed = state_for_monitor
@@ -827,7 +836,10 @@ impl LiteServer {
                 h.abort();
             }
             prometheus::record_shutdown_drain(
-                shutdown_state.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                shutdown_state
+                    .elapsed()
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
             );
         } else {
             drop(http_fut);
@@ -876,10 +888,15 @@ impl LiteServer {
 
     /// Check if any loaded model has hot_reload enabled.
     fn registry_has_hot_reload_models(&self) -> bool {
-        self.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload)
+        self.registry
+            .list_loaded()
+            .iter()
+            .any(|(_, _, mv)| mv.config.hot_reload)
     }
 
-    async fn load_initial_models(&self) -> Result<HashSet<(PathBuf, std::time::SystemTime)>, AppError> {
+    async fn load_initial_models(
+        &self,
+    ) -> Result<HashSet<(PathBuf, std::time::SystemTime)>, AppError> {
         let repo_path = PathBuf::from(&self.config.model_repository.path);
         let orch = &self.config.orchestration;
 
@@ -920,13 +937,16 @@ async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
         .parse()
         .map_err(|e| AppError::Config(format!("invalid metrics address: {}", e)))?;
 
-    let app = axum::Router::new().route("/metrics", axum::routing::get(|| async {
-        let body = prometheus::gather_metrics();
-        axum::response::Response::builder()
-            .header("content-type", "text/plain; charset=utf-8")
-            .body(body)
-            .expect("metrics response: builder should not fail with string body")
-    }));
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(|| async {
+            let body = prometheus::gather_metrics();
+            axum::response::Response::builder()
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(body)
+                .expect("metrics response: builder should not fail with string body")
+        }),
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -951,15 +971,9 @@ async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
 /// Timing: the cancel fires `grace + margin` before the drain backstop so
 /// wrap-up output and the eviction frame land while the connections are
 /// still being drained (the HTTP/gRPC drain only force-aborts AT `window`).
-async fn close_streams_for_shutdown(
-    queue: Arc<InferenceQueue>,
-    window: Duration,
-    grace: Duration,
-) {
+async fn close_streams_for_shutdown(queue: Arc<InferenceQueue>, window: Duration, grace: Duration) {
     const BACKSTOP_MARGIN: Duration = Duration::from_millis(500);
-    let fire_after = window
-        .saturating_sub(grace)
-        .saturating_sub(BACKSTOP_MARGIN);
+    let fire_after = window.saturating_sub(grace).saturating_sub(BACKSTOP_MARGIN);
     tokio::time::sleep(fire_after).await;
     let asked = queue.graceful_cancel_all_streams("shutdown", grace.as_millis() as u32);
     if asked.is_empty() {
@@ -1060,12 +1074,6 @@ async fn shutdown_signal() {
         .expect("failed to install Ctrl+C handler");
     info!("signal received, starting graceful shutdown");
 }
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {

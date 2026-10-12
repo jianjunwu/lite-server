@@ -1,11 +1,11 @@
 use crate::http::handlers::*;
 use crate::http::state::AppState;
 use axum::{
-    Router,
     extract::{Request, State},
     middleware::Next,
     response::Response,
     routing::{delete, get, post, put},
+    Router,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,8 +25,14 @@ pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let segs: Vec<&str> = segs.collect();
     match segs.as_slice() {
         [] => None,
-        ["infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate" | "generate_stream"] => Some((model, None)),
-        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate" | "generate_stream"] if !v.is_empty() => Some((model, Some(v))),
+        ["infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate"
+        | "generate_stream"] => Some((model, None)),
+        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate"
+        | "generate_stream"]
+            if !v.is_empty() =>
+        {
+            Some((model, Some(v)))
+        }
         ["versions", ..] => None,
         // B1 audit fix: bare `reload` is a registered state-changing ADMIN route
         // (POST /v2/models/:m/reload → reload_model_handler, no enforce_auth).
@@ -200,7 +206,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         router = router
             .route("/metrics/timeline", get(timeline_handler))
             .route("/metrics/timeline/:model_name", get(timeline_model_handler))
-            .route("/metrics/timeline/:model_name/versions/:version", get(timeline_model_version_handler));
+            .route(
+                "/metrics/timeline/:model_name/versions/:version",
+                get(timeline_model_version_handler),
+            );
     }
     if features.alerts {
         router = router.route("/metrics/alerts", get(alerts_handler));
@@ -209,7 +218,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         router = router.route("/metrics/accelerator", get(accelerator_handler));
     }
     if features.version_compare {
-        router = router.route("/v2/models/:model_name/compare", get(compare_versions_handler));
+        router = router.route(
+            "/v2/models/:model_name/compare",
+            get(compare_versions_handler),
+        );
     }
     // `streaming` is the master switch for the two streaming transports; each
     // transport also has its own toggle, so e.g. sse=false unmounts SSE while
@@ -217,14 +229,26 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     if features.streaming && features.sse {
         router = router
             .route("/v2/models/:model_name/events", post(sse_infer_handler))
-            .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
+            .route(
+                "/v2/models/:model_name/versions/:version/events",
+                post(sse_infer_version_handler),
+            )
             // 批次 4:/generate_stream 随同一开关族(J3,与 /events 同批挂载)
-            .route("/v2/models/:model_name/generate_stream", post(generate_stream_handler))
-            .route("/v2/models/:model_name/versions/:version/generate_stream", post(generate_stream_version_handler));
+            .route(
+                "/v2/models/:model_name/generate_stream",
+                post(generate_stream_handler),
+            )
+            .route(
+                "/v2/models/:model_name/versions/:version/generate_stream",
+                post(generate_stream_version_handler),
+            );
     }
     if features.streaming && features.sse && features.decoupled {
         router = router
-            .route("/v2/models/:model_name/decoupled", post(sse_decoupled_handler))
+            .route(
+                "/v2/models/:model_name/decoupled",
+                post(sse_decoupled_handler),
+            )
             .route(
                 "/v2/models/:model_name/versions/:version/decoupled",
                 post(sse_decoupled_version_handler),
@@ -233,7 +257,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     if features.streaming && features.websocket_streaming {
         router = router
             .route("/v2/models/:model_name/stream", get(ws_stream_handler))
-            .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
+            .route(
+                "/v2/models/:model_name/versions/:version/stream",
+                get(ws_stream_version_handler),
+            );
     }
     if features.streaming && features.websocket_streaming && features.decoupled {
         router = router
@@ -250,7 +277,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     if features.streaming && features.http_bidi {
         router = router
             .route("/v2/models/:model_name/bidi", post(h2_bidi_handler))
-            .route("/v2/models/:model_name/versions/:version/bidi", post(h2_bidi_version_handler));
+            .route(
+                "/v2/models/:model_name/versions/:version/bidi",
+                post(h2_bidi_version_handler),
+            );
     }
     // Custom @route dispatch (phase 2) is handled by the fallback handler
     // (see http::route_fallback): exact system leaves above are matched by
@@ -296,8 +326,14 @@ mod tests {
         assert_eq!(access_log_target("/v2/models/m/events"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/stream"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/bidi"), Some(("m", None)));
-        assert_eq!(access_log_target("/v2/models/m/decoupled"), Some(("m", None)));
-        assert_eq!(access_log_target("/v2/models/m/decoupled-stream"), Some(("m", None)));
+        assert_eq!(
+            access_log_target("/v2/models/m/decoupled"),
+            Some(("m", None))
+        );
+        assert_eq!(
+            access_log_target("/v2/models/m/decoupled-stream"),
+            Some(("m", None))
+        );
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/infer"),
             Some(("m", Some("2")))
@@ -337,9 +373,15 @@ mod tests {
         assert_eq!(access_log_target("/v2/models/m"), None); // 模型元数据
         assert_eq!(access_log_target("/v2/models/m/versions/2"), None); // versioned 元数据
         assert_eq!(access_log_target("/v2/repository/models/m/load"), None); // bare load
-        // 批次 4:generate 归 inference 族(同 /events 流式日志)
-        assert_eq!(access_log_target("/v2/models/m/generate"), Some(("m", None)));
-        assert_eq!(access_log_target("/v2/models/m/generate_stream"), Some(("m", None)));
+                                                                             // 批次 4:generate 归 inference 族(同 /events 流式日志)
+        assert_eq!(
+            access_log_target("/v2/models/m/generate"),
+            Some(("m", None))
+        );
+        assert_eq!(
+            access_log_target("/v2/models/m/generate_stream"),
+            Some(("m", None))
+        );
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/generate_stream"),
             Some(("m", Some("2")))
@@ -350,7 +392,10 @@ mod tests {
     fn test_access_log_target_custom_route_tails() {
         // Custom @route declarations fall through to the fallback handler;
         // they belong to the model pipeline and are logged (active version).
-        assert_eq!(access_log_target("/v2/models/m/summarize"), Some(("m", None)));
+        assert_eq!(
+            access_log_target("/v2/models/m/summarize"),
+            Some(("m", None))
+        );
         assert_eq!(access_log_target("/v2/models/m/a/b"), Some(("m", None)));
     }
 }

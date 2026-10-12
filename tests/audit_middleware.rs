@@ -108,7 +108,9 @@ async fn test_audit_parity_grpc_admission_rejection_echoes_request_id() {
         .expect_err("saturated admission must reject");
     assert_eq!(err.code(), tonic::Code::Unavailable);
     assert_eq!(
-        err.metadata().get("x-request-id").and_then(|v| v.to_str().ok()),
+        err.metadata()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
         Some("echo-rid-admission"),
         "P2-2（蓝图 §4.1）：错误路径须回显 x-request-id（对齐 HTTP observability 错误路径）；\
          admission 拒绝发生在 echo 包装之前，当前无回显"

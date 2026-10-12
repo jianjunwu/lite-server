@@ -118,7 +118,12 @@ fn unary_ok(uid: &str) -> pb::Response {
 }
 
 fn open_req(stream_id: &str) -> pb::Request {
-    streaming::build_stream_open(stream_id.to_string(), bytes::Bytes::from_static(b"{}"), None, true)
+    streaming::build_stream_open(
+        stream_id.to_string(),
+        bytes::Bytes::from_static(b"{}"),
+        None,
+        true,
+    )
 }
 
 fn ping_req(uid: &str) -> pb::Request {

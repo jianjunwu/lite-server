@@ -2,8 +2,8 @@ pub mod cache;
 pub mod types;
 
 use crate::config::{ModelConfig, ModelStrategyConfig};
-use crate::registry::types::LoadPolicy;
 use crate::error::AppError;
+use crate::registry::types::LoadPolicy;
 use crate::registry::types::*;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -305,8 +305,7 @@ impl ModelRegistry {
             .versions
             .iter()
             .filter(|(_, mv)| {
-                mv.weight > 0
-                    && matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded)
+                mv.weight > 0 && matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded)
             })
             .map(|(v, mv)| (v, mv.weight))
             .collect();
@@ -338,10 +337,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         mv.status = status;
         Ok(())
     }
@@ -355,10 +353,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         mv.status = VersionStatus::Ready;
         mv.last_failure = None;
         if mv.loaded_at.is_none() {
@@ -376,10 +373,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         mv.status = VersionStatus::WarmingUp;
         Ok(())
     }
@@ -397,10 +393,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         mv.status = VersionStatus::Failed;
         mv.last_failure = Some(reason.into());
         Ok(())
@@ -416,10 +411,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         mv.workers = workers;
         Ok(())
     }
@@ -437,10 +431,9 @@ impl ModelRegistry {
             .models
             .get_mut(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get_mut(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get_mut(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
         if let Some(existing) = mv.workers.iter_mut().find(|w| w.worker_id == worker_id) {
             *existing = info;
         } else {
@@ -475,17 +468,17 @@ impl ModelRegistry {
             .models
             .get(model_name)
             .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
-        let mv = entry
-            .versions
-            .get(version)
-            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        let mv = entry.versions.get(version).ok_or_else(|| {
+            AppError::VersionNotFound(model_name.to_string(), version.to_string())
+        })?;
 
         if mv.status != VersionStatus::Ready {
             return Ok(false);
         }
         drop(entry);
 
-        self.active_versions.insert(model_name.to_string(), version.to_string());
+        self.active_versions
+            .insert(model_name.to_string(), version.to_string());
         Ok(true)
     }
 
@@ -530,7 +523,8 @@ impl ModelRegistry {
             if let Some(entry) = self.models.get(model_name) {
                 for (v, mv) in entry.versions.iter() {
                     if mv.status == VersionStatus::Ready {
-                        self.active_versions.insert(model_name.to_string(), v.clone());
+                        self.active_versions
+                            .insert(model_name.to_string(), v.clone());
                         break;
                     }
                 }
@@ -564,10 +558,7 @@ impl ModelRegistry {
     }
 
     /// P-CORS: active version's CORS policy (Arc-cloned, cheap on the hot path).
-    pub fn active_cors_policy(
-        &self,
-        model_name: &str,
-    ) -> Option<Arc<crate::config::CorsPolicy>> {
+    pub fn active_cors_policy(&self, model_name: &str) -> Option<Arc<crate::config::CorsPolicy>> {
         let active_version = self.active_versions.get(model_name)?;
         let model = self.models.get(model_name)?;
         let mv = model.versions.get(active_version.value())?;
@@ -635,7 +626,6 @@ impl Default for ModelRegistry {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
-    
 
     fn test_config() -> ModelConfig {
         ModelConfig {
@@ -874,7 +864,8 @@ mod tests {
         let reg = ModelRegistry::new();
         reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
             .unwrap();
-        reg.mark_failed("m1", "1", "cuda oom during warmup").unwrap();
+        reg.mark_failed("m1", "1", "cuda oom during warmup")
+            .unwrap();
         let status = reg.server_status();
         let e = status
             .entries
@@ -894,8 +885,11 @@ mod tests {
         }
         reg.mark_ready("m1", "1").unwrap();
         reg.mark_warming_up("m1", "2").unwrap();
-        reg.set_weights("m1", &HashMap::from([("1".into(), 1u32), ("2".into(), 100u32)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 1u32), ("2".into(), 100u32)]),
+        )
+        .unwrap();
         // v2 has 100% weight but is WarmingUp → never picked; v1 is the only
         // serving candidate. Run many times to be sure.
         for _ in 0..50 {
@@ -977,7 +971,10 @@ mod tests {
         // All non-active used → candidate is one of them, never active "3".
         reg.touch_last_used("m1", "2");
         let c = reg.lru_eviction_candidate("m1").unwrap();
-        assert!(c == "1" || c == "2", "active version must never be a candidate");
+        assert!(
+            c == "1" || c == "2",
+            "active version must never be a candidate"
+        );
     }
 
     #[test]
@@ -1000,8 +997,11 @@ mod tests {
                 .unwrap();
         }
 
-        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]),
+        )
+        .unwrap();
         assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 90);
         assert_eq!(reg.get("m1", Some("2")).unwrap().weight, 10);
 
@@ -1053,8 +1053,11 @@ mod tests {
                 .unwrap();
             reg.mark_ready("m1", v).unwrap();
         }
-        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32), ("2".into(), 0)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 100u32), ("2".into(), 0)]),
+        )
+        .unwrap();
         for _ in 0..20 {
             assert_eq!(reg.routing_pick("m1"), Some("1".to_string()));
         }
@@ -1070,7 +1073,11 @@ mod tests {
         }
         reg.set_weights(
             "m1",
-            &HashMap::from([("1".into(), 100u32), ("2".into(), 1u32), ("3".into(), 100u32)]),
+            &HashMap::from([
+                ("1".into(), 100u32),
+                ("2".into(), 1u32),
+                ("3".into(), 100u32),
+            ]),
         )
         .unwrap();
         // "1" Failed and "3" still Loading (reset below) → only "2" is eligible.
@@ -1111,8 +1118,11 @@ mod tests {
                 .unwrap();
             reg.mark_ready("m1", v).unwrap();
         }
-        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]),
+        )
+        .unwrap();
 
         reg.activate_version("m1", "2").unwrap();
         assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 90);
@@ -1127,8 +1137,11 @@ mod tests {
                 .unwrap();
             reg.mark_ready("m1", v).unwrap();
         }
-        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]),
+        )
+        .unwrap();
 
         let mut v2 = 0usize;
         let n = 10_000;
@@ -1470,9 +1483,12 @@ mod tests {
     #[test]
     fn test_list_loaded_keys() {
         let reg = ModelRegistry::new();
-        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir()).unwrap();
-        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir()).unwrap();
-        reg.register("m2", "1", test_config(), ModelType::Ensemble, tmp_dir()).unwrap();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.register("m2", "1", test_config(), ModelType::Ensemble, tmp_dir())
+            .unwrap();
 
         let keys = reg.list_loaded_keys();
         assert_eq!(keys.len(), 3);
@@ -1515,7 +1531,8 @@ mod tests {
             let r = reg_clone.clone();
             handles.push(tokio::spawn(async move {
                 let v = format!("{}", i + 2);
-                r.register("m1", &v, test_config(), ModelType::LitAPI, tmp_dir()).unwrap();
+                r.register("m1", &v, test_config(), ModelType::LitAPI, tmp_dir())
+                    .unwrap();
                 r.set_status("m1", &v, VersionStatus::Ready).unwrap();
             }));
         }
@@ -1535,8 +1552,11 @@ mod tests {
             .unwrap();
         reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
             .unwrap();
-        reg.set_weights("m1", &HashMap::from([("1".into(), 60u32), ("2".into(), 40)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 60u32), ("2".into(), 40)]),
+        )
+        .unwrap();
 
         reg.remove("m1", "1").unwrap();
 
@@ -1564,7 +1584,10 @@ mod tests {
         }
         reg.set_weights(
             "m1",
-            &HashMap::from([("1".into(), 3_000_000_000u32), ("2".into(), 3_000_000_000u32)]),
+            &HashMap::from([
+                ("1".into(), 3_000_000_000u32),
+                ("2".into(), 3_000_000_000u32),
+            ]),
         )
         .unwrap();
         for _ in 0..50 {

@@ -6,14 +6,17 @@
 //! `test_canonical_error_values_preserved`、`test_protocol_openai_renderer_log_levels_c7`。
 
 use super::detect;
-use super::{ApiProtocol, render};
+use super::{render, ApiProtocol};
 use crate::error::{AppError, ModelErrorData, ProtocolError};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 /// render 一个 AppError → (status, headers, body bytes)。协议感知路径走
 /// `into_canonical`,与生产 `ProtocolError::into_response` 同一管线。
-async fn render_canonical(err: AppError, protocol: ApiProtocol) -> (StatusCode, HeaderMap, Vec<u8>) {
+async fn render_canonical(
+    err: AppError,
+    protocol: ApiProtocol,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let resp = render(err.into_canonical(), protocol);
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -119,7 +122,8 @@ async fn test_protocol_openai_renderer_byte_identical() {
         ),
         (
             AppError::InvalidRequestBody(
-                "Failed to parse the request body as JSON: expected value at line 1 column 1".to_string(),
+                "Failed to parse the request body as JSON: expected value at line 1 column 1"
+                    .to_string(),
             ),
             StatusCode::BAD_REQUEST,
             r#"{"error":{"code":"invalid_request_body","message":"Failed to parse the request body as JSON: expected value at line 1 column 1","param":null,"type":"invalid_request_error"}}"#,
@@ -234,7 +238,9 @@ async fn test_protocol_openai_renderer_byte_identical_retry_after() {
         r#"{"error":{"code":"queue_full","message":"queue full","param":null,"type":"queue_full"}}"#
     );
 
-    let err = AppError::RateLimitExceeded { retry_after_secs: 5 };
+    let err = AppError::RateLimitExceeded {
+        retry_after_secs: 5,
+    };
     let (status, headers, body) = render_canonical(err, ApiProtocol::Legacy).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "5");
@@ -273,7 +279,10 @@ fn test_canonical_error_values_preserved() {
     assert_eq!(c.error_type, "invalid_request_error");
     assert_eq!(c.code.as_deref(), Some("invalid_parameter_value"));
 
-    let c = AppError::RateLimitExceeded { retry_after_secs: 5 }.into_canonical();
+    let c = AppError::RateLimitExceeded {
+        retry_after_secs: 5,
+    }
+    .into_canonical();
     assert_eq!(c.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(c.error_type, "rate_limit_exceeded");
     assert_eq!(c.headers.as_ref().unwrap()["retry-after"], "5");
@@ -295,7 +304,10 @@ fn test_canonical_error_values_preserved() {
         c.extra.as_ref().unwrap(),
         &serde_json::json!({"max_size": 100, "actual_size": 250})
     );
-    assert_eq!(c.message, "request body too large: 250 bytes exceeds the 100 bytes limit");
+    assert_eq!(
+        c.message,
+        "request body too large: 250 bytes exceeds the 100 bytes limit"
+    );
 
     // ModelError:status/type/code 来自模型数据;code 保留 Option(None → wire null)
     let c = AppError::ModelError(Box::new(ModelErrorData {
@@ -341,7 +353,10 @@ use crate::test_tracing::event_counts;
 async fn test_protocol_openai_renderer_log_levels_c7() {
     let c = event_counts(|| {
         let _ = render(
-            AppError::RateLimitExceeded { retry_after_secs: 1 }.into_canonical(),
+            AppError::RateLimitExceeded {
+                retry_after_secs: 1,
+            }
+            .into_canonical(),
             ApiProtocol::Legacy,
         );
     });
@@ -394,7 +409,10 @@ async fn test_kserve_renderer_flat() {
     let err = AppError::ModelNotFound("bert".into());
     let (status, body) = render_kserve_flat(err).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(String::from_utf8(body).unwrap(), r#"{"error":"model not found"}"#);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"error":"model not found"}"#
+    );
 
     // model error(message = 模型 detail,不 sanitize)
     let err = AppError::ModelError(Box::new(ModelErrorData {
@@ -438,22 +456,27 @@ async fn test_render_dispatch_matrix() {
     let makers: Vec<fn() -> AppError> = vec![
         || AppError::ModelNotFound("m".into()),
         || AppError::WorkerCrashed("boom".into()),
-        || AppError::PayloadTooLarge { max_size: 10, actual_size: None },
-        || AppError::RateLimitExceeded { retry_after_secs: 3 },
-        || AppError::ModelError(Box::new(ModelErrorData {
-            status_code: 422,
-            error_type: "INVALID_INPUT".into(),
-            detail: "bad".into(),
-            code: None,
-            param: None,
-            headers: None,
-        })),
+        || AppError::PayloadTooLarge {
+            max_size: 10,
+            actual_size: None,
+        },
+        || AppError::RateLimitExceeded {
+            retry_after_secs: 3,
+        },
+        || {
+            AppError::ModelError(Box::new(ModelErrorData {
+                status_code: 422,
+                error_type: "INVALID_INPUT".into(),
+                detail: "bad".into(),
+                code: None,
+                param: None,
+                headers: None,
+            }))
+        },
     ];
     for make in makers {
-        let (legacy_status, _, legacy_body) =
-            render_canonical(make(), ApiProtocol::Legacy).await;
-        let (kserve_status, _, kserve_body) =
-            render_canonical(make(), ApiProtocol::Kserve).await;
+        let (legacy_status, _, legacy_body) = render_canonical(make(), ApiProtocol::Legacy).await;
+        let (kserve_status, _, kserve_body) = render_canonical(make(), ApiProtocol::Kserve).await;
         assert_eq!(kserve_status, legacy_status, "状态码跨协议一致");
         // Legacy 形状:error 对象;Kserve 形状:error 字符串
         let legacy: serde_json::Value = serde_json::from_slice(&legacy_body).unwrap();
@@ -476,7 +499,9 @@ fn test_protocol_error_from_apperror_defaults_legacy() {
 #[tokio::test]
 async fn test_protocol_error_matches_apperror_shim() {
     let shim_body = axum::body::to_bytes(
-        AppError::ModelNotFound("bert".into()).into_response().into_body(),
+        AppError::ModelNotFound("bert".into())
+            .into_response()
+            .into_body(),
         4096,
     )
     .await
@@ -514,19 +539,31 @@ fn test_t1_prefilter_ihcl_header() {
     use axum::http::HeaderMap;
     let mut h = HeaderMap::new();
     h.insert("inference-header-content-length", "546".parse().unwrap());
-    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &h), Some(ApiProtocol::Kserve));
+    assert_eq!(
+        detect::t1_prefilter("/v2/models/m/infer", &h),
+        Some(ApiProtocol::Kserve)
+    );
 
     let mut h = HeaderMap::new();
     h.insert("inference-header-content-length", "0".parse().unwrap());
-    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &h), Some(ApiProtocol::Kserve));
+    assert_eq!(
+        detect::t1_prefilter("/v2/models/m/infer", &h),
+        Some(ApiProtocol::Kserve)
+    );
 
-    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &HeaderMap::new()), None);
+    assert_eq!(
+        detect::t1_prefilter("/v2/models/m/infer", &HeaderMap::new()),
+        None
+    );
 }
 
 #[test]
 fn test_t1_prefilter_other_paths() {
     // 无 IHCL header 的其他路径 → None(信封主判在 T2)
-    assert_eq!(detect::t1_prefilter("/health", &axum::http::HeaderMap::new()), None);
+    assert_eq!(
+        detect::t1_prefilter("/health", &axum::http::HeaderMap::new()),
+        None
+    );
 }
 
 #[test]
@@ -560,7 +597,10 @@ fn test_detect_resolve_precedence() {
     // T1 无 + 信封 → Kserve
     let mut h = HeaderMap::new();
     h.insert("inference-header-content-length", "10".parse().unwrap());
-    assert_eq!(detect::resolve(Some(ApiProtocol::Kserve), b"not-envelope"), ApiProtocol::Kserve);
+    assert_eq!(
+        detect::resolve(Some(ApiProtocol::Kserve), b"not-envelope"),
+        ApiProtocol::Kserve
+    );
     // 否则 Legacy
     assert_eq!(detect::resolve(None, br#"{"x":1}"#), ApiProtocol::Legacy);
     assert_eq!(detect::resolve(None, b"not-json"), ApiProtocol::Legacy);
@@ -576,16 +616,16 @@ async fn test_protocol_mount_noop() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let app = axum::Router::new().route(
-        "/health",
-        axum::routing::get(|| async { "ok" }),
-    );
+    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
     let mounted = super::mount(app.clone());
 
     let resp = mounted
         .clone()
         .oneshot(
-            Request::builder().uri("/health").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -601,7 +641,12 @@ async fn test_protocol_mount_noop() {
 
     // 未挂载的对照:行为一致(no-op 语义)
     let resp = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

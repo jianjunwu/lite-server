@@ -19,10 +19,13 @@ pub enum ResolvedRef {
 /// [`resolve_ref`]'s key derivation exactly (parse-time use; ref shapes are
 /// already validated, so unreachable shapes still derive the same key the
 /// runtime would compute before erroring).
-pub(crate) fn context_key_for_ref(steps: &[EnsembleStep], ref_str: &str) -> Result<String, AppError> {
-    let caps = REF_RE.captures(ref_str).ok_or_else(|| {
-        AppError::Config(format!("invalid reference: {}", ref_str))
-    })?;
+pub(crate) fn context_key_for_ref(
+    steps: &[EnsembleStep],
+    ref_str: &str,
+) -> Result<String, AppError> {
+    let caps = REF_RE
+        .captures(ref_str)
+        .ok_or_else(|| AppError::Config(format!("invalid reference: {}", ref_str)))?;
     let source = caps.get(1).unwrap().as_str();
     let rest = caps.get(2).map(|m| m.as_str());
     Ok(match source {
@@ -76,9 +79,9 @@ pub(crate) fn resolve_ref(
     ref_str: &str,
     context: &HashMap<String, EnsembleValue>,
 ) -> Result<ResolvedRef, AppError> {
-    let caps = REF_RE.captures(ref_str).ok_or_else(|| {
-        AppError::Config(format!("invalid reference: {}", ref_str))
-    })?;
+    let caps = REF_RE
+        .captures(ref_str)
+        .ok_or_else(|| AppError::Config(format!("invalid reference: {}", ref_str)))?;
     let source = caps.get(1).unwrap().as_str();
     let rest = caps.get(2).map(|m| m.as_str());
 
@@ -86,7 +89,8 @@ pub(crate) fn resolve_ref(
         "inputs" => {
             let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
             let key = format!("inputs.{name}");
-            let json_path = rest.and_then(|r| r.strip_prefix(name))
+            let json_path = rest
+                .and_then(|r| r.strip_prefix(name))
                 .and_then(|p| p.strip_prefix('.'));
             (key, json_path)
         }
@@ -97,7 +101,8 @@ pub(crate) fn resolve_ref(
                     // Declared step: context key is `step.alias`.
                     let alias = rest.and_then(|r| r.split('.').next()).unwrap_or("");
                     let key = format!("{step_name}.{alias}");
-                    let json_path = rest.and_then(|r| r.strip_prefix(alias))
+                    let json_path = rest
+                        .and_then(|r| r.strip_prefix(alias))
                         .and_then(|p| p.strip_prefix('.'));
                     (key, json_path)
                 }
@@ -151,7 +156,8 @@ pub(crate) fn resolve_ref(
                         .find(|s| s.name == step_name)
                         .and_then(|s| s.outputs_decl.as_ref())
                         .and_then(|d| {
-                            rest.and_then(|r| r.split('.').next()).and_then(|a| d.get(a))
+                            rest.and_then(|r| r.split('.').next())
+                                .and_then(|a| d.get(a))
                         })
                         .map(|dd| dd.ty == InputType::Binary)
                         .unwrap_or(false),
@@ -200,9 +206,9 @@ pub(crate) fn resolve_ref(
                 Ok(ResolvedRef::Value(EnsembleValue::Json(field_val)))
             }
         },
-        EnsembleValue::Envelope { .. } => {
-            Err(AppError::Internal("envelope reached a DAG edge".to_string()))
-        }
+        EnsembleValue::Envelope { .. } => Err(AppError::Internal(
+            "envelope reached a DAG edge".to_string(),
+        )),
     }
 }
 
@@ -223,4 +229,3 @@ pub(crate) fn project_json_path(v: &Value, path: &str) -> Result<Value, AppError
     }
     Ok(cur.clone())
 }
-

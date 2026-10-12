@@ -45,11 +45,17 @@ use std::sync::Arc;
 /// 返回签名约束为 `()`,运行时 state 已擦除进 router 内部。
 pub fn mount(router: axum::Router<Arc<AppState>>) -> axum::Router<Arc<AppState>> {
     router
-        .route("/v1/chat/completions", axum::routing::post(openai_infer_handler))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(openai_infer_handler),
+        )
         .route("/v1/completions", axum::routing::post(openai_infer_handler))
         .route("/v1/embeddings", axum::routing::post(openai_infer_handler))
         .route("/v1/models", axum::routing::get(v1_models_handler))
-        .route("/v1/models/:model", axum::routing::get(v1_model_retrieve_handler))
+        .route(
+            "/v1/models/:model",
+            axum::routing::get(v1_model_retrieve_handler),
+        )
 }
 
 /// /v1 专属鉴权门(openai_compact.auth):handler 入口调用。未配置 → 直通
@@ -86,7 +92,10 @@ struct OpenAiRoute {
 fn parse_route(body: &RequestBody) -> Result<OpenAiRoute, AppError> {
     let bytes = match body {
         RequestBody::Json(b) => b.as_ref(),
-        RequestBody::TritonBinary { body, json_head_len } => &body[..*json_head_len],
+        RequestBody::TritonBinary {
+            body,
+            json_head_len,
+        } => &body[..*json_head_len],
         RequestBody::Raw(..) => {
             return Err(AppError::InvalidRequestBody(
                 "OpenAI endpoints require a JSON body".to_string(),
@@ -98,9 +107,11 @@ fn parse_route(body: &RequestBody) -> Result<OpenAiRoute, AppError> {
             "request body is not valid JSON".to_string(),
         ));
     };
-    let model = v.get("model").and_then(|m| m.as_str()).map(String::from).ok_or_else(|| {
-        AppError::InvalidRequestBody("missing required field: model".to_string())
-    })?;
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(String::from)
+        .ok_or_else(|| AppError::InvalidRequestBody("missing required field: model".to_string()))?;
     // F-33: a present-but-non-boolean `stream` is a client error (400), not
     // a silent downgrade to unary.
     let stream = match v.get("stream") {
@@ -132,13 +143,25 @@ pub async fn openai_infer_handler(
         // 批次 5 审计修复(B1/B2/B7/B8/B10):流式并入 SSE 管线——鉴权/限流/
         // validate/binary-flag 400/worker 流 cancel/指标/回调全随
         // sse_infer_entry_impl 继承,帧封装 = SseFrameStyle::Openai。
-        crate::http::handlers::stream::openai_stream_entry(&state, &route.model, headers, body, cx, slot)
-            .await
-            .map_err(|error| ProtocolError { error, protocol })
+        crate::http::handlers::stream::openai_stream_entry(
+            &state,
+            &route.model,
+            headers,
+            body,
+            cx,
+            slot,
+        )
+        .await
+        .map_err(|error| ProtocolError { error, protocol })
     } else {
         run_infer(
-            state, route.model, None,
-            "/predict".to_string(), headers, body, cx,
+            state,
+            route.model,
+            None,
+            "/predict".to_string(),
+            headers,
+            body,
+            cx,
         )
         .await
     }
@@ -242,7 +265,13 @@ mod audit_tests {
     fn register_ready(state: &AppState, model: &str, cfg: ModelConfig) {
         state
             .registry
-            .register(model, "1", cfg, ModelType::LitAPI, std::path::PathBuf::new())
+            .register(
+                model,
+                "1",
+                cfg,
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
             .unwrap();
         state.registry.mark_ready(model, "1").unwrap();
         // open_worker_stream 检查 mv.workers.len() > 0。
@@ -287,8 +316,16 @@ mod audit_tests {
 
         // Absent and explicit booleans keep working.
         assert!(!parse_route(&body(r#"{"model":"m"}"#)).unwrap().stream);
-        assert!(parse_route(&body(r#"{"model":"m","stream":true}"#)).unwrap().stream);
-        assert!(!parse_route(&body(r#"{"model":"m","stream":false}"#)).unwrap().stream);
+        assert!(
+            parse_route(&body(r#"{"model":"m","stream":true}"#))
+                .unwrap()
+                .stream
+        );
+        assert!(
+            !parse_route(&body(r#"{"model":"m","stream":false}"#))
+                .unwrap()
+                .stream
+        );
     }
 
     /// oneshot 按值消耗 router(内含唯一 state 引用)——流式测试必须保留
@@ -378,10 +415,16 @@ mod audit_tests {
     async fn test_audit_v1_stream_rejection_recorded() {
         let state = make_state();
         let app = v1_router(state);
-        let counter = crate::metrics::prometheus::REQUESTS_TOTAL
-            .with_label_values(&[crate::metrics::prometheus::UNKNOWN_MODEL_LABEL, "", "4xx"]);
-        let raw_counter = crate::metrics::prometheus::REQUESTS_TOTAL
-            .with_label_values(&["audit-v1-rej", "", "4xx"]);
+        let counter = crate::metrics::prometheus::REQUESTS_TOTAL.with_label_values(&[
+            crate::metrics::prometheus::UNKNOWN_MODEL_LABEL,
+            "",
+            "4xx",
+        ]);
+        let raw_counter = crate::metrics::prometheus::REQUESTS_TOTAL.with_label_values(&[
+            "audit-v1-rej",
+            "",
+            "4xx",
+        ]);
         let before = counter.get();
         let before_raw = raw_counter.get();
         let resp = app.oneshot(chat_req("audit-v1-rej", true)).await.unwrap();
@@ -406,8 +449,12 @@ mod audit_tests {
             s.connect(&endpoint).expect("worker connect");
             let _ = s.set_rcvtimeo(4000);
             while let Ok(bytes) = s.recv_bytes(0) {
-                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else {
+                    continue;
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
                     continue;
                 }
@@ -486,8 +533,12 @@ mod audit_tests {
             s.connect(&endpoint).expect("worker connect");
             let _ = s.set_rcvtimeo(4000);
             while let Ok(bytes) = s.recv_bytes(0) {
-                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
-                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else {
+                    continue;
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
                 match st.action {
                     Some(pb::stream_request::Action::Open(_)) => {
                         let mk = |data: &str| pb::Response {
@@ -569,7 +620,11 @@ mod audit_tests {
     }
 
     fn models_req() -> Request<Body> {
-        Request::builder().uri("/v1/models").method("GET").body(Body::empty()).unwrap()
+        Request::builder()
+            .uri("/v1/models")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap()
     }
 
     fn models_req_with(key: &str) -> Request<Body> {
@@ -618,7 +673,11 @@ mod audit_tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "错 key 必须拒绝");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "错 key 必须拒绝"
+        );
     }
 
     /// 401 响应体为 OpenAI 形状(官方 SDK 解析 message/type 出可读错误)。
@@ -629,11 +688,16 @@ mod audit_tests {
         let app = v1_router(state);
         let resp = app.oneshot(chat_req("m", false)).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "authentication_error");
         assert!(
-            v["error"]["message"].as_str().unwrap().contains("missing API key"),
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing API key"),
             "缺 header 文案:{}",
             v["error"]["message"]
         );

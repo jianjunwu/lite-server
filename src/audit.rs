@@ -24,7 +24,11 @@ pub fn control_plane(
     details: &str,
 ) {
     let (rid, ip, principal) = match cx {
-        Some(c) => (c.request_id.as_str(), c.client_ip.as_str(), c.principal.as_deref()),
+        Some(c) => (
+            c.request_id.as_str(),
+            c.client_ip.as_str(),
+            c.principal.as_deref(),
+        ),
         None => ("", "", None),
     };
     tracing::info!(
@@ -110,7 +114,8 @@ mod tests {
     fn control_plane_record_carries_all_d27_fields() {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
@@ -140,7 +145,10 @@ mod tests {
         assert_eq!(get("request_id"), "rid-1");
         assert_eq!(get("client_ip"), "10.0.0.9");
         assert!(get("principal").contains("cn=admin"));
-        assert_eq!(get("details").trim_matches('"'), "weights {\"1\": 70} -> {\"2\": 100}");
+        assert_eq!(
+            get("details").trim_matches('"'),
+            "weights {\"1\": 70} -> {\"2\": 100}"
+        );
         // D27 key 指纹：key 模式必有值且非明文
         let fp = get("key_fingerprint");
         assert!(fp.contains("Some("), "key 模式必须有指纹: {fp}");
@@ -151,17 +159,33 @@ mod tests {
     fn control_plane_key_fingerprint_none_when_not_key_mode() {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(Layer(rec.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();
-            control_plane(None, &AccessControl::default(), Protocol::Http, "load", "m1", Some("1"), "loaded");
+            control_plane(
+                None,
+                &AccessControl::default(),
+                Protocol::Http,
+                "load",
+                "m1",
+                Some("1"),
+                "loaded",
+            );
         });
         handle.join().unwrap();
         let fields = &rec.lock().unwrap().fields;
-        let fp = fields.iter().find(|(n, _)| n == "key_fingerprint").map(|(_, v)| v.clone());
-        assert_eq!(fp.as_deref(), Some("None"), "非 key 模式指纹必须为 None: {fields:?}");
+        let fp = fields
+            .iter()
+            .find(|(n, _)| n == "key_fingerprint")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            fp.as_deref(),
+            Some("None"),
+            "非 key 模式指纹必须为 None: {fields:?}"
+        );
         // cx=None 时 request_id/client_ip 置空不 panic（上面 join 未炸即证）
     }
 }

@@ -97,7 +97,9 @@ fn kill_stale_on_port(port: u16) {
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -110,7 +112,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -125,7 +132,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -240,14 +252,15 @@ async fn test_audit_data_grpc_ensemble_binary_input_drops_declared_content_type(
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-audit-ensct-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-audit-ensct-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_ct_echo_model(&repo);
     write_ct_ensemble(&repo);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-audit-ensct-yaml-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-audit-ensct-yaml-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -279,7 +292,11 @@ async fn test_audit_data_grpc_ensemble_binary_input_drops_declared_content_type(
         .send()
         .await
         .expect("http ensemble infer failed");
-    assert_eq!(http_resp.status(), 200, "HTTP ensemble must accept binary root input");
+    assert_eq!(
+        http_resp.status(),
+        200,
+        "HTTP ensemble must accept binary root input"
+    );
     let http_body: Value = http_resp.json().await.expect("http response must be JSON");
     assert_eq!(
         http_body["out"].as_str(),
@@ -296,10 +313,7 @@ async fn test_audit_data_grpc_ensemble_binary_input_drops_declared_content_type(
             model_name: "ens_ct".to_string(),
             version: "1".to_string(),
             data: bytes::Bytes::from(payload.to_vec()),
-            headers: HashMap::from([(
-                "content-type".to_string(),
-                "image/png".to_string(),
-            )]),
+            headers: HashMap::from([("content-type".to_string(), "image/png".to_string())]),
             ..Default::default()
         })
         .await
@@ -356,15 +370,14 @@ async fn test_grpc_http_ensemble_parity_and_dag_not_found_mapping() {
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-cgap-ens-{}", std::process::id()));
+    let repo = std::env::temp_dir().join(format!("lite-server-cgap-ens-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     write_ct_echo_model(&repo);
     write_ct_ensemble(&repo);
     write_missing_sub_ensemble(&repo);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-cgap-ens-yaml-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-cgap-ens-yaml-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
@@ -560,15 +573,21 @@ async fn boot_batch_server() -> (String, u16, ServerGuard, std::path::PathBuf) {
     let metrics_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
-    let repo = std::env::temp_dir()
-        .join(format!("lite-server-audit-ensbatch-{}-{}", std::process::id(), http_port));
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-audit-ensbatch-{}-{}",
+        std::process::id(),
+        http_port
+    ));
     let _ = std::fs::remove_dir_all(&repo);
     write_batch_echo(&repo);
     write_batch_stream_tail(&repo);
     write_batch_ensembles(&repo);
 
-    let tmp_dir = std::env::temp_dir()
-        .join(format!("lite-server-audit-ensbatch-yaml-{}-{}", std::process::id(), http_port));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-audit-ensbatch-yaml-{}-{}",
+        std::process::id(),
+        http_port
+    ));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(

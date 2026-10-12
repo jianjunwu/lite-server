@@ -114,7 +114,10 @@ mod keepalive_server {
     async fn spawn_test_server(
         sock: &Path,
         deps: TestDeps,
-    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let options = HttpServerOptions {
             config: deps.config,
@@ -149,7 +152,10 @@ mod keepalive_server {
     async fn spawn_test_server_tcp(
         port: u16,
         deps: TestDeps,
-    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let options = HttpServerOptions {
             config: deps.config,
@@ -176,7 +182,9 @@ mod keepalive_server {
         for _ in 0..200 {
             if let Ok(mut probe) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
                 if probe
-                    .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
                     .await
                     .is_ok()
                 {
@@ -214,7 +222,10 @@ mod keepalive_server {
         let mut chunk = [0u8; 8192];
         while !rx_buf.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = stream.read(&mut chunk).await.expect("read response head");
-            assert!(n > 0, "connection closed before the response head completed");
+            assert!(
+                n > 0,
+                "connection closed before the response head completed"
+            );
             rx_buf.extend_from_slice(&chunk[..n]);
         }
         let head_end = rx_buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
@@ -237,7 +248,10 @@ mod keepalive_server {
             .expect("response must carry a Content-Length header");
         while rx_buf.len() < head_end + content_length {
             let n = stream.read(&mut chunk).await.expect("read response body");
-            assert!(n > 0, "connection closed before the response body completed");
+            assert!(
+                n > 0,
+                "connection closed before the response body completed"
+            );
             rx_buf.extend_from_slice(&chunk[..n]);
         }
         let body = rx_buf[head_end..head_end + content_length].to_vec();
@@ -257,8 +271,9 @@ mod keepalive_server {
         // K1: a positive keepalive window must be honored.
         let (shutdown_tx, server) = spawn_test_server(&sock, build_deps(&sock, 1.0)).await;
 
-        let mut stream =
-            UnixStream::connect(&sock).await.expect("connect to test server");
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect to test server");
         let mut rx_buf: Vec<u8> = Vec::new();
         let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
@@ -323,8 +338,7 @@ mod keepalive_server {
                 .get()
         };
         let gauge_baseline = gauge();
-        let (shutdown_tx, server) =
-            spawn_test_server_tcp(port, build_deps_tcp(1.0, port)).await;
+        let (shutdown_tx, server) = spawn_test_server_tcp(port, build_deps_tcp(1.0, port)).await;
 
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -398,8 +412,9 @@ mod keepalive_server {
         // K2: ka = 0 is the `Connection: close` middleware branch.
         let (shutdown_tx, server) = spawn_test_server(&sock, build_deps(&sock, 0.0)).await;
 
-        let mut stream =
-            UnixStream::connect(&sock).await.expect("connect to test server");
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect to test server");
 
         // HTTP/2 connection preface + an empty SETTINGS frame (client preface).
         // SETTINGS frame header: 3-byte length 0, type 0x04, flags 0, stream 0.
@@ -504,7 +519,10 @@ mod keepalive_server {
                  must be closed at accept — the read timed out (connection left open)"
             ),
         };
-        assert_eq!(n, 0, "D7: over-cap connection must be closed at accept, got {n} bytes");
+        assert_eq!(
+            n, 0,
+            "D7: over-cap connection must be closed at accept, got {n} bytes"
+        );
 
         // Connection 1 is unaffected.
         c1.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")

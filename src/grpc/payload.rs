@@ -57,9 +57,8 @@ pub(crate) fn validate_json_payload(
     data: &[u8],
 ) -> Result<(), Status> {
     if !data.is_empty() && grpc_payload_is_json(headers) {
-        serde_json::from_slice::<&serde_json::value::RawValue>(data).map_err(|e| {
-            Status::invalid_argument(format!("invalid JSON payload: {e}"))
-        })?;
+        serde_json::from_slice::<&serde_json::value::RawValue>(data)
+            .map_err(|e| Status::invalid_argument(format!("invalid JSON payload: {e}")))?;
     }
     Ok(())
 }
@@ -81,7 +80,10 @@ mod tests {
     fn payload_is_json_matrix() {
         // missing → JSON default
         assert!(grpc_payload_is_json(&h(&[])));
-        assert!(grpc_payload_is_json(&h(&[("content-type", "application/json")])));
+        assert!(grpc_payload_is_json(&h(&[(
+            "content-type",
+            "application/json"
+        )])));
         assert!(grpc_payload_is_json(&h(&[(
             "content-type",
             "application/vnd.api+json; charset=utf-8"
@@ -122,10 +124,11 @@ mod tests {
 
     #[test]
     fn validate_passes_raw_payload() {
-        assert!(
-            validate_json_payload(&h(&[("content-type", "application/octet-stream")]), b"\x00\xff")
-                .is_ok()
-        );
+        assert!(validate_json_payload(
+            &h(&[("content-type", "application/octet-stream")]),
+            b"\x00\xff"
+        )
+        .is_ok());
     }
 
     #[test]

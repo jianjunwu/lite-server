@@ -34,7 +34,10 @@ pub enum RequestPayload {
     #[serde(rename = "STREAM_OPEN")]
     StreamOpen { stream_id: String },
     #[serde(rename = "STREAM_CHUNK")]
-    StreamChunk { stream_id: String, chunk: serde_json::Value },
+    StreamChunk {
+        stream_id: String,
+        chunk: serde_json::Value,
+    },
     #[serde(rename = "STREAM_CLOSE")]
     StreamClose { stream_id: String },
     #[serde(rename = "STREAM_CANCEL")]
@@ -146,7 +149,11 @@ pub const SYSTEM_ROUTE_LEAVES: &[&str] = &[
 /// True if a declared route tail (e.g. "/status", "/infer", "/pets/{id}")
 /// collides with a system-reserved leaf. Matches on the first path segment.
 pub fn is_reserved_route(route: &str) -> bool {
-    let first = route.trim_start_matches('/').split('/').next().unwrap_or("");
+    let first = route
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
     !first.is_empty() && SYSTEM_ROUTE_LEAVES.contains(&first)
 }
 
@@ -302,14 +309,25 @@ mod tests {
 
     #[test]
     fn test_is_reserved_route_reserved_leaves() {
-        for leaf in ["infer", "events", "stream", "versions", "ready", "health", "reload", "compare"] {
-            assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
-            assert!(is_reserved_route(leaf), "{leaf} (no slash) should be reserved");
+        for leaf in [
+            "infer", "events", "stream", "versions", "ready", "health", "reload", "compare",
+        ] {
+            assert!(
+                is_reserved_route(&format!("/{leaf}")),
+                "{leaf} should be reserved"
+            );
+            assert!(
+                is_reserved_route(leaf),
+                "{leaf} (no slash) should be reserved"
+            );
         }
         // server-level health probes live at root, not under the model
         // namespace, so they are NOT reserved here (B3)
         for leaf in ["livez", "readyz", "startupz"] {
-            assert!(!is_reserved_route(&format!("/{leaf}")), "{leaf} should not be reserved");
+            assert!(
+                !is_reserved_route(&format!("/{leaf}")),
+                "{leaf} should not be reserved"
+            );
         }
         // a reserved first segment with deeper tail is still reserved
         assert!(is_reserved_route("/versions/v2/status"));

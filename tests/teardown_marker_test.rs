@@ -20,7 +20,10 @@ fn project_root() -> std::path::PathBuf {
 }
 
 fn lite_server_bin() -> std::path::PathBuf {
-    project_root().join("target").join("debug").join("lite-server-core")
+    project_root()
+        .join("target")
+        .join("debug")
+        .join("lite-server-core")
 }
 
 fn next_test_port() -> u16 {
@@ -31,10 +34,8 @@ fn next_test_port() -> u16 {
 /// A model whose `teardown()` + callbacks append ordered lines to the marker
 /// file (path injected via env so the spawned worker inherits it).
 fn create_teardown_marker_repo(marker_path: &std::path::Path) -> std::path::PathBuf {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-teardown-repo-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-teardown-repo-{}", std::process::id()));
     let model_dir = tmp.join("marker_model/1");
     std::fs::create_dir_all(&model_dir).unwrap();
     std::fs::write(
@@ -90,7 +91,12 @@ async fn wait_server_up(base: &str, timeout_secs: u64) -> bool {
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{}/v2/health/ready", base)).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(format!("{}/v2/health/ready", base))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             let _ = resp;
             return true;
         }
@@ -104,7 +110,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<serde_json::Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -186,8 +197,7 @@ async fn test_teardown_runs_on_graceful_shutdown() {
     let content = std::fs::read_to_string(&marker)
         .unwrap_or_else(|_| panic!("teardown marker file missing: {}", marker.display()));
     assert_eq!(
-        content,
-        "before_teardown\nteardown\nafter_teardown\n",
+        content, "before_teardown\nteardown\nafter_teardown\n",
         "teardown did not run (or ran out of order) on graceful shutdown"
     );
 

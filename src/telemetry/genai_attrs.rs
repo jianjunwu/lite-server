@@ -43,7 +43,14 @@ mod tests {
     /// one-file edit. This guards against accidental drift by pinning the set we use.
     #[test]
     fn genai_attribute_names_are_centralized_and_prefixed() {
-        for name in [SYSTEM, REQUEST_MODEL, RESPONSE_MODEL, OPERATION_NAME, USAGE_INPUT_TOKENS, USAGE_OUTPUT_TOKENS] {
+        for name in [
+            SYSTEM,
+            REQUEST_MODEL,
+            RESPONSE_MODEL,
+            OPERATION_NAME,
+            USAGE_INPUT_TOKENS,
+            USAGE_OUTPUT_TOKENS,
+        ] {
             assert!(
                 name.starts_with("gen_ai."),
                 "GenAI semconv attribute must live under gen_ai.* (got {name})"

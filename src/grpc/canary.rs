@@ -77,7 +77,12 @@ pub(super) fn resolve_bidi_version(
             None => registry
                 .routing_pick(model_name)
                 .or_else(|| registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+                .ok_or_else(|| {
+                    err(Status::not_found(format!(
+                        "{} has no active version",
+                        model_name
+                    )))
+                })?,
         },
     };
     registry.touch_last_used(model_name, &resolved);
@@ -94,12 +99,16 @@ mod tests {
 
     fn bidi_test_registry() -> ModelRegistry {
         let reg = ModelRegistry::new();
-        let dir = std::env::temp_dir().join(format!("lite-server-grpc-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lite-server-grpc-test-{}", std::process::id()));
         for v in ["1", "2"] {
             reg.register(
                 "m1",
                 v,
-                ModelConfig { max_batch_size: 1, ..Default::default() },
+                ModelConfig {
+                    max_batch_size: 1,
+                    ..Default::default()
+                },
                 ModelType::LitAPI,
                 dir.clone(),
             )
@@ -115,8 +124,11 @@ mod tests {
         reg.activate_version("m1", "1").unwrap();
         // Weight 100/0 → deterministic pick of the weighted version, even
         // though "1" is the active version.
-        reg.set_weights("m1", &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]))
-            .unwrap();
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]),
+        )
+        .unwrap();
 
         let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
         assert_eq!(resolved, "2");
@@ -139,7 +151,10 @@ mod tests {
 
         let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
         assert!(
-            reg.get("m1", Some(&resolved)).unwrap().last_used_at.is_some(),
+            reg.get("m1", Some(&resolved))
+                .unwrap()
+                .last_used_at
+                .is_some(),
             "bidi version resolution must stamp last_used_at like unary/batch/stream"
         );
     }
@@ -174,7 +189,11 @@ mod tests {
         let reg = bidi_test_registry();
         let headers = HashMap::from([("x-lite-version".to_string(), "2".to_string())]);
         let pin = canary_pin(&reg, true, "m1", &canary_metadata("1"), &headers).unwrap();
-        assert_eq!(pin.as_deref(), Some("1"), "metadata 优先于 proto headers map");
+        assert_eq!(
+            pin.as_deref(),
+            Some("1"),
+            "metadata 优先于 proto headers map"
+        );
     }
 
     #[test]
@@ -198,7 +217,8 @@ mod tests {
     #[test]
     fn test_canary_pin_invalid_is_invalid_argument() {
         let reg = bidi_test_registry();
-        let err = canary_pin(&reg, true, "m1", &canary_metadata("a b"), &HashMap::new()).unwrap_err();
+        let err =
+            canary_pin(&reg, true, "m1", &canary_metadata("a b"), &HashMap::new()).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
@@ -213,7 +233,8 @@ mod tests {
     fn test_bidi_resolve_version_pin_beats_weights() {
         let reg = bidi_test_registry();
         reg.activate_version("m1", "1").unwrap();
-        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32)])).unwrap();
+        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32)]))
+            .unwrap();
 
         let resolved = resolve_bidi_version(&reg, "m1", None, Some("2".to_string())).unwrap();
         assert_eq!(resolved, "2", "pin（开关开）优先级高于 routing_pick");

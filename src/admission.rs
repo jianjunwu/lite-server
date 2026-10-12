@@ -49,9 +49,7 @@ impl AdmissionCounter {
     pub fn try_acquire(&self) -> Option<AdmissionGuard> {
         let cap = self.inner.cap;
         if cap == 0 {
-            return Some(AdmissionGuard {
-                inner: None,
-            });
+            return Some(AdmissionGuard { inner: None });
         }
         loop {
             let c = self.inner.current.load(Ordering::Acquire);
@@ -176,7 +174,10 @@ mod tests {
         let g = ac.try_acquire().expect("admit");
         drop(g);
         assert_eq!(ac.current(), 0);
-        assert!(ac.try_acquire().is_some(), "slot reusable after clean release");
+        assert!(
+            ac.try_acquire().is_some(),
+            "slot reusable after clean release"
+        );
     }
 
     #[test]

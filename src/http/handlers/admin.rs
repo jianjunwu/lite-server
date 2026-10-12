@@ -1,5 +1,5 @@
-use super::*;
 use super::inference::resolve_version;
+use super::*;
 use crate::callback::Protocol;
 use crate::error::AppError;
 use crate::http::state::AppState;
@@ -42,10 +42,7 @@ pub async fn v2_server_metadata_handler() -> Json<Value> {
 /// inputs/outputs 必填;state 不是规范字段(C2)不返回。inputs/outputs
 /// 缺省空数组(合法降级,tritonclient 不校验非空);worker get_metadata()
 /// 回调是后续可选增强。
-async fn model_metadata_impl(
-    state: &AppState,
-    model_name: &str,
-) -> Result<Json<Value>, AppError> {
+async fn model_metadata_impl(state: &AppState, model_name: &str) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(model_name)?;
     let versions = state.registry.list_versions(model_name);
     if versions.is_empty() {
@@ -202,13 +199,24 @@ pub async fn model_ready_version_handler(
 
 // ===== Model Health =====
 
-fn model_health_json(state: &AppState, model_name: &str, resolved_version: &str) -> Result<Json<Value>, AppError> {
-    let mv = state.registry.get(model_name, Some(resolved_version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+fn model_health_json(
+    state: &AppState,
+    model_name: &str,
+    resolved_version: &str,
+) -> Result<Json<Value>, AppError> {
+    let mv = state
+        .registry
+        .get(model_name, Some(resolved_version))
+        .ok_or_else(|| {
+            AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version))
+        })?;
 
     let total_workers = mv.workers.len();
 
-    if let Some(outlier) = state.inference_queue.get_outlier_state(model_name, resolved_version) {
+    if let Some(outlier) = state
+        .inference_queue
+        .get_outlier_state(model_name, resolved_version)
+    {
         let mut workers_json = Vec::with_capacity(total_workers);
         let mut healthy_count = 0usize;
         for i in 0..total_workers {
@@ -284,7 +292,11 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
         if !model_dir.is_dir() {
             continue;
         }
-        let model_name = model_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let model_name = model_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         // Legal model names cannot start with a dot (IDENTIFIER_RE in
         // validation.rs), so dot directories (.artifacts, .git, staging
         // dirs) can never be models — skip them.
@@ -299,7 +311,11 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
                 if !version_dir.is_dir() {
                     continue;
                 }
-                let version = version_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let version = version_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 // Same rule as model dirs: dot-prefixed names are staging or
                 // backup leftovers, never model versions.
                 if version.starts_with('.') {
@@ -364,9 +380,10 @@ pub async fn bare_load_model_handler(
     Path(model_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    state.registry.get_active_version(&model_name).ok_or_else(|| {
-        AppError::ModelNotFound(format!("{} has no active version", model_name))
-    })?;
+    state
+        .registry
+        .get_active_version(&model_name)
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?;
     Ok(Json(json!({"name": model_name, "load": true})))
 }
 
@@ -381,14 +398,21 @@ pub async fn load_model_handler(
     crate::validation::validate_version(&version)?;
 
     // Load model config
-    let config_path = state.repo_path.join(&model_name).join(&version).join("config.yaml");
+    let config_path = state
+        .repo_path
+        .join(&model_name)
+        .join(&version)
+        .join("config.yaml");
     let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
     // Apply CLI model-default overrides, same as initial load (server.rs) and
     // hot reload — otherwise --max-queue-size etc. silently don't apply here.
     state.config.apply_model_defaults(&mut config);
 
     info!(model = %model_name, version = %version, "load model requested");
-    state.worker_manager.load_model(&model_name, &version, &config).await?;
+    state
+        .worker_manager
+        .load_model(&model_name, &version, &config)
+        .await?;
 
     // Update hot reload flag so watcher picks up events for this model
     if config.hot_reload {
@@ -427,7 +451,10 @@ async fn unload_model_impl(
     version: &str,
 ) -> Result<(), AppError> {
     info!(model = %model_name, version = %version, "unload model requested");
-    let success = state.worker_manager.unload_model(model_name, Some(version)).await?;
+    let success = state
+        .worker_manager
+        .unload_model(model_name, Some(version))
+        .await?;
     if !success {
         return Err(AppError::ModelNotFound(format!(
             "{} version {} not loaded",
@@ -436,10 +463,24 @@ async fn unload_model_impl(
     }
 
     // Re-check if any loaded models still have hot_reload enabled
-    let any_hot_reload = state.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
-    state.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+    let any_hot_reload = state
+        .registry
+        .list_loaded()
+        .iter()
+        .any(|(_, _, mv)| mv.config.hot_reload);
+    state
+        .has_hot_reload
+        .store(any_hot_reload, Ordering::Relaxed);
 
-    crate::audit::control_plane(Some(cx), &state.access_control, Protocol::Http, "unload", model_name, Some(version), "unloaded");
+    crate::audit::control_plane(
+        Some(cx),
+        &state.access_control,
+        Protocol::Http,
+        "unload",
+        model_name,
+        Some(version),
+        "unloaded",
+    );
 
     Ok(())
 }
@@ -453,9 +494,10 @@ pub async fn unload_model_handler(
     cx: RequestContext,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    let active = state.registry.get_active_version(&model_name).ok_or_else(|| {
-        AppError::ModelNotFound(format!("{} has no active version", model_name))
-    })?;
+    let active = state
+        .registry
+        .get_active_version(&model_name)
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?;
     unload_model_impl(&state, &cx, &model_name, &active).await?;
     Ok(Json(json!({"name": model_name, "unload": true})))
 }
@@ -484,9 +526,10 @@ pub async fn reload_model_handler(
     cx: RequestContext,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    let active = state.registry.get_active_version(&model_name).ok_or_else(|| {
-        AppError::ModelNotFound(format!("{} has no active version", model_name))
-    })?;
+    let active = state
+        .registry
+        .get_active_version(&model_name)
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?;
     reload_model_impl(&state, &cx, &model_name, &active).await
 }
 
@@ -508,14 +551,25 @@ async fn reload_model_impl(
     version: &str,
 ) -> Result<Json<Value>, AppError> {
     info!(model = %model_name, version = %version, "reload model requested");
-    let success = state.worker_manager.reload_model(model_name, Some(version)).await?;
+    let success = state
+        .worker_manager
+        .reload_model(model_name, Some(version))
+        .await?;
     if !success {
         return Err(AppError::ModelNotFound(format!(
             "{} version {} not loaded",
             model_name, version
         )));
     }
-    crate::audit::control_plane(Some(cx), &state.access_control, Protocol::Http, "reload", model_name, Some(version), "reloaded");
+    crate::audit::control_plane(
+        Some(cx),
+        &state.access_control,
+        Protocol::Http,
+        "reload",
+        model_name,
+        Some(version),
+        "reloaded",
+    );
     Ok(Json(json!({
         "success": true,
         "message": format!("Model {} version {} reloaded", model_name, version),
@@ -601,8 +655,7 @@ pub(crate) async fn delete_version_impl(
     // directory removal, artifact/swap-backup cleanup — not just the
     // remove_dir_all: an upload committing mid-delete would otherwise
     // leave a live worker running on a swapped-out directory.
-    let version_lock =
-        crate::http::handlers::files::version_op_lock(model_name, version).await;
+    let version_lock = crate::http::handlers::files::version_op_lock(model_name, version).await;
     let _version_guard = version_lock.lock().await;
 
     info!(model = %model_name, version = %version, "delete version requested");
@@ -1224,7 +1277,10 @@ pub(crate) async fn delete_model_core(
     let details = if removed.is_empty() {
         "model deleted".to_string()
     } else {
-        format!("model deleted; linked artifacts removed: {}", removed.join(", "))
+        format!(
+            "model deleted; linked artifacts removed: {}",
+            removed.join(", ")
+        )
     };
 
     // H8: same snapshot rewrite as the version-level delete — no ghost
@@ -1364,11 +1420,14 @@ pub async fn activate_version_handler(
             prometheus::record_version_switch(&model_name, from, &version);
         }
     }
-    state.callback_runner.on_model_activate(&crate::callback::ModelLifecycleContext {
-        model_name: model_name.clone(),
-        version: version.clone(),
-        device: None,
-    }).await;
+    state
+        .callback_runner
+        .on_model_activate(&crate::callback::ModelLifecycleContext {
+            model_name: model_name.clone(),
+            version: version.clone(),
+            device: None,
+        })
+        .await;
     crate::audit::control_plane(
         Some(&cx),
         &state.access_control,
@@ -1475,7 +1534,10 @@ mod scan_repository_ensemble_tests {
             "directory with 'ensemble:' only in a comment and no model.py \
              must NOT be discovered as a model. Got {} entry(s): {:?}",
             result.len(),
-            result.iter().map(|e| format!("{}:{}", e["name"], e["version"])).collect::<Vec<_>>()
+            result
+                .iter()
+                .map(|e| format!("{}:{}", e["name"], e["version"]))
+                .collect::<Vec<_>>()
         );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
@@ -1514,10 +1576,8 @@ mod scan_repository_ensemble_tests {
     /// can never be models and must not leak into the repository index.
     #[tokio::test]
     async fn test_scan_repository_skips_dot_directories() {
-        let repo = std::env::temp_dir().join(format!(
-            "lite-server-index-dotskip-{}",
-            std::process::id()
-        ));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-index-dotskip-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&repo).await;
 
         // A staging dir shaped like a model: version dir with model.py.
@@ -1547,7 +1607,10 @@ mod scan_repository_ensemble_tests {
             result.len(),
             1,
             "dot directories must be skipped, got {:?}",
-            result.iter().map(|e| format!("{}:{}", e["name"], e["version"])).collect::<Vec<_>>()
+            result
+                .iter()
+                .map(|e| format!("{}:{}", e["name"], e["version"]))
+                .collect::<Vec<_>>()
         );
         assert_eq!(result[0]["name"], "real_model");
 
@@ -1604,19 +1667,28 @@ pub(super) mod audit_tests {
 
     pub(crate) fn test_state(model: &str) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
-        let dir = std::env::temp_dir().join(format!("lite-server-audit-{}-{}", model, std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "lite-server-audit-{}-{}",
+            model,
+            std::process::id()
+        ));
         for v in ["1", "2"] {
             registry
                 .register(
                     model,
                     v,
-                    ModelConfig { max_batch_size: 1, ..Default::default() },
+                    ModelConfig {
+                        max_batch_size: 1,
+                        ..Default::default()
+                    },
                     ModelType::LitAPI,
                     dir.clone(),
                 )
                 .unwrap();
         }
-        registry.set_weights(model, &HashMap::from([("1".to_string(), 100u32)])).unwrap();
+        registry
+            .set_weights(model, &HashMap::from([("1".to_string(), 100u32)]))
+            .unwrap();
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
             std::env::temp_dir(),
@@ -1668,15 +1740,21 @@ pub(super) mod audit_tests {
     }
 
     /// 在 scoped dispatch 线程内跑 handler，返回捕获到的字段集。
-    pub(crate) fn run_captured<Fut: std::future::Future<Output = ()>>(f: impl FnOnce() -> Fut + Send + 'static) -> Vec<(String, String)> {
+    pub(crate) fn run_captured<Fut: std::future::Future<Output = ()>>(
+        f: impl FnOnce() -> Fut + Send + 'static,
+    ) -> Vec<(String, String)> {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(AuditLayer(rec.clone())));
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(AuditLayer(rec.clone())));
         crate::test_tracing::ensure_always_on_subscriber();
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&dispatch);
             tracing::callsite::rebuild_interest_cache();
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(f());
         });
         handle.join().unwrap();
@@ -1685,7 +1763,10 @@ pub(super) mod audit_tests {
     }
 
     fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+        fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
     #[test]
@@ -1696,7 +1777,9 @@ pub(super) mod audit_tests {
                 State(state),
                 Path("audit_rt".to_string()),
                 test_cx(),
-                ApiJson(SetRoutingRequest { weights: HashMap::from([("2".to_string(), 100u32)]) }),
+                ApiJson(SetRoutingRequest {
+                    weights: HashMap::from([("2".to_string(), 100u32)]),
+                }),
             )
             .await
             .expect("set_routing 应成功");
@@ -1727,7 +1810,10 @@ pub(super) mod audit_tests {
         });
         assert_eq!(field(&fields, "action"), Some("activate"), "{fields:?}");
         let details = field(&fields, "details").unwrap_or("");
-        assert!(details.contains("failed: not ready"), "失败审计须含原因: {details}");
+        assert!(
+            details.contains("failed: not ready"),
+            "失败审计须含原因: {details}"
+        );
     }
 
     /// G1: delete must emit a `control_plane` audit record with
@@ -1768,7 +1854,11 @@ pub(super) mod audit_tests {
             )
             .await;
             let err = resp.expect_err("delete of active version without force must 409");
-            assert_eq!(err.http_status(), axum::http::StatusCode::CONFLICT, "{err:?}");
+            assert_eq!(
+                err.http_status(),
+                axum::http::StatusCode::CONFLICT,
+                "{err:?}"
+            );
             assert_eq!(err.error_code(), "conflict");
             assert!(
                 format!("{err}").contains("force"),
@@ -1784,7 +1874,9 @@ pub(super) mod audit_tests {
         run_captured(|| async {
             let state = test_state("audit_del_force");
             state.registry.mark_ready("audit_del_force", "2").unwrap();
-            state.registry.force_pin_active_version("audit_del_force", "1");
+            state
+                .registry
+                .force_pin_active_version("audit_del_force", "1");
             let resp = delete_version_handler(
                 State(state.clone()),
                 Path(("audit_del_force".to_string(), "1".to_string())),
@@ -1825,8 +1917,22 @@ mod delete_model_tests {
             .await
             .expect("model delete must succeed");
         });
-        assert_eq!(fields.iter().find(|(n, _)| n == "action").map(|(_, v)| v.as_str()), Some("delete_model"), "{fields:?}");
-        assert_eq!(fields.iter().find(|(n, _)| n == "model").map(|(_, v)| v.as_str()), Some("audit_del_m"), "{fields:?}");
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(n, _)| n == "action")
+                .map(|(_, v)| v.as_str()),
+            Some("delete_model"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(n, _)| n == "model")
+                .map(|(_, v)| v.as_str()),
+            Some("audit_del_m"),
+            "{fields:?}"
+        );
     }
 }
 
@@ -1942,7 +2048,9 @@ mod delete_swap_backup_tests {
     #[tokio::test]
     async fn delete_version_dir_removal_failure_still_sweeps_artifacts() {
         let repo = unique_repo("vfail");
-        tokio::fs::create_dir_all(repo.join("f4vmodel")).await.unwrap();
+        tokio::fs::create_dir_all(repo.join("f4vmodel"))
+            .await
+            .unwrap();
         tokio::fs::write(repo.join("f4vmodel").join("1"), "not a dir")
             .await
             .unwrap();
@@ -2107,12 +2215,27 @@ mod drift_tests {
         // Disk: mymodel/2 (configured), mymodel/3 (unconfigured + ensemble
         // chain-referenced), chain/1 (an ensemble whose node references
         // mymodel/3 — itself unconfigured because it has no config entry).
-        tokio::fs::create_dir_all(repo.join("mymodel").join("2")).await.unwrap();
-        tokio::fs::write(repo.join("mymodel").join("2").join("model.py"), "x = 1").await.unwrap();
-        tokio::fs::create_dir_all(repo.join("mymodel").join("3")).await.unwrap();
-        tokio::fs::write(repo.join("mymodel").join("3").join("model.py"), "x = 2").await.unwrap();
-        tokio::fs::write(repo.join("mymodel").join("3").join("data.txt"), "0123456789").await.unwrap();
-        tokio::fs::create_dir_all(repo.join("chain").join("1")).await.unwrap();
+        tokio::fs::create_dir_all(repo.join("mymodel").join("2"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("2").join("model.py"), "x = 1")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(repo.join("mymodel").join("3"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("3").join("model.py"), "x = 2")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo.join("mymodel").join("3").join("data.txt"),
+            "0123456789",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(repo.join("chain").join("1"))
+            .await
+            .unwrap();
         tokio::fs::write(
             repo.join("chain").join("1").join("config.yaml"),
             "ensemble:\n  steps:\n    - name: s1\n      model: mymodel\n      version: \"3\"\n      inputs: {}\n",
@@ -2147,7 +2270,10 @@ mod drift_tests {
             .expect("mymodel/3 must be listed");
         assert_eq!(m3["version"], "3");
         assert_eq!(m3["size_bytes"], 15, "5-byte model.py + 10-byte data.txt");
-        assert_eq!(m3["ensemble_referenced"], true, "chain node references mymodel/3");
+        assert_eq!(
+            m3["ensemble_referenced"], true,
+            "chain node references mymodel/3"
+        );
         let chain1 = unconfigured
             .iter()
             .find(|e| e["model"] == "chain")
@@ -2159,10 +2285,15 @@ mod drift_tests {
 
     #[tokio::test]
     async fn drift_empty_when_config_matches_disk() {
-        let repo = std::env::temp_dir().join(format!("lite-server-drift-ok-{}", std::process::id()));
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-drift-ok-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&repo).await;
-        tokio::fs::create_dir_all(repo.join("mymodel").join("1")).await.unwrap();
-        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1")
+            .await
+            .unwrap();
 
         // load_models without a strategy: every disk version is configured.
         let orch = OrchestrationConfig {
@@ -2215,8 +2346,7 @@ mod drift_tests {
 
         let size = dir_size_bytes(&version_dir).await;
         assert_eq!(
-            size,
-            5,
+            size, 5,
             "size_bytes must count only the version dir's own files (5-byte \
              model.py); following symlinks inflates it (cycle re-counts, \
              escape leaks external files), got {size}"
@@ -2242,8 +2372,7 @@ mod delete_snapshot_tests {
 
     #[tokio::test]
     async fn delete_version_rewrites_snapshot_without_deleted_version() {
-        let repo =
-            std::env::temp_dir().join(format!("lite-server-h8-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("lite-server-h8-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&repo).await;
         tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
             .await
@@ -2255,7 +2384,13 @@ mod delete_snapshot_tests {
         let state = cache_on_state(&repo);
         state
             .registry
-            .register("mymodel", "1", ModelConfig::default(), ModelType::LitAPI, repo.join("mymodel").join("1"))
+            .register(
+                "mymodel",
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                repo.join("mymodel").join("1"),
+            )
             .unwrap();
         state
             .registry
@@ -2264,7 +2399,9 @@ mod delete_snapshot_tests {
 
         // Pre-write a snapshot carrying the version (what a previous run
         // would have left behind).
-        crate::registry::cache::save(&state.registry, &repo).await.unwrap();
+        crate::registry::cache::save(&state.registry, &repo)
+            .await
+            .unwrap();
 
         let cx = audit_tests::test_cx();
         let _ = delete_version_impl(
@@ -2379,10 +2516,8 @@ mod delete_snapshot_failure_tests {
     /// committed mutation.
     #[tokio::test]
     async fn test_delete_version_snapshot_failure_does_not_mask_delete() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-del-snapshot-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-del-snapshot-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         let version_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&version_dir).await.unwrap();

@@ -21,7 +21,7 @@ pub enum AcquireResult {
 const MAX_RETRY_AFTER_SECS: u64 = 86_400;
 
 pub struct TokenBucket {
-    rate: f64,        // tokens per second
+    rate: f64, // tokens per second
     capacity: f64,
     tokens: f64,
     last_update: Instant,
@@ -72,7 +72,9 @@ impl RateLimiter {
         // sane Retry-After — otherwise the bucket drains its burst tokens and
         // later requests compute retry_after = (1-0)/0, saturating to u64::MAX.
         if rpm <= 0.0 {
-            return AcquireResult::Rejected { retry_after_secs: 1 };
+            return AcquireResult::Rejected {
+                retry_after_secs: 1,
+            };
         }
 
         // Fast path: an existing bucket is read under DashMap's shard lock and
@@ -87,15 +89,14 @@ impl RateLimiter {
                 // buckets over is harmless; enforcing it exactly would need a
                 // global lock that defeats the DashMap's whole point.
                 if self.max_buckets != 0 && self.buckets.len() >= self.max_buckets {
-                    return AcquireResult::Rejected { retry_after_secs: 1 };
+                    return AcquireResult::Rejected {
+                        retry_after_secs: 1,
+                    };
                 }
                 self.buckets
                     .entry(key.to_string())
                     .or_insert_with(|| {
-                        Arc::new(std::sync::Mutex::new(TokenBucket::new(
-                            rpm / 60.0,
-                            burst,
-                        )))
+                        Arc::new(std::sync::Mutex::new(TokenBucket::new(rpm / 60.0, burst)))
                     })
                     .clone()
             }
@@ -104,9 +105,7 @@ impl RateLimiter {
         // std::sync::Mutex: poison only occurs after a panic while holding the
         // lock (none here — pure math), so recover the inner guard rather than
         // unwinding the request path.
-        let mut b = bucket
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut b = bucket.lock().unwrap_or_else(|poison| poison.into_inner());
 
         // Policy hot-reload: refresh rate/capacity when they change.
         let rate = rpm / 60.0;
@@ -265,12 +264,22 @@ mod tests {
         let limiter = RateLimiter::default();
         let result = limiter.acquire("zero-rpm", 0.0, 1.0);
         assert!(
-            matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
+            matches!(
+                result,
+                AcquireResult::Rejected {
+                    retry_after_secs: 1
+                }
+            ),
             "zero rpm must be rejected immediately"
         );
         let result = limiter.acquire("neg-rpm", -5.0, 1.0);
         assert!(
-            matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
+            matches!(
+                result,
+                AcquireResult::Rejected {
+                    retry_after_secs: 1
+                }
+            ),
             "negative rpm must be rejected immediately"
         );
     }
@@ -284,8 +293,14 @@ mod tests {
         // burst is large so token exhaustion never interferes with the
         // bucket-count assertions below.
         let limiter = RateLimiter::new(2);
-        assert!(matches!(limiter.acquire("a", 60.0, 100.0), AcquireResult::Allowed));
-        assert!(matches!(limiter.acquire("b", 60.0, 100.0), AcquireResult::Allowed));
+        assert!(matches!(
+            limiter.acquire("a", 60.0, 100.0),
+            AcquireResult::Allowed
+        ));
+        assert!(matches!(
+            limiter.acquire("b", 60.0, 100.0),
+            AcquireResult::Allowed
+        ));
         // Cap reached — a brand-new key is rejected, not admitted as a 3rd bucket.
         assert!(matches!(
             limiter.acquire("c", 60.0, 100.0),
@@ -293,7 +308,10 @@ mod tests {
         ));
         // Existing keys take the fast path and bypass the cap, so they still
         // acquire even though the bucket count is at the limit.
-        assert!(matches!(limiter.acquire("a", 60.0, 100.0), AcquireResult::Allowed));
+        assert!(matches!(
+            limiter.acquire("a", 60.0, 100.0),
+            AcquireResult::Allowed
+        ));
     }
 
     #[test]
@@ -302,30 +320,36 @@ mod tests {
         let limiter = RateLimiter::new(0);
         for i in 0..1000 {
             let key = format!("k{}", i);
-            assert!(matches!(limiter.acquire(&key, 60.0, 1.0), AcquireResult::Allowed));
+            assert!(matches!(
+                limiter.acquire(&key, 60.0, 1.0),
+                AcquireResult::Allowed
+            ));
         }
     }
 }
 
-    #[test]
-    fn test_subnormal_positive_rpm_rejects_with_sane_retry_after() {
-        // A positive-but-subnormal rpm (e.g. "1e-320" parsed from config)
-        // passes the C1 guard (rpm <= 0.0) but makes the refill rate
-        // effectively zero — the raw wait then saturates `as u64`, so every
-        // client gets Retry-After: u64::MAX (~584 billion years) and the
-        // bucket rejects forever. (1e-320, not 1e-330: the latter underflows
-        // to 0.0 already at literal-parse time and never reaches the bucket.)
-        let limiter = RateLimiter::default();
-        let first = limiter.acquire("subnormal", 1e-320, 1.0);
-        assert!(matches!(first, AcquireResult::Allowed), "burst token must pass");
+#[test]
+fn test_subnormal_positive_rpm_rejects_with_sane_retry_after() {
+    // A positive-but-subnormal rpm (e.g. "1e-320" parsed from config)
+    // passes the C1 guard (rpm <= 0.0) but makes the refill rate
+    // effectively zero — the raw wait then saturates `as u64`, so every
+    // client gets Retry-After: u64::MAX (~584 billion years) and the
+    // bucket rejects forever. (1e-320, not 1e-330: the latter underflows
+    // to 0.0 already at literal-parse time and never reaches the bucket.)
+    let limiter = RateLimiter::default();
+    let first = limiter.acquire("subnormal", 1e-320, 1.0);
+    assert!(
+        matches!(first, AcquireResult::Allowed),
+        "burst token must pass"
+    );
 
-        match limiter.acquire("subnormal", 1e-320, 1.0) {
-            AcquireResult::Rejected { retry_after_secs } => {
-                assert!(
-                    retry_after_secs < 1_000_000,
-                    "subnormal rpm must fail closed with a sane Retry-After, got {retry_after_secs}"
-                );
-            }
-            AcquireResult::Allowed => panic!("a 0.0-refill bucket must reject after the burst"),
+    match limiter.acquire("subnormal", 1e-320, 1.0) {
+        AcquireResult::Rejected { retry_after_secs } => {
+            assert!(
+                retry_after_secs < 1_000_000,
+                "subnormal rpm must fail closed with a sane Retry-After, got {retry_after_secs}"
+            );
         }
+        AcquireResult::Allowed => panic!("a 0.0-refill bucket must reject after the burst"),
     }
+}

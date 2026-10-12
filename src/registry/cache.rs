@@ -258,8 +258,14 @@ mod tests {
 
         // Build a registry with one registered model, a strategy, and a pin.
         let reg = ModelRegistry::new();
-        reg.register("m1", "1", test_config(), ModelType::LitAPI, model_dir.clone())
-            .unwrap();
+        reg.register(
+            "m1",
+            "1",
+            test_config(),
+            ModelType::LitAPI,
+            model_dir.clone(),
+        )
+        .unwrap();
         let strategy = ModelStrategyConfig {
             name: "m1".to_string(),
             load_policy: "all".to_string(),
@@ -366,4 +372,3 @@ mod tests {
         );
     }
 }
-

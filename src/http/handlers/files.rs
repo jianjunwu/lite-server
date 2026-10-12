@@ -45,7 +45,8 @@ type ModelOpLocks = dashmap::DashMap<String, Arc<tokio::sync::RwLock<()>>>;
 /// guard across its critical section.
 pub(crate) fn model_op_lock(model: &str) -> Arc<tokio::sync::RwLock<()>> {
     static LOCKS: std::sync::OnceLock<ModelOpLocks> = std::sync::OnceLock::new();
-    LOCKS.get_or_init(dashmap::DashMap::new)
+    LOCKS
+        .get_or_init(dashmap::DashMap::new)
         .entry(model.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
         .clone()
@@ -58,10 +59,7 @@ pub(crate) fn version_op_locks() -> &'static VersionOpLocks {
 
 /// Clone the Arc'd mutex for one (model, version) op; the caller holds the
 /// guard across its critical section.
-pub(crate) async fn version_op_lock(
-    model: &str,
-    version: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) async fn version_op_lock(model: &str, version: &str) -> Arc<tokio::sync::Mutex<()>> {
     version_op_locks()
         .entry((model.to_string(), version.to_string()))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -95,9 +93,11 @@ pub async fn upload_model_handler(
     // UploadModel RPC.
     let mut staged: Vec<StagedUploadFile> = Vec::new();
     let mut total_bytes: u64 = 0;
-    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
-        AppError::Validation(format!("multipart error: {}", e))
-    })? {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("multipart error: {}", e)))?
+    {
         // A form field without a filename is not a file — reject it
         // instead of writing a literal "unnamed" file into the version dir.
         let filename = field
@@ -333,18 +333,18 @@ pub(crate) async fn finalize_upload(
                 .map_err(|_| AppError::Validation("artifact manifest.json missing".to_string()))?;
             let manifest: Value = serde_json::from_str(&manifest_raw)
                 .map_err(|_| AppError::Validation("artifact manifest.json invalid".to_string()))?;
-            let manifest_name = manifest["name"]
-                .as_str()
-                .ok_or_else(|| AppError::Validation("artifact manifest lacks a name".to_string()))?;
+            let manifest_name = manifest["name"].as_str().ok_or_else(|| {
+                AppError::Validation("artifact manifest lacks a name".to_string())
+            })?;
             if manifest_name != model_name {
                 return Err(AppError::InvalidRequestBody(format!(
                     "artifact is for model '{}', not '{}'",
                     manifest_name, model_name
                 )));
             }
-            let mversion = manifest["version"]
-                .as_str()
-                .ok_or_else(|| AppError::Validation("artifact manifest lacks a version".to_string()))?;
+            let mversion = manifest["version"].as_str().ok_or_else(|| {
+                AppError::Validation("artifact manifest lacks a version".to_string())
+            })?;
             let v = mversion.strip_prefix('v').unwrap_or(mversion).to_string();
             crate::validation::validate_version(&v)?;
             v
@@ -382,12 +382,7 @@ pub(crate) async fn finalize_upload(
                 if let Ok(manifest) = serde_json::from_str::<Value>(&raw) {
                     let declared: u64 = manifest["files"]
                         .as_object()
-                        .map(|files| {
-                            files
-                                .values()
-                                .filter_map(|e| e["size"].as_u64())
-                                .sum()
-                        })
+                        .map(|files| files.values().filter_map(|e| e["size"].as_u64()).sum())
                         .unwrap_or(0);
                     if declared > max {
                         return Err(AppError::PayloadTooLarge {
@@ -411,7 +406,9 @@ pub(crate) async fn finalize_upload(
                 let raw_dir = staging.join(url_v);
                 if raw_dir.is_dir() {
                     let dst = staging.join(&effective_version);
-                    tokio::fs::create_dir_all(&dst).await.map_err(AppError::Io)?;
+                    tokio::fs::create_dir_all(&dst)
+                        .await
+                        .map_err(AppError::Io)?;
                     for f in staged.iter().filter(|f| !f.is_lma) {
                         tokio::fs::rename(&f.path, dst.join(&f.name))
                             .await
@@ -562,9 +559,11 @@ pub async fn upload_model_package_handler(
     // again for the gRPC UploadModel RPC.
     let mut staged: Vec<StagedUploadFile> = Vec::new();
     let mut total_bytes: u64 = 0;
-    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
-        AppError::Validation(format!("multipart error: {}", e))
-    })? {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("multipart error: {}", e)))?
+    {
         let filename = field
             .file_name()
             .ok_or_else(|| {
@@ -758,8 +757,8 @@ async fn wait_child_bounded(
     let wait_and_drain = async { tokio::join!(child.wait(), drain_out, drain_err) };
     match tokio::time::timeout(timeout, wait_and_drain).await {
         Ok((result, stdout, stderr)) => {
-            let status = result
-                .map_err(|e| AppError::Internal(format!("python {what} failed: {}", e)))?;
+            let status =
+                result.map_err(|e| AppError::Internal(format!("python {what} failed: {}", e)))?;
             Ok(std::process::Output {
                 status,
                 stdout,
@@ -855,7 +854,9 @@ async fn swap_dir_into(src: &std::path::Path, dst: &std::path::Path) -> Result<(
             dst.file_name().unwrap_or_default().to_string_lossy(),
             uuid::Uuid::new_v4()
         ));
-        tokio::fs::rename(dst, &backup).await.map_err(AppError::Io)?;
+        tokio::fs::rename(dst, &backup)
+            .await
+            .map_err(AppError::Io)?;
         match tokio::fs::rename(src, dst).await {
             Ok(()) => {
                 let _ = tokio::fs::remove_dir_all(&backup).await;
@@ -885,9 +886,7 @@ pub(crate) async fn commit_staging(
         .await
         .map_err(AppError::Io)?;
 
-    let mut entries = tokio::fs::read_dir(staging)
-        .await
-        .map_err(AppError::Io)?;
+    let mut entries = tokio::fs::read_dir(staging).await.map_err(AppError::Io)?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let src = entry.path();
         if src.is_dir() {
@@ -978,7 +977,15 @@ pub async fn download_model_handler(
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref(), &headers).await
+    download_version_impl(
+        &state,
+        &cx,
+        &model_name,
+        &version,
+        query.file.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 /// Shared download resolution (HTTP versioned/model-level endpoints + the
@@ -1049,7 +1056,13 @@ pub(crate) async fn resolve_download_source(
             .map_err(AppError::Io)?;
         let size = md.len();
         let mtime_secs = file_mtime_secs(&md);
-        let content_type = if file_name.ends_with(".py") || file_name.ends_with(".yaml") || file_name.ends_with(".yml") || file_name.ends_with(".json") || file_name.ends_with(".txt") || file_name.ends_with(".md") {
+        let content_type = if file_name.ends_with(".py")
+            || file_name.ends_with(".yaml")
+            || file_name.ends_with(".yml")
+            || file_name.ends_with(".json")
+            || file_name.ends_with(".txt")
+            || file_name.ends_with(".md")
+        {
             "text/plain; charset=utf-8"
         } else {
             "application/octet-stream"
@@ -1072,7 +1085,10 @@ pub(crate) async fn resolve_download_source(
     // (no repack). The artifact is the record of truth; drift between it
     // and the disk tree is surfaced by the E4 drift report.
     let artifact_name = format!("{}_v{}.lma", model_name, version);
-    for dir in [state.repo_path.to_path_buf(), state.repo_path.join(".artifacts")] {
+    for dir in [
+        state.repo_path.to_path_buf(),
+        state.repo_path.join(".artifacts"),
+    ] {
         let candidate = dir.join(&artifact_name);
         if candidate.is_file() {
             let md = tokio::fs::metadata(&candidate)
@@ -1090,7 +1106,8 @@ pub(crate) async fn resolve_download_source(
         }
     }
 
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-download-{}", uuid::Uuid::new_v4()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-download-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .map_err(AppError::Io)?;
@@ -1101,9 +1118,8 @@ pub(crate) async fn resolve_download_source(
 
     // H2: bound concurrent pack/unpack subprocesses; H1: bound this one
     // in time.
-    let pack_timeout = std::time::Duration::from_secs_f32(
-        state.config.tunables.unpack_timeout_secs,
-    );
+    let pack_timeout =
+        std::time::Duration::from_secs_f32(state.config.tunables.unpack_timeout_secs);
     let _permit = acquire_file_op_permit(pack_timeout).await?;
     let output = run_pack(
         &crate::python::resolve_python_interpreter(),
@@ -1116,14 +1132,22 @@ pub(crate) async fn resolve_download_source(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Internal(format!("pack failed: {}", stderr.trim())));
+        return Err(AppError::Internal(format!(
+            "pack failed: {}",
+            stderr.trim()
+        )));
     }
 
     // Find the generated .lma file
     let mut lma_file = None;
     let mut entries = tokio::fs::read_dir(&tmp_dir).await.map_err(AppError::Io)?;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.path().extension().map(|e| e == "lma").unwrap_or(false) {
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "lma")
+            .unwrap_or(false)
+        {
             lma_file = Some(entry.path());
             break;
         }
@@ -1133,9 +1157,7 @@ pub(crate) async fn resolve_download_source(
         return Err(AppError::Internal("pack produced no .lma file".to_string()));
     };
 
-    let md = tokio::fs::metadata(&lma_path)
-        .await
-        .map_err(AppError::Io)?;
+    let md = tokio::fs::metadata(&lma_path).await.map_err(AppError::Io)?;
     let size = md.len();
     let artifact_name = lma_path
         .file_name()
@@ -1220,7 +1242,9 @@ async fn download_version_impl(
     // lets the client see progress/size up front. The pack temp dir (when
     // any) is cleaned when the body stream is dropped.
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(&src.path).await.map_err(AppError::Io)?;
+    let mut file = tokio::fs::File::open(&src.path)
+        .await
+        .map_err(AppError::Io)?;
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start))
             .await
@@ -1278,14 +1302,25 @@ pub async fn download_model_package_handler(
             crate::validation::validate_version(&v)?;
             v
         }
-        None => state.registry.get_active_version(&model_name).ok_or_else(|| {
-            AppError::ModelNotFound(format!(
-                "{} has no active version; pass ?version= explicitly",
-                model_name
-            ))
-        })?,
+        None => state
+            .registry
+            .get_active_version(&model_name)
+            .ok_or_else(|| {
+                AppError::ModelNotFound(format!(
+                    "{} has no active version; pass ?version= explicitly",
+                    model_name
+                ))
+            })?,
     };
-    download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref(), &headers).await
+    download_version_impl(
+        &state,
+        &cx,
+        &model_name,
+        &version,
+        query.file.as_deref(),
+        &headers,
+    )
+    .await
 }
 
 // ===== List Files =====
@@ -1428,10 +1463,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_list_files_returns_directory_contents() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-list-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-list-test-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         tokio::fs::write(model_dir.join("model.py"), "print('hello')")
@@ -1473,10 +1506,7 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_list_files_returns_404_for_missing_model() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-list-404-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-list-404-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -1500,10 +1530,7 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_download_single_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-dl-test-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         tokio::fs::write(model_dir.join("model.py"), "def predict(x): return x")
@@ -1542,10 +1569,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_download_rejects_path_traversal() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-traversal-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-dl-traversal-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         tokio::fs::write(model_dir.join("model.py"), "test")
@@ -1591,17 +1616,25 @@ mod upload_download_tests {
         let app = range_test_app(&tmp).await;
 
         let response = app
-            .oneshot(download_req("/v2/repository/models/mymodel/versions/1/download?file=weights.bin"))
+            .oneshot(download_req(
+                "/v2/repository/models/mymodel/versions/1/download?file=weights.bin",
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes"),
             "all download responses must advertise range support"
         );
         let etag = response.headers().get("etag").and_then(|v| v.to_str().ok());
-        assert!(etag.is_some(), "ETag required for If-Range resume validation");
+        assert!(
+            etag.is_some(),
+            "ETag required for If-Range resume validation"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -1623,19 +1656,30 @@ mod upload_download_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
-            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes 4-9/16")
         );
         assert_eq!(
-            response.headers().get("content-length").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
             Some("6")
         );
         assert_eq!(
-            response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes")
         );
         assert!(response.headers().get("etag").is_some());
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"456789");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1660,10 +1704,15 @@ mod upload_download_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
-            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes 8-15/16")
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"89abcdef");
 
         // Suffix: bytes=-4
@@ -1679,10 +1728,15 @@ mod upload_download_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
-            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes 12-15/16")
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"cdef");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1705,7 +1759,10 @@ mod upload_download_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(
-            response.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
             Some("bytes */16"),
             "416 must carry the complete length so clients can resume correctly"
         );
@@ -1715,13 +1772,16 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_download_if_range_matching_etag_resumes_mismatching_restarts() {
-        let tmp = std::env::temp_dir().join(format!("lite-server-rg-ifrange-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-rg-ifrange-{}", std::process::id()));
         let app = range_test_app(&tmp).await;
 
         // Discover the ETag from a full response.
         let response = app
             .clone()
-            .oneshot(download_req("/v2/repository/models/mymodel/versions/1/download?file=weights.bin"))
+            .oneshot(download_req(
+                "/v2/repository/models/mymodel/versions/1/download?file=weights.bin",
+            ))
             .await
             .unwrap();
         let etag = response
@@ -1764,7 +1824,9 @@ mod upload_download_tests {
             StatusCode::OK,
             "a changed representation must restart the download from byte 0"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"0123456789abcdef");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1774,10 +1836,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_raw_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-upload-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-upload-test-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -1886,10 +1946,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_rejects_invalid_model_name() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-upload-invalid-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-upload-invalid-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -1986,10 +2044,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_lma_places_files_without_nesting() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-upload-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-upload-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
@@ -2049,10 +2105,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_lma_rejects_manifest_version_mismatch() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-mismatch-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-mismatch-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
@@ -2099,10 +2153,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_corrupted_lma_leaves_no_residue() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-corrupt-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-corrupt-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -2164,10 +2216,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_replaces_version_dir_swap_semantics() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-upload-swap-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-upload-swap-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -2175,11 +2225,7 @@ mod upload_download_tests {
         let boundary = "----swaptestboundary";
 
         // First upload: two files.
-        let body = multipart_body(
-            boundary,
-            "model.py",
-            b"def predict(x): return 'A'\n",
-        );
+        let body = multipart_body(boundary, "model.py", b"def predict(x): return 'A'\n");
         let response = app
             .clone()
             .oneshot(
@@ -2205,11 +2251,7 @@ mod upload_download_tests {
         // Second upload: only model.py. Swap semantics must replace the
         // whole version directory, so old.txt must disappear. Requires
         // explicit force — without it the upload would 409.
-        let body = multipart_body(
-            boundary,
-            "model.py",
-            b"def predict(x): return 'B'\n",
-        );
+        let body = multipart_body(boundary, "model.py", b"def predict(x): return 'B'\n");
         let response = app
             .oneshot(
                 Request::builder()
@@ -2240,10 +2282,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_existing_version_without_force_is_409() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-upload-409-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-upload-409-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let app = test_router(test_app_state(tmp.clone()));
@@ -2294,10 +2334,7 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_package_existing_version_without_force_is_409() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-pkg-409-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-pkg-409-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
@@ -2320,7 +2357,11 @@ mod upload_download_tests {
                             "content-type",
                             format!("multipart/form-data; boundary={}", boundary),
                         )
-                        .body(Body::from(multipart_body(boundary, "mymodel_v1.lma", &data)))
+                        .body(Body::from(multipart_body(
+                            boundary,
+                            "mymodel_v1.lma",
+                            &data,
+                        )))
                         .unwrap(),
                 )
                 .await
@@ -2344,10 +2385,7 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_delete_and_multipart_upload_serialize_to_a_defined_outcome() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-delrace-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-delrace-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let app = test_router(test_app_state(tmp.clone()));
@@ -2392,15 +2430,28 @@ mod upload_download_tests {
             .unwrap()
         };
         let (rd, ru) = tokio::join!(delete, upload(b"def predict(x): return 'B'\n", true));
-        assert_eq!(rd.status(), StatusCode::OK, "delete must not error under the lock");
-        assert_eq!(ru.status(), StatusCode::OK, "upload must not error under the lock");
+        assert_eq!(
+            rd.status(),
+            StatusCode::OK,
+            "delete must not error under the lock"
+        );
+        assert_eq!(
+            ru.status(),
+            StatusCode::OK,
+            "upload must not error under the lock"
+        );
 
         // Two defined outcomes: delete won (dir gone) or upload won (dir
         // holds exactly the new content). Anything else is a mixed state.
         let dir = tmp.join("mymodel").join("1");
         if dir.exists() {
-            let content = tokio::fs::read_to_string(dir.join("model.py")).await.unwrap();
-            assert_eq!(content, "def predict(x): return 'B'\n", "upload won: exact new content");
+            let content = tokio::fs::read_to_string(dir.join("model.py"))
+                .await
+                .unwrap();
+            assert_eq!(
+                content, "def predict(x): return 'B'\n",
+                "upload won: exact new content"
+            );
         }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -2408,10 +2459,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_upload_lma_retains_artifact_in_artifacts_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-retain-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-retain-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
@@ -2446,7 +2495,10 @@ mod upload_download_tests {
         let retained = tmp.join(".artifacts").join("mymodel_v1.lma");
         assert!(retained.exists(), "original artifact must be retained");
         let retained_bytes = tokio::fs::read(&retained).await.unwrap();
-        assert_eq!(retained_bytes, data, "retained artifact must be byte-identical");
+        assert_eq!(
+            retained_bytes, data,
+            "retained artifact must be byte-identical"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -2461,10 +2513,8 @@ mod upload_download_tests {
     async fn test_run_unpack_times_out_hung_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-unpack-timeout-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-unpack-timeout-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         // A "python" that never returns.
@@ -2530,10 +2580,7 @@ mod upload_download_tests {
     /// don't need it and don't set it).
     #[tokio::test]
     async fn test_download_single_file_has_content_length() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-cl-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-dl-cl-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         let content = b"def predict(x): return x\n".to_vec();
@@ -2578,10 +2625,8 @@ mod upload_download_tests {
     #[tokio::test]
     #[serial_test::serial(download_tmp)]
     async fn test_download_lma_has_content_length() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-lma-cl-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-dl-lma-cl-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         tokio::fs::write(model_dir.join("model.py"), "def predict(x): return x\n")
@@ -2624,13 +2669,14 @@ mod upload_download_tests {
     /// F6: `?file=` pointing at a directory must be a 400, not an Io 500.
     #[tokio::test]
     async fn test_download_file_targeting_directory_is_400() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-dir-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-dl-dir-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
-        tokio::fs::create_dir_all(model_dir.join("subdir")).await.unwrap();
-        tokio::fs::write(model_dir.join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::create_dir_all(model_dir.join("subdir"))
+            .await
+            .unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
 
         let state = test_app_state(tmp.clone());
         let app = test_router(state);
@@ -2657,13 +2703,13 @@ mod upload_download_tests {
     /// F6: `?file=` that does not exist must be a 404, not an Io 500.
     #[tokio::test]
     async fn test_download_nonexistent_file_is_404() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-missing-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-dl-missing-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
-        tokio::fs::write(model_dir.join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
 
         let state = test_app_state(tmp.clone());
         let app = test_router(state);
@@ -2696,13 +2742,12 @@ mod upload_download_tests {
     async fn test_lma_download_body_cleans_tmp_on_completion() {
         use futures::StreamExt;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-body-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-dl-body-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let file_path = tmp.join("mymodel_v1.lma");
-        tokio::fs::write(&file_path, b"artifact-bytes").await.unwrap();
+        tokio::fs::write(&file_path, b"artifact-bytes")
+            .await
+            .unwrap();
         let file = tokio::fs::File::open(&file_path).await.unwrap();
 
         {
@@ -2727,10 +2772,8 @@ mod upload_download_tests {
     /// F11b: uploads exceeding `server.max_upload_bytes` must be 413.
     #[tokio::test]
     async fn test_upload_exceeding_max_upload_bytes_is_413() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-max-upload-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-max-upload-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let mut config = Config::default();
@@ -2769,10 +2812,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_level_upload_lma_places_files_and_reports_real_load() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-upload-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-upload-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "mymodel", "2").await;
@@ -2822,10 +2863,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_level_upload_rejects_name_mismatch() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-upload-nm-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-upload-nm-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let lma = pack_fixture_lma(&tmp, "othermodel", "1").await;
@@ -2862,17 +2901,18 @@ mod upload_download_tests {
             "manifest.name mismatch must be 400"
         );
         // Nothing landed.
-        assert!(!tmp.join("mymodel").exists(), "no model dir on name mismatch");
+        assert!(
+            !tmp.join("mymodel").exists(),
+            "no model dir on name mismatch"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
     #[tokio::test]
     async fn test_model_level_upload_rejects_raw_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-upload-raw-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-upload-raw-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let state = test_app_state(tmp.clone());
@@ -2900,7 +2940,11 @@ mod upload_download_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "raw files must be rejected");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "raw files must be rejected"
+        );
         let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2949,17 +2993,18 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_level_download_bare_targets_active_version() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-dl-bare-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-dl-bare-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let state = model_dl_state(&tmp).await;
 
         let response = download_model_package_handler(
             State(state),
             Path("mymodel".to_string()),
-            ApiQuery(ModelDownloadQuery { file: Some("model.py".to_string()), version: None }),
+            ApiQuery(ModelDownloadQuery {
+                file: Some("model.py".to_string()),
+                version: None,
+            }),
             crate::http::handlers::admin::audit_tests::test_cx(),
             axum::http::HeaderMap::new(),
         )
@@ -2977,17 +3022,18 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_level_download_explicit_version_overrides_active() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-dl-ver-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-dl-ver-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let state = model_dl_state(&tmp).await;
 
         let response = download_model_package_handler(
             State(state),
             Path("mymodel".to_string()),
-            ApiQuery(ModelDownloadQuery { file: Some("model.py".to_string()), version: Some("1".to_string()) }),
+            ApiQuery(ModelDownloadQuery {
+                file: Some("model.py".to_string()),
+                version: Some("1".to_string()),
+            }),
             crate::http::handlers::admin::audit_tests::test_cx(),
             axum::http::HeaderMap::new(),
         )
@@ -3005,23 +3051,28 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_model_level_download_without_active_or_version_is_404() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-dl-404-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-dl-404-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let state = test_app_state(tmp.clone());
 
         let err = download_model_package_handler(
             State(state),
             Path("mymodel".to_string()),
-            ApiQuery(ModelDownloadQuery { file: None, version: None }),
+            ApiQuery(ModelDownloadQuery {
+                file: None,
+                version: None,
+            }),
             crate::http::handlers::admin::audit_tests::test_cx(),
             axum::http::HeaderMap::new(),
         )
         .await
         .expect_err("no active version and no ?version= must 404");
-        assert_eq!(err.http_status(), axum::http::StatusCode::NOT_FOUND, "{err:?}");
+        assert_eq!(
+            err.http_status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{err:?}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -3030,10 +3081,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_download_serves_retained_artifact_byte_identical() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-f10b-artifacts-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-f10b-artifacts-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         // Upload an .lma (F10a retains it in .artifacts/).
@@ -3087,18 +3136,20 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_download_serves_root_placed_artifact() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-f10b-root-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-f10b-root-{}", std::process::id()));
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
-        tokio::fs::write(model_dir.join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
 
         // An ops-placed artifact at the repo root (scanner auto-unpack
         // layout) — download must serve it as-is.
         let placed = b"PLACED-ORIGINAL-BYTES".to_vec();
-        tokio::fs::write(tmp.join("mymodel_v1.lma"), &placed).await.unwrap();
+        tokio::fs::write(tmp.join("mymodel_v1.lma"), &placed)
+            .await
+            .unwrap();
 
         let state = test_app_state(tmp.clone());
         let app = test_router(state);
@@ -3122,10 +3173,8 @@ mod upload_download_tests {
 
     #[tokio::test]
     async fn test_raw_upload_drops_stale_artifact() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-f10b-drift-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-f10b-drift-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         // Upload an .lma first (creates .artifacts/ + root-copy scenario).
@@ -3191,10 +3240,8 @@ mod upload_download_tests {
     async fn test_run_pack_times_out_hung_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-pack-timeout-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-pack-timeout-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         // A "python" that never returns.
@@ -3208,7 +3255,9 @@ mod upload_download_tests {
 
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
-        tokio::fs::write(model_dir.join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
         let out = tmp.join("out");
 
         let result = run_pack(
@@ -3267,19 +3316,21 @@ mod upload_download_tests {
         use crate::request_context::RequestContext;
 
         let fields = audit_tests::run_captured(|| async {
-            let tmp = std::env::temp_dir().join(format!(
-                "lite-server-dl-audit-{}",
-                std::process::id()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("lite-server-dl-audit-{}", std::process::id()));
             let model_dir = tmp.join("mymodel").join("1");
             tokio::fs::create_dir_all(&model_dir).await.unwrap();
-            tokio::fs::write(model_dir.join("model.py"), "x = 1").await.unwrap();
+            tokio::fs::write(model_dir.join("model.py"), "x = 1")
+                .await
+                .unwrap();
 
             let state = test_app_state(tmp.clone());
             let _resp = download_model_handler(
                 State(state),
                 Path(("mymodel".to_string(), "1".to_string())),
-                ApiQuery(DownloadQuery { file: Some("model.py".to_string()) }),
+                ApiQuery(DownloadQuery {
+                    file: Some("model.py".to_string()),
+                }),
                 RequestContext {
                     request_id: "audit-rid".to_string(),
                     client_ip: "127.0.0.1".to_string(),
@@ -3296,12 +3347,18 @@ mod upload_download_tests {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
         });
         assert_eq!(
-            fields.iter().find(|(n, _)| n == "action").map(|(_, v)| v.as_str()),
+            fields
+                .iter()
+                .find(|(n, _)| n == "action")
+                .map(|(_, v)| v.as_str()),
             Some("download"),
             "{fields:?}"
         );
         assert_eq!(
-            fields.iter().find(|(n, _)| n == "model").map(|(_, v)| v.as_str()),
+            fields
+                .iter()
+                .find(|(n, _)| n == "model")
+                .map(|(_, v)| v.as_str()),
             Some("mymodel"),
             "{fields:?}"
         );
@@ -3337,10 +3394,8 @@ mod upload_download_tests {
     /// valid .lma as an auto-unpack candidate.
     #[tokio::test]
     async fn test_upload_lma_filename_traversal_cannot_escape_staging() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-traversal-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-traversal-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
@@ -3380,10 +3435,8 @@ mod upload_download_tests {
     /// own `staging.join(&filename)` site with the same missing sanitize.
     #[tokio::test]
     async fn test_model_level_upload_lma_filename_traversal_cannot_escape_staging() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-traversal-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-traversal-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
@@ -3430,10 +3483,8 @@ mod upload_download_tests {
     /// though the upload never committed.
     #[tokio::test]
     async fn test_upload_oversize_lma_does_not_retain_artifact() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-lma-oversize-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-lma-oversize-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
@@ -3483,10 +3534,8 @@ mod upload_download_tests {
     /// artifact copy survives — an orphan the commit never produced.
     #[tokio::test]
     async fn test_model_level_upload_failure_after_unpack_leaves_no_artifact() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ml-orphan-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ml-orphan-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
@@ -3547,10 +3596,8 @@ mod upload_download_tests {
     #[tokio::test]
     #[serial_test::serial(download_tmp)]
     async fn test_download_semaphore_timeout_leaves_no_tmp_residue() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-dl-semleak-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-dl-semleak-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         let model_dir = tmp.join("mymodel").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
@@ -3573,10 +3620,18 @@ mod upload_download_tests {
 
         // Hold all four permits so the handler's acquire times out.
         let permits = [
-            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p1"),
-            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p2"),
-            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p3"),
-            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p4"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120))
+                .await
+                .expect("p1"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120))
+                .await
+                .expect("p2"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120))
+                .await
+                .expect("p3"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120))
+                .await
+                .expect("p4"),
         ];
 
         let response = app
@@ -3614,7 +3669,7 @@ mod upload_download_tests {
                 "semaphore-timeout rejection leaked temp dirs: {leaked:?}"
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        };
+        }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -3649,9 +3704,12 @@ mod upload_download_tests {
         // A "python" that writes 256 KiB to stderr (far beyond the pipe
         // buffer) and then exits 0 — a healthy but verbose child.
         let fake_py = tmp.join("fake-python");
-        tokio::fs::write(&fake_py, "#!/bin/sh\nhead -c 262144 /dev/zero >&2\nexit 0\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            &fake_py,
+            "#!/bin/sh\nhead -c 262144 /dev/zero >&2\nexit 0\n",
+        )
+        .await
+        .unwrap();
         tokio::fs::set_permissions(&fake_py, std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
@@ -3685,10 +3743,7 @@ mod upload_download_tests {
     /// in-flight upload instead of interleaving with it.
     #[tokio::test]
     async fn test_delete_model_waits_for_inflight_upload_read_guard() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-f1wait-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-f1wait-{}", std::process::id()));
         let model_dir = tmp.join("f1model").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
         tokio::fs::write(model_dir.join("model.py"), "x = 1")
@@ -3745,12 +3800,9 @@ mod upload_download_tests {
         drop(version_guard);
         drop(model_guard);
         // A writer must then get in (write-preferring, no deadlock).
-        let _write = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            model_lock.write(),
-        )
-        .await
-        .expect("write guard must be acquirable after readers release");
+        let _write = tokio::time::timeout(std::time::Duration::from_secs(5), model_lock.write())
+            .await
+            .expect("write guard must be acquirable after readers release");
     }
 
     // ===== F2: atomic artifact retention =====
@@ -3760,10 +3812,7 @@ mod upload_download_tests {
     /// otherwise be served forever by resolve_download_source.
     #[tokio::test]
     async fn test_retain_artifact_failed_copy_leaves_no_residue() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-f2retain-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("lite-server-f2retain-{}", std::process::id()));
         let artifacts = tmp.join(".artifacts");
         tokio::fs::create_dir_all(&artifacts).await.unwrap();
 
@@ -3783,4 +3832,3 @@ mod upload_download_tests {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }
-

@@ -1,6 +1,6 @@
 use crate::config::ModelConfig;
-use crate::registry::ModelRegistry;
 use crate::registry::types::*;
+use crate::registry::ModelRegistry;
 use crate::validation;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -51,9 +51,12 @@ impl PyModelRegistry {
         let mt = match model_type {
             "lit_api" => ModelType::LitAPI,
             "ensemble" => ModelType::Ensemble,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("unknown model_type: {}", model_type),
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown model_type: {}",
+                    model_type
+                )))
+            }
         };
         self.inner
             .register(name, version, mc, mt, PathBuf::from(model_dir))
@@ -158,8 +161,7 @@ fn python_dict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> 
     let json_module = py.import("json")?;
     let dumped = json_module.call_method1("dumps", (dict,))?;
     let s: String = dumped.extract()?;
-    serde_json::from_str(&s)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    serde_json::from_str(&s).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 fn parse_status(s: &str) -> PyResult<VersionStatus> {

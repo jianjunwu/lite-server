@@ -132,13 +132,13 @@ pub(super) async fn auto_unpack_lma_files(
                 };
                 let wait_and_drain = async { tokio::join!(child.wait(), drain) };
                 match tokio::time::timeout(unpack_timeout, wait_and_drain).await {
-                    Ok((status, (stdout, stderr))) => Some(status.map(|status| {
-                        std::process::Output {
+                    Ok((status, (stdout, stderr))) => {
+                        Some(status.map(|status| std::process::Output {
                             status,
                             stdout,
                             stderr,
-                        }
-                    })),
+                        }))
+                    }
                     Err(_) => {
                         warn!(
                             "Unpack of .lma artifact {} timed out after {:?}; skipping",
@@ -210,9 +210,7 @@ pub(super) async fn auto_unpack_lma_files(
 /// `{name}_v{version}.lma`. Non-conforming names return None (C3:
 /// convention holes accepted — the check is skipped, the artifact is still
 /// unpacked).
-fn model_version_from_artifact(
-    file_name: Option<&std::ffi::OsStr>,
-) -> Option<(String, String)> {
+fn model_version_from_artifact(file_name: Option<&std::ffi::OsStr>) -> Option<(String, String)> {
     let stem = file_name?.to_str()?.strip_suffix(".lma")?;
     let idx = stem.rfind("_v")?;
     if idx == 0 {
@@ -254,7 +252,9 @@ async fn move_staging_into_repo(staging: &Path, repo_path: &Path) -> Result<(), 
         let dst = repo_path.join(&name);
         let backup = repo_path.join(format!(".{}.old-{}", name, uuid::Uuid::new_v4()));
         if dst.exists() {
-            tokio::fs::rename(&dst, &backup).await.map_err(AppError::Io)?;
+            tokio::fs::rename(&dst, &backup)
+                .await
+                .map_err(AppError::Io)?;
         }
         if let Err(e) = tokio::fs::rename(&src, &dst).await {
             // Roll the old tree back, then report — a silent skip would
@@ -284,7 +284,9 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
             continue;
         }
         // 无文件名的目录条目不可作为模型目录,跳过(read_dir 返回的路径实际必有文件名)
-        let Some(model_name) = model_dir.file_name().map(|n| n.to_string_lossy().to_string())
+        let Some(model_name) = model_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
         else {
             continue;
         };
@@ -302,7 +304,9 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                 if !version_dir.is_dir() {
                     continue;
                 }
-                let Some(version) = version_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                let Some(version) = version_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
                 else {
                     continue;
                 };
@@ -467,8 +471,14 @@ mod tests {
         assert!(!matches_patterns("model.yaml", &["*.py".to_string()]));
 
         // Exact match
-        assert!(matches_patterns("config.yaml", &["config.yaml".to_string()]));
-        assert!(!matches_patterns("other.yaml", &["config.yaml".to_string()]));
+        assert!(matches_patterns(
+            "config.yaml",
+            &["config.yaml".to_string()]
+        ));
+        assert!(!matches_patterns(
+            "other.yaml",
+            &["config.yaml".to_string()]
+        ));
 
         // Empty patterns = match all
         assert!(matches_patterns("anything.txt", &[]));
@@ -489,10 +499,8 @@ mod tests {
     /// (`config_content_is_ensemble`).
     #[tokio::test]
     async fn test_scan_repo_models_ensemble_detection_false_positive_on_comment() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ensemble-fp-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ensemble-fp-{}", std::process::id()));
         let model_dir = tmp.join("test_model").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
 
@@ -531,10 +539,8 @@ batch_timeout: 0.05
     /// model; structural detection must skip it.
     #[tokio::test]
     async fn test_scan_repo_models_ensemble_detection_pure_false_positive() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-ensemble-fp2-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-ensemble-fp2-{}", std::process::id()));
         let model_dir = tmp.join("no_py_model").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
 
@@ -569,10 +575,8 @@ max_batch_size: 4
     /// dirs like `.tmp-upload-*` must not produce ghost model entries.
     #[tokio::test]
     async fn test_scan_repo_models_skips_dot_directories() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-scan-dotskip-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-scan-dotskip-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
 
         // A staging dir shaped like a model: version dir with model.py.
@@ -595,7 +599,10 @@ max_batch_size: 4
             result.len(),
             1,
             "dot directories must be skipped, got {:?}",
-            result.iter().map(|m| format!("{}:{}", m.name, m.version)).collect::<Vec<_>>()
+            result
+                .iter()
+                .map(|m| format!("{}:{}", m.name, m.version))
+                .collect::<Vec<_>>()
         );
         assert_eq!(result[0].name, "real_model");
         assert_eq!(result[0].version, "1");
@@ -632,10 +639,8 @@ max_batch_size: 4
     /// directories behind (the unpack fails inside the staging dir).
     #[tokio::test]
     async fn test_auto_unpack_corrupt_artifact_leaves_no_staging() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-unpack-corrupt-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-unpack-corrupt-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         tokio::fs::write(tmp.join("mymodel_v1.lma"), b"not a zip at all")
@@ -811,10 +816,8 @@ with zipfile.ZipFile(out, "w") as zf:
     #[tokio::test]
     async fn auto_unpack_prunes_seen_entries_for_replaced_artifacts() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-seen-prune-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-seen-prune-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let artifact = tmp.join("m_v1.lma");

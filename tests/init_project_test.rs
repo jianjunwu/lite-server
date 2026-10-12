@@ -81,7 +81,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -96,10 +101,8 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
 /// auto-loaded, active, and inference works.
 #[tokio::test]
 async fn test_init_project_runs_end_to_end() {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lite-server-init-test-{}",
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-init-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
     // Generate project via Python CLI
@@ -169,10 +172,7 @@ async fn test_init_project_runs_end_to_end() {
         sleep(Duration::from_millis(500)).await;
     }
     assert!(ready, "model should be ready after init project startup");
-    assert!(
-        active_version.is_some(),
-        "active_version should be set"
-    );
+    assert!(active_version.is_some(), "active_version should be set");
 
     // 2. Inference should succeed
     let resp = client
@@ -182,7 +182,8 @@ async fn test_init_project_runs_end_to_end() {
         .await
         .expect("Failed to connect to infer endpoint");
     assert_eq!(
-        resp.status(), 200,
+        resp.status(),
+        200,
         "inference should succeed: {:?}",
         resp.text().await.unwrap_or_default()
     );

@@ -236,7 +236,10 @@ mod tests {
         let d = resolve_from_http(&hmap(&[]), 5.0);
         assert!(!d.client_specified, "fallback => not client_specified");
         let rem = d.unix_ns.unwrap() - now_unix_ns();
-        assert!(rem > 4_000_000_000 && rem < 6_000_000_000, "fallback ~5s, got {rem}");
+        assert!(
+            rem > 4_000_000_000 && rem < 6_000_000_000,
+            "fallback ~5s, got {rem}"
+        );
     }
 
     #[test]
@@ -253,7 +256,10 @@ mod tests {
         for bad in ["garbage", "0", "-5", "nan", "inf"] {
             let d = resolve_from_http(&hmap(&[("x-lite-timeout", bad)]), 10.0);
             assert!(!d.client_specified, "{bad} should fall back, got {d:?}");
-            assert!(d.unix_ns.is_some(), "{bad} should fall back to server.timeout");
+            assert!(
+                d.unix_ns.is_some(),
+                "{bad} should fall back to server.timeout"
+            );
         }
     }
 
@@ -269,10 +275,18 @@ mod tests {
         let rem = d.unix_ns.unwrap() - now_unix_ns();
         assert!(rem > 1_900_000_000 && rem < 2_100_000_000, "2S, got {rem}");
         // microseconds / nanoseconds / minutes / hours parse without panic
-        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "500u")]), 30.0).unix_ns.is_some());
-        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1000n")]), 30.0).unix_ns.is_some());
-        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1M")]), 30.0).unix_ns.is_some());
-        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1H")]), 30.0).unix_ns.is_some());
+        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "500u")]), 30.0)
+            .unix_ns
+            .is_some());
+        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1000n")]), 30.0)
+            .unix_ns
+            .is_some());
+        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1M")]), 30.0)
+            .unix_ns
+            .is_some());
+        assert!(resolve_from_grpc(&grpc(&[("grpc-timeout", "1H")]), 30.0)
+            .unix_ns
+            .is_some());
     }
 
     #[test]
@@ -343,11 +357,17 @@ mod tests {
         let d = resolve_from_http(&hmap(&[("x-lite-timeout", "10000000000")]), 30.0);
         assert!(d.client_specified);
         let rem = remaining(d.unix_ns).expect("deadline present");
-        assert!(!rem.is_zero(), "huge timeout must not resolve to already-expired");
+        assert!(
+            !rem.is_zero(),
+            "huge timeout must not resolve to already-expired"
+        );
         // grpc-timeout with a huge hour count hits the same arithmetic.
         let d = resolve_from_grpc(&grpc(&[("grpc-timeout", "10000000000H")]), 30.0);
         assert!(d.client_specified);
         let rem = remaining(d.unix_ns).expect("deadline present");
-        assert!(!rem.is_zero(), "huge grpc-timeout must not resolve to already-expired");
+        assert!(
+            !rem.is_zero(),
+            "huge grpc-timeout must not resolve to already-expired"
+        );
     }
 }

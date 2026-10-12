@@ -6,6 +6,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use bytes::Bytes;
+use futures::StreamExt;
 use lite_server::callback::CallbackRunner;
 use lite_server::config::Config;
 use lite_server::http::handlers::files::upload_model_handler;
@@ -13,8 +15,6 @@ use lite_server::http::state::AppState;
 use lite_server::inference_queue::InferenceQueue;
 use lite_server::registry::ModelRegistry;
 use lite_server::worker::WorkerManager;
-use bytes::Bytes;
-use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -62,11 +62,7 @@ fn unique_tmp(tag: &str) -> std::path::PathBuf {
 
 /// Pack a minimal model fixture into a `.lma` artifact via the Python CLI
 /// (same fixture style as src/http/handlers/files.rs mod tests).
-async fn pack_fixture_lma(
-    tmp: &std::path::Path,
-    name: &str,
-    version: &str,
-) -> Vec<u8> {
+async fn pack_fixture_lma(tmp: &std::path::Path, name: &str, version: &str) -> Vec<u8> {
     let version_dir = tmp.join("src").join(name).join(version);
     tokio::fs::create_dir_all(&version_dir).await.unwrap();
     tokio::fs::write(version_dir.join("model.py"), "def predict(x): return x\n")
@@ -228,7 +224,10 @@ async fn test_mixed_upload_vprefixed_version_places_raw_in_reported_version() {
 
     // Every staged file must land under the version the response reports.
     assert!(
-        tmp.join("mymodel").join(&reported).join("extra.txt").exists(),
+        tmp.join("mymodel")
+            .join(&reported)
+            .join("extra.txt")
+            .exists(),
         "raw file must land under the reported version '{}', got disk layout: {:?}",
         reported,
         std::fs::read_dir(tmp.join("mymodel"))

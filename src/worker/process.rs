@@ -281,9 +281,7 @@ pub(crate) fn crash_exit_handler_with_grace(
     let spawned_at = std::time::Instant::now();
     move |kind| {
         let kind = match kind {
-            WorkerExitKind::Clean
-                if clean_grace.is_some_and(|g| spawned_at.elapsed() < g) =>
-            {
+            WorkerExitKind::Clean if clean_grace.is_some_and(|g| spawned_at.elapsed() < g) => {
                 error!(
                     model = %model_name, version = %version, worker_id,
                     "Replacement exited cleanly within the respawn grace window; \
@@ -313,14 +311,12 @@ pub(crate) fn crash_exit_handler_with_grace(
         // pid for the slot; a mismatch (replacement present, entry gone)
         // discards the event as stale. `None` pid = unknown, act as before.
         if let Some(pid) = worker_pid {
-            let current_pid = registry
-                .get(&model_name, Some(&version))
-                .and_then(|mv| {
-                    mv.workers
-                        .iter()
-                        .find(|w| w.worker_id == worker_id)
-                        .and_then(|w| w.pid)
-                });
+            let current_pid = registry.get(&model_name, Some(&version)).and_then(|mv| {
+                mv.workers
+                    .iter()
+                    .find(|w| w.worker_id == worker_id)
+                    .and_then(|w| w.pid)
+            });
             if current_pid != Some(pid) {
                 info!(
                     model = %model_name, version = %version, worker_id,
@@ -393,15 +389,12 @@ pub(super) fn slot_occupied_by(
     worker_id: u32,
     pid: Option<u32>,
 ) -> bool {
-    registry
-        .get(model_name, Some(version))
-        .and_then(|mv| {
-            mv.workers
-                .iter()
-                .find(|w| w.worker_id == worker_id)
-                .and_then(|w| w.pid)
-        })
-        == pid
+    registry.get(model_name, Some(version)).and_then(|mv| {
+        mv.workers
+            .iter()
+            .find(|w| w.worker_id == worker_id)
+            .and_then(|w| w.pid)
+    }) == pid
 }
 
 /// Spawn a background task that monitors a worker child process.
@@ -784,7 +777,9 @@ impl WorkerManager {
                             .and_then(|cs| cs.get(worker_id as usize).cloned())
                     };
                     if let Some(client) = client {
-                        let _ = client.send_raw(crate::streaming::build_stop_request()).await;
+                        let _ = client
+                            .send_raw(crate::streaming::build_stop_request())
+                            .await;
                     }
                 }
                 let escalated = stop_worker_gracefully(&mut proc, model_name, version).await;
@@ -1332,9 +1327,7 @@ mod tests {
 
     /// Spawn a child that exits 0 immediately and run its monitor with the
     /// given handler; returns once the monitor reaped it.
-    async fn run_clean_exit_monitor(
-        on_exit: impl FnOnce(WorkerExitKind) + Send + 'static,
-    ) {
+    async fn run_clean_exit_monitor(on_exit: impl FnOnce(WorkerExitKind) + Send + 'static) {
         #[cfg(unix)]
         let child = tokio::process::Command::new("sh")
             .args(["-c", "exit 0"])
@@ -2168,7 +2161,11 @@ mod tests {
             crate::registry::types::WorkerStatus::Ready,
             "a stale exit event must not flip the replacement's registry entry"
         );
-        assert_eq!(workers[0].pid, Some(2222), "the replacement's pid must stay");
+        assert_eq!(
+            workers[0].pid,
+            Some(2222),
+            "the replacement's pid must stay"
+        );
 
         // Sanity: the CURRENT occupant's own exit event still acts.
         let outlier2 = Arc::new(crate::inference_queue::OutlierState::new(1));
@@ -2319,7 +2316,11 @@ class TestAPI(LitAPI):
             "B7: the mid-respawn unload must not leave re-registered metric state"
         );
         assert!(
-            wm.route_table.read().await.get(&model_version_key(tag, "1")).is_none(),
+            wm.route_table
+                .read()
+                .await
+                .get(&model_version_key(tag, "1"))
+                .is_none(),
             "B7: no route-table residue for the torn-down version"
         );
 
@@ -2580,9 +2581,7 @@ class TestAPI(LitAPI):
         // a global serial loop) — poll for its effects instead of expecting
         // them synchronously.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while (lines(&marker) < 4 || warmups() < w0 + 2.0)
-            && std::time::Instant::now() < deadline
-        {
+        while (lines(&marker) < 4 || warmups() < w0 + 2.0) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(
@@ -2862,12 +2861,9 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn should_run_teardown_hook_in_graceful_respawn() {
-        let (wm, registry, repo, marker) = teardown_marker_harness(
-            "grace_stop",
-            "open(r'{marker}', 'a').write('t\\n')",
-            10.0,
-        )
-        .await;
+        let (wm, registry, repo, marker) =
+            teardown_marker_harness("grace_stop", "open(r'{marker}', 'a').write('t\\n')", 10.0)
+                .await;
 
         wm.respawn_worker("grace_stop", "1", 0, "rolling_recycle", true)
             .await
@@ -2893,12 +2889,9 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn should_not_run_teardown_hook_in_kill_respawn() {
-        let (wm, _registry, repo, marker) = teardown_marker_harness(
-            "kill_mode",
-            "open(r'{marker}', 'a').write('t\\n')",
-            10.0,
-        )
-        .await;
+        let (wm, _registry, repo, marker) =
+            teardown_marker_harness("kill_mode", "open(r'{marker}', 'a').write('t\\n')", 10.0)
+                .await;
 
         wm.respawn_worker("kill_mode", "1", 0, "health_check", false)
             .await
@@ -2919,12 +2912,8 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn should_escalate_to_sigkill_when_graceful_stop_hangs() {
-        let (wm, registry, repo, _marker) = teardown_marker_harness(
-            "hang_stop",
-            "import time; time.sleep(3600)",
-            1.0,
-        )
-        .await;
+        let (wm, registry, repo, _marker) =
+            teardown_marker_harness("hang_stop", "import time; time.sleep(3600)", 1.0).await;
 
         timeout(
             Duration::from_secs(30),

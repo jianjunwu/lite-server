@@ -151,8 +151,12 @@ mod tests {
 
     #[test]
     fn parse_network_accepts_cidr_and_bare_ip() {
-        assert!(parse_network("10.0.0.0/8").unwrap().contains(&ip("10.1.2.3")));
-        assert!(parse_network("192.168.1.1").unwrap().contains(&ip("192.168.1.1")));
+        assert!(parse_network("10.0.0.0/8")
+            .unwrap()
+            .contains(&ip("10.1.2.3")));
+        assert!(parse_network("192.168.1.1")
+            .unwrap()
+            .contains(&ip("192.168.1.1")));
         assert!(
             parse_network("::1").unwrap().contains(&ip("::1")),
             "bare v6 → /128"
@@ -326,7 +330,11 @@ mod tests {
         ] {
             let parsed: IpAddr = raw.parse().unwrap();
             let r = extract_client_ip(Some(raw), None, peer("10.0.0.1"), &trusted);
-            assert_eq!(r, Some(parsed), "single XFF segment {raw} should pass through");
+            assert_eq!(
+                r,
+                Some(parsed),
+                "single XFF segment {raw} should pass through"
+            );
         }
     }
 
@@ -398,8 +406,8 @@ mod prop_tests {
 
     /// 受信 peer 场景：50% 概率把一个由 peer 派生的网段塞进 trusted，
     /// 保证假设 `is_trusted(p)` 有足量通过样本。
-    fn arb_trusted_scenario()
-    -> impl Strategy<Value = (Vec<String>, Option<IpAddr>, IpAddr, Vec<IpNet>)> {
+    fn arb_trusted_scenario(
+    ) -> impl Strategy<Value = (Vec<String>, Option<IpAddr>, IpAddr, Vec<IpNet>)> {
         (
             prop::collection::vec(arb_segment(), 0..8),
             prop::option::of(arb_ip()),

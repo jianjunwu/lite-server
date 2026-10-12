@@ -41,7 +41,10 @@ pub(crate) fn parse_binary_output_request(
 ) -> Option<BinaryOutputRequest> {
     let json_head: &[u8] = match body {
         RequestBody::Json(b) => b.as_ref(),
-        RequestBody::TritonBinary { body, json_head_len } => &body[..*json_head_len],
+        RequestBody::TritonBinary {
+            body,
+            json_head_len,
+        } => &body[..*json_head_len],
         RequestBody::Raw(..) => return None,
     };
     // 双条件防御:非信封形状(含解析失败)一律不启用(D5)。
@@ -135,11 +138,14 @@ pub(crate) async fn convert_response(
             continue;
         }
         // 转换必需信息,不猜:缺 datatype/shape/data → 400(D6)。
-        let datatype = out.get("datatype").and_then(|d| d.as_str()).ok_or_else(|| {
-            AppError::InvalidRequestBody(format!(
-                "binary_data_output: output {name} is missing datatype"
-            ))
-        })?;
+        let datatype = out
+            .get("datatype")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| {
+                AppError::InvalidRequestBody(format!(
+                    "binary_data_output: output {name} is missing datatype"
+                ))
+            })?;
         if out.get("shape").is_none() {
             return Err(AppError::InvalidRequestBody(format!(
                 "binary_data_output: output {name} is missing shape"
@@ -183,8 +189,7 @@ pub(crate) async fn convert_response(
         head.insert("id".into(), json!(id));
     }
     head.insert("outputs".into(), json!(new_outputs));
-    let head_bytes = serde_json::to_vec(&Value::Object(head))
-        .map_err(AppError::Serialization)?;
+    let head_bytes = serde_json::to_vec(&Value::Object(head)).map_err(AppError::Serialization)?;
     let head_len = head_bytes.len();
 
     let mut full = head_bytes;
@@ -251,13 +256,11 @@ fn boolish(v: &Value) -> bool {
 }
 
 fn float_of(v: &Value) -> Result<f32, AppError> {
-    v.as_f64()
-        .map(|f| f as f32)
-        .ok_or_else(|| {
-            AppError::InvalidRequestBody(
-                "binary_data_output: data element is not a JSON number".to_string(),
-            )
-        })
+    v.as_f64().map(|f| f as f32).ok_or_else(|| {
+        AppError::InvalidRequestBody(
+            "binary_data_output: data element is not a JSON number".to_string(),
+        )
+    })
 }
 
 fn float_of64(v: &Value) -> Result<f64, AppError> {
@@ -342,7 +345,11 @@ fn f64_to_f16_bits(v: f64) -> u16 {
         let m = (mant | 0x10_0000_0000_0000) as u128; // 隐式 1
         let shift = shift as u32;
         let round = (m >> (shift - 1)) & 1;
-        let sticky = if shift >= 2 { m & ((1u128 << (shift - 1)) - 1) } else { 0 };
+        let sticky = if shift >= 2 {
+            m & ((1u128 << (shift - 1)) - 1)
+        } else {
+            0
+        };
         let mut hm = (m >> shift) as u32;
         if round == 1 && (sticky != 0 || hm & 1 == 1) {
             hm += 1;
@@ -403,7 +410,9 @@ mod tests {
 
     #[test]
     fn test_parse_top_level_flag() {
-        let r = req(r#"{"id":"r1","inputs":[{"name":"a","shape":[2],"datatype":"FP32","data":[1,2]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"id":"r1","inputs":[{"name":"a","shape":[2],"datatype":"FP32","data":[1,2]}],"parameters":{"binary_data_output":true}}"#,
+        );
         assert_eq!(r.id.as_deref(), Some("r1"));
         assert_eq!(r.model_name, "m1");
         assert_eq!(r.model_version.as_deref(), Some("1"));
@@ -412,7 +421,9 @@ mod tests {
 
     #[test]
     fn test_parse_per_output_flag() {
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"outputs":[{"name":"o1","parameters":{"binary_data":true}}]}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"outputs":[{"name":"o1","parameters":{"binary_data":true}}]}"#,
+        );
         assert_eq!(r.binary_outputs.as_deref(), Some(&["o1".to_string()][..]));
     }
 
@@ -471,8 +482,14 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        assert_eq!(&body[head_len..head_len + 4], &1.0f32.to_le_bytes(), "FP32 小端编码");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[head_len..head_len + 4],
+            &1.0f32.to_le_bytes(),
+            "FP32 小端编码"
+        );
         assert_eq!(&body[head_len + 4..], &2.0f32.to_le_bytes());
     }
 
@@ -495,8 +512,14 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        assert_eq!(&body[body.len() - 8..], b"\x04\x00\x00\x00test", "BYTES = 4B 长度前缀 + 内容");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[body.len() - 8..],
+            b"\x04\x00\x00\x00test",
+            "BYTES = 4B 长度前缀 + 内容"
+        );
         let _ = head_len;
     }
 
@@ -524,7 +547,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_output_fp32_full() {
-        let r = req(r#"{"id":"r1","inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"id":"r1","inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response(
                 r#"{"outputs":[{"name":"o","shape":[2],"datatype":"FP32","data":[1.0,2.0]}]}"#,
@@ -547,7 +572,9 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert_eq!(body.len() - head_len, 8, "二进制尾 = 2 × FP32");
         assert_eq!(&body[head_len..head_len + 4], &1.0f32.to_le_bytes());
         assert_eq!(&body[head_len + 4..], &2.0f32.to_le_bytes());
@@ -557,13 +584,18 @@ mod tests {
         assert_eq!(head["model_name"], "m1");
         assert_eq!(head["model_version"], "1");
         assert_eq!(head["outputs"][0]["parameters"]["binary_data_size"], 8);
-        assert!(head["outputs"][0].get("data").is_none(), "data 必须从 JSON 头删除");
+        assert!(
+            head["outputs"][0].get("data").is_none(),
+            "data 必须从 JSON 头删除"
+        );
     }
 
     #[tokio::test]
     async fn test_binary_output_per_output_flag_mixed() {
         // 混合输出:仅命中者进二进制尾,未命中保留 JSON data
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"outputs":[{"name":"bin_out","parameters":{"binary_data":true}}]}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"outputs":[{"name":"bin_out","parameters":{"binary_data":true}}]}"#,
+        );
         let resp = convert_response(
             envelope_response(
                 r#"{"outputs":[{"name":"json_out","shape":[1],"datatype":"FP32","data":[9.0]},{"name":"bin_out","shape":[1],"datatype":"FP32","data":[1.5]}]}"#,
@@ -581,17 +613,25 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert_eq!(body.len() - head_len, 4, "仅命中者进二进制尾");
         assert_eq!(&body[head_len..], &1.5f32.to_le_bytes());
         let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
-        assert_eq!(head["outputs"][0]["data"], json!([9.0]), "未命中保留 JSON data");
+        assert_eq!(
+            head["outputs"][0]["data"],
+            json!([9.0]),
+            "未命中保留 JSON data"
+        );
         assert_eq!(head["outputs"][1]["parameters"]["binary_data_size"], 4);
     }
 
     #[tokio::test]
     async fn test_binary_output_non_envelope_400() {
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response(r#"{"result": 42}"#, "application/json"),
             &r,
@@ -605,7 +645,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_output_missing_datatype_400() {
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response(
                 r#"{"outputs":[{"name":"o","shape":[1],"data":[1]}]}"#,
@@ -620,14 +662,19 @@ mod tests {
     #[tokio::test]
     async fn test_binary_output_worker_media_type_wins() {
         // G21:worker 非 JSON media_type + flag → 原样返回(不转换)
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response("not-json-bytes", "application/octet-stream"),
             &r,
         )
         .await
         .unwrap();
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/octet-stream");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(body, "not-json-bytes");
     }
@@ -635,7 +682,9 @@ mod tests {
     #[tokio::test]
     async fn test_binary_output_worker_error_untouched() {
         // 非 2xx(worker 错误响应)→ 原样
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let err_resp = Response::builder()
             .status(400)
             .header("content-type", "application/json")
@@ -647,7 +696,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_output_id_omitted_when_absent() {
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response(
                 r#"{"outputs":[{"name":"o","shape":[1],"datatype":"FP32","data":[1.0]}]}"#,
@@ -665,7 +716,9 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
         assert!(head.get("id").is_none(), "无请求 id 则省略");
     }
@@ -706,7 +759,9 @@ mod tests {
     /// 拿不到切分长度,wire 响应损坏。必须 400(不猜)。
     #[tokio::test]
     async fn test_audit_convert_non_object_parameters_loses_binary_size() {
-        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let r = req(
+            r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#,
+        );
         let resp = convert_response(
             envelope_response(
                 r#"{"outputs":[{"name":"o","shape":[1],"datatype":"FP32","data":[1.0],"parameters":"bogus"}]}"#,
@@ -719,7 +774,9 @@ mod tests {
             Err(AppError::InvalidRequestBody(_)) => {}
             Err(other) => panic!("expected InvalidRequestBody 400, got {other:?}"),
             Ok(resp) => {
-                let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
                 let head_len: usize = resp_header_len(&body);
                 let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
                 panic!(

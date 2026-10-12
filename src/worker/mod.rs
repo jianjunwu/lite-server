@@ -7,8 +7,8 @@ mod process;
 mod routing;
 
 pub use hooks::execute_hook;
-pub use routing::{pick_worker_random, pick_worker_skip_ejected};
 pub(crate) use routing::{pick_streaming_worker, PickError};
+pub use routing::{pick_worker_random, pick_worker_skip_ejected};
 
 use crate::callback::CallbackRunner;
 use crate::inference_queue::{
@@ -209,7 +209,10 @@ impl WorkerManager {
     }
 
     /// P10 (D40): install the global streaming-DAG semaphore.
-    pub fn with_streaming_capacity(mut self, capacity: Arc<crate::ensemble::StreamingCapacityState>) -> Self {
+    pub fn with_streaming_capacity(
+        mut self,
+        capacity: Arc<crate::ensemble::StreamingCapacityState>,
+    ) -> Self {
         self.streaming_capacity = Some(capacity);
         self
     }
@@ -316,7 +319,8 @@ impl WorkerManager {
     pub async fn shutdown(&self) {
         // B1: signal all worker monitors that we're in draining mode so they
         // suppress spurious "exited unexpectedly" errors during teardown.
-        self.draining.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Cancel in-flight loads FIRST: a worker stuck in setup() would
         // otherwise hold its load_model (and the spawned process, invisible
         // to the unload loop below until the loop finished registering)
@@ -408,10 +412,15 @@ mod tests {
         let key_with_underscore_version = "bert_base_2024_03_v1";
         let parts: Vec<&str> = key_with_underscore_version.rsplitn(2, '_').collect();
         // Assert the BUG: model_name should be "bert_base_2024" but is "bert_base_2024_03"
-        assert_ne!(parts[1], "bert_base_2024",
-            "rsplitn('_', 2) mis-parses keys when version contains underscores");
+        assert_ne!(
+            parts[1], "bert_base_2024",
+            "rsplitn('_', 2) mis-parses keys when version contains underscores"
+        );
         // Assert the version is also wrong
-        assert_eq!(parts[0], "v1", "rsplitn only captures last segment of underscored version");
+        assert_eq!(
+            parts[0], "v1",
+            "rsplitn only captures last segment of underscored version"
+        );
 
         // Also breaks when model_name contains underscores and version is simple:
         let key_with_underscore_model = "my_model_v1";

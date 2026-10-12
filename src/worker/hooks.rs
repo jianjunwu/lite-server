@@ -127,51 +127,56 @@ pub fn execute_hook(
     if let Some(http) = http_hook {
         let url = replace_hook_vars(&http.url, &vars);
         let method = http.method.clone();
-        let body = http.body_template.as_deref().map(|t| replace_hook_vars(t, &vars));
+        let body = http
+            .body_template
+            .as_deref()
+            .map(|t| replace_hook_vars(t, &vars));
         let hook_name = hook_type.to_string();
         let hook_timeout = Duration::from_secs_f32(hooks.hook_http_timeout);
         hook_tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawn(async move {
-            // Per-call client so the timeout is configurable (§3). reqwest::Client
-            // is Arc internally, so building it per firing is cheap.
-            // B15: on a client build failure (TLS backend init), fall back
-            // LOUDLY — and apply the timeout per request too, so even the
-            // fallback client (which carries no default timeout) stays
-            // bounded instead of silently losing the one safety knob.
-            let client = match reqwest::Client::builder()
-                .timeout(hook_timeout)
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "Hook '{}' HTTP client build failed ({}); using the \
+                // Per-call client so the timeout is configurable (§3). reqwest::Client
+                // is Arc internally, so building it per firing is cheap.
+                // B15: on a client build failure (TLS backend init), fall back
+                // LOUDLY — and apply the timeout per request too, so even the
+                // fallback client (which carries no default timeout) stays
+                // bounded instead of silently losing the one safety knob.
+                let client = match reqwest::Client::builder().timeout(hook_timeout).build() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            "Hook '{}' HTTP client build failed ({}); using the \
                          fallback client with a per-request timeout",
-                        hook_name, e
-                    );
-                    reqwest::Client::default()
-                }
-            };
-            let result = match method.to_uppercase().as_str() {
-                "GET" => client.get(&url).timeout(hook_timeout).send().await,
-                _ => {
-                    let b = body.unwrap_or_default();
-                    client.post(&url).timeout(hook_timeout).body(b).send().await
-                }
-            };
-            match result {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        warn!("Hook '{}' HTTP {} returned {}", hook_name, url, resp.status());
+                            hook_name, e
+                        );
+                        reqwest::Client::default()
+                    }
+                };
+                let result = match method.to_uppercase().as_str() {
+                    "GET" => client.get(&url).timeout(hook_timeout).send().await,
+                    _ => {
+                        let b = body.unwrap_or_default();
+                        client.post(&url).timeout(hook_timeout).body(b).send().await
+                    }
+                };
+                match result {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            warn!(
+                                "Hook '{}' HTTP {} returned {}",
+                                hook_name,
+                                url,
+                                resp.status()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Hook '{}' HTTP {} failed: {}", hook_name, url, e);
                     }
                 }
-                Err(e) => {
-                    warn!("Hook '{}' HTTP {} failed: {}", hook_name, url, e);
-                }
-            }
-        });
+            });
     }
 }
 
@@ -199,9 +204,13 @@ mod tests {
             ("$EXIT_CODE".to_string(), "137".to_string()),
             ("$REASON".to_string(), "crash".to_string()),
         ];
-        let template = "model=$MODEL version=$VERSION worker=$WORKER_ID exit=$EXIT_CODE reason=$REASON";
+        let template =
+            "model=$MODEL version=$VERSION worker=$WORKER_ID exit=$EXIT_CODE reason=$REASON";
         let result = replace_hook_vars(template, &vars);
-        assert_eq!(result, "model=bert version=v1 worker=2 exit=137 reason=crash");
+        assert_eq!(
+            result,
+            "model=bert version=v1 worker=2 exit=137 reason=crash"
+        );
     }
 
     #[test]
@@ -260,10 +269,7 @@ mod tests {
         let _ = std::fs::remove_file(&pidfile);
         let hooks = crate::config::WorkerHooksConfig {
             // exec keeps the recorded pid for the sleep itself.
-            on_ready: Some(format!(
-                "echo $$ > {}; exec sleep 300",
-                pidfile.display()
-            )),
+            on_ready: Some(format!("echo $$ > {}; exec sleep 300", pidfile.display())),
             hook_http_timeout: 60.0,
             ..Default::default()
         };
@@ -354,13 +360,17 @@ mod tests {
         let parsed: crate::config::WorkerHooksConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.on_ready, Some("echo ready".to_string()));
         assert!(parsed.on_ready_http.is_some());
-        assert_eq!(parsed.on_ready_http.as_ref().unwrap().url, "http://localhost/hook");
+        assert_eq!(
+            parsed.on_ready_http.as_ref().unwrap().url,
+            "http://localhost/hook"
+        );
     }
 
     #[tokio::test]
     async fn test_execute_shell_hook_runs_command() {
         // Use a hook that creates a temp file to verify execution
-        let tmp = std::env::temp_dir().join(format!("lite-server-hook-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-hook-test-{}", std::process::id()));
         let tmp_str = tmp.to_string_lossy().to_string();
         let hooks = crate::config::WorkerHooksConfig {
             on_ready: Some(format!("touch {}", tmp_str)),
@@ -394,10 +404,8 @@ mod tests {
     /// machine (observed: retained 51 with zero reaped).
     #[tokio::test]
     async fn l2_completed_hook_tasks_are_reaped() {
-        let marker = std::env::temp_dir().join(format!(
-            "liteserver-l2-hook-{}.log",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("liteserver-l2-hook-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let hooks = crate::config::WorkerHooksConfig {
             // Instant shell command that leaves a completion marker line.

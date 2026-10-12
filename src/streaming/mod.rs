@@ -148,7 +148,13 @@ where
         (None, None) => return SendOutcome::Sent(send.await),
         (Some(a), None) => a,
         (None, Some(b)) => b,
-        (Some(a), Some(b)) => if a < b { a } else { b },
+        (Some(a), Some(b)) => {
+            if a < b {
+                a
+            } else {
+                b
+            }
+        }
     };
     match tokio::time::timeout(cap, send).await {
         Ok(r) => SendOutcome::Sent(r),
@@ -259,7 +265,9 @@ impl Drop for StreamCancelGuard {
                 let client = self.client.clone();
                 let stream_id = std::mem::take(&mut self.stream_id);
                 handle.spawn(async move {
-                    let _ = client.send_raw(crate::streaming::build_stream_cancel(stream_id)).await;
+                    let _ = client
+                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                        .await;
                 });
             }
         }
@@ -294,7 +302,11 @@ impl StreamInflightGuard {
         worker_idx: usize,
     ) -> Self {
         outlier.stream_inflight_inc(worker_idx);
-        Self { outlier, worker_idx, permit: None }
+        Self {
+            outlier,
+            worker_idx,
+            permit: None,
+        }
     }
 
     /// Fold the G4 concurrency permit into this guard (single Drop path).
@@ -375,7 +387,11 @@ mod tests {
             }
             assert_eq!(outlier.stream_inflight(1), 1);
         }
-        assert_eq!(outlier.stream_inflight(1), 0, "all guards dropped → slot drains to zero");
+        assert_eq!(
+            outlier.stream_inflight(1),
+            0,
+            "all guards dropped → slot drains to zero"
+        );
     }
 
     #[tokio::test]
@@ -396,7 +412,11 @@ mod tests {
             .await;
         });
         task.await.unwrap();
-        assert_eq!(outlier.stream_inflight(0), 0, "panic unwind must release the count");
+        assert_eq!(
+            outlier.stream_inflight(0),
+            0,
+            "panic unwind must release the count"
+        );
     }
 
     #[tokio::test]
@@ -420,7 +440,11 @@ mod tests {
         assert_eq!(outlier.stream_inflight(0), 1);
         task.abort();
         let _ = task.await;
-        assert_eq!(outlier.stream_inflight(0), 0, "abort/drop mid-poll must release the count");
+        assert_eq!(
+            outlier.stream_inflight(0),
+            0,
+            "abort/drop mid-poll must release the count"
+        );
     }
 
     // --- observe_or_abort ---
@@ -447,16 +471,12 @@ mod tests {
     async fn catch_forward_panic_runs_cleanup_on_panic() {
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_c = ran.clone();
-        catch_forward_panic(
-            "test",
-            async { panic!("boom") },
-            move || {
-                let ran_c = ran_c.clone();
-                async move {
-                    ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            },
-        )
+        catch_forward_panic("test", async { panic!("boom") }, move || {
+            let ran_c = ran_c.clone();
+            async move {
+                ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
         .await;
         assert!(
             ran.load(std::sync::atomic::Ordering::Relaxed),
@@ -468,16 +488,12 @@ mod tests {
     async fn catch_forward_panic_clean_body_skips_cleanup() {
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_c = ran.clone();
-        catch_forward_panic(
-            "test",
-            async {},
-            move || {
-                let ran_c = ran_c.clone();
-                async move {
-                    ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            },
-        )
+        catch_forward_panic("test", async {}, move || {
+            let ran_c = ran_c.clone();
+            async move {
+                ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
         .await;
         assert!(
             !ran.load(std::sync::atomic::Ordering::Relaxed),
@@ -519,7 +535,12 @@ mod tests {
 
     #[test]
     fn test_build_stream_open() {
-        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None, false);
+        let req = build_stream_open(
+            "s1".to_string(),
+            bytes::Bytes::from_static(b"data"),
+            None,
+            false,
+        );
         assert_eq!(req.uid, "stream-open-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => {
@@ -541,7 +562,12 @@ mod tests {
     fn test_build_stream_open_decoupled() {
         // P9-1: decoupled=true sets the additive flag the worker reads to
         // keep the channel open after predict_decoupled returns.
-        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None, true);
+        let req = build_stream_open(
+            "s1".to_string(),
+            bytes::Bytes::from_static(b"data"),
+            None,
+            true,
+        );
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => match s.action {
                 Some(pb::stream_request::Action::Open(o)) => {
@@ -574,7 +600,10 @@ mod tests {
         assert_eq!(req.uid, "stream-close-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => {
-                assert!(matches!(s.action, Some(pb::stream_request::Action::Close(_))));
+                assert!(matches!(
+                    s.action,
+                    Some(pb::stream_request::Action::Close(_))
+                ));
             }
             _ => panic!("expected stream payload"),
         }
@@ -586,7 +615,10 @@ mod tests {
         assert_eq!(req.uid, "stream-cancel-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => {
-                assert!(matches!(s.action, Some(pb::stream_request::Action::Cancel(_))));
+                assert!(matches!(
+                    s.action,
+                    Some(pb::stream_request::Action::Cancel(_))
+                ));
             }
             _ => panic!("expected stream payload"),
         }
@@ -603,7 +635,12 @@ mod tests {
             payload: Default::default(),
             ..Default::default()
         };
-        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"d"), Some(meta), false);
+        let req = build_stream_open(
+            "s1".to_string(),
+            bytes::Bytes::from_static(b"d"),
+            Some(meta),
+            false,
+        );
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => match s.action {
                 Some(pb::stream_request::Action::Open(o)) => {
@@ -627,10 +664,12 @@ mod tests {
     fn chunk() -> pb::StreamResponse {
         pb::StreamResponse {
             stream_id: "s".to_string(),
-            payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                data: bytes::Bytes::from_static(b"x"),
-                is_final: false,
-            })),
+            payload: Some(pb::stream_response::Payload::Chunk(
+                pb::StreamChunkResponse {
+                    data: bytes::Bytes::from_static(b"x"),
+                    is_final: false,
+                },
+            )),
         }
     }
 
@@ -657,13 +696,9 @@ mod tests {
     async fn recv_chunk_idle_fires_on_stall() {
         let (_tx, mut rx) = rx_pair();
         // No sender, tiny idle → must trip Idle promptly.
-        let elapsed = recv_chunk(
-            &mut rx,
-            None,
-            Some(std::time::Duration::from_millis(20)),
-        )
-        .await
-        .unwrap_err();
+        let elapsed = recv_chunk(&mut rx, None, Some(std::time::Duration::from_millis(20)))
+            .await
+            .unwrap_err();
         assert_eq!(elapsed, RecvElapsed::Idle);
     }
 

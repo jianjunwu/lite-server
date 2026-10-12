@@ -19,7 +19,9 @@ pub fn is_valid_request_id(s: &str) -> bool {
 /// Allowed: alphanumeric, underscore, hyphen. Length: 1-64.
 pub fn validate_identifier(s: &str) -> Result<(), AppError> {
     if s.is_empty() {
-        return Err(AppError::Validation("identifier cannot be empty".to_string()));
+        return Err(AppError::Validation(
+            "identifier cannot be empty".to_string(),
+        ));
     }
     if s.len() > MAX_IDENTIFIER_LEN {
         return Err(AppError::Validation(format!(
@@ -71,7 +73,10 @@ pub fn resolve_model_dir(
     let model_dir = repo_path.join(model_name).join(version);
 
     // Defensive: reject any path containing parent-dir components
-    if model_dir.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if model_dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(AppError::ModelNotFound(format!(
             "{} version {} not found",
             model_name, version
@@ -79,12 +84,8 @@ pub fn resolve_model_dir(
     }
 
     if model_dir.exists() {
-        let canonical = model_dir
-            .canonicalize()
-            .map_err(AppError::Io)?;
-        let canonical_repo = repo_path
-            .canonicalize()
-            .map_err(AppError::Io)?;
+        let canonical = model_dir.canonicalize().map_err(AppError::Io)?;
+        let canonical_repo = repo_path.canonicalize().map_err(AppError::Io)?;
         if !canonical.starts_with(&canonical_repo) {
             return Err(AppError::ModelNotFound(format!(
                 "{} version {} not found",
@@ -100,7 +101,6 @@ pub fn resolve_model_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn test_is_valid_request_id() {
@@ -174,7 +174,8 @@ mod tests {
 
     #[test]
     fn test_resolve_model_dir_rejects_outside_repo() {
-        let tmp = std::env::temp_dir().join(format!("lite-server-resolve-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-resolve-test-{}", std::process::id()));
         let repo = tmp.join("repo");
         let safe = repo.join("safe_model").join("1");
         std::fs::create_dir_all(&safe).unwrap();

@@ -118,7 +118,9 @@ fn kill_stale_on_port(port: u16) {
                 if let Ok(ps_out) = ps {
                     let comm = String::from_utf8_lossy(&ps_out.stdout);
                     if comm.contains("lite-server") {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }
@@ -136,7 +138,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -151,7 +158,12 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     let url = format!("{}/v2/models/{}/ready", base, model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.json::<Value>().await {
                 if body["ready"].as_bool() == Some(true) {
                     return true;
@@ -376,7 +388,10 @@ fn write_server_yaml(
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("server.yaml");
     let (grpc_port_line, grpc_block) = match grpc {
-        Some(p) => (format!("  grpc_port: {p}\n"), "grpc:\n  enabled: true\n\n".to_string()),
+        Some(p) => (
+            format!("  grpc_port: {p}\n"),
+            "grpc:\n  enabled: true\n\n".to_string(),
+        ),
         None => (String::new(), String::new()),
     };
     let load_list = models
@@ -453,9 +468,12 @@ async fn boot_minimal(
 #[tokio::test]
 #[serial]
 async fn test_audit_p10_reject_after_open_leaks_worker_stream() {
-    let (base, _gp, _guard, repo) =
-        boot_minimal("  max_concurrent_streaming_dags: 1", false, &["pre", "tail_mark", "ens_mark"])
-            .await;
+    let (base, _gp, _guard, repo) = boot_minimal(
+        "  max_concurrent_streaming_dags: 1",
+        false,
+        &["pre", "tail_mark", "ens_mark"],
+    )
+    .await;
     wait_ready_all(&base, &["pre", "tail_mark", "ens_mark"]).await;
     let log_path = repo.join("tail_mark.log");
 
@@ -468,7 +486,11 @@ async fn test_audit_p10_reject_after_open_leaks_worker_stream() {
         .send()
         .await
         .expect("first stream must open");
-    assert_eq!(first.status(), reqwest::StatusCode::OK, "first stream opens");
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::OK,
+        "first stream opens"
+    );
 
     // Let A acquire the slot and start streaming.
     sleep(Duration::from_millis(700)).await;
@@ -528,13 +550,20 @@ async fn test_audit_ws_aggregation_idle_timeout_close_contract() {
     )
     .await;
     wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     // One data frame, then silence — the aggregation never gets its close
     // trigger, so the always-on idle budget must reclaim it (~1s).
-    ws.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+    ws.send(Message::Text(r#"{"text":"hi"}"#.into()))
+        .await
+        .unwrap();
 
     let mut error_json: Option<Value> = None;
     let mut close_code: Option<u16> = None;
@@ -590,9 +619,14 @@ async fn test_audit_ws_multi_round_close_contract() {
     let (base, _gp, _guard, _repo) =
         boot_minimal("", false, &["pre", "tail_slow", "ens_ws_slow"]).await;
     wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     // Data frame → close frame (aggregation trigger, D33) → extra data frame
     // (multi-round violation). The slow tail keeps the downstream open while
@@ -684,7 +718,9 @@ async fn test_audit_grpc_bidi_multi_round_invalid_argument() {
     .await
     .unwrap();
     let resp = client
-        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
         .await
         .expect("bidi must open");
     // Multi-round violation: another data frame after the trigger. The slow
@@ -834,10 +870,15 @@ async fn test_audit_ws_early_reject_must_send_error_json_and_coded_close() {
 
     let (base, _gp, _guard, _repo) = boot_minimal("", false, &["pre"]).await;
     wait_ready_all(&base, &["pre"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     // "ghost" is not in the repo: resolve_version fails → early reject.
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ghost/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     let mut error_json: Option<Value> = None;
     let mut close_frame: Option<Option<(u16, String)>> = None;
@@ -901,13 +942,20 @@ async fn test_audit_ws_aggregation_ping_must_not_reset_idle_reclaim() {
     )
     .await;
     wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
-    let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
     let (mut sink, mut stream) = ws.split();
 
     // One data frame starts the aggregation (no close trigger follows).
-    sink.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+    sink.send(Message::Text(r#"{"text":"hi"}"#.into()))
+        .await
+        .unwrap();
 
     // Keep pinging for 8s — well past the 1s aggregation idle budget. A
     // correct server reclaims at ~1s regardless; the pinger keeps running
@@ -969,12 +1017,19 @@ async fn test_audit_ws_aggregation_idle_close_reason_must_distinguish_idle() {
     )
     .await;
     wait_ready_all(&base, &["pre", "tail_slow", "ens_ws_slow"]).await;
-    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let http_port = base
+        .trim_start_matches("http://127.0.0.1:")
+        .parse::<u16>()
+        .unwrap();
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_ws_slow/stream");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
 
     // One data frame, then silence → idle reclaim at ~1s.
-    ws.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+    ws.send(Message::Text(r#"{"text":"hi"}"#.into()))
+        .await
+        .unwrap();
 
     let mut close_reason: Option<String> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

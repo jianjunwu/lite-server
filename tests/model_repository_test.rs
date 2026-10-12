@@ -98,7 +98,12 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             if resp.status() == 200 {
                 return;
             }
@@ -227,11 +232,7 @@ fn pack_lma(
         "pack failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let name = model_dir
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let name = model_dir.file_name().unwrap().to_string_lossy().to_string();
     output_dir.join(format!("{}_v{}.lma", name, version))
 }
 
@@ -275,7 +276,11 @@ async fn test_upload_lma_places_files_and_loads_model() {
     let v1 = src.join("1");
     std::fs::create_dir_all(&v1).unwrap();
     std::fs::write(v1.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v1.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
     let lma = pack_lma(&src, "1", &tmp);
     let lma_bytes = std::fs::read(&lma).unwrap();
 
@@ -286,7 +291,14 @@ async fn test_upload_lma_places_files_and_loads_model() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    let resp = upload_files(&base, "mymodel", "1", true, &[("mymodel_v1.lma", &lma_bytes)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[("mymodel_v1.lma", &lma_bytes)],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "upload failed: {}", body);
@@ -364,7 +376,14 @@ async fn test_upload_lma_reports_load_failure() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    let resp = upload_files(&base, "mymodel", "1", true, &[("mymodel_v1.lma", &lma_bytes)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[("mymodel_v1.lma", &lma_bytes)],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "upload failed: {}", body);
@@ -534,7 +553,10 @@ async fn wait_until_ready(base: &str, model: &str, version: &str, timeout_secs: 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         if let Ok(r) = client
-            .get(format!("{}/v2/models/{}/versions/{}/ready", base, model, version))
+            .get(format!(
+                "{}/v2/models/{}/versions/{}/ready",
+                base, model, version
+            ))
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -613,11 +635,24 @@ async fn test_delete_loaded_version_stops_worker_and_removes_files() {
 
     let base = format!("http://127.0.0.1:{}", port);
     let config_yaml: &[u8] = b"max_batch_size: 1\nbatch_timeout: 0.0\n";
-    let resp = upload_files(&base, "mymodel", "1", true, &[("model.py", MODEL_PY.as_bytes()), ("config.yaml", config_yaml)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[
+            ("model.py", MODEL_PY.as_bytes()),
+            ("config.yaml", config_yaml),
+        ],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "upload failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "model must be ready before delete");
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "model must be ready before delete"
+    );
 
     // The worker process carries the model.py path on its command line.
     let model_py_path = repo.join("mymodel").join("1").join("model.py");
@@ -634,7 +669,10 @@ async fn test_delete_loaded_version_stops_worker_and_removes_files() {
     assert_eq!(status, 200, "delete failed: {}", body);
 
     // Version directory removed from disk.
-    assert!(!repo.join("mymodel").join("1").exists(), "version dir must be deleted");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "version dir must be deleted"
+    );
 
     // Registry no longer lists the version (404 once the model is empty).
     let client = reqwest::Client::new();
@@ -643,7 +681,11 @@ async fn test_delete_loaded_version_stops_worker_and_removes_files() {
         .send()
         .await
         .unwrap();
-    assert_eq!(lv.status(), 404, "list_versions must 404 after the only version is deleted");
+    assert_eq!(
+        lv.status(),
+        404,
+        "list_versions must 404 after the only version is deleted"
+    );
 
     // Repository index no longer lists it.
     let idx = client
@@ -664,7 +706,10 @@ async fn test_delete_loaded_version_stops_worker_and_removes_files() {
         .await
         .unwrap();
     let ready_json: serde_json::Value = ready.json().await.unwrap();
-    assert_eq!(ready_json["ready"], false, "ready must be false after delete");
+    assert_eq!(
+        ready_json["ready"], false,
+        "ready must be false after delete"
+    );
 
     // Worker process is gone (poll: graceful stop takes a moment).
     #[cfg(unix)]
@@ -683,11 +728,24 @@ async fn test_delete_loaded_version_stops_worker_and_removes_files() {
 
     // Re-upload + load the same version: must come back cleanly (an orphan
     // worker would have stolen the re-bound ZMQ socket and poisoned load).
-    let resp = upload_files(&base, "mymodel", "1", true, &[("model.py", MODEL_PY.as_bytes()), ("config.yaml", config_yaml)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[
+            ("model.py", MODEL_PY.as_bytes()),
+            ("config.yaml", config_yaml),
+        ],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "re-upload failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "re-uploaded version must become ready");
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "re-uploaded version must become ready"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -715,11 +773,25 @@ async fn test_delete_active_version_with_force_falls_back_to_other_ready() {
     let base = format!("http://127.0.0.1:{}", port);
     let config_yaml: &[u8] = b"max_batch_size: 1\nbatch_timeout: 0.0\n";
     for version in ["1", "2"] {
-        let resp = upload_files(&base, "mymodel", version, true, &[("model.py", MODEL_PY.as_bytes()), ("config.yaml", config_yaml)]).await;
+        let resp = upload_files(
+            &base,
+            "mymodel",
+            version,
+            true,
+            &[
+                ("model.py", MODEL_PY.as_bytes()),
+                ("config.yaml", config_yaml),
+            ],
+        )
+        .await;
         let status = resp.status();
         let body = resp.text().await.unwrap();
         assert!(status.is_success(), "upload {} failed: {}", version, body);
-        assert!(wait_until_ready(&base, "mymodel", version, 30).await, "version {} must be ready", version);
+        assert!(
+            wait_until_ready(&base, "mymodel", version, 30).await,
+            "version {} must be ready",
+            version
+        );
     }
 
     // Make v1 the active version, then delete it with force.
@@ -731,10 +803,20 @@ async fn test_delete_active_version_with_force_falls_back_to_other_ready() {
     let resp = delete_version(&base, "mymodel", "1", true).await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert_eq!(status, 200, "forced delete of active version failed: {}", body);
+    assert_eq!(
+        status, 200,
+        "forced delete of active version failed: {}",
+        body
+    );
 
-    assert!(!repo.join("mymodel").join("1").exists(), "deleted version dir must be gone");
-    assert!(repo.join("mymodel").join("2").exists(), "surviving version dir must stay");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "deleted version dir must be gone"
+    );
+    assert!(
+        repo.join("mymodel").join("2").exists(),
+        "surviving version dir must stay"
+    );
 
     // Active pointer must fall back to the remaining ready version.
     let client = reqwest::Client::new();
@@ -744,7 +826,10 @@ async fn test_delete_active_version_with_force_falls_back_to_other_ready() {
         .await
         .unwrap();
     let ready_json: serde_json::Value = ready.json().await.unwrap();
-    assert_eq!(ready_json["ready"], true, "model must stay ready after fallback");
+    assert_eq!(
+        ready_json["ready"], true,
+        "model must stay ready after fallback"
+    );
     assert_eq!(
         ready_json["active_version"], "2",
         "active version must fall back to the other ready version: {ready_json}"
@@ -757,10 +842,8 @@ async fn test_delete_active_version_with_force_falls_back_to_other_ready() {
 /// with 409 (accident protection); ?force=true proceeds.
 #[tokio::test]
 async fn test_delete_active_version_requires_force() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-del-force-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-del-force-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -774,11 +857,24 @@ async fn test_delete_active_version_requires_force() {
 
     let base = format!("http://127.0.0.1:{}", port);
     let config_yaml: &[u8] = b"max_batch_size: 1\nbatch_timeout: 0.0\n";
-    let resp = upload_files(&base, "mymodel", "1", true, &[("model.py", MODEL_PY.as_bytes()), ("config.yaml", config_yaml)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[
+            ("model.py", MODEL_PY.as_bytes()),
+            ("config.yaml", config_yaml),
+        ],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "upload failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "model must be ready");
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "model must be ready"
+    );
     let act = activate_version(&base, "mymodel", "1").await;
     let status = act.status();
     let body = act.text().await.unwrap();
@@ -788,19 +884,29 @@ async fn test_delete_active_version_requires_force() {
     let resp = delete_version(&base, "mymodel", "1", false).await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert_eq!(status, 409, "delete of active version without force must 409: {}", body);
+    assert_eq!(
+        status, 409,
+        "delete of active version without force must 409: {}",
+        body
+    );
     assert!(
         body.contains("force"),
         "409 body must explain the force override: {body}"
     );
-    assert!(repo.join("mymodel").join("1").exists(), "409 must not delete anything");
+    assert!(
+        repo.join("mymodel").join("1").exists(),
+        "409 must not delete anything"
+    );
 
     // With force → 200; directory gone.
     let resp = delete_version(&base, "mymodel", "1", true).await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "forced delete failed: {}", body);
-    assert!(!repo.join("mymodel").join("1").exists(), "forced delete must remove the dir");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "forced delete must remove the dir"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -809,10 +915,8 @@ async fn test_delete_active_version_requires_force() {
 /// semver-lenient (10 > 2 > 1), keeping the N highest.
 #[tokio::test]
 async fn test_delete_versions_keep_preserves_latest() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-del-keep-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-del-keep-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -844,10 +948,20 @@ async fn test_delete_versions_keep_preserves_latest() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "batch delete failed: {}", body);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["deleted"], json!(["1"]), "keep=2 must delete only the lowest: {v}");
-    assert!(v["failed"].as_array().unwrap().is_empty(), "no failures expected: {v}");
+    assert_eq!(
+        v["deleted"],
+        json!(["1"]),
+        "keep=2 must delete only the lowest: {v}"
+    );
+    assert!(
+        v["failed"].as_array().unwrap().is_empty(),
+        "no failures expected: {v}"
+    );
 
-    assert!(!repo.join("mymodel").join("1").exists(), "lowest version must be gone");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "lowest version must be gone"
+    );
     assert!(repo.join("mymodel").join("2").exists(), "v2 must be kept");
     assert!(repo.join("mymodel").join("10").exists(), "v10 must be kept");
 
@@ -876,11 +990,25 @@ async fn test_delete_versions_list_reports_partial_failure_for_active() {
     let base = format!("http://127.0.0.1:{}", port);
     let config_yaml: &[u8] = b"max_batch_size: 1\nbatch_timeout: 0.0\n";
     for version in ["1", "2"] {
-        let resp = upload_files(&base, "mymodel", version, true, &[("model.py", MODEL_PY.as_bytes()), ("config.yaml", config_yaml)]).await;
+        let resp = upload_files(
+            &base,
+            "mymodel",
+            version,
+            true,
+            &[
+                ("model.py", MODEL_PY.as_bytes()),
+                ("config.yaml", config_yaml),
+            ],
+        )
+        .await;
         let status = resp.status();
         let body = resp.text().await.unwrap();
         assert!(status.is_success(), "upload {} failed: {}", version, body);
-        assert!(wait_until_ready(&base, "mymodel", version, 30).await, "version {} must be ready", version);
+        assert!(
+            wait_until_ready(&base, "mymodel", version, 30).await,
+            "version {} must be ready",
+            version
+        );
     }
     let act = activate_version(&base, "mymodel", "1").await;
     let status = act.status();
@@ -898,15 +1026,26 @@ async fn test_delete_versions_list_reports_partial_failure_for_active() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "partial failure must still be 200: {}", body);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["deleted"], json!(["2"]), "non-active version must be deleted: {v}");
+    assert_eq!(
+        v["deleted"],
+        json!(["2"]),
+        "non-active version must be deleted: {v}"
+    );
     let failed = v["failed"].as_array().unwrap();
-    assert_eq!(failed.len(), 1, "active version must be reported in failed: {v}");
+    assert_eq!(
+        failed.len(),
+        1,
+        "active version must be reported in failed: {v}"
+    );
     assert_eq!(failed[0]["version"], "1");
     assert!(
         failed[0]["error"].as_str().unwrap().contains("force"),
         "failed entry must explain the force override: {v}"
     );
-    assert!(repo.join("mymodel").join("1").exists(), "active version must remain on disk");
+    assert!(
+        repo.join("mymodel").join("1").exists(),
+        "active version must remain on disk"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -932,7 +1071,11 @@ async fn test_delete_versions_invalid_request_is_400() {
 
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
-    for body in [json!({"keep": 0}), json!({"versions": ["bad version!"]}), json!({})] {
+    for body in [
+        json!({"keep": 0}),
+        json!({"versions": ["bad version!"]}),
+        json!({}),
+    ] {
         let resp = client
             .delete(format!("{}/v2/models/mymodel/versions", base))
             .json(&body)
@@ -950,10 +1093,8 @@ async fn test_delete_versions_invalid_request_is_400() {
 /// (.artifacts/<name>_v*.lma + root <name>_v*.lma).
 #[tokio::test]
 async fn test_delete_model_removes_directory_and_linked_artifacts() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-del-model-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-del-model-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -964,7 +1105,11 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
     let v1 = src.join("1");
     std::fs::create_dir_all(&v1).unwrap();
     std::fs::write(v1.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v1.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
     let lma = pack_lma(&src, "1", &tmp);
     let lma_bytes = std::fs::read(&lma).unwrap();
 
@@ -975,16 +1120,36 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    let resp = upload_files(&base, "mymodel", "1", true, &[("mymodel_v1.lma", &lma_bytes)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[("mymodel_v1.lma", &lma_bytes)],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "upload v1 failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "v1 must be ready");
-    let resp = upload_files(&base, "mymodel", "2", true, &[("model.py", MODEL_PY.as_bytes())]).await;
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "v1 must be ready"
+    );
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "2",
+        true,
+        &[("model.py", MODEL_PY.as_bytes())],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "upload v2 failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "2", 30).await, "v2 must be ready");
+    assert!(
+        wait_until_ready(&base, "mymodel", "2", 30).await,
+        "v2 must be ready"
+    );
 
     let act = activate_version(&base, "mymodel", "1").await;
     let status = act.status();
@@ -993,7 +1158,10 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
 
     // Simulate an ops-placed artifact at the repo root.
     std::fs::write(repo.join("mymodel_v1.lma"), &lma_bytes).unwrap();
-    assert!(repo.join(".artifacts").join("mymodel_v1.lma").exists(), "F10a must keep the artifact");
+    assert!(
+        repo.join(".artifacts").join("mymodel_v1.lma").exists(),
+        "F10a must keep the artifact"
+    );
 
     // Without force → 409 (an active version exists).
     let client = reqwest::Client::new();
@@ -1004,7 +1172,11 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
         .expect("model delete request failed");
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert_eq!(status, 409, "model delete with active version must 409: {}", body);
+    assert_eq!(
+        status, 409,
+        "model delete with active version must 409: {}",
+        body
+    );
 
     // With force → 200; everything gone.
     let resp = client
@@ -1016,19 +1188,29 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "forced model delete failed: {}", body);
 
-    assert!(!repo.join("mymodel").exists(), "model directory must be gone");
+    assert!(
+        !repo.join("mymodel").exists(),
+        "model directory must be gone"
+    );
     assert!(
         !repo.join(".artifacts").join("mymodel_v1.lma").exists(),
         "linked .artifacts copy must be gone"
     );
-    assert!(!repo.join("mymodel_v1.lma").exists(), "linked root .lma must be gone");
+    assert!(
+        !repo.join("mymodel_v1.lma").exists(),
+        "linked root .lma must be gone"
+    );
 
     let lv = client
         .get(format!("{}/v2/models/mymodel/versions", base))
         .send()
         .await
         .unwrap();
-    assert_eq!(lv.status(), 404, "list_versions must 404 after model delete");
+    assert_eq!(
+        lv.status(),
+        404,
+        "list_versions must 404 after model delete"
+    );
 
     let idx = client
         .post(format!("{}/v2/repository/index", base))
@@ -1048,10 +1230,8 @@ async fn test_delete_model_removes_directory_and_linked_artifacts() {
 /// downloaded artifact → files land without nesting and match the originals.
 #[tokio::test]
 async fn test_lma_upload_download_reupload_round_trip() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-lma-loop-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-lma-loop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -1061,7 +1241,11 @@ async fn test_lma_upload_download_reupload_round_trip() {
     let v1 = src.join("1");
     std::fs::create_dir_all(&v1).unwrap();
     std::fs::write(v1.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v1.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
     let lma = pack_lma(&src, "1", &tmp);
     let lma_bytes = std::fs::read(&lma).unwrap();
 
@@ -1072,12 +1256,22 @@ async fn test_lma_upload_download_reupload_round_trip() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    let resp = upload_files(&base, "mymodel", "1", false, &[("mymodel_v1.lma", &lma_bytes)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        false,
+        &[("mymodel_v1.lma", &lma_bytes)],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "first upload failed: {}", body);
     assert!(repo.join("mymodel").join("1").join("model.py").exists());
-    assert!(!repo.join("mymodel").join("1").join("1").exists(), "no nesting after upload");
+    assert!(
+        !repo.join("mymodel").join("1").join("1").exists(),
+        "no nesting after upload"
+    );
 
     // Download the whole version as .lma (repacked — F10b serves the
     // original only in a later step).
@@ -1099,15 +1293,30 @@ async fn test_lma_upload_download_reupload_round_trip() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "delete failed: {}", body);
 
-    let resp = upload_files(&base, "mymodel", "1", false, &[("mymodel_v1.lma", downloaded.as_ref())]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        false,
+        &[("mymodel_v1.lma", downloaded.as_ref())],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert_eq!(status, 200, "re-upload of downloaded artifact failed: {}", body);
+    assert_eq!(
+        status, 200,
+        "re-upload of downloaded artifact failed: {}",
+        body
+    );
 
     // Still no nesting, and the content survived the full loop.
     assert!(repo.join("mymodel").join("1").join("model.py").exists());
-    assert!(!repo.join("mymodel").join("1").join("1").exists(), "no nesting after re-upload");
-    let re_uploaded = std::fs::read_to_string(repo.join("mymodel").join("1").join("model.py")).unwrap();
+    assert!(
+        !repo.join("mymodel").join("1").join("1").exists(),
+        "no nesting after re-upload"
+    );
+    let re_uploaded =
+        std::fs::read_to_string(repo.join("mymodel").join("1").join("model.py")).unwrap();
     assert_eq!(re_uploaded, MODEL_PY, "content must survive the round trip");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1117,10 +1326,8 @@ async fn test_lma_upload_download_reupload_round_trip() {
 /// and ?load=true must bring the model up ready.
 #[tokio::test]
 async fn test_model_level_upload_lma_loads_model() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-ml-upload-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-ml-upload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -1130,7 +1337,11 @@ async fn test_model_level_upload_lma_loads_model() {
     let v2 = src.join("2");
     std::fs::create_dir_all(&v2).unwrap();
     std::fs::write(v2.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v2.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v2.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
     let lma = pack_lma(&src, "2", &tmp);
     let lma_bytes = std::fs::read(&lma).unwrap();
 
@@ -1144,7 +1355,10 @@ async fn test_model_level_upload_lma_loads_model() {
     let boundary = "----ml-upload-boundary";
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v2/repository/models/mymodel/upload?load=true", base))
+        .post(format!(
+            "{}/v2/repository/models/mymodel/upload?load=true",
+            base
+        ))
         .header(
             "content-type",
             format!("multipart/form-data; boundary={}", boundary),
@@ -1158,11 +1372,20 @@ async fn test_model_level_upload_lma_loads_model() {
     assert_eq!(status, 200, "model-level upload failed: {}", body);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], "2", "version must come from the manifest");
-    assert_eq!(json["loaded"], true, "load=true must report the real outcome");
+    assert_eq!(
+        json["loaded"], true,
+        "load=true must report the real outcome"
+    );
 
     assert!(repo.join("mymodel").join("2").join("model.py").exists());
-    assert!(!repo.join("mymodel").join("2").join("2").exists(), "no nesting");
-    assert!(wait_until_ready(&base, "mymodel", "2", 30).await, "uploaded model must become ready");
+    assert!(
+        !repo.join("mymodel").join("2").join("2").exists(),
+        "no nesting"
+    );
+    assert!(
+        wait_until_ready(&base, "mymodel", "2", 30).await,
+        "uploaded model must become ready"
+    );
 
     let infer = client
         .post(format!("{}/v2/models/mymodel/infer", base))
@@ -1181,10 +1404,7 @@ async fn test_model_level_upload_lma_loads_model() {
 /// (read-only; detailed semantics covered by mod tests).
 #[tokio::test]
 async fn test_drift_endpoint_returns_empty_groups_on_fresh_repo() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-drift-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("lite-server-repo-drift-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -1236,7 +1456,11 @@ async fn test_delete_model_nonexistent_is_idempotent() {
         .send()
         .await
         .expect("model delete request failed");
-    assert_eq!(resp.status(), 200, "delete of nonexistent model must succeed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "delete of nonexistent model must succeed"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -1264,7 +1488,11 @@ async fn test_delete_nonexistent_version_is_idempotent() {
         let resp = delete_version(&base, "ghost", "9", false).await;
         let status = resp.status();
         let body = resp.text().await.unwrap();
-        assert_eq!(status, 200, "delete of nonexistent version must succeed: {}", body);
+        assert_eq!(
+            status, 200,
+            "delete of nonexistent version must succeed: {}",
+            body
+        );
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1275,10 +1503,8 @@ async fn test_delete_nonexistent_version_is_idempotent() {
 /// to load.
 #[tokio::test]
 async fn test_delete_in_auto_mode_does_not_resurrect() {
-    let tmp = std::env::temp_dir().join(format!(
-        "lite-server-repo-del-auto-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("lite-server-repo-del-auto-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let repo = tmp.join("repo");
@@ -1289,7 +1515,11 @@ async fn test_delete_in_auto_mode_does_not_resurrect() {
     let v1 = repo.join("mymodel").join("1");
     std::fs::create_dir_all(&v1).unwrap();
     std::fs::write(v1.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v1.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
 
     let port = next_test_port();
     kill_stale_servers(port);
@@ -1298,14 +1528,20 @@ async fn test_delete_in_auto_mode_does_not_resurrect() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "watcher must load the model");
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "watcher must load the model"
+    );
 
     // The watcher auto-activates the first loaded version — E3 needs force.
     let resp = delete_version(&base, "mymodel", "1", true).await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "delete failed: {}", body);
-    assert!(!repo.join("mymodel").join("1").exists(), "version dir must be deleted");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "version dir must be deleted"
+    );
 
     // Wait several poll ticks (interval = 1s) — the watcher must not
     // resurrect the deleted version.
@@ -1317,8 +1553,14 @@ async fn test_delete_in_auto_mode_does_not_resurrect() {
         .await
         .unwrap();
     let ready_json: serde_json::Value = ready.json().await.unwrap();
-    assert_eq!(ready_json["ready"], false, "watcher must not resurrect the deleted version");
-    assert!(!repo.join("mymodel").join("1").exists(), "dir must not reappear");
+    assert_eq!(
+        ready_json["ready"], false,
+        "watcher must not resurrect the deleted version"
+    );
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "dir must not reappear"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -1343,7 +1585,11 @@ async fn test_delete_version_removes_linked_artifacts_and_survives_restart() {
     let v1 = src.join("1");
     std::fs::create_dir_all(&v1).unwrap();
     std::fs::write(v1.join("model.py"), MODEL_PY).unwrap();
-    std::fs::write(v1.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+    std::fs::write(
+        v1.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\n",
+    )
+    .unwrap();
     let lma = pack_lma(&src, "1", &tmp);
     let lma_bytes = std::fs::read(&lma).unwrap();
 
@@ -1354,12 +1600,25 @@ async fn test_delete_version_removes_linked_artifacts_and_survives_restart() {
     wait_for_server(port, 30).await;
 
     let base = format!("http://127.0.0.1:{}", port);
-    let resp = upload_files(&base, "mymodel", "1", true, &[("mymodel_v1.lma", &lma_bytes)]).await;
+    let resp = upload_files(
+        &base,
+        "mymodel",
+        "1",
+        true,
+        &[("mymodel_v1.lma", &lma_bytes)],
+    )
+    .await;
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert!(status.is_success(), "upload failed: {}", body);
-    assert!(wait_until_ready(&base, "mymodel", "1", 30).await, "model must be ready");
-    assert!(repo.join(".artifacts").join("mymodel_v1.lma").exists(), "F10a must keep the original artifact");
+    assert!(
+        wait_until_ready(&base, "mymodel", "1", 30).await,
+        "model must be ready"
+    );
+    assert!(
+        repo.join(".artifacts").join("mymodel_v1.lma").exists(),
+        "F10a must keep the original artifact"
+    );
 
     // Simulate an ops-placed artifact at the repo root (explicit mode has
     // no reconcile task, so it stays put while this server runs).
@@ -1371,7 +1630,10 @@ async fn test_delete_version_removes_linked_artifacts_and_survives_restart() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "delete failed: {}", body);
 
-    assert!(!repo.join("mymodel").join("1").exists(), "version dir must be deleted");
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "version dir must be deleted"
+    );
     // G5: linked cleanup — RED until implemented.
     assert!(
         !repo.join("mymodel_v1.lma").exists(),
@@ -1401,8 +1663,14 @@ async fn test_delete_version_removes_linked_artifacts_and_survives_restart() {
         .await
         .unwrap();
     let ready_json: serde_json::Value = ready.json().await.unwrap();
-    assert_eq!(ready_json["ready"], false, "deleted version must not resurrect after restart");
-    assert!(!repo.join("mymodel").join("1").exists(), "version dir must not reappear after restart");
+    assert_eq!(
+        ready_json["ready"], false,
+        "deleted version must not resurrect after restart"
+    );
+    assert!(
+        !repo.join("mymodel").join("1").exists(),
+        "version dir must not reappear after restart"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

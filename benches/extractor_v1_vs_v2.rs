@@ -147,12 +147,20 @@ fn bench_extractor(c: &mut Criterion) {
     for (label, size) in sizes {
         let body = Bytes::from(json_payload(size));
         group.throughput(Throughput::Bytes(body.len() as u64));
-        group.bench_with_input(BenchmarkId::new("v1_value_round_trip", label), &body, |b, body| {
-            b.iter(|| v1_round_trip(body));
-        });
-        group.bench_with_input(BenchmarkId::new("v2_rawvalue_forward", label), &body, |b, body| {
-            b.iter(|| v2_validate_forward(body));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("v1_value_round_trip", label),
+            &body,
+            |b, body| {
+                b.iter(|| v1_round_trip(body));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("v2_rawvalue_forward", label),
+            &body,
+            |b, body| {
+                b.iter(|| v2_validate_forward(body));
+            },
+        );
     }
     group.finish();
 
@@ -177,8 +185,7 @@ fn bench_extractor(c: &mut Criterion) {
 
     // 阶段 2(批次 2):T2 信封判定成本门禁——< 2× 既有 &RawValue 校验。
     let mut t2 = c.benchmark_group("t2_envelope");
-    t2
-        .sample_size(20)
+    t2.sample_size(20)
         .warm_up_time(std::time::Duration::from_secs(1))
         .measurement_time(std::time::Duration::from_secs(4));
     for (label, size) in sizes {
@@ -219,7 +226,11 @@ fn bench_extractor(c: &mut Criterion) {
 
     // Allocation-count report (separate from criterion timing).
     println!("\n=== allocations per call (warm) ===");
-    for (label, size) in [("1KiB", 1usize << 10), ("1MiB", 1usize << 20), ("8MiB", 8usize << 20)] {
+    for (label, size) in [
+        ("1KiB", 1usize << 10),
+        ("1MiB", 1usize << 20),
+        ("8MiB", 8usize << 20),
+    ] {
         let body = Bytes::from(json_payload(size));
         let v1 = allocs_per_call(|| v1_round_trip(&body), 10);
         let v2 = allocs_per_call(|| v2_validate_forward(&body), 10);

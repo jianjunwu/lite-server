@@ -476,9 +476,12 @@ lazy_static! {
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
 // since the critical section is a brief HashMap lookup/insert (no async needed).
 lazy_static! {
-    static ref CUSTOM_COUNTERS: std::sync::Mutex<HashMap<String, CounterVec>> = std::sync::Mutex::new(HashMap::new());
-    static ref CUSTOM_GAUGES: std::sync::Mutex<HashMap<String, GaugeVec>> = std::sync::Mutex::new(HashMap::new());
-    static ref CUSTOM_HISTOGRAMS: std::sync::Mutex<HashMap<String, HistogramVec>> = std::sync::Mutex::new(HashMap::new());
+    static ref CUSTOM_COUNTERS: std::sync::Mutex<HashMap<String, CounterVec>> =
+        std::sync::Mutex::new(HashMap::new());
+    static ref CUSTOM_GAUGES: std::sync::Mutex<HashMap<String, GaugeVec>> =
+        std::sync::Mutex::new(HashMap::new());
+    static ref CUSTOM_HISTOGRAMS: std::sync::Mutex<HashMap<String, HistogramVec>> =
+        std::sync::Mutex::new(HashMap::new());
 }
 
 // Pre-allocated custom metric objects, indexed by numeric ID (from register_metric).
@@ -580,7 +583,8 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_RSS_BYTES.clone()))?;
     REGISTRY.register(Box::new(WORKER_VIRT_BYTES.clone()))?;
     REGISTRY.register(Box::new(WORKERS_RSS_BYTES.clone()))?;
-    INFO.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1.0);
+    INFO.with_label_values(&[env!("CARGO_PKG_VERSION")])
+        .set(1.0);
     REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
     // M4: vendor-neutral accelerator families (fixed names, device+accel
     // labels; empty until a worker reports — registration is ungated, the
@@ -747,7 +751,11 @@ fn worker_registry_insert(
 /// (same worker_id overwrites the stale PID).
 pub fn set_worker_pid(model: &str, version: &str, worker_id: u32, pid: u32) {
     let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
-    let key: WorkerKey = (model.to_string(), version.to_string(), worker_id.to_string());
+    let key: WorkerKey = (
+        model.to_string(),
+        version.to_string(),
+        worker_id.to_string(),
+    );
     let entry = WorkerPidEntry {
         pid: sysinfo::Pid::from(pid as usize),
         start_time: None,
@@ -792,13 +800,14 @@ struct ProcessSamplerState {
 }
 
 lazy_static! {
-    static ref PROCESS_SAMPLER: std::sync::Mutex<ProcessSamplerState> = std::sync::Mutex::new(ProcessSamplerState {
-        system: sysinfo::System::new(),
-        pid: sysinfo::Pid::from(std::process::id() as usize),
-        last_cpu_ms: 0,
-        primed: false,
-        worker_pids: HashMap::new(),
-    });
+    static ref PROCESS_SAMPLER: std::sync::Mutex<ProcessSamplerState> =
+        std::sync::Mutex::new(ProcessSamplerState {
+            system: sysinfo::System::new(),
+            pid: sysinfo::Pid::from(std::process::id() as usize),
+            last_cpu_ms: 0,
+            primed: false,
+            worker_pids: HashMap::new(),
+        });
 }
 
 /// Refresh process metrics from sysinfo. Called by `gather_metrics` on every
@@ -823,7 +832,8 @@ pub fn refresh_process_metrics() {
             pids.push(entry.pid);
         }
     }
-    st.system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+    st.system
+        .refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
     if let Some(p) = st.system.process(pid) {
         let (rss, virt, start, cpu_ms, n_tasks) = (
             p.memory(),
@@ -847,7 +857,11 @@ pub fn refresh_process_metrics() {
 
     // Worker sampling. Destructure the guard for disjoint field borrows:
     // iterate worker_pids mutably, read system immutably.
-    let ProcessSamplerState { system, worker_pids, .. } = &mut *st;
+    let ProcessSamplerState {
+        system,
+        worker_pids,
+        ..
+    } = &mut *st;
     let mut dead: Vec<WorkerKey> = Vec::new();
     let mut sums: HashMap<(String, String), u64> = HashMap::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
@@ -902,8 +916,12 @@ pub fn record_request_start(_model: &str, _version: &str) {
 }
 
 pub fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
-    REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
-    REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
+    REQUESTS_TOTAL
+        .with_label_values(&[model, version, status])
+        .inc();
+    REQUEST_DURATION
+        .with_label_values(&[model, version])
+        .observe(duration_secs);
     super::aggregator::TIMELINE.record_latency(model, version, duration_secs);
     // P-TRACE C4: OTel metrics overlay (no-op unless telemetry.metrics_enabled +
     // feature). Exemplar-ready plumbing; opentelemetry_sdk 0.30 stubs exemplars.
@@ -943,7 +961,9 @@ pub fn record_request_body_bytes(content_type: &str, route: &str, size_bytes: us
 // ===== Outlier detection metrics =====
 
 pub fn inc_worker_ejection(model: &str, version: &str) {
-    WORKER_EJECTIONS_TOTAL.with_label_values(&[model, version]).inc();
+    WORKER_EJECTIONS_TOTAL
+        .with_label_values(&[model, version])
+        .inc();
 }
 
 pub fn inc_retry(model: &str, version: &str) {
@@ -995,17 +1015,23 @@ fn mirror_gie_queued(model: &str, version: &str, delta: f64) {
 
 /// 排队等待时长采样（提交 → 首次派发）。
 pub fn observe_queue_wait(model: &str, version: &str, secs: f64) {
-    QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).observe(secs);
+    QUEUE_WAIT_SECONDS
+        .with_label_values(&[model, version])
+        .observe(secs);
 }
 
 /// Worker 饱和度（最热 worker 的并发 in-flight batch 数）。
 pub fn set_worker_saturation(model: &str, version: &str, value: f64) {
-    WORKER_SATURATION.with_label_values(&[model, version]).set(value);
+    WORKER_SATURATION
+        .with_label_values(&[model, version])
+        .set(value);
 }
 
 /// 已接受未完成请求数（in_flight_requests）增减。
 pub fn inc_in_flight(model: &str, version: &str) {
-    IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).inc();
+    IN_FLIGHT_REQUESTS
+        .with_label_values(&[model, version])
+        .inc();
 }
 
 pub fn dec_in_flight(model: &str, version: &str) {
@@ -1018,7 +1044,9 @@ pub fn dec_in_flight(model: &str, version: &str) {
 
 pub fn record_model_load(model: &str, version: &str, success: bool) {
     let status = if success { "success" } else { "fail" };
-    MODEL_LOAD_TOTAL.with_label_values(&[model, version, "load", status]).inc();
+    MODEL_LOAD_TOTAL
+        .with_label_values(&[model, version, "load", status])
+        .inc();
 }
 
 /// G6: terminal status of a warmup run — the closed label set of
@@ -1079,11 +1107,15 @@ pub fn record_model_reload_restore(model: &str, version: &str, status: ReloadRes
 }
 
 pub fn record_model_unload(model: &str, version: &str) {
-    MODEL_LOAD_TOTAL.with_label_values(&[model, version, "unload", "success"]).inc();
+    MODEL_LOAD_TOTAL
+        .with_label_values(&[model, version, "unload", "success"])
+        .inc();
 }
 
 pub fn set_active_workers(model: &str, version: &str, count: f64) {
-    ACTIVE_WORKERS.with_label_values(&[model, version]).set(count);
+    ACTIVE_WORKERS
+        .with_label_values(&[model, version])
+        .set(count);
 }
 
 /// P10 (D40): reflect the global streaming-DAG semaphore's in-use count.
@@ -1114,7 +1146,9 @@ pub fn record_ensemble_pipeline_channel_saturation_seconds(secs: f64) {
 }
 
 pub fn set_version_weight(model: &str, version: &str, weight: f64) {
-    VERSION_WEIGHT.with_label_values(&[model, version]).set(weight);
+    VERSION_WEIGHT
+        .with_label_values(&[model, version])
+        .set(weight);
 }
 
 pub fn remove_version_weight(model: &str, version: &str) {
@@ -1180,37 +1214,145 @@ pub fn remove_version_metrics(model: &str, version: &str) {
             }
         };
     }
-    purge!(REQUESTS_TOTAL, "liteserver_requests_total", ["model", "version", "status"]);
-    purge!(REQUEST_DURATION, "liteserver_request_duration_seconds", ["model", "version"]);
+    purge!(
+        REQUESTS_TOTAL,
+        "liteserver_requests_total",
+        ["model", "version", "status"]
+    );
+    purge!(
+        REQUEST_DURATION,
+        "liteserver_request_duration_seconds",
+        ["model", "version"]
+    );
     purge!(QUEUE_DEPTH, "liteserver_queue_depth", ["model", "version"]);
-    purge!(ACTIVE_WORKERS, "liteserver_active_workers", ["model", "version"]);
-    purge!(WORKER_EJECTIONS_TOTAL, "liteserver_worker_ejections_total", ["model", "version"]);
-    purge!(RETRIES_TOTAL, "liteserver_retries_total", ["model", "version"]);
-    purge!(STREAMING_CONNECTIONS, "liteserver_streaming_connections", ["model", "version", "protocol"]);
-    purge!(STREAMING_TTFT, "liteserver_streaming_ttft_seconds", ["model", "version", "protocol"]);
-    purge!(STREAMING_TBT, "liteserver_streaming_tbt_seconds", ["model", "version", "protocol"]);
-    purge!(STREAMING_CHUNKS_TOTAL, "liteserver_streaming_chunks_total", ["model", "version", "protocol"]);
-    purge!(STREAM_CANCELLED_TOTAL, "liteserver_stream_cancelled_total", ["model", "version", "protocol"]);
-    purge!(STREAM_ERRORS_TOTAL, "liteserver_stream_errors_total", ["model", "version", "stream_kind", "kind"]);
-    purge!(STREAM_DURATION_SECONDS, "liteserver_stream_duration_seconds", ["model", "version", "stream_kind"]);
-    purge!(STREAM_OUTPUT_BYTES_TOTAL, "liteserver_stream_output_bytes_total", ["model", "version", "stream_kind"]);
-    purge!(STREAM_REJECTED_TOTAL, "liteserver_stream_rejected_total", ["model", "version", "reason"]);
-    purge!(HEALTH_CHECK_TOTAL, "liteserver_health_check_total", ["model", "version", "result"]);
-    purge!(WORKER_HEALTH_STATUS, "liteserver_worker_health_status", ["model", "version", "worker_id"]);
-    purge!(WORKER_RSS_BYTES, "liteserver_worker_resident_memory_bytes", ["model", "version", "worker_id"]);
-    purge!(WORKER_VIRT_BYTES, "liteserver_worker_virtual_memory_bytes", ["model", "version", "worker_id"]);
-    purge!(WORKERS_RSS_BYTES, "liteserver_workers_resident_memory_bytes", ["model", "version"]);
-    purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
-    purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
-    purge!(WORKER_RESPAWN_FAILURES_TOTAL, "liteserver_worker_respawn_failures_total", ["model", "version", "reason"]);
-    purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
-    purge!(QUEUE_WAIT_SECONDS, "liteserver_queue_wait_seconds", ["model", "version"]);
-    purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);
-    purge!(INFERENCE_DURATION, "liteserver_inference_duration_seconds", ["model", "version"]);
+    purge!(
+        ACTIVE_WORKERS,
+        "liteserver_active_workers",
+        ["model", "version"]
+    );
+    purge!(
+        WORKER_EJECTIONS_TOTAL,
+        "liteserver_worker_ejections_total",
+        ["model", "version"]
+    );
+    purge!(
+        RETRIES_TOTAL,
+        "liteserver_retries_total",
+        ["model", "version"]
+    );
+    purge!(
+        STREAMING_CONNECTIONS,
+        "liteserver_streaming_connections",
+        ["model", "version", "protocol"]
+    );
+    purge!(
+        STREAMING_TTFT,
+        "liteserver_streaming_ttft_seconds",
+        ["model", "version", "protocol"]
+    );
+    purge!(
+        STREAMING_TBT,
+        "liteserver_streaming_tbt_seconds",
+        ["model", "version", "protocol"]
+    );
+    purge!(
+        STREAMING_CHUNKS_TOTAL,
+        "liteserver_streaming_chunks_total",
+        ["model", "version", "protocol"]
+    );
+    purge!(
+        STREAM_CANCELLED_TOTAL,
+        "liteserver_stream_cancelled_total",
+        ["model", "version", "protocol"]
+    );
+    purge!(
+        STREAM_ERRORS_TOTAL,
+        "liteserver_stream_errors_total",
+        ["model", "version", "stream_kind", "kind"]
+    );
+    purge!(
+        STREAM_DURATION_SECONDS,
+        "liteserver_stream_duration_seconds",
+        ["model", "version", "stream_kind"]
+    );
+    purge!(
+        STREAM_OUTPUT_BYTES_TOTAL,
+        "liteserver_stream_output_bytes_total",
+        ["model", "version", "stream_kind"]
+    );
+    purge!(
+        STREAM_REJECTED_TOTAL,
+        "liteserver_stream_rejected_total",
+        ["model", "version", "reason"]
+    );
+    purge!(
+        HEALTH_CHECK_TOTAL,
+        "liteserver_health_check_total",
+        ["model", "version", "result"]
+    );
+    purge!(
+        WORKER_HEALTH_STATUS,
+        "liteserver_worker_health_status",
+        ["model", "version", "worker_id"]
+    );
+    purge!(
+        WORKER_RSS_BYTES,
+        "liteserver_worker_resident_memory_bytes",
+        ["model", "version", "worker_id"]
+    );
+    purge!(
+        WORKER_VIRT_BYTES,
+        "liteserver_worker_virtual_memory_bytes",
+        ["model", "version", "worker_id"]
+    );
+    purge!(
+        WORKERS_RSS_BYTES,
+        "liteserver_workers_resident_memory_bytes",
+        ["model", "version"]
+    );
+    purge!(
+        WORKER_INFERENCE_TOTAL,
+        "liteserver_worker_inference_total",
+        ["model", "version", "worker_id"]
+    );
+    purge!(
+        WORKER_RESPAWNS_TOTAL,
+        "liteserver_worker_respawns_total",
+        ["model", "version", "reason"]
+    );
+    purge!(
+        WORKER_RESPAWN_FAILURES_TOTAL,
+        "liteserver_worker_respawn_failures_total",
+        ["model", "version", "reason"]
+    );
+    purge!(
+        IN_FLIGHT_REQUESTS,
+        "liteserver_in_flight_requests",
+        ["model", "version"]
+    );
+    purge!(
+        QUEUE_WAIT_SECONDS,
+        "liteserver_queue_wait_seconds",
+        ["model", "version"]
+    );
+    purge!(
+        WORKER_SATURATION,
+        "liteserver_worker_saturation",
+        ["model", "version"]
+    );
+    purge!(
+        INFERENCE_DURATION,
+        "liteserver_inference_duration_seconds",
+        ["model", "version"]
+    );
     purge!(BATCH_SIZE, "liteserver_batch_size", ["model", "version"]);
     // M8: sub-model unload ages out its ensemble step-latency series
     // (ensemble/step/depth values enumerated via gather).
-    purge!(ENSEMBLE_STEP_LATENCY, "liteserver_ensemble_step_latency_seconds", ["ensemble", "step", "model", "version", "depth"]);
+    purge!(
+        ENSEMBLE_STEP_LATENCY,
+        "liteserver_ensemble_step_latency_seconds",
+        ["ensemble", "step", "model", "version", "depth"]
+    );
     // GIE TotalQueuedRequests mirror (namespace-configurable name — clean via
     // the registered vecs directly, not gather).
     let guard = GIE_TOTAL_QUEUED_REQUESTS
@@ -1226,27 +1368,63 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     // A late in-flight Done frame may re-create one series via
     // with_label_values after the purge; the stream is terminal, so it never
     // grows beyond that single series.
-    for vec in CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_GAUGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_HISTOGRAMS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_HISTOGRAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_GAUGE_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_COUNTER_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_HISTOGRAM_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    purge!(MODEL_WARMUP_TOTAL, "liteserver_model_warmup_total", ["model", "version", "status"]);
-    purge!(MODEL_WARMUP_DURATION, "liteserver_model_warmup_duration_seconds", ["model", "version"]);
-    purge!(MODEL_RELOAD_RESTORE_TOTAL, "liteserver_model_reload_restore_total", ["model", "version", "status"]);
+    purge!(
+        MODEL_WARMUP_TOTAL,
+        "liteserver_model_warmup_total",
+        ["model", "version", "status"]
+    );
+    purge!(
+        MODEL_WARMUP_DURATION,
+        "liteserver_model_warmup_duration_seconds",
+        ["model", "version"]
+    );
+    purge!(
+        MODEL_RELOAD_RESTORE_TOTAL,
+        "liteserver_model_reload_restore_total",
+        ["model", "version", "status"]
+    );
     // B16: routing history ages out for the unloaded version — purge
     // VERSION_SWITCHES_TOTAL series whose from OR to names it (the standard
     // purge's model+version filter can't match its label shape). Series
@@ -1286,22 +1464,46 @@ pub fn remove_version_metrics(model: &str, version: &str) {
 /// observability, but its custom FAMILY OBJECTS and refs must not leak
 /// (a Failed version never sees the unload-time purge).
 pub(crate) fn remove_custom_version_metrics(model: &str, version: &str) {
-    for vec in CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_GAUGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_COUNTERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_HISTOGRAMS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+    for vec in CUSTOM_HISTOGRAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_GAUGE_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_COUNTER_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
-    for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for vec in CUSTOM_HISTOGRAM_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         let _ = vec.remove_label_values(&[model, version]);
     }
     deregister_unreferenced_custom_families(model, version);
@@ -1321,14 +1523,25 @@ pub(crate) fn custom_family_registered_for_test(key: &str) -> bool {
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {
-    VERSION_SWITCHES_TOTAL.with_label_values(&[model, from, to]).inc();
+    VERSION_SWITCHES_TOTAL
+        .with_label_values(&[model, from, to])
+        .inc();
 }
 
 // ===== Ensemble metrics =====
 
-pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, version: &str, depth: u32, latency_secs: f64) {
+pub fn record_ensemble_step_latency(
+    ensemble: &str,
+    step: &str,
+    model: &str,
+    version: &str,
+    depth: u32,
+    latency_secs: f64,
+) {
     let depth_str = depth.to_string();
-    ENSEMBLE_STEP_LATENCY.with_label_values(&[ensemble, step, model, version, &depth_str]).observe(latency_secs);
+    ENSEMBLE_STEP_LATENCY
+        .with_label_values(&[ensemble, step, model, version, &depth_str])
+        .observe(latency_secs);
 }
 
 // ===== Streaming metrics =====
@@ -1346,8 +1559,16 @@ pub fn record_http_connection_close(transport: &str) {
 
 /// `stream_id`/`decoupled` 仅用于 G5 生命周期日志(metrics label 不含)。
 /// 门控继承:调用点都在 `if stream_metrics` 内。
-pub fn record_stream_open(model: &str, version: &str, protocol: &str, stream_id: &str, decoupled: bool) {
-    STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).inc();
+pub fn record_stream_open(
+    model: &str,
+    version: &str,
+    protocol: &str,
+    stream_id: &str,
+    decoupled: bool,
+) {
+    STREAMING_CONNECTIONS
+        .with_label_values(&[model, version, protocol])
+        .inc();
     // G5:流 open 生命周期事件。
     tracing::info!(
         model,
@@ -1360,14 +1581,18 @@ pub fn record_stream_open(model: &str, version: &str, protocol: &str, stream_id:
 }
 
 pub fn record_stream_chunk(model: &str, version: &str, protocol: &str) {
-    STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).inc();
+    STREAMING_CHUNKS_TOTAL
+        .with_label_values(&[model, version, protocol])
+        .inc();
     // G2:OTel 流式镜像(双重门控:调用点在 streaming_metrics 内,OTel 侧
     // metrics_enabled 关时 meter 为 no-op)。
     crate::telemetry::record_stream_chunks(protocol, 1);
 }
 
 pub fn record_stream_close(model: &str, version: &str, protocol: &str) {
-    STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).dec();
+    STREAMING_CONNECTIONS
+        .with_label_values(&[model, version, protocol])
+        .dec();
 }
 
 // ===== S1/S2 (批次 1):流收口统一记录 =====
@@ -1408,8 +1633,7 @@ impl StreamCloseReason {
     /// 是服务端故障,不得在指标上与正常结束(Done)混淆。
     pub fn status_family(self) -> &'static str {
         match self {
-            StreamCloseReason::Done
-            | StreamCloseReason::Cancel => "2xx",
+            StreamCloseReason::Done | StreamCloseReason::Cancel => "2xx",
             StreamCloseReason::Error
             | StreamCloseReason::Deadline
             | StreamCloseReason::Idle
@@ -1476,15 +1700,9 @@ pub fn record_stream_terminal(
         "stream closed"
     );
     if let Some(kind) = reason.error_kind() {
-        tracing::warn!(
-            model, version, stream_kind, kind,
-            "stream ended with error"
-        );
+        tracing::warn!(model, version, stream_kind, kind, "stream ended with error");
     } else if reason == StreamCloseReason::Cancel {
-        tracing::warn!(
-            model, version, protocol,
-            "stream cancelled by client"
-        );
+        tracing::warn!(model, version, protocol, "stream cancelled by client");
     }
     if streaming_metrics {
         if reason == StreamCloseReason::Cancel {
@@ -1515,9 +1733,17 @@ pub fn record_stream_terminal(
 /// family 由调用方按 `AppError::http_status` 映射;version 未解析时传请求
 /// 原值(可为空串)。与 close 收口互斥——open 失败不会抵达收口点,无重复计数。
 /// Round2 A6:同时记专属 counter(reason 有界:concurrency_limit|early_reject)。
-pub fn record_stream_rejected(model: &str, version: &str, family: &str, duration_secs: f64, reason: &'static str) {
+pub fn record_stream_rejected(
+    model: &str,
+    version: &str,
+    family: &str,
+    duration_secs: f64,
+    reason: &'static str,
+) {
     record_request_end(model, version, family, duration_secs);
-    STREAM_REJECTED_TOTAL.with_label_values(&[model, version, reason]).inc();
+    STREAM_REJECTED_TOTAL
+        .with_label_values(&[model, version, reason])
+        .inc();
 }
 
 // Pre-defined worker metrics (liteserver compatible)
@@ -1526,32 +1752,42 @@ lazy_static! {
         HistogramOpts::new(
             "liteserver_inference_duration_seconds",
             "Worker round-trip latency (queue dispatch → response)"
-        ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+        )
+        .buckets(vec![
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        ]),
         &["model", "version"]
-    ).unwrap();
-
+    )
+    .unwrap();
     pub static ref BATCH_SIZE: HistogramVec = HistogramVec::new(
-        HistogramOpts::new(
-            "liteserver_batch_size",
-            "Actual batch size processed"
-        ).buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
+        HistogramOpts::new("liteserver_batch_size", "Actual batch size processed")
+            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
         &["model", "version"]
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 pub fn observe_inference_duration(model: &str, version: &str, secs: f64) {
-    INFERENCE_DURATION.with_label_values(&[model, version]).observe(secs);
+    INFERENCE_DURATION
+        .with_label_values(&[model, version])
+        .observe(secs);
 }
 
 pub fn observe_batch_size(model: &str, version: &str, size: usize) {
-    BATCH_SIZE.with_label_values(&[model, version]).observe(size as f64);
+    BATCH_SIZE
+        .with_label_values(&[model, version])
+        .observe(size as f64);
 }
 
 // ===== Custom metrics from Python workers =====
 
 /// Record metrics reported by a Python worker, tagged by the serving
 /// (model, version) of the response (§4.6).
-pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
+pub fn record_worker_metrics(
+    model: &str,
+    version: &str,
+    metrics: Option<&crate::proto::liteserver::Metrics>,
+) {
     if let Some(m) = metrics {
         if m.prefill_ms > 0.0 {
             let mut guard = CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1559,11 +1795,14 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
                     &["model", "version"],
-                ).unwrap();
+                )
+                .unwrap();
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            gauge.with_label_values(&[model, version]).set(m.prefill_ms as f64);
+            gauge
+                .with_label_values(&[model, version])
+                .set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
             let mut guard = CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1571,23 +1810,34 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
                     &["model", "version"],
-                ).unwrap();
+                )
+                .unwrap();
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            gauge.with_label_values(&[model, version]).set(m.decode_ms as f64);
+            gauge
+                .with_label_values(&[model, version])
+                .set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
             let mut guard = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
-            let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
-                let c = CounterVec::new(
-                    prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
-                    &["model", "version"],
-                ).unwrap();
-                let _ = REGISTRY.register(Box::new(c.clone()));
-                c
-            });
-            counter.with_label_values(&[model, version]).inc_by(m.tokens_generated as f64);
+            let counter = guard
+                .entry("tokens_generated".to_string())
+                .or_insert_with(|| {
+                    let c = CounterVec::new(
+                        prometheus::Opts::new(
+                            "lite_server_tokens_generated_total",
+                            "Total tokens generated",
+                        ),
+                        &["model", "version"],
+                    )
+                    .unwrap();
+                    let _ = REGISTRY.register(Box::new(c.clone()));
+                    c
+                });
+            counter
+                .with_label_values(&[model, version])
+                .inc_by(m.tokens_generated as f64);
         }
         // M4: device-scoped accelerator readings ride the same piggyback
         // channel but are NOT (model, version) tagged — the neutral families
@@ -1613,10 +1863,18 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
     // model_ids); deregister_unreferenced_custom_families takes the same set
     // nested in the same order, so register/deregister are atomic w.r.t.
     // each other.
-    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gauges = CUSTOM_GAUGE_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut counters = CUSTOM_COUNTER_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut index = CUSTOM_METRIC_INDEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
     let mut model_ids = CUSTOM_MODEL_IDS.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1641,7 +1899,8 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                             format!("Custom gauge: {}", name),
                         ),
                         &["model", "version"],
-                    ).unwrap();
+                    )
+                    .unwrap();
                     let _ = REGISTRY.register(Box::new(g.clone()));
                     gauges.push(g);
                     index.insert(key, ("gauge".to_string(), idx));
@@ -1655,7 +1914,8 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                             format!("Custom counter: {}", name),
                         ),
                         &["model", "version"],
-                    ).unwrap();
+                    )
+                    .unwrap();
                     let _ = REGISTRY.register(Box::new(c.clone()));
                     counters.push(c);
                     index.insert(key, ("counter".to_string(), idx));
@@ -1672,7 +1932,8 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
                         ]),
                         &["model", "version"],
-                    ).unwrap();
+                    )
+                    .unwrap();
                     let _ = REGISTRY.register(Box::new(h.clone()));
                     histograms.push(h);
                     index.insert(key, ("histogram".to_string(), idx));
@@ -1704,10 +1965,18 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
 /// index entry. Runs on the unload path only (cold).
 fn deregister_unreferenced_custom_families(model: &str, version: &str) {
     // Canonical lock order: same set, same order as register_custom_metrics.
-    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gauges = CUSTOM_GAUGE_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut counters = CUSTOM_COUNTER_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut index = CUSTOM_METRIC_INDEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
     let mut model_ids = CUSTOM_MODEL_IDS.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1780,8 +2049,16 @@ fn deregister_unreferenced_custom_families(model: &str, version: &str) {
         }
         match mtype.as_str() {
             "gauge" => deregister_object(&mut gauges, &mut index, &mut model_ids, idx, "gauge"),
-            "counter" => deregister_object(&mut counters, &mut index, &mut model_ids, idx, "counter"),
-            "histogram" => deregister_object(&mut histograms, &mut index, &mut model_ids, idx, "histogram"),
+            "counter" => {
+                deregister_object(&mut counters, &mut index, &mut model_ids, idx, "counter")
+            }
+            "histogram" => deregister_object(
+                &mut histograms,
+                &mut index,
+                &mut model_ids,
+                idx,
+                "histogram",
+            ),
             _ => {}
         }
     }
@@ -1809,7 +2086,9 @@ pub fn record_custom_metrics(
         .cloned();
     let Some(ids) = ids else { return };
     if !gauges.is_empty() {
-        let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = CUSTOM_GAUGE_OBJECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for mv in gauges {
             if let Some(&global) = ids.gauges.get(mv.id as usize) {
                 if let Some(g) = guard.get(global) {
@@ -1819,21 +2098,27 @@ pub fn record_custom_metrics(
         }
     }
     if !counters.is_empty() {
-        let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = CUSTOM_COUNTER_OBJECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for mv in counters {
             if let Some(&global) = ids.counters.get(mv.id as usize) {
                 if let Some(c) = guard.get(global) {
-                    c.with_label_values(&[model, version]).inc_by(mv.value as f64);
+                    c.with_label_values(&[model, version])
+                        .inc_by(mv.value as f64);
                 }
             }
         }
     }
     if !histograms.is_empty() {
-        let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = CUSTOM_HISTOGRAM_OBJECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for mv in histograms {
             if let Some(&global) = ids.histograms.get(mv.id as usize) {
                 if let Some(h) = guard.get(global) {
-                    h.with_label_values(&[model, version]).observe(mv.value as f64);
+                    h.with_label_values(&[model, version])
+                        .observe(mv.value as f64);
                 }
             }
         }
@@ -1843,13 +2128,17 @@ pub fn record_custom_metrics(
 // ===== Streaming metric recording functions =====
 
 pub fn record_stream_ttft(model: &str, version: &str, protocol: &str, ttft_secs: f64) {
-    STREAMING_TTFT.with_label_values(&[model, version, protocol]).observe(ttft_secs);
+    STREAMING_TTFT
+        .with_label_values(&[model, version, protocol])
+        .observe(ttft_secs);
     // G2:OTel 镜像。
     crate::telemetry::record_stream_ttft(protocol, ttft_secs);
 }
 
 pub fn record_stream_tbt(model: &str, version: &str, protocol: &str, tbt_secs: f64) {
-    STREAMING_TBT.with_label_values(&[model, version, protocol]).observe(tbt_secs);
+    STREAMING_TBT
+        .with_label_values(&[model, version, protocol])
+        .observe(tbt_secs);
     // G2:OTel 镜像。
     crate::telemetry::record_stream_tbt(protocol, tbt_secs);
 }
@@ -1857,12 +2146,16 @@ pub fn record_stream_tbt(model: &str, version: &str, protocol: &str, tbt_secs: f
 // ===== Health check metric recording functions =====
 
 pub fn inc_health_check(model: &str, version: &str, result: &str) {
-    HEALTH_CHECK_TOTAL.with_label_values(&[model, version, result]).inc();
+    HEALTH_CHECK_TOTAL
+        .with_label_values(&[model, version, result])
+        .inc();
 }
 
 pub fn set_worker_health(model: &str, version: &str, worker_id: usize, healthy: bool) {
     let id_str = worker_id.to_string();
-    WORKER_HEALTH_STATUS.with_label_values(&[model, version, &id_str]).set(if healthy { 1.0 } else { 0.0 });
+    WORKER_HEALTH_STATUS
+        .with_label_values(&[model, version, &id_str])
+        .set(if healthy { 1.0 } else { 0.0 });
 }
 
 /// Per-worker inference dispatch count (P6 GetModelStats). Incremented at every
@@ -1933,9 +2226,13 @@ mod tests {
         let model = "ttft_model";
         let version = "1";
         let protocol = "sse";
-        let before = STREAMING_TTFT.with_label_values(&[model, version, protocol]).get_sample_count();
+        let before = STREAMING_TTFT
+            .with_label_values(&[model, version, protocol])
+            .get_sample_count();
         record_stream_ttft(model, version, protocol, 0.05);
-        let after = STREAMING_TTFT.with_label_values(&[model, version, protocol]).get_sample_count();
+        let after = STREAMING_TTFT
+            .with_label_values(&[model, version, protocol])
+            .get_sample_count();
         assert_eq!(after, before + 1);
     }
 
@@ -1944,9 +2241,13 @@ mod tests {
         let model = "tbt_model";
         let version = "1";
         let protocol = "websocket";
-        let before = STREAMING_TBT.with_label_values(&[model, version, protocol]).get_sample_count();
+        let before = STREAMING_TBT
+            .with_label_values(&[model, version, protocol])
+            .get_sample_count();
         record_stream_tbt(model, version, protocol, 0.01);
-        let after = STREAMING_TBT.with_label_values(&[model, version, protocol]).get_sample_count();
+        let after = STREAMING_TBT
+            .with_label_values(&[model, version, protocol])
+            .get_sample_count();
         assert_eq!(after, before + 1);
     }
 
@@ -1955,9 +2256,13 @@ mod tests {
         let model = "conn_model";
         let version = "1";
         let protocol = "sse";
-        let before = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
+        let before = STREAMING_CONNECTIONS
+            .with_label_values(&[model, version, protocol])
+            .get();
         record_stream_open(model, version, protocol, "test-stream", false);
-        let after = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
+        let after = STREAMING_CONNECTIONS
+            .with_label_values(&[model, version, protocol])
+            .get();
         assert_eq!(after, before + 1.0);
         // cleanup
         record_stream_close(model, version, protocol);
@@ -2016,9 +2321,13 @@ mod tests {
         let model = "chunk_model";
         let version = "1";
         let protocol = "grpc";
-        let before = STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).get();
+        let before = STREAMING_CHUNKS_TOTAL
+            .with_label_values(&[model, version, protocol])
+            .get();
         record_stream_chunk(model, version, protocol);
-        let after = STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).get();
+        let after = STREAMING_CHUNKS_TOTAL
+            .with_label_values(&[model, version, protocol])
+            .get();
         assert_eq!(after, before + 1.0);
     }
 
@@ -2028,9 +2337,15 @@ mod tests {
         record_stream_open("proto_m", "1", "websocket", "test-w", false);
         record_stream_open("proto_m", "1", "grpc", "test-g", false);
 
-        let sse = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "sse"]).get();
-        let ws = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "websocket"]).get();
-        let grpc = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "grpc"]).get();
+        let sse = STREAMING_CONNECTIONS
+            .with_label_values(&["proto_m", "1", "sse"])
+            .get();
+        let ws = STREAMING_CONNECTIONS
+            .with_label_values(&["proto_m", "1", "websocket"])
+            .get();
+        let grpc = STREAMING_CONNECTIONS
+            .with_label_values(&["proto_m", "1", "grpc"])
+            .get();
 
         assert!(sse >= 1.0);
         assert!(ws >= 1.0);
@@ -2067,11 +2382,15 @@ mod tests {
     fn test_register_custom_metrics_and_record() {
         use crate::proto::liteserver::MetricValue;
 
-        register_custom_metrics("rcmr_model", "1", &[
-            ("rcmr_gauge", "gauge"),
-            ("rcmr_counter", "counter"),
-            ("rcmr_histogram", "histogram"),
-        ]);
+        register_custom_metrics(
+            "rcmr_model",
+            "1",
+            &[
+                ("rcmr_gauge", "gauge"),
+                ("rcmr_counter", "counter"),
+                ("rcmr_histogram", "histogram"),
+            ],
+        );
 
         // Worker-side ids are per-type declaration ordinals: this model
         // declares one metric of each type, so every local id is 0.
@@ -2081,9 +2400,21 @@ mod tests {
         record_custom_metrics("rcmr_model", "1", &gauges, &counters, &histograms);
 
         let output = gather_metrics();
-        assert!(output.contains("lite_server_rcmr_gauge"), "gauge missing: {}", output);
-        assert!(output.contains("lite_server_rcmr_counter_total"), "counter missing: {}", output);
-        assert!(output.contains("lite_server_rcmr_histogram"), "histogram missing: {}", output);
+        assert!(
+            output.contains("lite_server_rcmr_gauge"),
+            "gauge missing: {}",
+            output
+        );
+        assert!(
+            output.contains("lite_server_rcmr_counter_total"),
+            "counter missing: {}",
+            output
+        );
+        assert!(
+            output.contains("lite_server_rcmr_histogram"),
+            "histogram missing: {}",
+            output
+        );
     }
 
     #[test]
@@ -2106,7 +2437,11 @@ mod tests {
         record_worker_metrics("rwmc_model", "1", Some(&metrics));
 
         let output = gather_metrics();
-        assert!(output.contains("lite_server_rwmc_gauge"), "custom gauge missing: {}", output);
+        assert!(
+            output.contains("lite_server_rwmc_gauge"),
+            "custom gauge missing: {}",
+            output
+        );
     }
 
     /// P1 PROM-1 evidence (project-resource-leak-sweep-0815.md): worker-reported
@@ -2166,7 +2501,9 @@ mod tests {
             }
             for m in family.get_metric() {
                 let labels = m.get_label();
-                let hit = labels.iter().any(|l| l.get_name() == "model" && l.get_value() == model)
+                let hit = labels
+                    .iter()
+                    .any(|l| l.get_name() == "model" && l.get_value() == model)
                     && labels
                         .iter()
                         .any(|l| l.get_name() == "version" && l.get_value() == version);
@@ -2337,7 +2674,10 @@ mod tests {
         // Idempotence: a second unload of the same version is a no-op.
         remove_version_metrics(model, version);
         assert!(
-            !REGISTRY.gather().iter().any(|f| f.get_name() == "lite_server_m6b_gauge"),
+            !REGISTRY
+                .gather()
+                .iter()
+                .any(|f| f.get_name() == "lite_server_m6b_gauge"),
             "M6b: custom family lite_server_m6b_gauge still exported after unload — \
              family objects are never deregistered"
         );
@@ -2364,8 +2704,12 @@ mod tests {
         record_custom_metrics("cm_a", "1", &[MetricValue { id: 0, value: 1.0 }], &[], &[]);
         record_custom_metrics("cm_b", "1", &[MetricValue { id: 0, value: 2.0 }], &[], &[]);
 
-        let objects = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
-        let index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+        let objects = CUSTOM_GAUGE_OBJECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let index = CUSTOM_METRIC_INDEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let a_idx = index.get("cm_a_gauge:gauge").unwrap().1;
         let b_idx = index.get("cm_b_gauge:gauge").unwrap().1;
         let value = |idx: usize, model: &str| {
@@ -2374,7 +2718,11 @@ mod tests {
                 .map(|g| g.get())
                 .unwrap_or(0.0)
         };
-        assert_eq!(value(a_idx, "cm_a"), 1.0, "A's value must land in A's family");
+        assert_eq!(
+            value(a_idx, "cm_a"),
+            1.0,
+            "A's value must land in A's family"
+        );
         assert_eq!(
             value(a_idx, "cm_b"),
             0.0,
@@ -2386,7 +2734,11 @@ mod tests {
             "B's value must land in B's family — worker-local id 0 must be \
              translated to B's global slot"
         );
-        assert_eq!(value(b_idx, "cm_a"), 0.0, "B's family must not gain A's label set");
+        assert_eq!(
+            value(b_idx, "cm_a"),
+            0.0,
+            "B's family must not gain A's label set"
+        );
     }
 
     /// Shared-family refcount gap (audit 2026-08-20): two versions declaring
@@ -2497,7 +2849,11 @@ mod tests {
         let before = QUEUE_DEPTH.with_label_values(&[model, version]).get();
         inc_queue_depth(model, version);
         let after = QUEUE_DEPTH.with_label_values(&[model, version]).get();
-        assert_eq!(after, before + 1.0, "inc_queue_depth should increment gauge by 1");
+        assert_eq!(
+            after,
+            before + 1.0,
+            "inc_queue_depth should increment gauge by 1"
+        );
     }
 
     #[test]
@@ -2509,7 +2865,11 @@ mod tests {
         let before = QUEUE_DEPTH.with_label_values(&[model, version]).get();
         dec_queue_depth(model, version);
         let after = QUEUE_DEPTH.with_label_values(&[model, version]).get();
-        assert_eq!(after, before - 1.0, "dec_queue_depth should decrement gauge by 1");
+        assert_eq!(
+            after,
+            before - 1.0,
+            "dec_queue_depth should decrement gauge by 1"
+        );
     }
 
     /// Audit (2026-08-22, resource-leak/observability sweep): a `dec` that
@@ -2532,7 +2892,9 @@ mod tests {
         remove_version_metrics(model, version);
         dec_in_flight(model, version);
         assert_eq!(
-            IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).get(),
+            IN_FLIGHT_REQUESTS
+                .with_label_values(&[model, version])
+                .get(),
             0.0,
             "a dec arriving after the purge must be a no-op, not resurrect the series at -1"
         );
@@ -2551,7 +2913,11 @@ mod tests {
         let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
         // With equal inc and dec, the gauge should have returned to its original
         // value (0 for a fresh label set in this test binary).
-        assert_eq!(value, 0.0, "balanced inc/dec should net to zero, got {}", value);
+        assert_eq!(
+            value, 0.0,
+            "balanced inc/dec should net to zero, got {}",
+            value
+        );
     }
 
     #[test]
@@ -2565,7 +2931,11 @@ mod tests {
         dec_queue_depth(model, version); // 0
         dec_queue_depth(model, version); // extra dec, floored at 0
         let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
-        assert_eq!(value, 0.0, "extra dec must be floored at zero, got {}", value);
+        assert_eq!(
+            value, 0.0,
+            "extra dec must be floored at zero, got {}",
+            value
+        );
     }
 
     // ===== Audit: B3 — mutex poisoning in record_worker_metrics =====
@@ -2627,21 +2997,28 @@ mod tests {
 
         let model = "b1_single_m";
         let version = "1";
-        let before = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+        let before = CUSTOM_COUNTERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get("tokens_generated")
             .map(|c| c.with_label_values(&[model, version]).get())
             .unwrap_or(0.0);
 
         record_worker_metrics(model, version, Some(&metrics));
 
-        let after = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+        let after = CUSTOM_COUNTERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get("tokens_generated")
             .map(|c| c.with_label_values(&[model, version]).get())
             .unwrap_or(0.0);
 
         let delta = after - before;
-        assert_eq!(delta, 50.0,
-            "single call should record 1x tokens_generated, got {}", delta);
+        assert_eq!(
+            delta, 50.0,
+            "single call should record 1x tokens_generated, got {}",
+            delta
+        );
     }
 
     // ===== Audit: B4 — record_request_end is a plain synchronous fn =====
@@ -2655,7 +3032,12 @@ mod tests {
         // Direct call from a sync test context: this only compiles and runs
         // because record_request_end is not async.
         record_request_end("b4_model", "1", "2xx", 0.05);
-        assert!(REQUESTS_TOTAL.with_label_values(&["b4_model", "1", "2xx"]).get() >= 1.0);
+        assert!(
+            REQUESTS_TOTAL
+                .with_label_values(&["b4_model", "1", "2xx"])
+                .get()
+                >= 1.0
+        );
     }
 
     /// `record_custom_metrics` recovers from poisoned `CUSTOM_*_OBJECTS`
@@ -2692,8 +3074,10 @@ mod tests {
         inc_queue_depth(model, version);
         let output = gather_metrics();
         assert!(
-            output.contains("gie_p21a:total_queued_requests{model=\"gie_q_model\",version=\"1\"} 1"),
-            "GIE TotalQueuedRequests gauge missing or wrong value: {}", output
+            output
+                .contains("gie_p21a:total_queued_requests{model=\"gie_q_model\",version=\"1\"} 1"),
+            "GIE TotalQueuedRequests gauge missing or wrong value: {}",
+            output
         );
     }
 
@@ -2705,7 +3089,9 @@ mod tests {
         inc_queue_depth(model, version);
         inc_queue_depth(model, version);
         dec_queue_depth(model, version);
-        let guard = GIE_TOTAL_QUEUED_REQUESTS.read().unwrap_or_else(|e| e.into_inner());
+        let guard = GIE_TOTAL_QUEUED_REQUESTS
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let gauge = guard.get("gie_p21b").expect("gie_p21b gauge registered");
         assert_eq!(gauge.with_label_values(&[model, version]).get(), 1.0);
     }
@@ -2717,15 +3103,25 @@ mod tests {
         let output = gather_metrics();
         assert!(
             output.contains("gie_p21c:kv_cache_utilization NaN"),
-            "KVCacheUtilization must be exposed as NaN (N/A): {}", output
+            "KVCacheUtilization must be exposed as NaN (N/A): {}",
+            output
         );
     }
 
     #[test]
     fn should_reject_invalid_metric_namespace() {
-        assert!(register_gie_metrics("").is_err(), "empty namespace must be rejected");
-        assert!(register_gie_metrics("9bad").is_err(), "leading digit must be rejected");
-        assert!(register_gie_metrics("bad-name").is_err(), "dash must be rejected");
+        assert!(
+            register_gie_metrics("").is_err(),
+            "empty namespace must be rejected"
+        );
+        assert!(
+            register_gie_metrics("9bad").is_err(),
+            "leading digit must be rejected"
+        );
+        assert!(
+            register_gie_metrics("bad-name").is_err(),
+            "dash must be rejected"
+        );
     }
 
     #[test]
@@ -2752,9 +3148,13 @@ mod tests {
     fn should_observe_queue_wait_seconds() {
         let model = "qwait_model";
         let version = "1";
-        let before = QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).get_sample_count();
+        let before = QUEUE_WAIT_SECONDS
+            .with_label_values(&[model, version])
+            .get_sample_count();
         observe_queue_wait(model, version, 0.05);
-        let after = QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).get_sample_count();
+        let after = QUEUE_WAIT_SECONDS
+            .with_label_values(&[model, version])
+            .get_sample_count();
         assert_eq!(after, before + 1);
     }
 
@@ -2763,9 +3163,15 @@ mod tests {
         let model = "sat_model";
         let version = "1";
         set_worker_saturation(model, version, 2.0);
-        assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 2.0);
+        assert_eq!(
+            WORKER_SATURATION.with_label_values(&[model, version]).get(),
+            2.0
+        );
         set_worker_saturation(model, version, 0.0);
-        assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 0.0);
+        assert_eq!(
+            WORKER_SATURATION.with_label_values(&[model, version]).get(),
+            0.0
+        );
     }
 
     // ===== S1/S2: StreamCloseReason 收口 + record_stream_terminal =====
@@ -2790,14 +3196,27 @@ mod tests {
     fn record_stream_terminal_records_request_end_ungated() {
         let model = "term_ungated";
         let version = "1";
-        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        let before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "2xx"])
+            .get();
         record_stream_terminal(
-            model, version, "sse", "sse", std::time::Instant::now(),
-            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false, 0, 0,
+            model,
+            version,
+            "sse",
+            "sse",
+            std::time::Instant::now(),
+            StreamCloseReason::Done.status_family(),
+            StreamCloseReason::Done,
+            false,
+            0,
+            0,
         );
-        let after = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        let after = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "2xx"])
+            .get();
         assert_eq!(
-            after, before + 1.0,
+            after,
+            before + 1.0,
             "S1: record_request_end must NOT be gated by streaming_metrics"
         );
     }
@@ -2808,25 +3227,45 @@ mod tests {
         let model = "term_cancel_on";
         let version = "1";
         record_stream_open(model, version, "sse", "test-s", false);
-        let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
-        let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get();
-        let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get();
+        let req_before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "2xx"])
+            .get();
+        let canc_before = STREAM_CANCELLED_TOTAL
+            .with_label_values(&[model, version, "sse"])
+            .get();
+        let conn_before = STREAMING_CONNECTIONS
+            .with_label_values(&[model, version, "sse"])
+            .get();
         record_stream_terminal(
-            model, version, "sse", "sse", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true, 0, 0,
+            model,
+            version,
+            "sse",
+            "sse",
+            std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(),
+            StreamCloseReason::Cancel,
+            true,
+            0,
+            0,
         );
         assert_eq!(
-            STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get(),
+            STREAM_CANCELLED_TOTAL
+                .with_label_values(&[model, version, "sse"])
+                .get(),
             canc_before + 1.0,
             "S2: cancelled must count when gated on"
         );
         assert_eq!(
-            REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get(),
+            REQUESTS_TOTAL
+                .with_label_values(&[model, version, "2xx"])
+                .get(),
             req_before + 1.0,
             "D1: disconnected stream keeps 2xx family + separate cancel counter"
         );
         assert_eq!(
-            STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get(),
+            STREAMING_CONNECTIONS
+                .with_label_values(&[model, version, "sse"])
+                .get(),
             conn_before - 1.0,
             "close must decrement connections"
         );
@@ -2838,25 +3277,45 @@ mod tests {
         let model = "term_cancel_off";
         let version = "1";
         record_stream_open(model, version, "websocket", "test-w", false);
-        let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
-        let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get();
-        let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get();
+        let req_before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "2xx"])
+            .get();
+        let canc_before = STREAM_CANCELLED_TOTAL
+            .with_label_values(&[model, version, "websocket"])
+            .get();
+        let conn_before = STREAMING_CONNECTIONS
+            .with_label_values(&[model, version, "websocket"])
+            .get();
         record_stream_terminal(
-            model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false, 0, 0,
+            model,
+            version,
+            "websocket",
+            "ws",
+            std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(),
+            StreamCloseReason::Cancel,
+            false,
+            0,
+            0,
         );
         assert_eq!(
-            STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
+            STREAM_CANCELLED_TOTAL
+                .with_label_values(&[model, version, "websocket"])
+                .get(),
             canc_before,
             "D9: cancelled gated by streaming_metrics"
         );
         assert_eq!(
-            STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get(),
+            STREAMING_CONNECTIONS
+                .with_label_values(&[model, version, "websocket"])
+                .get(),
             conn_before,
             "record_stream_close stays gated (open was gated too)"
         );
         assert_eq!(
-            REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get(),
+            REQUESTS_TOTAL
+                .with_label_values(&[model, version, "2xx"])
+                .get(),
             req_before + 1.0,
             "requests_total must still record with metrics off"
         );
@@ -2867,13 +3326,25 @@ mod tests {
     fn record_stream_terminal_protocol_maps_4xx() {
         let model = "term_proto";
         let version = "1";
-        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
+        let before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "4xx"])
+            .get();
         record_stream_terminal(
-            model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false, 0, 0,
+            model,
+            version,
+            "websocket",
+            "ws",
+            std::time::Instant::now(),
+            StreamCloseReason::Protocol.status_family(),
+            StreamCloseReason::Protocol,
+            false,
+            0,
+            0,
         );
         assert_eq!(
-            REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
+            REQUESTS_TOTAL
+                .with_label_values(&[model, version, "4xx"])
+                .get(),
             before + 1.0,
             "WS protocol violation maps to 4xx (D7)"
         );
@@ -2884,13 +3355,25 @@ mod tests {
     fn record_stream_terminal_panic_maps_5xx() {
         let model = "term_panic";
         let version = "1";
-        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get();
+        let before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "5xx"])
+            .get();
         record_stream_terminal(
-            model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false, 0, 0,
+            model,
+            version,
+            "websocket",
+            "ws",
+            std::time::Instant::now(),
+            StreamCloseReason::Panic.status_family(),
+            StreamCloseReason::Panic,
+            false,
+            0,
+            0,
         );
         assert_eq!(
-            REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get(),
+            REQUESTS_TOTAL
+                .with_label_values(&[model, version, "5xx"])
+                .get(),
             before + 1.0,
             "WS writer panic maps to 5xx"
         );
@@ -2913,7 +3396,8 @@ mod tests {
             .expect("REQUEST_DURATION must be registered");
         let mut found = false;
         for m in family.get_metric() {
-            if !m.get_label()
+            if !m
+                .get_label()
                 .iter()
                 .any(|l| l.get_name() == "model" && l.get_value() == model)
             {
@@ -2973,7 +3457,10 @@ mod tests {
         let version = "1";
         record_stream_ttft(model, version, "sse", 5.0);
         let le5 = histogram_bucket_count("liteserver_streaming_ttft_seconds", model, 5.0);
-        assert!(le5 >= 1, "5.0s TTFT must land in the new le=5 bucket (got {le5})");
+        assert!(
+            le5 >= 1,
+            "5.0s TTFT must land in the new le=5 bucket (got {le5})"
+        );
     }
 
     /// Round2 B4:ENSEMBLE_STEP_LATENCY 桶追加 10/30/60——冷启动子模型/慢
@@ -2984,7 +3471,10 @@ mod tests {
         let model = "ens_bucket_m";
         record_ensemble_step_latency("ens_bucket_e", "s1", model, "1", 0, 15.0);
         let le30 = histogram_bucket_count("liteserver_ensemble_step_latency_seconds", model, 30.0);
-        assert!(le30 >= 1, "15s step must land in the new le=30 bucket (got {le30})");
+        assert!(
+            le30 >= 1,
+            "15s step must land in the new le=30 bucket (got {le30})"
+        );
     }
 
     // ===== Round2 A6: dedicated stream rejection counter =====
@@ -3090,7 +3580,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert!(leftover.is_empty(), "series left after cleanup: {leftover:?}");
+        assert!(
+            leftover.is_empty(),
+            "series left after cleanup: {leftover:?}"
+        );
         assert_eq!(
             REQUESTS_TOTAL.with_label_values(&[model, "8", "2xx"]).get(),
             1.0,
@@ -3185,7 +3678,10 @@ mod tests {
         let _ = gather_metrics();
         let rss = gather_family_value("liteserver_process_resident_memory_bytes")
             .expect("process RSS must be exported");
-        assert!(rss > 0.0, "RSS of the live process must be positive, got {rss}");
+        assert!(
+            rss > 0.0,
+            "RSS of the live process must be positive, got {rss}"
+        );
         let cpu = gather_family_value("liteserver_process_cpu_seconds_total")
             .expect("process CPU seconds must be exported");
         assert!(cpu >= 0.0);
@@ -3195,7 +3691,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
-        assert!(start > 0.0 && start <= now, "start time must be a past epoch, got {start}");
+        assert!(
+            start > 0.0 && start <= now,
+            "start time must be a past epoch, got {start}"
+        );
     }
 
     /// Thread count is populated where the platform exposes tasks (Linux).
@@ -3206,7 +3705,10 @@ mod tests {
         let _ = gather_metrics();
         let threads = gather_family_value("liteserver_process_threads")
             .expect("process threads must be exported");
-        assert!(threads >= 1.0, "live process has at least one thread, got {threads}");
+        assert!(
+            threads >= 1.0,
+            "live process has at least one thread, got {threads}"
+        );
     }
 
     // ===== Worker memory metrics (per-worker RSS/VIRT + per-version aggregate) =====
@@ -3216,7 +3718,11 @@ mod tests {
     }
 
     fn worker_key(model: &str, version: &str, worker_id: &str) -> WorkerKey {
-        (model.to_string(), version.to_string(), worker_id.to_string())
+        (
+            model.to_string(),
+            version.to_string(),
+            worker_id.to_string(),
+        )
     }
 
     /// True when the gathered output contains a series of `family` whose label
@@ -3287,9 +3793,18 @@ mod tests {
             st.worker_pids.get_mut(&key).unwrap().pid = sysinfo::Pid::from(u32::MAX as usize);
         }
         refresh_process_metrics();
-        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
-        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
-        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", m), ("version", v)]));
+        assert!(!gathered_has_series(
+            "liteserver_worker_resident_memory_bytes",
+            &[("model", m), ("version", v), ("worker_id", w)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_worker_virtual_memory_bytes",
+            &[("model", m), ("version", v), ("worker_id", w)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_workers_resident_memory_bytes",
+            &[("model", m), ("version", v)]
+        ));
         let st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!st.worker_pids.contains_key(&worker_key(m, v, w)));
     }
@@ -3308,7 +3823,10 @@ mod tests {
             st.worker_pids.get_mut(&key).unwrap().start_time = Some(u64::MAX);
         }
         refresh_process_metrics();
-        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+        assert!(!gathered_has_series(
+            "liteserver_worker_resident_memory_bytes",
+            &[("model", m), ("version", v), ("worker_id", w)]
+        ));
         let st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!st.worker_pids.contains_key(&worker_key(m, v, w)));
     }
@@ -3325,7 +3843,10 @@ mod tests {
         assert!(WORKER_RSS_BYTES.with_label_values(&[m, v, w]).get() > 0);
         set_worker_pid(m, v, 0, u32::MAX);
         refresh_process_metrics();
-        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+        assert!(!gathered_has_series(
+            "liteserver_worker_resident_memory_bytes",
+            &[("model", m), ("version", v), ("worker_id", w)]
+        ));
     }
 
     /// clear_worker_pids drops registry entries AND exported series for
@@ -3339,9 +3860,18 @@ mod tests {
         refresh_process_metrics();
         assert!(WORKER_RSS_BYTES.with_label_values(&[ma, v, w]).get() > 0);
         clear_worker_pids(ma, v);
-        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", ma), ("version", v)]));
-        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", ma), ("version", v)]));
-        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", ma), ("version", v)]));
+        assert!(!gathered_has_series(
+            "liteserver_worker_resident_memory_bytes",
+            &[("model", ma), ("version", v)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_worker_virtual_memory_bytes",
+            &[("model", ma), ("version", v)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_workers_resident_memory_bytes",
+            &[("model", ma), ("version", v)]
+        ));
         refresh_process_metrics();
         assert!(WORKER_RSS_BYTES.with_label_values(&[mb, v, w]).get() > 0);
         clear_worker_pids(mb, v);
@@ -3352,7 +3882,10 @@ mod tests {
     #[test]
     fn should_reject_registry_insert_beyond_cap() {
         let mut map = std::collections::HashMap::new();
-        let entry = || WorkerPidEntry { pid: sysinfo::Pid::from(1usize), start_time: None };
+        let entry = || WorkerPidEntry {
+            pid: sysinfo::Pid::from(1usize),
+            start_time: None,
+        };
         for i in 0..MAX_WORKER_PID_ENTRIES {
             let key = (format!("m{i}"), "1".to_string(), "0".to_string());
             assert!(worker_registry_insert(&mut map, key, entry()));
@@ -3372,9 +3905,18 @@ mod tests {
         WORKER_VIRT_BYTES.with_label_values(&[m, v, w]).set(1);
         WORKERS_RSS_BYTES.with_label_values(&[m, v]).set(1);
         remove_version_metrics(m, v);
-        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v)]));
-        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", m), ("version", v)]));
-        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", m), ("version", v)]));
+        assert!(!gathered_has_series(
+            "liteserver_worker_resident_memory_bytes",
+            &[("model", m), ("version", v)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_worker_virtual_memory_bytes",
+            &[("model", m), ("version", v)]
+        ));
+        assert!(!gathered_has_series(
+            "liteserver_workers_resident_memory_bytes",
+            &[("model", m), ("version", v)]
+        ));
     }
 
     /// S7:TBT 桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。
@@ -3386,7 +3928,10 @@ mod tests {
         let version = "1";
         record_stream_tbt(model, version, "sse", 1.0);
         let le1 = histogram_bucket_count("liteserver_streaming_tbt_seconds", model, 1.0);
-        assert!(le1 >= 1, "1.0s TBT must land in the new le=1 bucket (got {le1})");
+        assert!(
+            le1 >= 1,
+            "1.0s TBT must land in the new le=1 bucket (got {le1})"
+        );
     }
 
     // ===== G1 (批次 4):OPEN_CONNECTIONS 死代码已删除 =====
@@ -3429,11 +3974,21 @@ mod tests {
             .with_label_values(&[model, version, "sse", "worker_error"])
             .get();
         record_stream_terminal(
-            model, version, "sse", "sse", std::time::Instant::now(),
-            "5xx", StreamCloseReason::Error, true, 0, 0,
+            model,
+            version,
+            "sse",
+            "sse",
+            std::time::Instant::now(),
+            "5xx",
+            StreamCloseReason::Error,
+            true,
+            0,
+            0,
         );
         assert_eq!(
-            STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "worker_error"]).get(),
+            STREAM_ERRORS_TOTAL
+                .with_label_values(&[model, version, "sse", "worker_error"])
+                .get(),
             before + 1.0,
             "S4: Error frame must count kind=worker_error"
         );
@@ -3454,11 +4009,21 @@ mod tests {
                 .with_label_values(&[model, version, "sse", "x"])
                 .get();
             record_stream_terminal(
-                model, version, "sse", "sse", std::time::Instant::now(),
-                family, reason, true, 0, 0,
+                model,
+                version,
+                "sse",
+                "sse",
+                std::time::Instant::now(),
+                family,
+                reason,
+                true,
+                0,
+                0,
             );
             assert_eq!(
-                STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "x"]).get(),
+                STREAM_ERRORS_TOTAL
+                    .with_label_values(&[model, version, "sse", "x"])
+                    .get(),
                 before,
                 "{reason:?} must not count as a stream error"
             );
@@ -3477,16 +4042,28 @@ mod tests {
             .with_label_values(&[model, version, "sse"])
             .get();
         record_stream_terminal(
-            model, version, "sse", "sse", std::time::Instant::now(),
-            "2xx", StreamCloseReason::Done, true, 42, 3,
+            model,
+            version,
+            "sse",
+            "sse",
+            std::time::Instant::now(),
+            "2xx",
+            StreamCloseReason::Done,
+            true,
+            42,
+            3,
         );
         assert_eq!(
-            STREAM_DURATION_SECONDS.with_label_values(&[model, version, "sse"]).get_sample_count(),
+            STREAM_DURATION_SECONDS
+                .with_label_values(&[model, version, "sse"])
+                .get_sample_count(),
             before_dur + 1,
             "S6: close must observe stream duration"
         );
         assert_eq!(
-            STREAM_OUTPUT_BYTES_TOTAL.with_label_values(&[model, version, "sse"]).get(),
+            STREAM_OUTPUT_BYTES_TOTAL
+                .with_label_values(&[model, version, "sse"])
+                .get(),
             before_bytes + 42.0,
             "S6: chunk bytes must accumulate"
         );
@@ -3506,28 +4083,46 @@ mod tests {
         let b_before = STREAM_OUTPUT_BYTES_TOTAL
             .with_label_values(&[model, version, "websocket"])
             .get();
-        let r_before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
+        let r_before = REQUESTS_TOTAL
+            .with_label_values(&[model, version, "4xx"])
+            .get();
         record_stream_terminal(
-            model, version, "websocket", "ws", std::time::Instant::now(),
-            "4xx", StreamCloseReason::Protocol, false, 7, 1,
+            model,
+            version,
+            "websocket",
+            "ws",
+            std::time::Instant::now(),
+            "4xx",
+            StreamCloseReason::Protocol,
+            false,
+            7,
+            1,
         );
         assert_eq!(
-            STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "websocket", "protocol"]).get(),
+            STREAM_ERRORS_TOTAL
+                .with_label_values(&[model, version, "websocket", "protocol"])
+                .get(),
             e_before,
             "D9: errors gated by streaming_metrics"
         );
         assert_eq!(
-            STREAM_DURATION_SECONDS.with_label_values(&[model, version, "websocket"]).get_sample_count(),
+            STREAM_DURATION_SECONDS
+                .with_label_values(&[model, version, "websocket"])
+                .get_sample_count(),
             d_before,
             "D9: duration gated by streaming_metrics"
         );
         assert_eq!(
-            STREAM_OUTPUT_BYTES_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
+            STREAM_OUTPUT_BYTES_TOTAL
+                .with_label_values(&[model, version, "websocket"])
+                .get(),
             b_before,
             "D9: bytes gated by streaming_metrics"
         );
         assert_eq!(
-            REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
+            REQUESTS_TOTAL
+                .with_label_values(&[model, version, "4xx"])
+                .get(),
             r_before + 1.0,
             "S1: requests_total must NOT be gated"
         );
@@ -3591,7 +4186,10 @@ mod tests {
                 event: &tracing::Event<'_>,
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                let mut v = FieldPairs { fields: Vec::new(), message: None };
+                let mut v = FieldPairs {
+                    fields: Vec::new(),
+                    message: None,
+                };
                 event.record(&mut v);
                 self.0
                     .lock()

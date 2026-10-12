@@ -24,11 +24,21 @@ pub fn startup_preflight(cfg: &Config) -> Vec<String> {
 /// ① 多 origin CORS（server.cors 全局 + 逐版本 model policies.cors）。
 fn check_cors_multi_origin(cfg: &Config, warnings: &mut Vec<String>) {
     let mut hits: Vec<String> = Vec::new();
-    if cfg.server.cors.as_ref().is_some_and(|c| c.allow_origins.len() > 1) {
+    if cfg
+        .server
+        .cors
+        .as_ref()
+        .is_some_and(|c| c.allow_origins.len() > 1)
+    {
         hits.push("server.cors".to_string());
     }
     for (model, version, mc) in load_model_configs(cfg) {
-        if mc.policies.cors.as_ref().is_some_and(|c| c.allow_origins.len() > 1) {
+        if mc
+            .policies
+            .cors
+            .as_ref()
+            .is_some_and(|c| c.allow_origins.len() > 1)
+        {
             hits.push(format!("{model}/{version} policies.cors"));
         }
     }
@@ -48,7 +58,12 @@ fn check_ip_rate_limit_without_trusted_proxies(cfg: &Config, warnings: &mut Vec<
     }
     let hits: Vec<String> = load_model_configs(cfg)
         .into_iter()
-        .filter(|(_, _, mc)| mc.policies.rate_limit.as_ref().is_some_and(|rl| rl.key == "ip"))
+        .filter(|(_, _, mc)| {
+            mc.policies
+                .rate_limit
+                .as_ref()
+                .is_some_and(|rl| rl.key == "ip")
+        })
         .map(|(m, v, _)| format!("{m}/{v}"))
         .collect();
     if !hits.is_empty() {
@@ -99,7 +114,11 @@ fn bind_ip(host: &str) -> Option<IpAddr> {
     }
     // [v6]:port / host:port 形态兜底
     if let Some((h, _)) = host.rsplit_once(':') {
-        return h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok();
+        return h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .ok();
     }
     None
 }
@@ -183,8 +202,15 @@ mod tests {
         );
         let warnings = startup_preflight(&cfg);
         let m2: Vec<_> = warnings.iter().filter(|w| w.starts_with("M2:")).collect();
-        assert_eq!(m2.len(), 1, "全局+模型两处多 origin 应合并为一条 M2: {warnings:?}");
-        assert!(m2[0].contains("server.cors") && m2[0].contains("m/1"), "须点名命中位置: {m2:?}");
+        assert_eq!(
+            m2.len(),
+            1,
+            "全局+模型两处多 origin 应合并为一条 M2: {warnings:?}"
+        );
+        assert!(
+            m2[0].contains("server.cors") && m2[0].contains("m/1"),
+            "须点名命中位置: {m2:?}"
+        );
     }
 
     #[test]
@@ -195,31 +221,49 @@ mod tests {
             allow_origins: vec!["https://a.example".into()],
             ..Default::default()
         });
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M2:")));
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M2:")));
     }
 
     #[test]
     fn warns_ip_rate_limit_only_without_trusted_proxies() {
         let repo = test_dir("rl");
         let mut cfg = loopback_cfg(&repo);
-        write_model(&repo, "m", "1", "name: m\npolicies:\n  rate_limit:\n    requests_per_minute: 100\n    key: ip\n");
+        write_model(
+            &repo,
+            "m",
+            "1",
+            "name: m\npolicies:\n  rate_limit:\n    requests_per_minute: 100\n    key: ip\n",
+        );
         // 空 trusted_proxies → M1 且点名模型
         let warnings = startup_preflight(&cfg);
         assert!(
-            warnings.iter().any(|w| w.starts_with("M1:") && w.contains("m/1")),
+            warnings
+                .iter()
+                .any(|w| w.starts_with("M1:") && w.contains("m/1")),
             "key=ip + 空 trusted_proxies 应告警: {warnings:?}"
         );
         // 配了 trusted_proxies → 无 M1
         cfg.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M1:")));
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M1:")));
     }
 
     #[test]
     fn route_key_rate_limit_does_not_warn() {
         let repo = test_dir("rl-route");
         let cfg = loopback_cfg(&repo);
-        write_model(&repo, "m", "1", "name: m\npolicies:\n  rate_limit:\n    requests_per_minute: 100\n    key: route\n");
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M1:")));
+        write_model(
+            &repo,
+            "m",
+            "1",
+            "name: m\npolicies:\n  rate_limit:\n    requests_per_minute: 100\n    key: route\n",
+        );
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M1:")));
     }
 
     #[test]
@@ -233,7 +277,9 @@ mod tests {
         );
         // loopback 绑定 → 无 M4
         cfg.server.host = "127.0.0.1".to_string();
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M4:")));
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M4:")));
     }
 
     #[test]
@@ -243,7 +289,9 @@ mod tests {
         cfg.model_repository.path = repo.to_string_lossy().into_owned();
         cfg.access_control.admin.http = Some(crate::config::EndpointControl::Public);
         cfg.access_control.admin.grpc = Some(crate::config::EndpointControl::Public);
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M4:")));
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M4:")));
     }
 
     #[test]
@@ -252,6 +300,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.host = "unix:/tmp/lite-server-preflight.sock".to_string();
         cfg.model_repository.path = repo.to_string_lossy().into_owned();
-        assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M4:")));
+        assert!(startup_preflight(&cfg)
+            .iter()
+            .all(|w| !w.starts_with("M4:")));
     }
 }

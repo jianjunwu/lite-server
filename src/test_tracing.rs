@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 use tracing::subscriber::Interest;
 use tracing::Metadata;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
 
 /// Events emitted on one thread, tallied by level (debug/trace are not
@@ -65,9 +65,8 @@ fn handle() -> Arc<Mutex<HashMap<ThreadId, Counters>>> {
             // If that ever changes this install silently fails and every
             // capture assertion fails LOUDLY with zero counts — a
             // deterministic failure, never a flake.
-            let _ = tracing::subscriber::set_global_default(
-                tracing_subscriber::registry().with(layer),
-            );
+            let _ =
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer));
             counts
         })
         .clone()
@@ -135,7 +134,9 @@ mod tests {
     #[test]
     fn should_not_attribute_other_threads_events() {
         let c = event_counts(|| {
-            std::thread::spawn(|| tracing::error!("off-thread")).join().unwrap();
+            std::thread::spawn(|| tracing::error!("off-thread"))
+                .join()
+                .unwrap();
             tracing::info!("on-thread");
         });
         assert_eq!(c.error, 0, "another thread's event must not be attributed");

@@ -1,11 +1,10 @@
+pub mod access_control;
+pub mod admission;
+pub mod audit;
 pub mod callback;
 pub mod client_ip;
 pub mod config;
 pub mod deadline;
-pub mod access_control;
-pub mod admission;
-pub mod audit;
-pub mod rate_limit;
 pub mod ensemble;
 pub mod error;
 pub mod grpc;
@@ -13,10 +12,11 @@ pub mod http;
 pub mod inference_queue;
 pub mod logging;
 pub mod metrics;
+pub mod preflight;
 pub mod proto;
 pub mod protocol;
-pub mod preflight;
 pub mod python;
+pub mod rate_limit;
 pub mod registry;
 pub mod request_context;
 pub mod sequence;
@@ -371,24 +371,48 @@ fn serve(
             std::thread::Builder::new()
                 .name("lite-server-main".into())
                 .spawn(move || {
-                    run_server(ServerOptions {
-                        config, port, host, model_repo, threads, timeout, log_level,
-                        log_info_output, log_error_output, log_rotation,
-                        metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
-                        max_queue_size, max_requests, max_requests_jitter, request_timeout,
-                        health_check_interval, graceful_timeout, keepalive_timeout,
-                        shutdown_stream_grace_ms,
-                        ejection_error_threshold, ejection_timeout, ejection_max_percent,
-                        ejection_max_timeout,
-                        max_retries, startup_timeout, health_check_timeout,
-                        health_check_kill_threshold, worker_kill_timeout, hook_http_timeout,
-                    }, Some(shutdown_rx))
+                    run_server(
+                        ServerOptions {
+                            config,
+                            port,
+                            host,
+                            model_repo,
+                            threads,
+                            timeout,
+                            log_level,
+                            log_info_output,
+                            log_error_output,
+                            log_rotation,
+                            metrics_port,
+                            no_metrics,
+                            grpc_port,
+                            no_grpc,
+                            no_streaming_metrics,
+                            max_queue_size,
+                            max_requests,
+                            max_requests_jitter,
+                            request_timeout,
+                            health_check_interval,
+                            graceful_timeout,
+                            keepalive_timeout,
+                            shutdown_stream_grace_ms,
+                            ejection_error_threshold,
+                            ejection_timeout,
+                            ejection_max_percent,
+                            ejection_max_timeout,
+                            max_retries,
+                            startup_timeout,
+                            health_check_timeout,
+                            health_check_kill_threshold,
+                            worker_kill_timeout,
+                            hook_http_timeout,
+                        },
+                        Some(shutdown_rx),
+                    )
                 })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
                 .join()
-                .map_err(|_| {
-                    pyo3::exceptions::PyRuntimeError::new_err("server thread panicked")
-                })?
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("server thread panicked"))?
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     })
@@ -405,7 +429,11 @@ fn serve(
 #[cfg(feature = "python")]
 #[pyfunction]
 fn stop_server() -> bool {
-    match serve_slot().lock().unwrap_or_else(|e| e.into_inner()).take() {
+    match serve_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         Some(tx) => {
             let _ = tx.send(());
             true

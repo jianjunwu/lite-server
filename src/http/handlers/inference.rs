@@ -35,14 +35,20 @@ pub(crate) fn ensemble_input_from_body(
             Ok(crate::ensemble::EnsembleValue::Json(v))
         }
         // B3 (E6): binary root input — Raw bytes go straight to the first layer.
-        RequestBody::Raw(bytes, ct) => {
-            Ok(crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone(), None, None))
-        }
+        RequestBody::Raw(bytes, ct) => Ok(crate::ensemble::EnsembleValue::Binary(
+            bytes.clone(),
+            ct.clone(),
+            None,
+            None,
+        )),
         // MIMO (D31/D32): transport de-framing only — the TritonBinary
         // container splits into the KServe JSON head + binary tail; all
         // envelope VALIDATION stays single-point in parse_root_inputs (D39).
         // Undeclared ensembles keep their historical 400 there.
-        RequestBody::TritonBinary { body, json_head_len } => {
+        RequestBody::TritonBinary {
+            body,
+            json_head_len,
+        } => {
             let head: Value = serde_json::from_slice(&body[..*json_head_len]).map_err(|e| {
                 AppError::InvalidRequestBody(format!(
                     "ensemble requires valid JSON in the Triton head: {e}"
@@ -65,9 +71,15 @@ pub async fn infer_handler(
 ) -> Result<Response, ProtocolError> {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
     run_infer(
-        state, model_name, None,
-        "/predict".to_string(), headers, body, cx,
-    ).await
+        state,
+        model_name,
+        None,
+        "/predict".to_string(),
+        headers,
+        body,
+        cx,
+    )
+    .await
 }
 
 pub async fn infer_version_handler(
@@ -78,9 +90,15 @@ pub async fn infer_version_handler(
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     run_infer(
-        state, model_name, Some(version),
-        "/predict".to_string(), headers, body, cx,
-    ).await
+        state,
+        model_name,
+        Some(version),
+        "/predict".to_string(),
+        headers,
+        body,
+        cx,
+    )
+    .await
 }
 
 // ===== Triton Generate extension(阶段 4,批次 4,D9) =====
@@ -97,9 +115,15 @@ pub async fn generate_handler(
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     run_infer(
-        state, model_name, None,
-        "/predict".to_string(), headers, body, cx,
-    ).await
+        state,
+        model_name,
+        None,
+        "/predict".to_string(),
+        headers,
+        body,
+        cx,
+    )
+    .await
 }
 
 pub async fn generate_version_handler(
@@ -110,9 +134,15 @@ pub async fn generate_version_handler(
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     run_infer(
-        state, model_name, Some(version),
-        "/predict".to_string(), headers, body, cx,
-    ).await
+        state,
+        model_name,
+        Some(version),
+        "/predict".to_string(),
+        headers,
+        body,
+        cx,
+    )
+    .await
 }
 
 /// 协议感知的 infer 入口(D11 P2.1):T1(预筛)+ T2(信封主判)→ 语义协议,
@@ -128,15 +158,18 @@ pub async fn run_infer(
     cx: RequestContext,
 ) -> Result<Response, ProtocolError> {
     // 早期错误(validate,发生在 T2 判定前)按 T1 预筛值渲染(C9)。
-    crate::validation::validate_identifier(&model_name)
-        .map_err(|e| ProtocolError {
-            error: e,
-            protocol: cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy),
-        })?;
+    crate::validation::validate_identifier(&model_name).map_err(|e| ProtocolError {
+        error: e,
+        protocol: cx
+            .api_protocol
+            .unwrap_or(crate::protocol::ApiProtocol::Legacy),
+    })?;
     if let Some(ref v) = version {
         crate::validation::validate_version(v).map_err(|e| ProtocolError {
             error: e,
-            protocol: cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy),
+            protocol: cx
+                .api_protocol
+                .unwrap_or(crate::protocol::ApiProtocol::Legacy),
         })?;
     }
     // T2 信封主判:仅 T1 缺失时计算(T1 强信号短路,二进制/Raw 路径零成本)。
@@ -645,7 +678,11 @@ fn ensemble_outcome_response(
                     .map_err(|e| AppError::Internal(format!("build response: {e}"))),
             )
         }
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct, ..)) => {
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(
+            data,
+            ct,
+            ..,
+        )) => {
             // Same builder-error handling as the unary passthrough
             // (inference.rs:291-302): a worker-supplied media_type that is
             // not a valid header value must become a 500, never a panic.
@@ -670,13 +707,20 @@ fn ensemble_outcome_response(
         // (kserve.rs convention). A tail-less envelope degrades to
         // plain JSON (build_response never emits one with an empty
         // tail — the guard is defensive).
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope {
+            head,
+            tail,
+        }) => {
             if tail.is_empty() {
                 return finish(Ok(Json(head).into_response()));
             }
             let head_bytes = match serde_json::to_vec(&head) {
                 Ok(b) => b,
-                Err(e) => return finish(Err(AppError::Internal(format!("serialize envelope head: {e}")))),
+                Err(e) => {
+                    return finish(Err(AppError::Internal(format!(
+                        "serialize envelope head: {e}"
+                    ))))
+                }
             };
             let mut body = head_bytes.clone();
             body.extend_from_slice(&tail);
@@ -743,9 +787,12 @@ pub(super) async fn resolve_version(
                 (picked, None)
             } else {
                 (
-                    state.registry.get_active_version(model_name).ok_or_else(|| {
-                        AppError::ModelNotFound(format!("{} has no active version", model_name))
-                    })?,
+                    state
+                        .registry
+                        .get_active_version(model_name)
+                        .ok_or_else(|| {
+                            AppError::ModelNotFound(format!("{} has no active version", model_name))
+                        })?,
                     None,
                 )
             }
@@ -756,7 +803,13 @@ pub(super) async fn resolve_version(
     Ok((resolved, honored_pin))
 }
 
-pub(super) fn build_request_meta(headers: &HeaderMap, payload_bytes: Bytes, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {
+pub(super) fn build_request_meta(
+    headers: &HeaderMap,
+    payload_bytes: Bytes,
+    route: &str,
+    cx: &RequestContext,
+    deadline_unix_ns: Option<i64>,
+) -> pb::RequestMeta {
     let mut header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
@@ -808,13 +861,16 @@ mod streaming_tests {
         // build_request_meta takes raw Bytes and passes them through
         // into meta.payload byte-identical (no JSON round-trip).
         let headers = HeaderMap::new();
-        let payload_bytes = bytes::Bytes::from_static(b"{\"prompt\": \"hello\", \"max_tokens\": 100}");
+        let payload_bytes =
+            bytes::Bytes::from_static(b"{\"prompt\": \"hello\", \"max_tokens\": 100}");
         let cx = test_cx("test-id-001", "");
 
         let meta = build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, None);
 
-        assert_eq!(meta.payload, payload_bytes,
-            "meta.payload must preserve the input bytes byte-identical");
+        assert_eq!(
+            meta.payload, payload_bytes,
+            "meta.payload must preserve the input bytes byte-identical"
+        );
     }
 
     #[test]
@@ -1002,19 +1058,17 @@ mod rejection_metrics_tests {
                 std::path::PathBuf::new(),
             )
             .unwrap();
-        state
-            .registry
-            .set_policies(
-                "a1_auth",
-                "1",
-                Some(crate::config::ModelPolicies {
-                    auth: Some(crate::config::AuthPolicy {
-                        header: "x-api-key".to_string(),
-                        keys: vec![],
-                    }),
-                    ..Default::default()
+        state.registry.set_policies(
+            "a1_auth",
+            "1",
+            Some(crate::config::ModelPolicies {
+                auth: Some(crate::config::AuthPolicy {
+                    header: "x-api-key".to_string(),
+                    keys: vec![],
                 }),
-            );
+                ..Default::default()
+            }),
+        );
         state.registry.mark_ready("a1_auth", "1").unwrap();
         let before = requests_total("a1_auth", "1", "4xx");
         let result = do_infer(
@@ -1053,12 +1107,11 @@ mod rejection_metrics_tests {
     fn ensemble_unary_envelope_success_records_2xx() {
         let _ = prometheus::register_metrics();
         let before = requests_total("b7_ens_env", "1", "2xx");
-        let outcome = crate::ensemble::EnsembleOutcome::Unary(
-            crate::ensemble::EnsembleValue::Envelope {
+        let outcome =
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope {
                 head: json!({"h": 1}),
                 tail: bytes::Bytes::from_static(b"\x00\x01"),
-            },
-        );
+            });
         let resp = ensemble_outcome_response("b7_ens_env", "1", Instant::now(), outcome);
         assert!(resp.is_ok());
         assert_eq!(requests_total("b7_ens_env", "1", "2xx"), before + 1.0);

@@ -40,9 +40,7 @@ enum ZmqCommand {
     /// later as `StreamResponse`s routed through the stream's registered
     /// channel (set up at open).  A plain `send()` here would deadlock for
     /// `ZMQ_RESPONSE_TIMEOUT` waiting for a unary reply that never matches.
-    Raw {
-        request: pb::Request,
-    },
+    Raw { request: pb::Request },
     /// Custom-route call whose reply shape is not known up front: a plain
     /// handler result answers with one `SingleResponse`, a `StreamingResponse`
     /// result answers with a start→chunks→done `StreamResponse` sequence.
@@ -143,7 +141,11 @@ impl WorkerZmqClient {
     /// RN-14 (resource-leak-plan): `stream_channel_size` sets the per-stream
     /// chunk channel depth (server.stream_channel_size; default
     /// STREAM_CHANNEL_SIZE).
-    pub fn new_with_channel_size(endpoint: String, is_cb: bool, stream_channel_size: usize) -> Self {
+    pub fn new_with_channel_size(
+        endpoint: String,
+        is_cb: bool,
+        stream_channel_size: usize,
+    ) -> Self {
         let stream_channel_size = stream_channel_size.max(1);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ZmqCommand>(128);
 
@@ -174,9 +176,14 @@ impl WorkerZmqClient {
             Some((rx, tx))
         })();
         let (wake_rx, wake_tx) = match wake_pair {
-            Some((rx, tx)) => (Some(rx), Some(std::sync::Arc::new(std::sync::Mutex::new(tx)))),
+            Some((rx, tx)) => (
+                Some(rx),
+                Some(std::sync::Arc::new(std::sync::Mutex::new(tx))),
+            ),
             None => {
-                error!("Failed to create ZMQ wake pair; commands will wait for the backstop poll tick");
+                error!(
+                    "Failed to create ZMQ wake pair; commands will wait for the backstop poll tick"
+                );
                 (None, None)
             }
         };
@@ -269,7 +276,8 @@ impl WorkerZmqClient {
             info!("ZMQ PAIR worker socket bound to {}", endpoint);
 
             let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
-            let mut stream_routes: HashMap<String, mpsc::Sender<pb::StreamResponse>> = HashMap::new();
+            let mut stream_routes: HashMap<String, mpsc::Sender<pb::StreamResponse>> =
+                HashMap::new();
             let mut last_pending_sweep = Instant::now();
 
             loop {
@@ -332,22 +340,29 @@ impl WorkerZmqClient {
                         if worker_fired {
                             match socket.recv_bytes(zmq::DONTWAIT) {
                                 Ok(bytes) => {
-                                match pb::Response::decode(bytes.as_slice()) {
-                                    Ok(resp) => {
-                                        if let Some(pb::response::Payload::Stream(stream_resp)) = resp.payload {
-                                            // Move the frame into the channel
-                                            // (try_send returns the value on
-                                            // Full) instead of cloning it per
-                                            // chunk. sid / is_terminal are
-                                            // computed up front for post-move
-                                            // cleanup.
-                                            let sid = stream_resp.stream_id.clone();
-                                            let is_terminal = matches!(stream_resp.payload,
-                                                Some(pb::stream_response::Payload::Done(_))
-                                                | Some(pb::stream_response::Payload::Error(_)));
-                                            let mut overflowed = false;
-                                            if let Some(tx) = stream_routes.get(&sid) {
-                                                match tx.try_send(stream_resp) {
+                                    match pb::Response::decode(bytes.as_slice()) {
+                                        Ok(resp) => {
+                                            if let Some(pb::response::Payload::Stream(
+                                                stream_resp,
+                                            )) = resp.payload
+                                            {
+                                                // Move the frame into the channel
+                                                // (try_send returns the value on
+                                                // Full) instead of cloning it per
+                                                // chunk. sid / is_terminal are
+                                                // computed up front for post-move
+                                                // cleanup.
+                                                let sid = stream_resp.stream_id.clone();
+                                                let is_terminal = matches!(
+                                                    stream_resp.payload,
+                                                    Some(pb::stream_response::Payload::Done(_))
+                                                        | Some(
+                                                            pb::stream_response::Payload::Error(_)
+                                                        )
+                                                );
+                                                let mut overflowed = false;
+                                                if let Some(tx) = stream_routes.get(&sid) {
+                                                    match tx.try_send(stream_resp) {
                                                     Ok(()) => {
                                                         if is_terminal {
                                                             stream_routes.remove(&sid);
@@ -385,29 +400,32 @@ impl WorkerZmqClient {
                                                         stream_routes.remove(&sid);
                                                     }
                                                 }
+                                                }
+                                                if overflowed {
+                                                    stream_routes.remove(&sid);
+                                                }
+                                                // A streaming route reply leaves its
+                                                // unused unary slot behind — free it
+                                                // once the stream terminates.
+                                                if is_terminal {
+                                                    pending.remove(&sid);
+                                                }
+                                            } else if let Some(tx) = pending.remove(&resp.uid) {
+                                                // A unary route reply leaves its
+                                                // unused stream route behind.
+                                                stream_routes.remove(&resp.uid);
+                                                let _ = tx.send(resp);
+                                            } else {
+                                                warn!(
+                                                    "Received response for unknown uid: {}",
+                                                    resp.uid
+                                                );
                                             }
-                                            if overflowed {
-                                                stream_routes.remove(&sid);
-                                            }
-                                            // A streaming route reply leaves its
-                                            // unused unary slot behind — free it
-                                            // once the stream terminates.
-                                            if is_terminal {
-                                                pending.remove(&sid);
-                                            }
-                                        } else if let Some(tx) = pending.remove(&resp.uid) {
-                                            // A unary route reply leaves its
-                                            // unused stream route behind.
-                                            stream_routes.remove(&resp.uid);
-                                            let _ = tx.send(resp);
-                                        } else {
-                                            warn!("Received response for unknown uid: {}", resp.uid);
+                                        }
+                                        Err(e) => {
+                                            error!("Protobuf decode error: {}", e);
                                         }
                                     }
-                                    Err(e) => {
-                                        error!("Protobuf decode error: {}", e);
-                                    }
-                                }
                                 }
                                 Err(zmq::Error::EAGAIN) => {
                                     // poll signaled readable but recv got EAGAIN — rare
@@ -444,14 +462,25 @@ impl WorkerZmqClient {
                     let before = stream_routes.len();
                     stream_routes.retain(|_, tx| !tx.is_closed());
                     if stream_routes.len() < before {
-                        warn!("Swept {} orphaned ZMQ stream route(s)", before - stream_routes.len());
+                        warn!(
+                            "Swept {} orphaned ZMQ stream route(s)",
+                            before - stream_routes.len()
+                        );
                     }
                     last_pending_sweep = Instant::now();
                 }
             }
         });
 
-        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal, stream_channel_size, actor_exit }
+        Self {
+            cmd_tx,
+            wake_tx,
+            actor_asleep,
+            wake_send_count,
+            fatal,
+            stream_channel_size,
+            actor_exit,
+        }
     }
 
     /// F-14: the actor's recorded construction failure, if any.
@@ -526,14 +555,24 @@ impl WorkerZmqClient {
     pub async fn send_route_or_stream(
         &self,
         request: pb::Request,
-    ) -> Result<(oneshot::Receiver<pb::Response>, mpsc::Receiver<pb::StreamResponse>), AppError> {
+    ) -> Result<
+        (
+            oneshot::Receiver<pb::Response>,
+            mpsc::Receiver<pb::StreamResponse>,
+        ),
+        AppError,
+    > {
         if let Some(e) = self.fatal_err() {
             return Err(e);
         }
         let (response_tx, response_rx) = oneshot::channel();
         let (chunk_tx, chunk_rx) = mpsc::channel(self.stream_channel_size);
         self.cmd_tx
-            .send(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx })
+            .send(ZmqCommand::RouteOrStream {
+                request,
+                response_tx,
+                chunk_tx,
+            })
             .await
             .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
         self.wake_actor();
@@ -566,7 +605,9 @@ impl WorkerZmqClient {
     /// it. Best-effort: a full/closed command channel (flood or teardown)
     /// falls back to the timeout path with a warn.
     pub fn fail_all(&self, reason: &str) {
-        match self.cmd_tx.try_send(ZmqCommand::FailAll { reason: reason.to_string() }) {
+        match self.cmd_tx.try_send(ZmqCommand::FailAll {
+            reason: reason.to_string(),
+        }) {
             Ok(()) => self.wake_actor(),
             Err(e) => warn!(
                 "ZMQ fail_all dropped ({}); in-flight requests fall back to timeouts",
@@ -611,7 +652,8 @@ impl WorkerZmqClient {
             // disable waking — matches ShutdownState's precedent.
             let guard = wake.lock().unwrap_or_else(|e| e.into_inner());
             if guard.send(b"\0".as_ref(), zmq::DONTWAIT).is_ok() {
-                self.wake_send_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.wake_send_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -640,14 +682,15 @@ impl WorkerZmqClient {
         // message). If the actor is already dead the send fails fast.
         let _ = self.cmd_tx.send(ZmqCommand::Shutdown).await;
         self.wake_actor();
-        if self.actor_exit.done.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .actor_exit
+            .done
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.actor_exit.notify.notified(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), self.actor_exit.notify.notified()).await;
     }
 }
 
@@ -680,7 +723,10 @@ fn drain_commands(
 ) -> DrainOutcome {
     loop {
         match cmd_rx.try_recv() {
-            Ok(ZmqCommand::Unary { request, response_tx }) => {
+            Ok(ZmqCommand::Unary {
+                request,
+                response_tx,
+            }) => {
                 let uid = request.uid.clone();
                 let bytes = request.encode_to_vec();
                 match socket.send(&bytes, 0) {
@@ -693,7 +739,11 @@ fn drain_commands(
                     }
                 }
             }
-            Ok(ZmqCommand::Stream { request, chunk_tx, stream_id }) => {
+            Ok(ZmqCommand::Stream {
+                request,
+                chunk_tx,
+                stream_id,
+            }) => {
                 let bytes = request.encode_to_vec();
                 match socket.send(&bytes, 0) {
                     Ok(_) => {
@@ -741,7 +791,11 @@ fn drain_commands(
                     }
                 }
             }
-            Ok(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx }) => {
+            Ok(ZmqCommand::RouteOrStream {
+                request,
+                response_tx,
+                chunk_tx,
+            }) => {
                 let uid = request.uid.clone();
                 let bytes = request.encode_to_vec();
                 match socket.send(&bytes, 0) {
@@ -830,7 +884,7 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
                 code: "Error".to_string(),
                 message: message.to_string(),
             }),
-        
+
             ..Default::default()
         })),
         metrics: None,
@@ -992,17 +1046,21 @@ mod tests {
             chunk_tx
                 .try_send(pb::StreamResponse {
                     stream_id: "s-full".to_string(),
-                    payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                        data: bytes::Bytes::from_static(b"x"),
-                        is_final: false,
-                    })),
+                    payload: Some(pb::stream_response::Payload::Chunk(
+                        pb::StreamChunkResponse {
+                            data: bytes::Bytes::from_static(b"x"),
+                            is_final: false,
+                        },
+                    )),
                 })
                 .unwrap();
         }
         stream_routes.insert("s-full".to_string(), chunk_tx);
 
         cmd_tx
-            .send(ZmqCommand::FailAll { reason: "worker exited unexpectedly".to_string() })
+            .send(ZmqCommand::FailAll {
+                reason: "worker exited unexpectedly".to_string(),
+            })
             .await
             .unwrap();
         drain_commands(&mut cmd_rx, &socket, &mut pending, &mut stream_routes);
@@ -1018,7 +1076,11 @@ mod tests {
             .expect("channel closed without terminal frame");
         match term.payload {
             Some(pb::stream_response::Payload::Error(e)) => {
-                assert!(e.message.contains("worker exited unexpectedly"), "reason lost: {}", e.message);
+                assert!(
+                    e.message.contains("worker exited unexpectedly"),
+                    "reason lost: {}",
+                    e.message
+                );
             }
             other => panic!("expected terminal Error frame, got {:?}", other),
         }
@@ -1069,7 +1131,8 @@ mod tests {
     async fn test_zmq_client_cleanup_does_not_panic() {
         #[cfg(unix)]
         let endpoint = {
-            let sock = std::env::temp_dir().join(format!("lite-server-zmq-test-{}.sock", std::process::id()));
+            let sock = std::env::temp_dir()
+                .join(format!("lite-server-zmq-test-{}.sock", std::process::id()));
             format!("ipc://{}", sock.display())
         };
         #[cfg(windows)]
@@ -1083,7 +1146,10 @@ mod tests {
     async fn test_zmq_client_send_fails_when_no_peer() {
         #[cfg(unix)]
         let endpoint = {
-            let sock = std::env::temp_dir().join(format!("lite-server-zmq-test-timeout-{}.sock", std::process::id()));
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-test-timeout-{}.sock",
+                std::process::id()
+            ));
             format!("ipc://{}", sock.display())
         };
         #[cfg(windows)]
@@ -1209,7 +1275,10 @@ mod tests {
         };
         let unary_task = tokio::spawn({
             let c = client.clone();
-            async move { c.send_with_timeout(unary_req, Duration::from_secs(30)).await }
+            async move {
+                c.send_with_timeout(unary_req, Duration::from_secs(30))
+                    .await
+            }
         });
 
         // 2. Stream route with no terminal frame in sight.
@@ -1499,11 +1568,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         const N: usize = 1000;
-        let base = client.wake_send_count.load(std::sync::atomic::Ordering::SeqCst);
+        let base = client
+            .wake_send_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         for _ in 0..N {
             client.send_raw(req.clone()).await.expect("send_raw");
         }
-        let wakes = client.wake_send_count.load(std::sync::atomic::Ordering::SeqCst) - base;
+        let wakes = client
+            .wake_send_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            - base;
         assert!(
             wakes < N / 2,
             "wake gate barely engaged under a sustained flood: {wakes}/{N} commands paid a wake \
@@ -1689,7 +1763,10 @@ mod tests {
                 Err(_) => panic!("channel stalled"),
             }
         };
-        assert_eq!(chunks, STREAM_CHANNEL_SIZE, "channel must drain its full capacity first");
+        assert_eq!(
+            chunks, STREAM_CHANNEL_SIZE,
+            "channel must drain its full capacity first"
+        );
         match terminal.payload {
             Some(pb::stream_response::Payload::Error(e)) => {
                 assert!(
@@ -1715,10 +1792,8 @@ mod tests {
     async fn send_raw_is_fire_and_forget_for_bidi_chunks() {
         #[cfg(unix)]
         let endpoint = {
-            let sock = std::env::temp_dir().join(format!(
-                "lite-server-zmq-bidi-{}.sock",
-                std::process::id()
-            ));
+            let sock = std::env::temp_dir()
+                .join(format!("lite-server-zmq-bidi-{}.sock", std::process::id()));
             format!("ipc://{}", sock.display())
         };
         #[cfg(windows)]
@@ -1929,9 +2004,8 @@ mod tests {
     async fn stop_request_send_raw_tolerates_missing_peer() {
         #[cfg(unix)]
         let endpoint = {
-            let sock = std::env::temp_dir().join(format!(
-                "lite-server-zmq-stop-{}.sock", std::process::id()
-            ));
+            let sock = std::env::temp_dir()
+                .join(format!("lite-server-zmq-stop-{}.sock", std::process::id()));
             format!("ipc://{}", sock.display())
         };
         #[cfg(windows)]
@@ -1942,7 +2016,10 @@ mod tests {
         // Send a stop request — the worker peer never existed, so this may fail
         // at the transport level, but it must not crash.
         let stop_req = crate::streaming::build_stop_request();
-        assert_eq!(stop_req.uid, "stop", "stop request uid must be 'stop' for B2 detection");
+        assert_eq!(
+            stop_req.uid, "stop",
+            "stop request uid must be 'stop' for B2 detection"
+        );
 
         // send_raw is fire-and-forget; it should not panic even with no peer.
         // The transport thread may or may not still be alive — either result

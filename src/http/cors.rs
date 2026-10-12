@@ -251,7 +251,9 @@ pub async fn cors_middleware(
 
     // 预检：OPTIONS + Access-Control-Request-Method。
     let is_preflight = request.method() == Method::OPTIONS
-        && request.headers().contains_key("access-control-request-method");
+        && request
+            .headers()
+            .contains_key("access-control-request-method");
     if is_preflight {
         let req_method = request
             .headers()
@@ -269,14 +271,10 @@ pub async fn cors_middleware(
     let headers = response.headers_mut();
     vary(headers, "origin");
     if let Some(acao) = acao {
-        if apply_acao(headers, &acao, policy.allow_credentials)
-            && !policy.expose_headers.is_empty()
+        if apply_acao(headers, &acao, policy.allow_credentials) && !policy.expose_headers.is_empty()
         {
             if let Ok(v) = HeaderValue::from_str(&policy.expose_headers.join(", ")) {
-                headers.insert(
-                    HeaderName::from_static("access-control-expose-headers"),
-                    v,
-                );
+                headers.insert(HeaderName::from_static("access-control-expose-headers"), v);
             }
         }
     }
@@ -310,22 +308,21 @@ fn preflight_response(
         h.split(',')
             .map(str::trim)
             .filter(|h| !h.is_empty())
-            .all(|h| policy.allow_headers.iter().any(|ah| ah == "*" || ah.eq_ignore_ascii_case(h)))
+            .all(|h| {
+                policy
+                    .allow_headers
+                    .iter()
+                    .any(|ah| ah == "*" || ah.eq_ignore_ascii_case(h))
+            })
     });
 
     if let Some(acao) = acao {
         if method_ok && headers_ok && apply_acao(headers, acao, policy.allow_credentials) {
             if let Ok(v) = HeaderValue::from_str(&policy.allow_methods.join(", ")) {
-                headers.insert(
-                    HeaderName::from_static("access-control-allow-methods"),
-                    v,
-                );
+                headers.insert(HeaderName::from_static("access-control-allow-methods"), v);
             }
             if let Ok(v) = HeaderValue::from_str(&policy.allow_headers.join(", ")) {
-                headers.insert(
-                    HeaderName::from_static("access-control-allow-headers"),
-                    v,
-                );
+                headers.insert(HeaderName::from_static("access-control-allow-headers"), v);
             }
             if let Ok(v) = HeaderValue::from_str(&policy.max_age_secs.to_string()) {
                 headers.insert(HeaderName::from_static("access-control-max-age"), v);
@@ -376,14 +373,26 @@ mod tests {
 
     #[test]
     fn normalize_lowercases_scheme_host() {
-        assert_eq!(norm("HTTPS://Example.COM/").canonical(), "https://example.com");
+        assert_eq!(
+            norm("HTTPS://Example.COM/").canonical(),
+            "https://example.com"
+        );
     }
 
     #[test]
     fn normalize_strips_default_port() {
-        assert_eq!(norm("https://example.com:443").canonical(), "https://example.com");
-        assert_eq!(norm("http://example.com:80").canonical(), "http://example.com");
-        assert_eq!(norm("https://example.com:8443").canonical(), "https://example.com:8443");
+        assert_eq!(
+            norm("https://example.com:443").canonical(),
+            "https://example.com"
+        );
+        assert_eq!(
+            norm("http://example.com:80").canonical(),
+            "http://example.com"
+        );
+        assert_eq!(
+            norm("https://example.com:8443").canonical(),
+            "https://example.com:8443"
+        );
     }
 
     #[test]
@@ -461,7 +470,10 @@ mod tests {
             &AcaoValue::Origin("https://app.example.com".into()),
             true
         ));
-        assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.example.com");
+        assert_eq!(
+            h.get("access-control-allow-origin").unwrap(),
+            "https://app.example.com"
+        );
         assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
     }
 
@@ -481,13 +493,23 @@ mod tests {
         let resp = preflight_response(&policy, acao.as_ref(), Some("POST"), Some("content-type"));
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let h = resp.headers();
-        assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.example.com");
+        assert_eq!(
+            h.get("access-control-allow-origin").unwrap(),
+            "https://app.example.com"
+        );
         assert_eq!(h.get("access-control-allow-methods").unwrap(), "POST");
-        assert_eq!(h.get("access-control-allow-headers").unwrap(), "content-type");
+        assert_eq!(
+            h.get("access-control-allow-headers").unwrap(),
+            "content-type"
+        );
         assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
         assert_eq!(h.get("access-control-max-age").unwrap(), "600");
         // Vary 携带 origin / acrm / acrh
-        let vary = h.get_all("vary").iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>();
+        let vary = h
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>();
         assert!(vary.contains(&"origin"));
         assert!(vary.contains(&"access-control-request-method"));
     }
@@ -720,13 +742,23 @@ mod gap_tests {
             .register(
                 "m",
                 "1",
-                ModelConfig { max_batch_size: 1, ..Default::default() },
+                ModelConfig {
+                    max_batch_size: 1,
+                    ..Default::default()
+                },
                 ModelType::LitAPI,
                 dir,
             )
             .unwrap();
         if let Some(pm) = per_model {
-            registry.set_policies("m", "1", Some(ModelPolicies { cors: Some(pm), ..Default::default() }));
+            registry.set_policies(
+                "m",
+                "1",
+                Some(ModelPolicies {
+                    cors: Some(pm),
+                    ..Default::default()
+                }),
+            );
         }
         let queue = Arc::new(InferenceQueue::new());
         let cb = Arc::new(CallbackRunner::new());
@@ -762,7 +794,12 @@ mod gap_tests {
     #[test]
     fn ws_origin_no_cors_config_allows() {
         let state = state_with(None, None);
-        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://anything.example"))));
+        assert!(ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("https://anything.example"))
+        ));
     }
 
     #[test]
@@ -775,10 +812,25 @@ mod gap_tests {
     #[test]
     fn ws_origin_allow_and_deny_and_null() {
         let state = state_with(Some(policy(&["https://ok.example"])), None);
-        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://ok.example"))));
-        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://evil.example"))));
+        assert!(ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("https://ok.example"))
+        ));
+        assert!(!ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("https://evil.example"))
+        ));
         // 非法/null Origin → 拒绝（CSWSH 防护）。
-        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("null"))));
+        assert!(!ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("null"))
+        ));
     }
 
     #[test]
@@ -788,8 +840,18 @@ mod gap_tests {
             Some(policy(&["https://model.example"])),
         );
         // per-model 胜出:model.example 放行,global.example 不再命中。
-        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://model.example"))));
-        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://global.example"))));
+        assert!(ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("https://model.example"))
+        ));
+        assert!(!ws_origin_allowed(
+            &state,
+            "m",
+            Some("1"),
+            &headers_with_origin(Some("https://global.example"))
+        ));
     }
 
     // ===== 中间件级:admin 豁免 / @route 落全局 / per-model 覆盖全局 =====
@@ -841,14 +903,24 @@ mod gap_tests {
             Some(policy(&["https://global.example"])),
             Some(policy(&["https://model.example"])),
         );
-        let resp = roundtrip(state.clone(), "/v2/models/m/versions/1/infer", "https://model.example").await;
+        let resp = roundtrip(
+            state.clone(),
+            "/v2/models/m/versions/1/infer",
+            "https://model.example",
+        )
+        .await;
         assert_eq!(
             resp.headers().get("access-control-allow-origin"),
             Some(&HeaderValue::from_static("https://model.example")),
             "per-model 策略须覆盖全局"
         );
         // 全局 origin 在 per-model 策略生效时不命中。
-        let resp = roundtrip(state, "/v2/models/m/versions/1/infer", "https://global.example").await;
+        let resp = roundtrip(
+            state,
+            "/v2/models/m/versions/1/infer",
+            "https://global.example",
+        )
+        .await;
         assert_eq!(resp.headers().get("access-control-allow-origin"), None);
     }
 }

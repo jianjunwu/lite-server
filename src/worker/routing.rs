@@ -14,12 +14,7 @@ impl WorkerManager {
     /// (`is_reserved_route`) are skipped with a warning — they must not shadow
     /// the inference / admin / streaming contract. Idempotent across workers of
     /// the same version (all run identical LitAPI code).
-    pub async fn upsert_routes(
-        &self,
-        model_name: &str,
-        version: &str,
-        routes: Vec<RouteDecl>,
-    ) {
+    pub async fn upsert_routes(&self, model_name: &str, version: &str, routes: Vec<RouteDecl>) {
         let mut accepted: Vec<RouteDecl> = Vec::with_capacity(routes.len());
         for r in routes {
             if is_reserved_route(&r.route) {
@@ -145,7 +140,9 @@ pub(crate) fn pick_streaming_worker(
         .get("x-lite-worker-id")
         .and_then(|v| v.parse::<usize>().ok())
     {
-        let ejected = outlier.map(|o| o.is_ejected(w) || o.is_dead(w)).unwrap_or(false);
+        let ejected = outlier
+            .map(|o| o.is_ejected(w) || o.is_dead(w))
+            .unwrap_or(false);
         if w >= num_workers {
             return Err(PickError::InvalidPin(format!(
                 "x-lite-worker-id {w} out of range (workers: {num_workers}) for {model} {version}"
@@ -268,7 +265,8 @@ mod tests {
         let outlier = OutlierState::new(2);
         outlier.mark_dead(1);
         let mut meta = pb::RequestMeta::default();
-        meta.headers.insert("x-lite-worker-id".to_string(), "1".to_string());
+        meta.headers
+            .insert("x-lite-worker-id".to_string(), "1".to_string());
         let seq = SequenceRegistry::new(std::time::Duration::from_secs(60), 16);
         let err = pick_streaming_worker(&meta, 2, Some(&outlier), &seq, "m", "1")
             .expect_err("pinning a dead worker must fail the pick");
@@ -302,7 +300,11 @@ mod tests {
         // Should never pick ejected worker 0
         for _ in 0..100 {
             let idx = pick_worker_skip_ejected(3, &outlier);
-            assert!(idx == 1 || idx == 2, "should skip ejected worker 0, got {}", idx);
+            assert!(
+                idx == 1 || idx == 2,
+                "should skip ejected worker 0, got {}",
+                idx
+            );
         }
     }
 
@@ -345,9 +347,15 @@ mod tests {
         );
 
         let routes = vec![
-            RouteDecl { route: "/status".to_string(), methods: vec!["GET".to_string()] },
+            RouteDecl {
+                route: "/status".to_string(),
+                methods: vec!["GET".to_string()],
+            },
             // reserved leaf → skipped at ingest
-            RouteDecl { route: "/infer".to_string(), methods: vec!["POST".to_string()] },
+            RouteDecl {
+                route: "/infer".to_string(),
+                methods: vec!["POST".to_string()],
+            },
         ];
         wm.upsert_routes("m", "1", routes).await;
 
@@ -406,7 +414,10 @@ mod tests {
         let meta = hint_meta(&[("x-lite-worker-id", "5")], None);
         let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
         match err {
-            PickError::InvalidPin(msg) => assert!(msg.contains("out of range"), "expected out-of-range error, got: {msg}"),
+            PickError::InvalidPin(msg) => assert!(
+                msg.contains("out of range"),
+                "expected out-of-range error, got: {msg}"
+            ),
             other => panic!("expected InvalidPin, got {other:?}"),
         }
     }
@@ -419,7 +430,10 @@ mod tests {
         let meta = hint_meta(&[("x-lite-worker-id", "1")], None);
         let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
         match err {
-            PickError::InvalidPin(msg) => assert!(msg.contains("ejected"), "expected ejected error, got: {msg}"),
+            PickError::InvalidPin(msg) => assert!(
+                msg.contains("ejected"),
+                "expected ejected error, got: {msg}"
+            ),
             other => panic!("expected InvalidPin, got {other:?}"),
         }
     }
@@ -455,7 +469,11 @@ mod tests {
         // No prior mapping; a sequence_id request must record its chosen worker.
         let meta = hint_meta(&[], Some("seq-rec"));
         let w = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
-        assert_eq!(reg.lookup("seq-rec", "m", "1"), Some(w), "chosen worker must be recorded");
+        assert_eq!(
+            reg.lookup("seq-rec", "m", "1"),
+            Some(w),
+            "chosen worker must be recorded"
+        );
     }
 
     // ===== /audit P8-1 举证测试（2026-08-09）=====

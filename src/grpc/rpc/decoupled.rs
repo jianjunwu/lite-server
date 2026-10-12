@@ -78,7 +78,12 @@ impl GrpcService {
                     .registry
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
-                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+                    .ok_or_else(|| {
+                        err(Status::not_found(format!(
+                            "{} has no active version",
+                            model_name
+                        )))
+                    })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
@@ -103,7 +108,12 @@ impl GrpcService {
                 ))));
             }
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+            enforce_grpc_rate_limit(
+                &self.rate_limiter,
+                mv.policies.rate_limit.as_ref(),
+                model_name,
+                &client_ip,
+            )?;
         }
 
         // FD-1: gateway-side JSON validation (HTTP ApiBody/B1 parity) —
@@ -202,7 +212,11 @@ impl GrpcService {
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
         // G3: count the stream toward the slot's max_requests budget.
-        self.app_state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
+        self.app_state.inference_queue.record_stream_served(
+            model_name,
+            &resolved_version,
+            worker_id,
+        );
 
         // Task D: fire InferenceRequest once the worker stream opened (streaming
         // bypasses the queue) and arm the response callback. `self` is not
@@ -220,15 +234,20 @@ impl GrpcService {
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         // RN-14: per-stream channel depth is operator-tunable (default 64).
-        let (tx, rx) =
-            mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
+        let (tx, rx) = mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
         let cancel_client = client.clone();
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.to_string();
         let metrics_version = resolved_version.clone();
         if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, true);
+            crate::metrics::prometheus::record_stream_open(
+                &metrics_model,
+                &metrics_version,
+                "grpc",
+                &stream_id,
+                true,
+            );
         }
 
         // P-DEADLINE + P9-1: always-on decoupled idle reclaim, plus an overall
@@ -499,7 +518,11 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -568,7 +591,8 @@ mod tests {
 
         let worker = spawn_stall_chunk_worker(endpoint.clone());
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        wm.insert_zmq_clients_for_test(model, "1", vec![client]).await;
+        wm.insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
 
         let app_state = Arc::new(AppState::new(
             registry.clone(),

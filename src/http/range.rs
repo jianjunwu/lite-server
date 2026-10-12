@@ -51,12 +51,18 @@ pub fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
             return ByteRange::Unsatisfiable;
         }
         let n = suffix.min(size);
-        return ByteRange::Single { start: size - n, end: size - 1 };
+        return ByteRange::Single {
+            start: size - n,
+            end: size - 1,
+        };
     }
     let (Ok(start), Ok(end)) = (first.parse::<u64>(), last.parse::<u64>()) else {
         // One side unparsable: only "start-" (open end) is legal syntax.
         return match (first.parse::<u64>(), last.is_empty()) {
-            (Ok(start), true) if start < size => ByteRange::Single { start, end: size - 1 },
+            (Ok(start), true) if start < size => ByteRange::Single {
+                start,
+                end: size - 1,
+            },
             (Ok(_), true) => ByteRange::Unsatisfiable,
             _ => ByteRange::Full, // garbage — ignore
         };
@@ -64,7 +70,10 @@ pub fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
     if start > end || start >= size {
         return ByteRange::Unsatisfiable;
     }
-    ByteRange::Single { start, end: end.min(size - 1) }
+    ByteRange::Single {
+        start,
+        end: end.min(size - 1),
+    }
 }
 
 /// Entity tag for a download representation: size + mtime in hex. Weak but
@@ -136,13 +145,22 @@ mod tests {
 
     #[test]
     fn should_reject_start_at_or_past_size() {
-        assert_eq!(parse_range(Some("bytes=100-"), 100), ByteRange::Unsatisfiable);
-        assert_eq!(parse_range(Some("bytes=200-300"), 100), ByteRange::Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=100-"), 100),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some("bytes=200-300"), 100),
+            ByteRange::Unsatisfiable
+        );
     }
 
     #[test]
     fn should_reject_inverted_range() {
-        assert_eq!(parse_range(Some("bytes=50-20"), 100), ByteRange::Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=50-20"), 100),
+            ByteRange::Unsatisfiable
+        );
     }
 
     #[test]
@@ -180,6 +198,9 @@ mod tests {
         assert!(if_range_allows(None, "\"a\""));
         assert!(if_range_allows(Some("\"a\""), "\"a\""));
         assert!(!if_range_allows(Some("\"stale\""), "\"a\""));
-        assert!(!if_range_allows(Some("Wed, 21 Oct 2015 07:28:00 GMT"), "\"a\""));
+        assert!(!if_range_allows(
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+            "\"a\""
+        ));
     }
 }

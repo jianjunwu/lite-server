@@ -43,11 +43,8 @@ pub(super) async fn reconcile_models(
         _ => orch.load_models.clone(),
     };
 
-    let strategy_map: HashMap<String, &ModelStrategyConfig> = orch
-        .models
-        .iter()
-        .map(|s| (s.name.clone(), s))
-        .collect();
+    let strategy_map: HashMap<String, &ModelStrategyConfig> =
+        orch.models.iter().map(|s| (s.name.clone(), s)).collect();
 
     for name in &names {
         let strategy = strategy_map.get(name).copied();
@@ -63,7 +60,10 @@ pub(super) async fn reconcile_models(
 
         // Unload managed versions that should no longer be present.
         for version in loaded.difference(&target_set) {
-            info!("Unloading {} version {} (no longer in target set)", name, version);
+            info!(
+                "Unloading {} version {} (no longer in target set)",
+                name, version
+            );
             if let Err(e) = worker_manager.unload_model(name, Some(version)).await {
                 warn!("Failed to unload {} version {}: {}", name, version, e);
             }
@@ -80,7 +80,10 @@ pub(super) async fn reconcile_models(
                 break;
             }
             if let Err(e) = crate::validation::validate_identifier(version) {
-                error!("Skipping {} version with invalid version '{}': {}", name, version, e);
+                error!(
+                    "Skipping {} version with invalid version '{}': {}",
+                    name, version, e
+                );
                 continue;
             }
             // Respect max_loaded_versions: loading beyond the cap would
@@ -103,7 +106,10 @@ pub(super) async fn reconcile_models(
             let mut config = match crate::config::load_model_config(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("Skipping {} version {}: invalid config.yaml: {}", name, version, e);
+                    error!(
+                        "Skipping {} version {}: invalid config.yaml: {}",
+                        name, version, e
+                    );
                     continue;
                 }
             };
@@ -122,8 +128,14 @@ pub(super) async fn reconcile_models(
             if versions_loaded.contains(dv) {
                 match registry.activate_version(name, dv) {
                     Ok(true) => info!("Activated default version {} for {}", dv, name),
-                    Ok(false) => warn!("Failed to activate default version {} for {} (not ready)", dv, name),
-                    Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
+                    Ok(false) => warn!(
+                        "Failed to activate default version {} for {} (not ready)",
+                        dv, name
+                    ),
+                    Err(e) => error!(
+                        "Error activating default version {} for {}: {}",
+                        dv, name, e
+                    ),
                 }
             }
         } else if !versions_loaded.is_empty() && !registry.active_version_is_ready(name) {
@@ -134,8 +146,14 @@ pub(super) async fn reconcile_models(
             // or the model is stuck unusable after restart (B1).
             match registry.activate_version(name, &versions_loaded[0]) {
                 Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
-                Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
-                Err(e) => error!("Error activating version {} for {}: {}", versions_loaded[0], name, e),
+                Ok(false) => warn!(
+                    "Failed to activate version {} for {} (not ready)",
+                    versions_loaded[0], name
+                ),
+                Err(e) => error!(
+                    "Error activating version {} for {}: {}",
+                    versions_loaded[0], name, e
+                ),
             }
         }
     }
@@ -193,29 +211,34 @@ pub(super) async fn start_reconcile_task(
     );
     let seen_lma = Arc::new(tokio::sync::Mutex::new(seen_lma));
     let coalesce = Duration::from_secs_f32(server_tunables.reconcile_coalesce_secs);
-    reconcile_loop(Duration::from_secs(poll_secs), trigger_rx, coalesce, move || {
-        let repo_path = repo_path.clone();
-        let orch = orch.clone();
-        let worker_manager = worker_manager.clone();
-        let registry = registry.clone();
-        let model_defaults = model_defaults.clone();
-        let server_tunables = server_tunables.clone();
-        let seen_lma = seen_lma.clone();
-        async move {
-            let mut seen_lma = seen_lma.lock().await;
-            reconcile_models(
-                &repo_path,
-                &orch,
-                &worker_manager,
-                &registry,
-                &model_defaults,
-                &server_tunables,
-                &mut seen_lma,
-            )
-            .instrument(tracing::info_span!("reconcile"))
-            .await;
-        }
-    })
+    reconcile_loop(
+        Duration::from_secs(poll_secs),
+        trigger_rx,
+        coalesce,
+        move || {
+            let repo_path = repo_path.clone();
+            let orch = orch.clone();
+            let worker_manager = worker_manager.clone();
+            let registry = registry.clone();
+            let model_defaults = model_defaults.clone();
+            let server_tunables = server_tunables.clone();
+            let seen_lma = seen_lma.clone();
+            async move {
+                let mut seen_lma = seen_lma.lock().await;
+                reconcile_models(
+                    &repo_path,
+                    &orch,
+                    &worker_manager,
+                    &registry,
+                    &model_defaults,
+                    &server_tunables,
+                    &mut seen_lma,
+                )
+                .instrument(tracing::info_span!("reconcile"))
+                .await;
+            }
+        },
+    )
     .await;
 }
 
@@ -349,12 +372,17 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, Duration::from_secs(2), move || {
-            let c = c.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            }
-        }));
+        let handle = tokio::spawn(reconcile_loop(
+            Duration::from_secs(3600),
+            rx,
+            Duration::from_secs(2),
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
 
         tx.send(()).await.unwrap();
         // Auto-advances past the coalesce window; the 3600s tick never fires.
@@ -372,12 +400,17 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, Duration::from_secs(2), move || {
-            let c = c.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            }
-        }));
+        let handle = tokio::spawn(reconcile_loop(
+            Duration::from_secs(3600),
+            rx,
+            Duration::from_secs(2),
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
 
         for _ in 0..5 {
             tx.send(()).await.unwrap();
@@ -396,12 +429,17 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(1), rx, Duration::from_secs(2), move || {
-            let c = c.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            }
-        }));
+        let handle = tokio::spawn(reconcile_loop(
+            Duration::from_secs(1),
+            rx,
+            Duration::from_secs(2),
+            move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
 
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(
@@ -411,5 +449,4 @@ mod tests {
         );
         handle.abort();
     }
-
 }

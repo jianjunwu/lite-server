@@ -83,8 +83,8 @@ mod tests {
     /// parallel lib tests never share a directory.
     fn path_entry_with(files: &[&str]) -> OsString {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir: PathBuf = std::env::temp_dir()
-            .join(format!("lite-server-pyresolve-{}-{n}", std::process::id()));
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("lite-server-pyresolve-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in files {
@@ -115,7 +115,10 @@ mod tests {
     fn override_takes_precedence_over_path() {
         let path = path_entry_with(&["python3"]);
         assert_eq!(
-            resolve_with(Some(std::ffi::OsStr::new("/opt/pinned/python")), Some(&path)),
+            resolve_with(
+                Some(std::ffi::OsStr::new("/opt/pinned/python")),
+                Some(&path)
+            ),
             "/opt/pinned/python"
         );
     }

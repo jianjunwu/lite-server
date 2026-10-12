@@ -59,10 +59,7 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
     for e in &status.entries {
         // Per-version service "{model}/{version}" (§4.5).
         let version_svc = format!("{}/{}", e.name, e.version);
-        let version_serving = matches!(
-            e.status,
-            VersionStatus::Ready | VersionStatus::Degraded
-        );
+        let version_serving = matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded);
         let version_status = if version_serving {
             ServingStatus::Serving
         } else {
@@ -97,15 +94,14 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
         } else {
             ServingStatus::NotServing
         };
-        state.reporter.set_service_status(e.name.clone(), svc_status).await;
+        state
+            .reporter
+            .set_service_status(e.name.clone(), svc_status)
+            .await;
         current.insert(e.name.clone());
     }
 
-    let stale: Vec<String> = state
-        .known_models
-        .difference(&current)
-        .cloned()
-        .collect();
+    let stale: Vec<String> = state.known_models.difference(&current).cloned().collect();
     for name in stale {
         state.reporter.clear_service_status(&name).await;
     }
@@ -167,7 +163,10 @@ impl WorkerManager {
     /// never reach MODEL_LOAD_TOTAL (only the warmup path recorded it), so
     /// the load failure rate was silently underestimated.
     pub(super) fn mark_load_failed(&self, model_name: &str, version: &str) {
-        if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Failed) {
+        if let Err(e) = self
+            .registry
+            .set_status(model_name, version, VersionStatus::Failed)
+        {
             warn!(model = %model_name, version = %version, "failed to mark version failed: {}", e);
         }
         crate::metrics::prometheus::record_model_load(model_name, version, false);
@@ -178,7 +177,10 @@ impl WorkerManager {
     /// failure). The coordinator takes it from there; outlier recovery can
     /// bring it back to Ready.
     pub(super) fn mark_degraded(&self, model_name: &str, version: &str) {
-        if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Degraded) {
+        if let Err(e) = self
+            .registry
+            .set_status(model_name, version, VersionStatus::Degraded)
+        {
             warn!(model = %model_name, version = %version, "failed to mark version degraded: {}", e);
         }
         self.queue_grpc_health_sync();
@@ -188,7 +190,12 @@ impl WorkerManager {
     /// reconcile Ready/Degraded from the outlier-ejection state. Called at
     /// load when `health_check_interval > 0`; an interval of 0 means no
     /// periodic coordination — status is then purely event-driven.
-    pub(super) async fn start_status_coordinator(&self, model_name: &str, version: &str, interval: Duration) {
+    pub(super) async fn start_status_coordinator(
+        &self,
+        model_name: &str,
+        version: &str,
+        interval: Duration,
+    ) {
         let key = model_version_key(model_name, version);
         let task_key = key.clone();
         let registry = self.registry.clone();
@@ -237,10 +244,7 @@ impl WorkerManager {
     }
 
     /// Install the gRPC Health reporter (called once by start_grpc_server).
-    pub async fn set_grpc_health_reporter(
-        &self,
-        reporter: tonic_health::server::HealthReporter,
-    ) {
+    pub async fn set_grpc_health_reporter(&self, reporter: tonic_health::server::HealthReporter) {
         *self.grpc_health.write().await = Some(GrpcHealthState {
             reporter,
             known_models: std::collections::HashSet::new(),
@@ -323,7 +327,10 @@ mod tests {
     fn reconcile_ready_all_healthy_no_change() {
         let reg = ready_registry(2);
         let outlier = OutlierState::new(2);
-        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            None
+        );
     }
 
     #[test]
@@ -349,7 +356,10 @@ mod tests {
         let outlier = OutlierState::new(2);
         assert!(outlier.claim_recycle(0));
         assert!(!outlier.is_ejected(0), "test setup: recycle never ejects");
-        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            None
+        );
     }
 
     #[test]
@@ -371,7 +381,10 @@ mod tests {
         for _ in 0..3 {
             outlier.record_error(0);
         }
-        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            None
+        );
     }
 
     #[test]
@@ -379,7 +392,10 @@ mod tests {
         let reg = ready_registry(2);
         reg.set_status("m", "1", VersionStatus::Loading).unwrap();
         let outlier = OutlierState::new(2);
-        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            None
+        );
     }
 
     #[test]
@@ -402,6 +418,9 @@ mod tests {
     fn reconcile_unloaded_version_no_change() {
         let reg = ModelRegistry::new();
         let outlier = OutlierState::new(1);
-        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            None
+        );
     }
 }

@@ -27,15 +27,12 @@ pub(crate) fn resolve_output(
             "ensemble.output must reference a step, not $request".to_string(),
         ));
     }
-    let idx = steps
-        .iter()
-        .position(|s| s.name == source)
-        .ok_or_else(|| {
-            AppError::Config(format!(
-                "ensemble.output references unknown step '{}'",
-                source
-            ))
-        })?;
+    let idx = steps.iter().position(|s| s.name == source).ok_or_else(|| {
+        AppError::Config(format!(
+            "ensemble.output references unknown step '{}'",
+            source
+        ))
+    })?;
     let field = caps.get(2).map(|m| m.as_str().to_string());
     // C3 (B5 parity): the output field is a SINGLE segment — legacy refs
     // reject multi-segment paths, and select_output_field does a single
@@ -191,15 +188,12 @@ pub(crate) fn analyze_static_types(
                 _ => {
                     // Step ref — the static type comes from the source step's
                     // declaration (undeclared steps are json, I3).
-                    let src = steps
-                        .iter()
-                        .find(|s| s.name == source)
-                        .ok_or_else(|| {
-                            AppError::Config(format!(
-                                "step '{}' references unknown step '{}'",
-                                step.name, source
-                            ))
-                        })?;
+                    let src = steps.iter().find(|s| s.name == source).ok_or_else(|| {
+                        AppError::Config(format!(
+                            "step '{}' references unknown step '{}'",
+                            step.name, source
+                        ))
+                    })?;
                     match &src.outputs_decl {
                         None => {
                             // Undeclared → static type json (whole or legacy
@@ -218,13 +212,14 @@ pub(crate) fn analyze_static_types(
                         Some(alias_decl) => {
                             // R7: a declared step must be referenced by alias
                             // (both modes — the whole ref has no type).
-                            let alias = rest.and_then(|r| r.split('.').next()).ok_or_else(|| {
-                                AppError::Config(format!(
-                                    "step '{}': '{}' — step '{}' declares outputs and must be \
+                            let alias =
+                                rest.and_then(|r| r.split('.').next()).ok_or_else(|| {
+                                    AppError::Config(format!(
+                                        "step '{}': '{}' — step '{}' declares outputs and must be \
                                      referenced by alias ($stepX.ALIAS, R7)",
-                                    step.name, ref_str, source
-                                ))
-                            })?;
+                                        step.name, ref_str, source
+                                    ))
+                                })?;
                             let d = alias_decl.get(alias).ok_or_else(|| {
                                 AppError::Config(format!(
                                     "step '{}': '{}' — '{}' is not a declared alias of step \
@@ -310,9 +305,8 @@ pub(crate) fn validate_skip_rules(
         .iter()
         .enumerate()
         .filter(|(i, s)| {
-            s.on_error == OnErrorKind::Skip
-                || !conditional_refs[*i].is_empty()
-                || s.when.is_some() // E8-2: a when-false step is absent too
+            s.on_error == OnErrorKind::Skip || !conditional_refs[*i].is_empty() || s.when.is_some()
+            // E8-2: a when-false step is absent too
         })
         .map(|(_, s)| s.name.as_str())
         .collect();
@@ -414,7 +408,9 @@ pub(crate) fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 
     // Check for duplicate names
     if step_names.len() != steps.len() {
-        return Err(AppError::Config("duplicate step names in ensemble".to_string()));
+        return Err(AppError::Config(
+            "duplicate step names in ensemble".to_string(),
+        ));
     }
 
     // C7: `request` and `inputs` are reserved root namespaces ($request /
@@ -455,16 +451,15 @@ pub(crate) fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
     }
 
     // Kahn's algorithm for cycle detection
-    let mut in_degree: HashMap<&str, usize> = steps.iter()
-        .map(|s| (s.name.as_str(), 0))
-        .collect();
+    let mut in_degree: HashMap<&str, usize> = steps.iter().map(|s| (s.name.as_str(), 0)).collect();
     for (step_name, deps) in &dependencies {
         for _dep in deps {
             *in_degree.get_mut(*step_name).unwrap() += 1;
         }
     }
 
-    let mut queue: Vec<&str> = in_degree.iter()
+    let mut queue: Vec<&str> = in_degree
+        .iter()
         .filter(|(_, d)| **d == 0)
         .map(|(n, _)| *n)
         .collect();
@@ -473,7 +468,11 @@ pub(crate) fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
     while let Some(node) = queue.pop() {
         visited += 1;
         for step in steps {
-            if dependencies.get(step.name.as_str()).map(|d| d.contains(node)).unwrap_or(false) {
+            if dependencies
+                .get(step.name.as_str())
+                .map(|d| d.contains(node))
+                .unwrap_or(false)
+            {
                 let deg = in_degree.get_mut(step.name.as_str()).unwrap();
                 *deg -= 1;
                 if *deg == 0 {
@@ -484,7 +483,9 @@ pub(crate) fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
     }
 
     if visited != steps.len() {
-        return Err(AppError::Config("cycle detected in ensemble DAG".to_string()));
+        return Err(AppError::Config(
+            "cycle detected in ensemble DAG".to_string(),
+        ));
     }
 
     Ok(())
@@ -531,7 +532,10 @@ pub struct Chain {
 ///         step — a chain plus an orphan streaming step is an error
 ///   D26   a chain's unary consumer has no clean chunk→unary→chunk semantics
 ///         → the whole form is rejected at parse time
-pub(crate) fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result<Vec<Chain>, AppError> {
+pub(crate) fn build_chains(
+    steps: &[EnsembleStep],
+    output_step: usize,
+) -> Result<Vec<Chain>, AppError> {
     let is_stream: Vec<bool> = steps.iter().map(|s| s.stream).collect();
     let stream_count = is_stream.iter().filter(|b| **b).count();
     if stream_count == 0 {
@@ -542,9 +546,13 @@ pub(crate) fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result
     let mut consumers: HashMap<usize, Vec<(usize, bool)>> = HashMap::new();
     for (i, step) in steps.iter().enumerate() {
         for ref_str in step.inputs.values() {
-            let Some(caps) = REF_RE.captures(ref_str) else { continue };
+            let Some(caps) = REF_RE.captures(ref_str) else {
+                continue;
+            };
             let source = caps.get(1).unwrap().as_str();
-            let Some(src_idx) = steps.iter().position(|s| s.name == source) else { continue };
+            let Some(src_idx) = steps.iter().position(|s| s.name == source) else {
+                continue;
+            };
             if is_stream[src_idx] {
                 consumers
                     .entry(src_idx)
@@ -651,7 +659,10 @@ pub(crate) fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result
     Ok(chains)
 }
 
-pub(crate) fn validate_stream_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(), AppError> {
+pub(crate) fn validate_stream_rules(
+    steps: &[EnsembleStep],
+    output_step: usize,
+) -> Result<(), AppError> {
     let stream_steps: Vec<&EnsembleStep> = steps.iter().filter(|s| s.stream).collect();
     if stream_steps.is_empty() {
         return Ok(());
@@ -710,13 +721,10 @@ pub(crate) fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleSte
         }
     }
 
-    let step_map: HashMap<&str, &EnsembleStep> = steps.iter()
-        .map(|s| (s.name.as_str(), s))
-        .collect();
+    let step_map: HashMap<&str, &EnsembleStep> =
+        steps.iter().map(|s| (s.name.as_str(), s)).collect();
 
-    let mut in_degree: HashMap<&str, usize> = steps.iter()
-        .map(|s| (s.name.as_str(), 0))
-        .collect();
+    let mut in_degree: HashMap<&str, usize> = steps.iter().map(|s| (s.name.as_str(), 0)).collect();
     for (step_name, deps) in &dependencies {
         for _dep in deps {
             *in_degree.get_mut(*step_name).unwrap() += 1;
@@ -727,7 +735,8 @@ pub(crate) fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleSte
     let mut remaining: HashSet<&str> = steps.iter().map(|s| s.name.as_str()).collect();
 
     while !remaining.is_empty() {
-        let layer: Vec<&EnsembleStep> = remaining.iter()
+        let layer: Vec<&EnsembleStep> = remaining
+            .iter()
             .filter(|n| in_degree.get(**n).copied().unwrap_or(0) == 0)
             .map(|n| *step_map.get(n).unwrap())
             .collect();
@@ -739,7 +748,11 @@ pub(crate) fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleSte
         for step in &layer {
             remaining.remove(step.name.as_str());
             for other in &remaining {
-                if dependencies.get(*other).map(|d| d.contains(step.name.as_str())).unwrap_or(false) {
+                if dependencies
+                    .get(*other)
+                    .map(|d| d.contains(step.name.as_str()))
+                    .unwrap_or(false)
+                {
                     *in_degree.get_mut(*other).unwrap() -= 1;
                 }
             }
@@ -800,4 +813,3 @@ pub(crate) fn select_output_field(
         EnsembleValue::Envelope { .. } => unreachable!("envelope never reaches output selection"),
     }
 }
-

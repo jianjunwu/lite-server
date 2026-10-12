@@ -116,15 +116,22 @@ impl BidiAggregator {
                     Ok(EnsembleValue::Json(Value::Array(items)))
                 }
             }
-            BidiAggState::Binary { parts, content_type } => {
+            BidiAggState::Binary {
+                parts,
+                content_type,
+            } => {
                 let total: usize = parts.iter().map(|p| p.len()).sum();
                 let mut buf = Vec::with_capacity(total);
                 for p in parts {
                     buf.extend_from_slice(&p);
                 }
-                Ok(EnsembleValue::Binary(bytes::Bytes::from(buf), content_type, None, None))
+                Ok(EnsembleValue::Binary(
+                    bytes::Bytes::from(buf),
+                    content_type,
+                    None,
+                    None,
+                ))
             }
         }
     }
 }
-

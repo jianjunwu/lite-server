@@ -23,9 +23,9 @@ use axum::{
     response::Response,
 };
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
@@ -52,7 +52,10 @@ async fn send_frame_bounded(
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Closed(_)) => false,
         Err(mpsc::error::TrySendError::Full(frame)) => {
-            matches!(tokio::time::timeout(budget, tx.send(frame)).await, Ok(Ok(())))
+            matches!(
+                tokio::time::timeout(budget, tx.send(frame)).await,
+                Ok(Ok(()))
+            )
         }
     }
 }
@@ -66,7 +69,9 @@ pub async fn h2_bidi_handler(
     request: axum::extract::Request,
 ) -> Result<Response, ProtocolError> {
     let model_name = path.0;
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
     h2_bidi_entry(state, &model_name, None, headers, cx, slot, request)
         .await
         .map_err(|error| ProtocolError { error, protocol })
@@ -81,10 +86,20 @@ pub async fn h2_bidi_version_handler(
     request: axum::extract::Request,
 ) -> Result<Response, ProtocolError> {
     let (model_name, version) = path.0;
-    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    h2_bidi_entry(state, &model_name, Some(version), headers, cx, slot, request)
-        .await
-        .map_err(|error| ProtocolError { error, protocol })
+    let protocol = cx
+        .api_protocol
+        .unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    h2_bidi_entry(
+        state,
+        &model_name,
+        Some(version),
+        headers,
+        cx,
+        slot,
+        request,
+    )
+    .await
+    .map_err(|error| ProtocolError { error, protocol })
 }
 
 async fn h2_bidi_entry(
@@ -179,8 +194,13 @@ async fn h2_bidi_entry_impl(
     }
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
         enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-        enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), model_name, &cx.client_ip)
-            .await?;
+        enforce_rate_limit(
+            &state,
+            mv.policies.rate_limit.as_ref(),
+            model_name,
+            &cx.client_ip,
+        )
+        .await?;
     }
 
     // 3. Read the first LPM frame (must be Open) from the body stream, with
@@ -212,9 +232,9 @@ async fn h2_bidi_entry_impl(
     let initial_is_json = bidi_initial_data_is_json(&headers);
     let initial_body_len = initial_data.len();
     if !initial_data.is_empty() && initial_is_json {
-        serde_json::from_slice::<&serde_json::value::RawValue>(&initial_data)
-            .map_err(|e| AppError::InvalidRequestBody(
-                format!("invalid JSON in BidiOpen initial_data: {e}")))?;
+        serde_json::from_slice::<&serde_json::value::RawValue>(&initial_data).map_err(|e| {
+            AppError::InvalidRequestBody(format!("invalid JSON in BidiOpen initial_data: {e}"))
+        })?;
     }
 
     // 4. Build RequestMeta from HTTP headers + initial_data bytes.
@@ -248,7 +268,8 @@ async fn h2_bidi_entry_impl(
     let mut ensemble_step_deadline: Option<std::time::Instant> = None;
     // D18: chain handles + chain-tree abort held for the outgoing task's
     // cancellation (pipeline chains broadcast over every streaming step).
-    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> =
+        None;
     let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
@@ -279,7 +300,9 @@ async fn h2_bidi_entry_impl(
         // reader (S5: late data frames get one LPM Error frame); half-close
         // is then the client's normal finish.
         let declared = crate::ensemble::ensemble_declares_inputs(
-            &state, model_name, &resolved_version,
+            &state,
+            model_name,
+            &resolved_version,
             crate::ensemble::dag_selector_from_http(&headers)?.as_deref(),
         )
         .await?;
@@ -289,114 +312,115 @@ async fn h2_bidi_entry_impl(
             // bytes.
             crate::ensemble::bidi_envelope_frame(&meta.payload, initial_is_json, ct.clone())?
         } else {
-        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
-        // initial_data moved into meta above — meta.payload is the same bytes.
-        aggregator.push(meta.payload.clone(), initial_is_json, ct.as_deref())?;
-        // Aggregation loop: decode LPM frames until the body stream EOFs
-        // (half-close → trigger). Chunk-idle budget applies between frames
-        // (an abandoned aggregating client is reclaimed); the overall
-        // deadline runs since the FIRST frame (aggregation eats the DAG
-        // budget — the client is effectively streaming its body).
-        let mut buf = remainder_buf;
-        let mut body_stream = body_stream;
-        let agg_idle = crate::deadline::idle_budget(
-            state.config.server.decoupled_idle_timeout_secs,
-        );
-        let agg_deadline = if deadline.client_specified {
-            crate::deadline::to_instant(deadline.unix_ns)
-        } else {
-            None
-        };
-        let aggregate_start = std::time::Instant::now();
-        let mut last_activity = aggregate_start;
-        loop {
-            if let Some(idle) = agg_idle {
-                if last_activity.elapsed() > idle {
-                    // B9 (cluster B): idle reclaims construct IdleTimeout so
-                    // the wire error_code (idle_timeout) is distinguishable
-                    // from the overall deadline.
-                    return Err(AppError::IdleTimeout(format!(
-                        "bidi aggregation idle timeout for {}",
-                        model_name
-                    )));
-                }
-            }
-            if let Some(d) = agg_deadline {
-                if std::time::Instant::now() >= d {
-                    return Err(AppError::InferenceTimeout(
-                        "bidi aggregation exceeded the overall deadline".to_string(),
-                    ));
-                }
-            }
-            match lpm::try_decode_frame(&mut buf) {
-                Ok(Some(chunk)) => match chunk.payload {
-                    Some(pb::bidi_chunk::Payload::Data(data)) => {
-                        aggregator.push(data.data, initial_is_json, ct.as_deref())?;
-                        last_activity = std::time::Instant::now();
+            let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
+            // initial_data moved into meta above — meta.payload is the same bytes.
+            aggregator.push(meta.payload.clone(), initial_is_json, ct.as_deref())?;
+            // Aggregation loop: decode LPM frames until the body stream EOFs
+            // (half-close → trigger). Chunk-idle budget applies between frames
+            // (an abandoned aggregating client is reclaimed); the overall
+            // deadline runs since the FIRST frame (aggregation eats the DAG
+            // budget — the client is effectively streaming its body).
+            let mut buf = remainder_buf;
+            let mut body_stream = body_stream;
+            let agg_idle =
+                crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+            let agg_deadline = if deadline.client_specified {
+                crate::deadline::to_instant(deadline.unix_ns)
+            } else {
+                None
+            };
+            let aggregate_start = std::time::Instant::now();
+            let mut last_activity = aggregate_start;
+            loop {
+                if let Some(idle) = agg_idle {
+                    if last_activity.elapsed() > idle {
+                        // B9 (cluster B): idle reclaims construct IdleTimeout so
+                        // the wire error_code (idle_timeout) is distinguishable
+                        // from the overall deadline.
+                        return Err(AppError::IdleTimeout(format!(
+                            "bidi aggregation idle timeout for {}",
+                            model_name
+                        )));
                     }
-                    Some(pb::bidi_chunk::Payload::Close(_)) => break,
-                    _ => {}
-                },
-                Ok(None) => {
-                    // D17: the recv itself must be bounded — a loop-top idle
-                    // check between blocking recvs would never fire for a
-                    // silent client (it would pin the aggregation buffer
-                    // forever; N connections = N× max_request_body_bytes).
-                    // Bound = min(overall remaining, idle remaining), the
-                    // recv_chunk two-stage semantics.
-                    let now = std::time::Instant::now();
-                    let idle_rem = agg_idle.map(|i| i.saturating_sub(last_activity.elapsed()));
-                    let overall_rem = agg_deadline.map(|d| d.saturating_duration_since(now));
-                    let bound = match (overall_rem, idle_rem) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    };
-                    let next = match bound {
-                        Some(b) => match tokio::time::timeout(b, body_stream.next()).await {
-                            Ok(v) => v,
-                            Err(_) => {
-                                let deadline_fired = agg_deadline
-                                    .map(|d| d <= std::time::Instant::now())
-                                    .unwrap_or(false);
-                                // B9 (cluster B): idle → IdleTimeout
-                                // (error_code idle_timeout); deadline keeps
-                                // InferenceTimeout.
-                                return Err(if deadline_fired {
-                                    AppError::InferenceTimeout(
-                                        "bidi aggregation exceeded the overall deadline".to_string()
-                                    )
-                                } else {
-                                    AppError::IdleTimeout(
-                                        format!("bidi aggregation idle timeout for {}", model_name)
-                                    )
-                                });
+                }
+                if let Some(d) = agg_deadline {
+                    if std::time::Instant::now() >= d {
+                        return Err(AppError::InferenceTimeout(
+                            "bidi aggregation exceeded the overall deadline".to_string(),
+                        ));
+                    }
+                }
+                match lpm::try_decode_frame(&mut buf) {
+                    Ok(Some(chunk)) => match chunk.payload {
+                        Some(pb::bidi_chunk::Payload::Data(data)) => {
+                            aggregator.push(data.data, initial_is_json, ct.as_deref())?;
+                            last_activity = std::time::Instant::now();
+                        }
+                        Some(pb::bidi_chunk::Payload::Close(_)) => break,
+                        _ => {}
+                    },
+                    Ok(None) => {
+                        // D17: the recv itself must be bounded — a loop-top idle
+                        // check between blocking recvs would never fire for a
+                        // silent client (it would pin the aggregation buffer
+                        // forever; N connections = N× max_request_body_bytes).
+                        // Bound = min(overall remaining, idle remaining), the
+                        // recv_chunk two-stage semantics.
+                        let now = std::time::Instant::now();
+                        let idle_rem = agg_idle.map(|i| i.saturating_sub(last_activity.elapsed()));
+                        let overall_rem = agg_deadline.map(|d| d.saturating_duration_since(now));
+                        let bound = match (overall_rem, idle_rem) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        let next = match bound {
+                            Some(b) => match tokio::time::timeout(b, body_stream.next()).await {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    let deadline_fired = agg_deadline
+                                        .map(|d| d <= std::time::Instant::now())
+                                        .unwrap_or(false);
+                                    // B9 (cluster B): idle → IdleTimeout
+                                    // (error_code idle_timeout); deadline keeps
+                                    // InferenceTimeout.
+                                    return Err(if deadline_fired {
+                                        AppError::InferenceTimeout(
+                                            "bidi aggregation exceeded the overall deadline"
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        AppError::IdleTimeout(format!(
+                                            "bidi aggregation idle timeout for {}",
+                                            model_name
+                                        ))
+                                    });
+                                }
+                            },
+                            None => body_stream.next().await,
+                        };
+                        match next {
+                            Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                            // Body EOF → half-close → trigger (D33).
+                            None => break,
+                            // Transport error mid-aggregation is NOT a clean
+                            // half-close: abandon the execution (§4.4), never run
+                            // the DAG on possibly-truncated input.
+                            Some(Err(e)) => {
+                                return Err(AppError::Internal(format!(
+                                    "bidi body stream error during aggregation: {e}"
+                                )));
                             }
-                        },
-                        None => body_stream.next().await,
-                    };
-                    match next {
-                        Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
-                        // Body EOF → half-close → trigger (D33).
-                        None => break,
-                        // Transport error mid-aggregation is NOT a clean
-                        // half-close: abandon the execution (§4.4), never run
-                        // the DAG on possibly-truncated input.
-                        Some(Err(e)) => {
-                            return Err(AppError::Internal(format!(
-                                "bidi body stream error during aggregation: {e}"
-                            )));
                         }
                     }
-                }
-                Err(_) => {
-                    return Err(AppError::InvalidRequestBody(
-                        "bidi LPM frame error during aggregation".to_string(),
-                    ));
+                    Err(_) => {
+                        return Err(AppError::InvalidRequestBody(
+                            "bidi LPM frame error during aggregation".to_string(),
+                        ));
+                    }
                 }
             }
-        }
             crate::metrics::prometheus::record_ensemble_bidi_aggregate(
                 aggregator.total_bytes(),
                 aggregate_start.elapsed().as_secs_f64(),
@@ -426,21 +450,25 @@ async fn h2_bidi_entry_impl(
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
-                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
+                ensemble_tail = Some((
+                    s.tail_step.clone(),
+                    s.tail_model.clone(),
+                    s.tail_version.clone(),
+                ));
                 // Ensemble streams are counted per DAG node at the worker
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.cancel_client, s.chunk_rx, None, s.inflight_guard)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
                 return Err(AppError::InvalidRequestBody(
-                    "ensemble DAG has no streaming step; use a unary endpoint"
-                        .to_string(),
+                    "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
                 ));
             }
         }
     } else {
-        let (wc, rx, inflight_guard) = open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
-            .await?;
+        let (wc, rx, inflight_guard) =
+            open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
+                .await?;
         // Incoming task: decode LPM frames from the request body → worker
         // (fire-and-forget). The body stream is OWNED here for the whole
         // session — frames may arrive long after Open (full-duplex).
@@ -455,16 +483,12 @@ async fn h2_bidi_entry_impl(
                     Ok(Some(chunk)) => {
                         match chunk.payload {
                             Some(pb::bidi_chunk::Payload::Data(data)) => {
-                                let req = streaming::build_stream_chunk(
-                                    stream_id_inc.clone(),
-                                    data.data,
-                                );
+                                let req =
+                                    streaming::build_stream_chunk(stream_id_inc.clone(), data.data);
                                 let _ = incoming_client.send_raw(req).await;
                             }
                             Some(pb::bidi_chunk::Payload::Close(_)) => {
-                                let req = streaming::build_stream_close(
-                                    stream_id_inc.clone(),
-                                );
+                                let req = streaming::build_stream_close(stream_id_inc.clone());
                                 let _ = incoming_client.send_raw(req).await;
                                 close_sent = true;
                                 break; // graceful close
@@ -533,8 +557,7 @@ async fn h2_bidi_entry_impl(
         // D35 (E5): the ensemble tail step's timeout cap.
         ensemble_step_deadline,
     );
-    let stream_idle =
-        crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+    let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
     // Spawn forwarder: incoming → worker, worker → outgoing → response body.
     let (tx, rx) = mpsc::channel::<Bytes>(64);
@@ -625,272 +648,266 @@ async fn h2_bidi_entry_impl(
     let panic_open_time = std::time::Instant::now();
     tokio::spawn(
         async move {
-            streaming::catch_forward_panic("http2", async move {
-            // P10 (D40): held for the outgoing task's lifetime — released on
-            // drop (terminal frame / idle / disconnect; D18 teardown path).
-            let _ensemble_permit = ensemble_permit;
-            // G1/G3: per-slot in-flight stream count, held for the session's
-            // lifetime; dropped when this outgoing task ends (any exit).
-            let _inflight_guard = inflight_guard;
-            // RN-13 (D9-A, O1): the admission slot is held for the session's
-            // lifetime.
-            let _admission_guard = admission_guard;
-            // Outgoing loop: worker chunks → LPM frames → tx.
-            let open_time = std::time::Instant::now();
-            let mut first_chunk = true;
-            let mut last_chunk_time = open_time;
-            // H2B-1: send-side budget mirrors the chunk-idle budget; a
-            // stalled reader must trip the same reclaim as a stalled worker.
-            let send_budget = stream_idle.unwrap_or(SEND_BUDGET_FALLBACK);
-            // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
-            // 统一消费(family/cancelled 单一来源)。
-            let reason;
-            // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
-            let mut output_bytes: u64 = 0;
-            // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
-            let mut chunks: u64 = 0;
+            streaming::catch_forward_panic(
+                "http2",
+                async move {
+                    // P10 (D40): held for the outgoing task's lifetime — released on
+                    // drop (terminal frame / idle / disconnect; D18 teardown path).
+                    let _ensemble_permit = ensemble_permit;
+                    // G1/G3: per-slot in-flight stream count, held for the session's
+                    // lifetime; dropped when this outgoing task ends (any exit).
+                    let _inflight_guard = inflight_guard;
+                    // RN-13 (D9-A, O1): the admission slot is held for the session's
+                    // lifetime.
+                    let _admission_guard = admission_guard;
+                    // Outgoing loop: worker chunks → LPM frames → tx.
+                    let open_time = std::time::Instant::now();
+                    let mut first_chunk = true;
+                    let mut last_chunk_time = open_time;
+                    // H2B-1: send-side budget mirrors the chunk-idle budget; a
+                    // stalled reader must trip the same reclaim as a stalled worker.
+                    let send_budget = stream_idle.unwrap_or(SEND_BUDGET_FALLBACK);
+                    // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
+                    // 统一消费(family/cancelled 单一来源)。
+                    let reason;
+                    // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
+                    let mut output_bytes: u64 = 0;
+                    // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
+                    let mut chunks: u64 = 0;
 
-            loop {
-                let chunk =
-                    match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                    loop {
+                        let chunk = match streaming::recv_chunk(
+                            &mut chunk_rx,
+                            stream_deadline,
+                            stream_idle,
+                        )
                         .await
-                    {
-                        Ok(Some(c)) => c,
-                        Ok(None) => {
-                            // G5: the worker died mid-stream — terminal: an
-                            // LPM error frame + close (mirror the worker
-                            // Error arm), so a killed worker is
-                            // distinguishable from the worker's normal EOF.
-                            reason = prometheus::StreamCloseReason::WorkerEof;
-                            let frame = lpm::encode_frame(&pb::BidiChunk {
-                                stream_id: stream_id_out.clone(),
-                                payload: Some(pb::bidi_chunk::Payload::Error(
-                                    pb::BidiError {
+                        {
+                            Ok(Some(c)) => c,
+                            Ok(None) => {
+                                // G5: the worker died mid-stream — terminal: an
+                                // LPM error frame + close (mirror the worker
+                                // Error arm), so a killed worker is
+                                // distinguishable from the worker's normal EOF.
+                                reason = prometheus::StreamCloseReason::WorkerEof;
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
                                         message: "worker exited mid-stream".to_string(),
                                         error_type: String::new(),
-                                    },
-                                )),
-                            });
-                            // Bounded, same as the D35 reclaim path.
-                            let _ = send_frame_bounded(&tx, frame, send_budget).await;
-                            crate::callback::fire_inference_response(
-                                &cb_runner,
-                                &req_ctx,
-                                open_time,
-                            );
-                            break;
-                        }
-                        Err(elapsed) => {
-                            tracing::warn!(
-                                ?elapsed, stream_id = %stream_id_out,
-                                "h2 bidi stream closed: deadline/idle elapsed"
-                            );
-                            // D35 (§4.4, F-11): a mid-stream reclaim —
-                            // deadline OR idle — is terminal: an error frame
-                            // + close (mirror the worker Error arm), so
-                            // truncated output is distinguishable from the
-                            // worker's normal EOF.
-                            let msg = match elapsed {
-                                crate::streaming::RecvElapsed::Deadline => {
-                                    reason = prometheus::StreamCloseReason::Deadline;
-                                    "stream closed: deadline exceeded"
-                                }
-                                crate::streaming::RecvElapsed::Idle => {
-                                    reason = prometheus::StreamCloseReason::Idle;
-                                    "stream closed: idle timeout"
-                                }
-                            };
-                            let frame = lpm::encode_frame(&pb::BidiChunk {
-                                stream_id: stream_id_out.clone(),
-                                payload: Some(pb::bidi_chunk::Payload::Error(
-                                    pb::BidiError {
+                                    })),
+                                });
+                                // Bounded, same as the D35 reclaim path.
+                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                crate::callback::fire_inference_response(
+                                    &cb_runner, &req_ctx, open_time,
+                                );
+                                break;
+                            }
+                            Err(elapsed) => {
+                                tracing::warn!(
+                                    ?elapsed, stream_id = %stream_id_out,
+                                    "h2 bidi stream closed: deadline/idle elapsed"
+                                );
+                                // D35 (§4.4, F-11): a mid-stream reclaim —
+                                // deadline OR idle — is terminal: an error frame
+                                // + close (mirror the worker Error arm), so
+                                // truncated output is distinguishable from the
+                                // worker's normal EOF.
+                                let msg = match elapsed {
+                                    crate::streaming::RecvElapsed::Deadline => {
+                                        reason = prometheus::StreamCloseReason::Deadline;
+                                        "stream closed: deadline exceeded"
+                                    }
+                                    crate::streaming::RecvElapsed::Idle => {
+                                        reason = prometheus::StreamCloseReason::Idle;
+                                        "stream closed: idle timeout"
+                                    }
+                                };
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
                                         message: msg.to_string(),
                                         error_type: String::new(),
-                                    },
-                                )),
-                            });
-                            // H2B-1: bounded — a wedged reader must not block
-                            // the terminal path; the frame is best-effort.
-                            let _ = send_frame_bounded(&tx, frame, send_budget).await;
-                            crate::callback::fire_inference_response(
-                                &cb_runner,
-                                &req_ctx,
-                                open_time,
-                            );
-                            break;
-                        }
-                    };
-                match chunk.payload {
-                    Some(pb::stream_response::Payload::Chunk(c)) => {
-                        output_bytes += c.data.len() as u64;
-                        chunks += 1;
-                        if stream_metrics {
-                            if first_chunk {
-                                prometheus::record_stream_ttft(
-                                    &metrics_model,
-                                    &metrics_version,
-                                    "http2",
-                                    open_time.elapsed().as_secs_f64(),
+                                    })),
+                                });
+                                // H2B-1: bounded — a wedged reader must not block
+                                // the terminal path; the frame is best-effort.
+                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                crate::callback::fire_inference_response(
+                                    &cb_runner, &req_ctx, open_time,
                                 );
-                                first_chunk = false;
-                            } else {
-                                prometheus::record_stream_tbt(
-                                    &metrics_model,
-                                    &metrics_version,
-                                    "http2",
-                                    last_chunk_time.elapsed().as_secs_f64(),
-                                );
+                                break;
                             }
-                            last_chunk_time = std::time::Instant::now();
-                            prometheus::record_stream_chunk(
-                                &metrics_model,
-                                &metrics_version,
-                                "http2",
-                            );
-                        }
-                        let frame = lpm::encode_frame(&pb::BidiChunk {
-                            stream_id: stream_id_out.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
-                                data: c.data.clone(),
-                            })),
-                        });
-                        // H2B-1: bounded send — a stalled reader times out
-                        // into the same terminal path as a client disconnect.
-                        if !send_frame_bounded(&tx, frame, send_budget).await {
-                            reason = prometheus::StreamCloseReason::Cancel;
-                            break;
+                        };
+                        match chunk.payload {
+                            Some(pb::stream_response::Payload::Chunk(c)) => {
+                                output_bytes += c.data.len() as u64;
+                                chunks += 1;
+                                if stream_metrics {
+                                    if first_chunk {
+                                        prometheus::record_stream_ttft(
+                                            &metrics_model,
+                                            &metrics_version,
+                                            "http2",
+                                            open_time.elapsed().as_secs_f64(),
+                                        );
+                                        first_chunk = false;
+                                    } else {
+                                        prometheus::record_stream_tbt(
+                                            &metrics_model,
+                                            &metrics_version,
+                                            "http2",
+                                            last_chunk_time.elapsed().as_secs_f64(),
+                                        );
+                                    }
+                                    last_chunk_time = std::time::Instant::now();
+                                    prometheus::record_stream_chunk(
+                                        &metrics_model,
+                                        &metrics_version,
+                                        "http2",
+                                    );
+                                }
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                                        data: c.data.clone(),
+                                    })),
+                                });
+                                // H2B-1: bounded send — a stalled reader times out
+                                // into the same terminal path as a client disconnect.
+                                if !send_frame_bounded(&tx, frame, send_budget).await {
+                                    reason = prometheus::StreamCloseReason::Cancel;
+                                    break;
+                                }
+                            }
+                            Some(pb::stream_response::Payload::Error(e)) => {
+                                reason = prometheus::StreamCloseReason::Error;
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
+                                        message: e.message.clone(),
+                                        error_type: String::new(),
+                                    })),
+                                });
+                                // H2B-1: bounded — best-effort terminal frame.
+                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                crate::callback::fire_inference_response(
+                                    &cb_runner, &req_ctx, open_time,
+                                );
+                                break;
+                            }
+                            Some(pb::stream_response::Payload::Done(done)) => {
+                                reason = prometheus::StreamCloseReason::Done;
+                                prometheus::record_worker_metrics(
+                                    &metrics_model,
+                                    &metrics_version,
+                                    done.metrics.as_ref(),
+                                );
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
+                                });
+                                // H2B-1: bounded — best-effort terminal frame.
+                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                crate::callback::fire_inference_response(
+                                    &cb_runner, &req_ctx, open_time,
+                                );
+                                break;
+                            }
+                            _ => {}
                         }
                     }
-                    Some(pb::stream_response::Payload::Error(e)) => {
-                        reason = prometheus::StreamCloseReason::Error;
-                        let frame = lpm::encode_frame(&pb::BidiChunk {
-                            stream_id: stream_id_out.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
-                                message: e.message.clone(),
-                                error_type: String::new(),
-                            })),
-                        });
-                        // H2B-1: bounded — best-effort terminal frame.
-                        let _ = send_frame_bounded(&tx, frame, send_budget).await;
-                        crate::callback::fire_inference_response(
-                            &cb_runner,
-                            &req_ctx,
-                            open_time,
-                        );
-                        break;
-                    }
-                    Some(pb::stream_response::Payload::Done(done)) => {
-                        reason = prometheus::StreamCloseReason::Done;
-                        prometheus::record_worker_metrics(
+                    // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
+                    prometheus::record_stream_terminal(
+                        &metrics_model,
+                        &metrics_version,
+                        "http2",
+                        "http2",
+                        open_time,
+                        reason.status_family(),
+                        reason,
+                        stream_metrics,
+                        output_bytes,
+                        chunks,
+                    );
+                    // §4.1 指标行: the streaming step's latency, measured at stream close.
+                    if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+                        prometheus::record_ensemble_step_latency(
                             &metrics_model,
-                            &metrics_version,
-                            done.metrics.as_ref(),
+                            &tail_step,
+                            &tail_model,
+                            &tail_version,
+                            0, // tail step of a top-level ensemble = depth 0 (nested ensembles cannot stream, D4)
+                            open_time.elapsed().as_secs_f64(),
                         );
-                        let frame = lpm::encode_frame(&pb::BidiChunk {
-                            stream_id: stream_id_out.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
-                        });
-                        // H2B-1: bounded — best-effort terminal frame.
-                        let _ = send_frame_bounded(&tx, frame, send_budget).await;
-                        crate::callback::fire_inference_response(
-                            &cb_runner,
-                            &req_ctx,
-                            open_time,
-                        );
-                        break;
                     }
-                    _ => {}
-                }
-            }
-            // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
-            prometheus::record_stream_terminal(
-                &metrics_model,
-                &metrics_version,
-                "http2",
-                "http2",
-                open_time,
-                reason.status_family(),
-                reason,
-                stream_metrics,
-                output_bytes,
-                chunks,
-            );
-            // §4.1 指标行: the streaming step's latency, measured at stream close.
-            if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
-                prometheus::record_ensemble_step_latency(
-                    &metrics_model,
-                    &tail_step,
-                    &tail_model,
-                    &tail_version,
-                    0, // tail step of a top-level ensemble = depth 0 (nested ensembles cannot stream, D4)
-                    open_time.elapsed().as_secs_f64(),
-                );
-            }
 
-            // Targeted cancel.
-            if is_ensemble {
-                crate::ensemble::cancel_chain(
-                    ensemble_chain.as_ref(),
-                    ensemble_abort.as_ref(),
-                    &stream_id_out,
-                    &cancel_client,
-                )
-                .await;
-            } else {
-                let cancel_req = streaming::build_stream_cancel(stream_id_out);
-                let _ = cancel_client.send_raw(cancel_req).await;
-            }
+                    // Targeted cancel.
+                    if is_ensemble {
+                        crate::ensemble::cancel_chain(
+                            ensemble_chain.as_ref(),
+                            ensemble_abort.as_ref(),
+                            &stream_id_out,
+                            &cancel_client,
+                        )
+                        .await;
+                    } else {
+                        let cancel_req = streaming::build_stream_cancel(stream_id_out);
+                        let _ = cancel_client.send_raw(cancel_req).await;
+                    }
 
-            if let Some(task) = incoming_task {
-                streaming::observe_or_abort(task).await;
-            }
-            // B11: reap the post-trigger violation reader — its tx clone
-            // otherwise keeps the response body from ever reaching EOF.
-            if let Some(task) = violation_task {
-                streaming::observe_or_abort(task).await;
-            }
-            }, move || async move {
-                // Panic臂 (WS 同款):补记 Panic 终态 + 取消 worker 流 +
-                // 回收 incoming 任务(正常尾部 observe_or_abort 的兜底)。
-                prometheus::record_stream_terminal(
-                    &panic_model,
-                    &panic_version,
-                    "http2",
-                    "http2",
-                    panic_open_time,
-                    prometheus::StreamCloseReason::Panic.status_family(),
-                    prometheus::StreamCloseReason::Panic,
-                    stream_metrics,
-                    0,
-                    0,
-                );
-                if is_ensemble {
-                    crate::ensemble::cancel_chain(
-                        panic_chain.as_ref(),
-                        panic_abort.as_ref(),
-                        &panic_stream_id,
-                        &panic_cancel_client,
-                    )
-                    .await;
-                } else {
-                    let cancel_req = streaming::build_stream_cancel(panic_stream_id);
-                    let _ = panic_cancel_client.send_raw(cancel_req).await;
-                }
-                if let Some(h) = panic_violation_abort {
-                    h.abort();
-                }
-                if let Some(h) = panic_incoming_abort {
-                    h.abort();
-                }
-            }).await;
+                    if let Some(task) = incoming_task {
+                        streaming::observe_or_abort(task).await;
+                    }
+                    // B11: reap the post-trigger violation reader — its tx clone
+                    // otherwise keeps the response body from ever reaching EOF.
+                    if let Some(task) = violation_task {
+                        streaming::observe_or_abort(task).await;
+                    }
+                },
+                move || async move {
+                    // Panic臂 (WS 同款):补记 Panic 终态 + 取消 worker 流 +
+                    // 回收 incoming 任务(正常尾部 observe_or_abort 的兜底)。
+                    prometheus::record_stream_terminal(
+                        &panic_model,
+                        &panic_version,
+                        "http2",
+                        "http2",
+                        panic_open_time,
+                        prometheus::StreamCloseReason::Panic.status_family(),
+                        prometheus::StreamCloseReason::Panic,
+                        stream_metrics,
+                        0,
+                        0,
+                    );
+                    if is_ensemble {
+                        crate::ensemble::cancel_chain(
+                            panic_chain.as_ref(),
+                            panic_abort.as_ref(),
+                            &panic_stream_id,
+                            &panic_cancel_client,
+                        )
+                        .await;
+                    } else {
+                        let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                        let _ = panic_cancel_client.send_raw(cancel_req).await;
+                    }
+                    if let Some(h) = panic_violation_abort {
+                        h.abort();
+                    }
+                    if let Some(h) = panic_incoming_abort {
+                        h.abort();
+                    }
+                },
+            )
+            .await;
         }
         .instrument(span),
     );
 
     // 7. 200 + application/x-lite-bidi + streaming body.
-    let body = Body::from_stream(
-        ReceiverStream::new(rx).map(Ok::<Bytes, axum::Error>),
-    );
+    let body = Body::from_stream(ReceiverStream::new(rx).map(Ok::<Bytes, axum::Error>));
     Response::builder()
         .status(axum::http::StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, BIDI_CONTENT_TYPE)
@@ -959,7 +976,9 @@ async fn open_worker_stream_bidi(
     })?;
 
     // G4: stream concurrency cap — rejected pre-open (429 / ResourceExhausted).
-    let permit = state.inference_queue.try_acquire_stream_permit(model_name, resolved_version)?;
+    let permit = state
+        .inference_queue
+        .try_acquire_stream_permit(model_name, resolved_version)?;
     // G1/G3: count the in-flight stream on its slot; the caller moves the
     // guard into the chunk-consuming task (see the guard's doc).
     let inflight_guard = outlier
@@ -982,7 +1001,9 @@ async fn open_worker_stream_bidi(
 
     let chunk_rx = client.send_stream(open_req, stream_id.to_string()).await?;
     // G3: count the stream toward the slot's max_requests budget.
-    state.inference_queue.record_stream_served(model_name, resolved_version, worker_id);
+    state
+        .inference_queue
+        .record_stream_served(model_name, resolved_version, worker_id);
     Ok((Arc::clone(client), chunk_rx, inflight_guard))
 }
 
@@ -1118,7 +1139,10 @@ mod tests {
         make_state_with_config(cb, crate::config::Config::default())
     }
 
-    fn make_state_with_config(cb: Arc<CallbackRunner>, config: crate::config::Config) -> Arc<AppState> {
+    fn make_state_with_config(
+        cb: Arc<CallbackRunner>,
+        config: crate::config::Config,
+    ) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
         let queue = Arc::new(InferenceQueue::new());
         let wm = Arc::new(WorkerManager::new(
@@ -1188,7 +1212,10 @@ mod tests {
     /// PAIR worker: records actions; on Open → one Chunk + Done.
     fn spawn_chunk_done_recording_worker(
         endpoint: String,
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
         let handle = std::thread::spawn(move || {
             let ctx = zmq::Context::new();
@@ -1202,7 +1229,11 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -1218,10 +1249,12 @@ mod tests {
                     Some(pb::stream_request::Action::Open(_)) => {
                         let _ = action_tx.send("open".to_string());
                         let _ = s.send(
-                            mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                                data: Bytes::from_static(b"{}"),
-                                is_final: false,
-                            }))
+                            mk(pb::stream_response::Payload::Chunk(
+                                pb::StreamChunkResponse {
+                                    data: Bytes::from_static(b"{}"),
+                                    is_final: false,
+                                },
+                            ))
                             .encode_to_vec(),
                             0,
                         );
@@ -1253,7 +1286,10 @@ mod tests {
     fn spawn_flood_worker(
         endpoint: String,
         chunks: usize,
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
         let handle = std::thread::spawn(move || {
             let ctx = zmq::Context::new();
@@ -1267,7 +1303,11 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -1333,15 +1373,16 @@ mod tests {
                 };
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
                 };
-                if !matches!(
-                    st.action,
-                    Some(pb::stream_request::Action::Open(_))
-                ) {
+                if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
                     continue;
                 }
                 let chunk = pb::Response {
@@ -1383,7 +1424,11 @@ mod tests {
                 );
                 if !is_open {
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -1395,9 +1440,9 @@ mod tests {
                     pb::Response {
                         payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                             stream_id: st.stream_id.clone(),
-                            payload: Some(pb::stream_response::Payload::Error(
-                                pb::StreamError { message: "boom".to_string() },
-                            )),
+                            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                message: "boom".to_string(),
+                            })),
                         })),
                         ..Default::default()
                     }
@@ -1445,7 +1490,9 @@ mod tests {
         let (body_tx, resp) = start_bidi_session(model, state).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             BIDI_CONTENT_TYPE
         );
         drop(body_tx); // body EOF → D4 Close
@@ -1454,7 +1501,11 @@ mod tests {
             .await
             .expect("drain body");
         let frames = decode_all_frames(&body_bytes);
-        assert_eq!(frames.len(), 2, "expected [Data, Close] frames, got {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected [Data, Close] frames, got {frames:?}"
+        );
         assert!(
             matches!(frames[0].payload, Some(pb::bidi_chunk::Payload::Data(_))),
             "first downstream frame must be Data"
@@ -1499,7 +1550,11 @@ mod tests {
             .await
             .expect("drain body");
         let frames = decode_all_frames(&body_bytes);
-        assert_eq!(frames.len(), 1, "expected exactly one error frame, got {frames:?}");
+        assert_eq!(
+            frames.len(),
+            1,
+            "expected exactly one error frame, got {frames:?}"
+        );
         match &frames[0].payload {
             Some(pb::bidi_chunk::Payload::Error(e)) => assert_eq!(e.message, "boom"),
             other => panic!("expected error frame, got {other:?}"),
@@ -1626,7 +1681,10 @@ mod tests {
     /// holds the stream open until Close arrives (then replies Done).
     fn spawn_recording_worker(
         endpoint: String,
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
         let handle = std::thread::spawn(move || {
             let ctx = zmq::Context::new();
@@ -1641,7 +1699,11 @@ mod tests {
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     // Handshake / unary — ack so the client never stalls.
                     let _ = s.send(
-                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        pb::Response {
+                            uid: req.uid,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
                         0,
                     );
                     continue;
@@ -1697,8 +1759,7 @@ mod tests {
         tokio::sync::mpsc::Sender<Result<Bytes, axum::Error>>,
         Response,
     ) {
-        let (body_tx, body_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
         let body = Body::from_stream(ReceiverStream::new(body_rx));
         let req = axum::http::Request::builder()
             .method("POST")
@@ -1750,7 +1811,9 @@ mod tests {
         });
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .as_deref(),
             Ok("open"),
             "worker must see StreamOpen"
         );
@@ -1768,7 +1831,9 @@ mod tests {
             .expect("body stream must stay alive for the bidi session");
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .as_deref(),
             Ok("chunk"),
             "worker must receive StreamRequest::Chunk for a Data frame sent after Open"
         );
@@ -1793,7 +1858,9 @@ mod tests {
         });
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .as_deref(),
             Ok("open"),
             "worker must see StreamOpen"
         );
@@ -1802,7 +1869,9 @@ mod tests {
         drop(body_tx);
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .as_deref(),
             Ok("close"),
             "D4: body EOF must send StreamRequest::Close to the worker"
         );
@@ -1844,7 +1913,9 @@ mod tests {
 
         let (_body_tx, resp) = start_bidi_session(model, state).await;
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .as_deref(),
             Ok("open"),
             "worker must see StreamOpen"
         );
@@ -1860,7 +1931,10 @@ mod tests {
                 Some(Err(_)) | None => break,
             }
         }
-        assert!(seen >= 2, "expected a few frames before stalling, saw {seen}");
+        assert!(
+            seen >= 2,
+            "expected a few frames before stalling, saw {seen}"
+        );
 
         // The idle window (0.3s) is long past: a fixed implementation must have
         // bounded the send and cancelled the worker. Current code never does —
@@ -1899,7 +1973,9 @@ mod tests {
 
     #[test]
     fn bidi_is_json_framing_ct_is_true() {
-        assert!(bidi_initial_data_is_json(&ct_header("application/x-lite-bidi")));
+        assert!(bidi_initial_data_is_json(&ct_header(
+            "application/x-lite-bidi"
+        )));
     }
 
     #[test]
@@ -1956,8 +2032,7 @@ mod tests {
         state.registry.activate_version(model, "1").unwrap();
 
         // Body stream that never yields and never EOFs (sender held).
-        let (_body_tx, body_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(1);
+        let (_body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(1);
         let body = Body::from_stream(ReceiverStream::new(body_rx));
         let req = axum::http::Request::builder()
             .method("POST")
@@ -2008,7 +2083,11 @@ mod tests {
             drop(body_tx);
         });
         wait_for(|| counter.get() >= before + 1.0, "bidi requests_total 2xx").await;
-        assert_eq!(counter.get(), before + 1.0, "h2 bidi done must record one 2xx");
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "h2 bidi done must record one 2xx"
+        );
     }
 
     /// S1:h2 bidi Error 帧 → REQUESTS_TOTAL{5xx} +1。
@@ -2025,8 +2104,12 @@ mod tests {
         let before = counter.get();
         // S4/S5:Error 帧 → kind=worker_error,stream_kind=http2。before 须在
         // 流开始前取——errors 与 5xx 在同一次收口原子记录,晚取会漏计数。
-        let errs = prometheus::STREAM_ERRORS_TOTAL
-            .with_label_values(&[model, "1", "http2", "worker_error"]);
+        let errs = prometheus::STREAM_ERRORS_TOTAL.with_label_values(&[
+            model,
+            "1",
+            "http2",
+            "worker_error",
+        ]);
         let e_before = errs.get();
         let (body_tx, resp) = start_bidi_session(model, state).await;
         tokio::spawn(async move {
@@ -2034,8 +2117,16 @@ mod tests {
             drop(body_tx);
         });
         wait_for(|| counter.get() >= before + 1.0, "bidi requests_total 5xx").await;
-        assert_eq!(counter.get(), before + 1.0, "h2 bidi error must record one 5xx");
-        assert_eq!(errs.get(), e_before + 1.0, "S4: Error frame must count kind=worker_error");
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "h2 bidi error must record one 5xx"
+        );
+        assert_eq!(
+            errs.get(),
+            e_before + 1.0,
+            "S4: Error frame must count kind=worker_error"
+        );
     }
 
     /// D7:h2 bidi 早期拒绝(首帧非 BidiOpen)→ REQUESTS_TOTAL{4xx} +1。
@@ -2051,8 +2142,7 @@ mod tests {
         let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
         let before = counter.get();
         // 首帧发 Data 而非 Open → InvalidRequestBody(400)。
-        let (body_tx, body_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
         let body = Body::from_stream(ReceiverStream::new(body_rx));
         let req = axum::http::Request::builder()
             .method("POST")
@@ -2107,7 +2197,11 @@ mod tests {
         drop(body_tx);
         drop(resp);
         wait_for(|| canc.get() >= before + 1.0, "bidi cancelled").await;
-        assert_eq!(canc.get(), before + 1.0, "S2: h2 bidi disconnect must count");
+        assert_eq!(
+            canc.get(),
+            before + 1.0,
+            "S2: h2 bidi disconnect must count"
+        );
     }
 
     /// S8:h2 bidi open 成功后 per-worker dispatch 计数 +1。
@@ -2126,7 +2220,11 @@ mod tests {
             let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
             drop(body_tx);
         });
-        wait_for(|| prometheus::worker_inference_count(model, "1", 0) > before, "bidi worker inference").await;
+        wait_for(
+            || prometheus::worker_inference_count(model, "1", 0) > before,
+            "bidi worker inference",
+        )
+        .await;
     }
 
     // ===== F-09 (functional-defects-plan) ==================================
@@ -2152,7 +2250,9 @@ mod tests {
         });
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .as_deref(),
             Ok("open"),
             "worker must see StreamOpen"
         );
@@ -2164,7 +2264,9 @@ mod tests {
             .expect("send bad frame");
 
         assert_eq!(
-            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            actions
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .as_deref(),
             Ok("close"),
             "F-09: a decode error in the incoming task must still deliver the \
              D4 half-close (StreamRequest::Close) so the worker's generator \

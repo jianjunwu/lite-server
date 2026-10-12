@@ -55,7 +55,11 @@ pub(super) fn echo_early_rejection<T>(mut status: Status, request: &tonic::Reque
         .map(|rc| rc.request_id.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| metadata_request_id(request.metadata()));
-    inject_echo_headers(status.metadata_mut(), &rid, std::time::Duration::from_millis(0));
+    inject_echo_headers(
+        status.metadata_mut(),
+        &rid,
+        std::time::Duration::from_millis(0),
+    );
     status
 }
 
@@ -107,10 +111,7 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
 
 /// Inject custom response headers into tonic gRPC metadata,
 /// blocking hop-by-hop and transport headers.
-pub(super) fn inject_grpc_metadata(
-    metadata: &mut MetadataMap,
-    headers: &HashMap<String, String>,
-) {
+pub(super) fn inject_grpc_metadata(metadata: &mut MetadataMap, headers: &HashMap<String, String>) {
     for (k, v) in headers {
         let lower = k.to_ascii_lowercase();
         if BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {

@@ -189,7 +189,11 @@ impl CallbackRunner {
     /// Fire an event on all registered callbacks sequentially in the current task.
     /// Uses ``catch_unwind`` for panic isolation — a failing callback does not
     /// prevent other callbacks from executing.
-    async fn trigger_sequential(&self, event: &str, f: impl Fn(Arc<dyn Callback>) -> futures::future::BoxFuture<'static, ()>) {
+    async fn trigger_sequential(
+        &self,
+        event: &str,
+        f: impl Fn(Arc<dyn Callback>) -> futures::future::BoxFuture<'static, ()>,
+    ) {
         use futures::FutureExt;
         let cbs = self.callbacks.read().await;
         for (i, cb) in cbs.iter().enumerate() {
@@ -197,21 +201,20 @@ impl CallbackRunner {
             // C1: per-callback timeout (callbacks.timeout_secs; off by
             // default) — a hung callback is abandoned, the rest still run.
             let result = match self.dispatch_timeout {
-                Some(d) => match tokio::time::timeout(
-                    d,
-                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("Callback[{}] timed out during {} — abandoned", i, event);
-                        crate::metrics::prometheus::CALLBACK_DISPATCH_DROPPED
-                            .with_label_values(&["timeout"])
-                            .inc();
-                        continue;
+                Some(d) => {
+                    match tokio::time::timeout(d, std::panic::AssertUnwindSafe(fut).catch_unwind())
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            warn!("Callback[{}] timed out during {} — abandoned", i, event);
+                            crate::metrics::prometheus::CALLBACK_DISPATCH_DROPPED
+                                .with_label_values(&["timeout"])
+                                .inc();
+                            continue;
+                        }
                     }
-                },
+                }
                 None => std::panic::AssertUnwindSafe(fut).catch_unwind().await,
             };
             if let Err(e) = result {
@@ -234,7 +237,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_server_start", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_server_start(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_server_end(&self, ctx: &ServerContext) {
@@ -242,7 +246,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_server_end", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_server_end(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_model_load(&self, ctx: &ModelLifecycleContext) {
@@ -250,7 +255,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_model_load", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_model_load(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_model_unload(&self, ctx: &ModelLifecycleContext) {
@@ -258,7 +264,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_model_unload", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_model_unload(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_model_reload(&self, ctx: &ModelLifecycleContext) {
@@ -266,7 +273,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_model_reload", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_model_reload(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_model_activate(&self, ctx: &ModelLifecycleContext) {
@@ -274,7 +282,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_model_activate", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_model_activate(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_inference_request(&self, ctx: &InferenceContext) {
@@ -282,7 +291,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_inference_request", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_inference_request(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 
     pub async fn on_inference_response(&self, ctx: &InferenceContext) {
@@ -290,7 +300,8 @@ impl CallbackRunner {
         self.trigger_sequential("on_inference_response", move |cb| {
             let ctx = ctx.clone();
             Box::pin(async move { cb.on_inference_response(&ctx).await })
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -462,8 +473,20 @@ mod tests {
         let runner = CallbackRunner::new();
         assert!(runner.is_empty().await);
         // These should not panic
-        runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
-        runner.on_server_end(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_start(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
+        runner
+            .on_server_end(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -473,10 +496,22 @@ mod tests {
         runner.register(cb.clone()).await;
         assert_eq!(runner.len().await, 1);
 
-        runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_start(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
         assert_eq!(cb.start_count.load(Ordering::Relaxed), 1);
 
-        runner.on_server_end(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_end(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
         assert_eq!(cb.end_count.load(Ordering::Relaxed), 1);
     }
 
@@ -506,8 +541,7 @@ mod tests {
         impl Callback for ActivateCallback {
             async fn on_model_activate(&self, ctx: &ModelLifecycleContext) {
                 self.activations.fetch_add(1, Ordering::Relaxed);
-                *self.last.lock().unwrap() =
-                    Some((ctx.model_name.clone(), ctx.version.clone()));
+                *self.last.lock().unwrap() = Some((ctx.model_name.clone(), ctx.version.clone()));
             }
         }
 
@@ -515,11 +549,13 @@ mod tests {
         let runner = CallbackRunner::new();
         runner.register(cb.clone()).await;
 
-        runner.on_model_activate(&ModelLifecycleContext {
-            model_name: "m".into(),
-            version: "2".into(),
-            device: None,
-        }).await;
+        runner
+            .on_model_activate(&ModelLifecycleContext {
+                model_name: "m".into(),
+                version: "2".into(),
+                device: None,
+            })
+            .await;
         assert_eq!(cb.activations.load(Ordering::Relaxed), 1);
         assert_eq!(
             cb.last.lock().unwrap().clone(),
@@ -544,7 +580,13 @@ mod tests {
         runner.register(good.clone()).await;
 
         // This should not panic; the good callback still runs
-        runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_start(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
         assert_eq!(good.start_count.load(Ordering::Relaxed), 1);
     }
 
@@ -556,11 +598,13 @@ mod tests {
         runner.register(cb1.clone()).await;
         runner.register(cb2.clone()).await;
 
-        runner.on_model_load(&ModelLifecycleContext {
-            model_name: "m".into(),
-            version: "v1".into(),
-            device: None,
-        }).await;
+        runner
+            .on_model_load(&ModelLifecycleContext {
+                model_name: "m".into(),
+                version: "v1".into(),
+                device: None,
+            })
+            .await;
 
         assert_eq!(cb1.load_count.load(Ordering::Relaxed), 1);
         assert_eq!(cb2.load_count.load(Ordering::Relaxed), 1);
@@ -582,7 +626,10 @@ mod tests {
             }
         }
 
-        let cb = Arc::new(TrackCb { req_count: AtomicUsize::new(0), resp_count: AtomicUsize::new(0) });
+        let cb = Arc::new(TrackCb {
+            req_count: AtomicUsize::new(0),
+            resp_count: AtomicUsize::new(0),
+        });
         let runner = CallbackRunner::new();
         runner.register(cb.clone()).await;
 
@@ -598,7 +645,10 @@ mod tests {
         runner.on_inference_request(&ctx).await;
         assert_eq!(cb.req_count.load(Ordering::Relaxed), 1);
 
-        let resp_ctx = InferenceContext { elapsed_us: Some(1500), ..ctx };
+        let resp_ctx = InferenceContext {
+            elapsed_us: Some(1500),
+            ..ctx
+        };
         runner.on_inference_response(&resp_ctx).await;
         assert_eq!(cb.resp_count.load(Ordering::Relaxed), 1);
     }
@@ -619,7 +669,9 @@ mod tests {
             }
         }
 
-        let cb = Arc::new(TaskIdCallback { task_id: Mutex::new(None) });
+        let cb = Arc::new(TaskIdCallback {
+            task_id: Mutex::new(None),
+        });
         let runner = Arc::new(CallbackRunner::new());
         runner.register(cb.clone()).await;
 
@@ -629,7 +681,13 @@ mod tests {
             let runner = Arc::clone(&runner);
             async move {
                 let caller_id = tokio::task::id();
-                runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+                runner
+                    .on_server_start(&ServerContext {
+                        http_port: 8080,
+                        grpc_port: 9090,
+                        metrics_port: 9091,
+                    })
+                    .await;
                 (caller_id, *cb.task_id.lock().unwrap())
             }
         });
@@ -654,7 +712,13 @@ mod tests {
         runner.register(good.clone()).await;
 
         // trigger_sequential should catch the panic; good still runs
-        runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_start(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
         assert_eq!(good.start_count.load(Ordering::Relaxed), 1);
     }
 
@@ -666,7 +730,13 @@ mod tests {
         runner.register(cb1.clone()).await;
         runner.register(cb2.clone()).await;
 
-        runner.on_server_start(&ServerContext { http_port: 8080, grpc_port: 9090, metrics_port: 9091 }).await;
+        runner
+            .on_server_start(&ServerContext {
+                http_port: 8080,
+                grpc_port: 9090,
+                metrics_port: 9091,
+            })
+            .await;
         assert_eq!(cb1.start_count.load(Ordering::Relaxed), 1);
         assert_eq!(cb2.start_count.load(Ordering::Relaxed), 1);
     }

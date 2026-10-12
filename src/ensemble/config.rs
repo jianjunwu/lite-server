@@ -83,9 +83,7 @@ fn validate_outputs_rules(
                         ref_str, name
                     ))
                 })?;
-                if d.ty == InputType::Binary
-                    && rest.map(|r| r.contains('.')).unwrap_or(false)
-                {
+                if d.ty == InputType::Binary && rest.map(|r| r.contains('.')).unwrap_or(false) {
                     return Err(AppError::Config(format!(
                         "ensemble.outputs alias '{alias}': binary input '{}' \
                          must be referenced whole (R3)",
@@ -143,8 +141,7 @@ fn validate_outputs_rules(
             )));
         }
         let (alias, ref_str) = outputs.first().unwrap();
-        let caps = REF_RE.captures(ref_str)
-            .expect("refs validated above");
+        let caps = REF_RE.captures(ref_str).expect("refs validated above");
         let source = caps.get(1).unwrap().as_str();
         if source != steps[output_step].name.as_str() {
             return Err(AppError::Config(format!(
@@ -186,9 +183,8 @@ fn parse_when_expr(raw: &str) -> Result<WhenExpr, AppError> {
                 .chars()
                 .map(|c| if c == '\'' { '"' } else { c })
                 .collect();
-            serde_json::from_str(&swapped).map_err(|e| {
-                AppError::Config(format!("invalid when literal in '{raw}': {e}"))
-            })?
+            serde_json::from_str(&swapped)
+                .map_err(|e| AppError::Config(format!("invalid when literal in '{raw}': {e}")))?
         }
     };
     if op == WhenOp::In && !literal.is_array() {
@@ -196,7 +192,11 @@ fn parse_when_expr(raw: &str) -> Result<WhenExpr, AppError> {
             "when '{raw}': 'in' requires an array literal (E8-2)"
         )));
     }
-    Ok(WhenExpr { target, op, literal })
+    Ok(WhenExpr {
+        target,
+        op,
+        literal,
+    })
 }
 
 /// E8-2 (batch 5): the when target — the R16/m2 whitelist: `$request.dag` /
@@ -308,9 +308,10 @@ pub fn eval_when(
                 None => None, // absent — compares as null below
                 Some(EnsembleValue::Json(v)) => match path {
                     None => Some(v.clone()),
-                    Some(p) => Some(project_json_path(v, p).map_err(|e| {
-                        AppError::InvalidRequestBody(format!("when path: {e}"))
-                    })?),
+                    Some(p) => Some(
+                        project_json_path(v, p)
+                            .map_err(|e| AppError::InvalidRequestBody(format!("when path: {e}")))?,
+                    ),
                 },
                 Some(_) => {
                     return Err(AppError::InvalidRequestBody(format!(
@@ -388,9 +389,7 @@ pub fn select_dag_set(
 /// D38 (batch 5): extract + D22-validate the dag selector from the HTTP
 /// transport metadata channel (request / SSE / WS-upgrade / h2 stream
 /// headers — one key name, one client mental model).
-pub fn dag_selector_from_http(
-    headers: &axum::http::HeaderMap,
-) -> Result<Option<String>, AppError> {
+pub fn dag_selector_from_http(headers: &axum::http::HeaderMap) -> Result<Option<String>, AppError> {
     match headers.get("x-lite-dag") {
         None => Ok(None),
         Some(v) => v
@@ -430,7 +429,9 @@ pub fn dag_selector_from_grpc(
 pub fn validate_dag_selector(value: &str) -> Result<String, AppError> {
     if value.is_empty()
         || value.len() > 64
-        || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err(AppError::InvalidRequestBody(format!(
             "invalid x-lite-dag value '{value}' — must be 1-64 chars of              [A-Za-z0-9_-] (D22)"
@@ -525,10 +526,14 @@ pub(crate) fn build_response(
 ) -> Result<EnsembleOutcome, AppError> {
     let Some(outputs) = &plan.outputs else {
         // Historical single-output path (byte-identical).
-        let value = context.get(&plan.steps[plan.output_step].name).cloned()
+        let value = context
+            .get(&plan.steps[plan.output_step].name)
+            .cloned()
             .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
         let value = select_output_field(
-            &plan.steps[plan.output_step].name, value, plan.output_field.as_deref(),
+            &plan.steps[plan.output_step].name,
+            value,
+            plan.output_field.as_deref(),
         )?;
         return Ok(EnsembleOutcome::Unary(value));
     };
@@ -664,7 +669,10 @@ pub enum InputMode {
 /// streaming/MIMO validation stacks on top of it (no parse logic double
 /// write). The caller owns the file read — the cache re-parses only on
 /// miss/eviction.
-pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Result<EnsemblePlan, AppError> {
+pub fn parse_ensemble_plan(
+    content: &str,
+    config_path: &std::path::Path,
+) -> Result<EnsemblePlan, AppError> {
     let config: EnsembleConfig = serde_yaml::from_str(content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
 
@@ -695,12 +703,9 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         };
         let mut sets = IndexMap::new();
         for (name, set) in dags {
-            let plan = parse_ensemble_set(
-                set.steps, set.output, set.outputs, set.inputs, config_path,
-            )
-            .map_err(|e| {
-                AppError::Config(format!("dag set '{name}': {}", e))
-            })?;
+            let plan =
+                parse_ensemble_set(set.steps, set.output, set.outputs, set.inputs, config_path)
+                    .map_err(|e| AppError::Config(format!("dag set '{name}': {}", e)))?;
             sets.insert(name, Arc::new(plan));
         }
         // D41 (R22): a declared-inputs set has no anonymous `$request` root
@@ -762,33 +767,36 @@ fn parse_ensemble_set(
     inputs_decl: Option<IndexMap<String, InputDecl>>,
     config_path: &std::path::Path,
 ) -> Result<EnsemblePlan, AppError> {
-    let steps: Vec<EnsembleStep> = steps_raw.into_iter().map(|s| {
-        // E5: per-step timeout must be a positive, finite duration.
-        if let Some(t) = s.timeout_secs {
-            if !t.is_finite() || t <= 0.0 {
-                return Err(AppError::Config(format!(
-                    "step '{}': timeout_secs must be a positive finite number, got {}",
-                    s.name, t
-                )));
+    let steps: Vec<EnsembleStep> = steps_raw
+        .into_iter()
+        .map(|s| {
+            // E5: per-step timeout must be a positive, finite duration.
+            if let Some(t) = s.timeout_secs {
+                if !t.is_finite() || t <= 0.0 {
+                    return Err(AppError::Config(format!(
+                        "step '{}': timeout_secs must be a positive finite number, got {}",
+                        s.name, t
+                    )));
+                }
             }
-        }
-        Ok(EnsembleStep {
-            name: s.name,
-            model: s.model,
-            // E4: "latest" == omitted (execution-time active resolution).
-            version: s.version.filter(|v| v != "latest"),
-            inputs: s.inputs,
-            stream: s.stream,
-            params: s.params,
-            timeout_secs: s.timeout_secs,
-            on_error: s.on_error.unwrap_or_default(),
-            retries: s.retries.unwrap_or(0),
-            outputs_decl: s.outputs,
-            // E8-2: grammar parse here; the R16 whitelist check runs once
-            // the type environment exists (validate_when_refs).
-            when: s.when.as_deref().map(parse_when_expr).transpose()?,
+            Ok(EnsembleStep {
+                name: s.name,
+                model: s.model,
+                // E4: "latest" == omitted (execution-time active resolution).
+                version: s.version.filter(|v| v != "latest"),
+                inputs: s.inputs,
+                stream: s.stream,
+                params: s.params,
+                timeout_secs: s.timeout_secs,
+                on_error: s.on_error.unwrap_or_default(),
+                retries: s.retries.unwrap_or(0),
+                outputs_decl: s.outputs,
+                // E8-2: grammar parse here; the R16 whitelist check runs once
+                // the type environment exists (validate_when_refs).
+                when: s.when.as_deref().map(parse_when_expr).transpose()?,
+            })
         })
-    }).collect::<Result<_, AppError>>()?;
+        .collect::<Result<_, AppError>>()?;
 
     validate_dag(&steps)?;
     // E2: resolve the explicit output BEFORE chain construction / streaming
@@ -851,7 +859,12 @@ fn parse_ensemble_set(
         .collect();
     let layers = topological_layers(&steps)
         .into_iter()
-        .map(|layer| layer.into_iter().map(|s| index_of[s.name.as_str()]).collect())
+        .map(|layer| {
+            layer
+                .into_iter()
+                .map(|s| index_of[s.name.as_str()])
+                .collect()
+        })
         .collect();
     // P1 (batch 6): per-step referenced context keys — spawn-time clones
     // select these instead of the whole table. Runs after ref validation,
@@ -933,4 +946,3 @@ fn parse_ensemble_set(
         source_mtime: None,
     })
 }
-

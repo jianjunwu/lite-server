@@ -1,5 +1,5 @@
-use super::*;
 use super::inference::{build_request_meta, resolve_version};
+use super::*;
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
@@ -142,7 +142,13 @@ pub async fn resolve_custom_route(
             )
         })?;
     enforce_auth(mv.policies.auth.as_ref(), headers)?;
-    enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, client_ip).await?;
+    enforce_rate_limit(
+        state,
+        mv.policies.rate_limit.as_ref(),
+        model_name,
+        client_ip,
+    )
+    .await?;
 
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -152,9 +158,15 @@ pub async fn resolve_custom_route(
     }
 
     // Match against this version's declared routes.
-    let routes = state.worker_manager.get_routes(model_name, &resolved_version).await;
+    let routes = state
+        .worker_manager
+        .get_routes(model_name, &resolved_version)
+        .await;
     match match_route(&routes, &route_tail, method.as_str()) {
-        RouteMatch::Hit { pattern, path_params } => Ok(ResolvedCustomRoute {
+        RouteMatch::Hit {
+            pattern,
+            path_params,
+        } => Ok(ResolvedCustomRoute {
             resolved_version,
             route_pattern: pattern,
             path_params,
@@ -195,16 +207,26 @@ pub async fn dispatch_custom_route(
     let mv = state
         .registry
         .get(model_name, Some(&resolved_version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+        .ok_or_else(|| {
+            AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version))
+        })?;
     let num_workers = mv.workers.len();
     if num_workers == 0 {
-        return Err(AppError::WorkerCrashed(format!("{} has no workers", model_name)));
+        return Err(AppError::WorkerCrashed(format!(
+            "{} has no workers",
+            model_name
+        )));
     }
     let clients = state
         .worker_manager
         .get_zmq_clients(model_name, &resolved_version)
         .await
-        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", model_name, resolved_version)))?;
+        .ok_or_else(|| {
+            AppError::WorkerCrashed(format!(
+                "{} {} has no ZMQ clients",
+                model_name, resolved_version
+            ))
+        })?;
     let outlier = state
         .worker_manager
         .get_outlier_state(model_name, &resolved_version)
@@ -237,7 +259,13 @@ pub async fn dispatch_custom_route(
     // ride on RequestMeta (route_pattern == meta.route).
     let deadline = crate::deadline::resolve_from_http(headers, state.config.server.timeout);
     // B1 (cluster A): only a client-specified deadline rides the stream meta.
-    let mut meta = build_request_meta(headers, bytes::Bytes::from_static(b"null"), &route_pattern, cx, deadline.stream_meta_unix_ns());
+    let mut meta = build_request_meta(
+        headers,
+        bytes::Bytes::from_static(b"null"),
+        &route_pattern,
+        cx,
+        deadline.stream_meta_unix_ns(),
+    );
     meta.method = method_str.to_string();
     meta.query = query;
     meta.path_params = path_params;
@@ -250,12 +278,19 @@ pub async fn dispatch_custom_route(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let uid = format!("route_{}_{}-{}", model_name, resolved_version, Uuid::new_v4());
+    let uid = format!(
+        "route_{}_{}-{}",
+        model_name,
+        resolved_version,
+        Uuid::new_v4()
+    );
     let stream_id = uid.clone();
     let request = pb::Request {
         uid,
         meta: Some(meta),
-        payload: Some(pb::request::Payload::RouteCall(pb::SingleRequest { data: body })),
+        payload: Some(pb::request::Payload::RouteCall(pb::SingleRequest {
+            data: body,
+        })),
     };
 
     let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
@@ -288,12 +323,16 @@ pub async fn dispatch_custom_route(
                 // arrives — fire InferenceResponse with the full duration.
                 if r.is_ok() {
                     crate::callback::fire_inference_response(
-                        &state.callback_runner, &req_ctx, start,
+                        &state.callback_runner,
+                        &req_ctx,
+                        start,
                     );
                 }
                 r
             }
-            _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
+            _ => Err(AppError::WorkerCrashed(
+                "unexpected response type".to_string(),
+            )),
         },
         RouteReply::Unary(None) => Err(AppError::WorkerCrashed(
             "route reply channel closed".to_string(),
@@ -318,10 +357,15 @@ pub async fn dispatch_custom_route(
                         return Err(e);
                     }
                 };
-                let inflight_guard = outlier
-                    .map(|o| crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit));
+                let inflight_guard = outlier.map(|o| {
+                    crate::streaming::StreamInflightGuard::new(o, worker_id).with_permit(permit)
+                });
                 // G3: count the stream toward the slot's max_requests budget.
-                state.inference_queue.record_stream_served(model_name, &resolved_version, worker_id);
+                state.inference_queue.record_stream_served(
+                    model_name,
+                    &resolved_version,
+                    worker_id,
+                );
                 // Stream route: InferenceResponse fires on the terminal frame
                 // inside the body (aligned with SSE/WS), not here at Start.
                 build_route_stream_http_response(
@@ -433,52 +477,63 @@ fn build_route_stream_http_response(
             // G1/G3: same for the per-slot in-flight stream count.
             let _hold_inflight = &inflight_guard;
             async move {
-            if ended {
-                return None;
-            }
-            // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
-            // A reclaim is NOT a channel close: the worker may still be
-            // generating, so it keeps the guard armed (cancel on drop).
-            let (frame, reclaimed) = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
-                Ok(Some(f)) => (Some(f), false),
-                Ok(None) => (None, false), // worker closed the stream
-                Err(elapsed) => {
-                    tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
-                    (None, true)
+                if ended {
+                    return None;
                 }
-            };
-            match frame.map(|f| f.payload) {
-                Some(Some(pb::stream_response::Payload::Chunk(c))) => {
-                    let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
-                    Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false, cb, ctx, t0, guard)))
-                }
-                Some(Some(pb::stream_response::Payload::Error(e))) => {
-                    warn!("route stream error: {}", e.message);
-                    // Terminal frame → fire the response callback (full elapsed).
-                    guard.disarm();
-                    crate::callback::fire_inference_response(&cb, &ctx, t0);
-                    if is_sse {
-                        let event = sse_frame(e.message.as_bytes());
-                        Some((Ok(bytes::Bytes::from(event)), (rx, true, cb, ctx, t0, guard)))
-                    } else {
+                // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
+                // A reclaim is NOT a channel close: the worker may still be
+                // generating, so it keeps the guard armed (cancel on drop).
+                let (frame, reclaimed) =
+                    match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+                        Ok(Some(f)) => (Some(f), false),
+                        Ok(None) => (None, false), // worker closed the stream
+                        Err(elapsed) => {
+                            tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
+                            (None, true)
+                        }
+                    };
+                match frame.map(|f| f.payload) {
+                    Some(Some(pb::stream_response::Payload::Chunk(c))) => {
+                        let data = if is_sse {
+                            sse_frame(&c.data)
+                        } else {
+                            c.data.to_vec()
+                        };
+                        Some((
+                            Ok::<_, Infallible>(bytes::Bytes::from(data)),
+                            (rx, false, cb, ctx, t0, guard),
+                        ))
+                    }
+                    Some(Some(pb::stream_response::Payload::Error(e))) => {
+                        warn!("route stream error: {}", e.message);
+                        // Terminal frame → fire the response callback (full elapsed).
+                        guard.disarm();
+                        crate::callback::fire_inference_response(&cb, &ctx, t0);
+                        if is_sse {
+                            let event = sse_frame(e.message.as_bytes());
+                            Some((
+                                Ok(bytes::Bytes::from(event)),
+                                (rx, true, cb, ctx, t0, guard),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // Done or channel closed: the worker already ended its side —
+                    // disarm, no cancel.
+                    Some(Some(pb::stream_response::Payload::Done(_))) | None if !reclaimed => {
+                        guard.disarm();
+                        crate::callback::fire_inference_response(&cb, &ctx, t0);
+                        None
+                    }
+                    // Deadline/idle reclaim or an unexpected frame — terminal for
+                    // us, but the worker may still be generating: the armed
+                    // guard cancels on drop.
+                    _ => {
+                        crate::callback::fire_inference_response(&cb, &ctx, t0);
                         None
                     }
                 }
-                // Done or channel closed: the worker already ended its side —
-                // disarm, no cancel.
-                Some(Some(pb::stream_response::Payload::Done(_))) | None if !reclaimed => {
-                    guard.disarm();
-                    crate::callback::fire_inference_response(&cb, &ctx, t0);
-                    None
-                }
-                // Deadline/idle reclaim or an unexpected frame — terminal for
-                // us, but the worker may still be generating: the armed
-                // guard cancels on drop.
-                _ => {
-                    crate::callback::fire_inference_response(&cb, &ctx, t0);
-                    None
-                }
-            }
             }
         },
     );
@@ -513,7 +568,11 @@ fn sse_frame(data: &[u8]) -> Vec<u8> {
 /// is "Ok" on normal completion; "Error" carries an HTTP status in
 /// `status.message` (worker exception path).
 fn build_route_http_response(single: pb::SingleResponse) -> Result<Response, AppError> {
-    let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+    let code = single
+        .status
+        .as_ref()
+        .map(|s| s.code.as_str())
+        .unwrap_or("Ok");
     if code == "Ok" {
         let content_type = if single.media_type.is_empty() {
             "application/json; charset=utf-8"
@@ -546,19 +605,25 @@ fn build_route_http_response(single: pb::SingleResponse) -> Result<Response, App
             serde_json::from_slice(&single.data).unwrap_or(json!({}))
         };
         let o = data.get("error");
-        let pick = |k: &str| o.and_then(|e| e.get(k)).and_then(|v| v.as_str()).map(String::from);
-        Err(AppError::ModelError(Box::new(crate::error::ModelErrorData {
-            status_code: http_status,
-            error_type: pick("type").unwrap_or_else(|| "model_error".to_string()),
-            detail: pick("message").unwrap_or_else(|| "model error".to_string()),
-            code: pick("code"),
-            param: pick("param"),
-            headers: if single.headers.is_empty() {
-                None
-            } else {
-                Some(single.headers.clone())
+        let pick = |k: &str| {
+            o.and_then(|e| e.get(k))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        Err(AppError::ModelError(Box::new(
+            crate::error::ModelErrorData {
+                status_code: http_status,
+                error_type: pick("type").unwrap_or_else(|| "model_error".to_string()),
+                detail: pick("message").unwrap_or_else(|| "model error".to_string()),
+                code: pick("code"),
+                param: pick("param"),
+                headers: if single.headers.is_empty() {
+                    None
+                } else {
+                    Some(single.headers.clone())
+                },
             },
-        })))
+        )))
     } else {
         Err(AppError::WorkerCrashed(msg))
     }
@@ -661,7 +726,10 @@ mod route_match_tests {
     fn test_match_route_literal_hit() {
         let routes = vec![decl("/status", &["GET"])];
         match match_route(&routes, "status", "GET") {
-            RouteMatch::Hit { pattern, path_params } => {
+            RouteMatch::Hit {
+                pattern,
+                path_params,
+            } => {
                 assert_eq!(pattern, "/status");
                 assert!(path_params.is_empty());
             }
@@ -673,7 +741,10 @@ mod route_match_tests {
     fn test_match_route_path_params() {
         let routes = vec![decl("/pets/{id}", &["GET"])];
         match match_route(&routes, "pets/123", "GET") {
-            RouteMatch::Hit { pattern, path_params } => {
+            RouteMatch::Hit {
+                pattern,
+                path_params,
+            } => {
                 assert_eq!(pattern, "/pets/{id}");
                 assert_eq!(path_params.get("id"), Some(&"123".to_string()));
             }
@@ -704,7 +775,10 @@ mod route_match_tests {
     #[test]
     fn test_match_route_not_found() {
         let routes = vec![decl("/status", &["GET"])];
-        assert!(matches!(match_route(&routes, "nope", "GET"), RouteMatch::NotFound));
+        assert!(matches!(
+            match_route(&routes, "nope", "GET"),
+            RouteMatch::NotFound
+        ));
         // wrong segment count
         assert!(matches!(
             match_route(&routes, "status/extra", "GET"),
@@ -802,7 +876,12 @@ mod route_match_tests {
 
         // Missing key → 401.
         let err = resolve_custom_route(
-            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+            &state,
+            model,
+            "status",
+            &axum::http::Method::GET,
+            &HeaderMap::new(),
+            "127.0.0.1",
         )
         .await
         .unwrap_err();
@@ -815,7 +894,12 @@ mod route_match_tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "wrong".parse().unwrap());
         let err = resolve_custom_route(
-            &state, model, "status", &axum::http::Method::GET, &h, "127.0.0.1",
+            &state,
+            model,
+            "status",
+            &axum::http::Method::GET,
+            &h,
+            "127.0.0.1",
         )
         .await
         .unwrap_err();
@@ -828,7 +912,12 @@ mod route_match_tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "sk-route".parse().unwrap());
         let resolved = resolve_custom_route(
-            &state, model, "status", &axum::http::Method::GET, &h, "127.0.0.1",
+            &state,
+            model,
+            "status",
+            &axum::http::Method::GET,
+            &h,
+            "127.0.0.1",
         )
         .await
         .expect("valid key must pass");
@@ -844,7 +933,12 @@ mod route_match_tests {
         let state = policy_route_state(model, auth_policy()).await;
 
         let err = resolve_custom_route(
-            &state, model, "no-such-route", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+            &state,
+            model,
+            "no-such-route",
+            &axum::http::Method::GET,
+            &HeaderMap::new(),
+            "127.0.0.1",
         )
         .await
         .unwrap_err();
@@ -857,7 +951,12 @@ mod route_match_tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "sk-route".parse().unwrap());
         let err = resolve_custom_route(
-            &state, model, "no-such-route", &axum::http::Method::GET, &h, "127.0.0.1",
+            &state,
+            model,
+            "no-such-route",
+            &axum::http::Method::GET,
+            &h,
+            "127.0.0.1",
         )
         .await
         .unwrap_err();
@@ -886,12 +985,22 @@ mod route_match_tests {
         .await;
 
         resolve_custom_route(
-            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+            &state,
+            model,
+            "status",
+            &axum::http::Method::GET,
+            &HeaderMap::new(),
+            "127.0.0.1",
         )
         .await
         .expect("first call within budget");
         let err = resolve_custom_route(
-            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+            &state,
+            model,
+            "status",
+            &axum::http::Method::GET,
+            &HeaderMap::new(),
+            "127.0.0.1",
         )
         .await
         .unwrap_err();
@@ -931,26 +1040,21 @@ mod route_match_tests {
                     };
                     match req.payload {
                         Some(pb::request::Payload::Stream(st)) => {
-                            if matches!(
-                                st.action,
-                                Some(pb::stream_request::Action::Cancel(_))
-                            ) {
+                            if matches!(st.action, Some(pb::stream_request::Action::Cancel(_))) {
                                 let _ = tx.send(st.stream_id.clone());
                             }
                         }
                         Some(pb::request::Payload::RouteCall(_)) => {
                             let resp = pb::Response {
-                                payload: Some(pb::response::Payload::Stream(
-                                    pb::StreamResponse {
-                                        stream_id: req.uid.clone(),
-                                        payload: Some(pb::stream_response::Payload::Start(
-                                            pb::StreamStart {
-                                                media_type: "application/octet-stream".to_string(),
-                                                ..Default::default()
-                                            },
-                                        )),
-                                    },
-                                )),
+                                payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                    stream_id: req.uid.clone(),
+                                    payload: Some(pb::stream_response::Payload::Start(
+                                        pb::StreamStart {
+                                            media_type: "application/octet-stream".to_string(),
+                                            ..Default::default()
+                                        },
+                                    )),
+                                })),
                                 ..Default::default()
                             };
                             if s.send(resp.encode_to_vec(), 0).is_err() {
@@ -972,8 +1076,9 @@ mod route_match_tests {
             }
         });
 
-        let client =
-            std::sync::Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint.clone()));
+        let client = std::sync::Arc::new(crate::transport::zmq::WorkerZmqClient::new(
+            endpoint.clone(),
+        ));
         let uid = format!("route_m_1-test-{}", uuid::Uuid::new_v4());
         let request = pb::Request {
             uid: uid.clone(),
@@ -983,15 +1088,14 @@ mod route_match_tests {
             })),
         };
         let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await.unwrap();
-        let start = match tokio::time::timeout(std::time::Duration::from_secs(5), chunk_rx.recv())
-            .await
-        {
-            Ok(Some(f)) => match f.payload {
-                Some(pb::stream_response::Payload::Start(s)) => s,
-                other => panic!("expected Start, got {other:?}"),
-            },
-            r => panic!("no Start frame: {r:?}"),
-        };
+        let start =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), chunk_rx.recv()).await {
+                Ok(Some(f)) => match f.payload {
+                    Some(pb::stream_response::Payload::Start(s)) => s,
+                    other => panic!("expected Start, got {other:?}"),
+                },
+                r => panic!("no Start frame: {r:?}"),
+            };
         drop(resp_rx);
 
         let resp = build_route_stream_http_response(

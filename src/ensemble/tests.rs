@@ -1216,7 +1216,9 @@ async fn c2_loader_panic_does_not_wedge_the_slot() {
     );
     // The slot is not wedged: the next call re-parses and succeeds.
     let ok = cache
-        .get_or_load(key, || async { Ok::<_, AppError>(test_plan("/nonexistent")) })
+        .get_or_load(key, || async {
+            Ok::<_, AppError>(test_plan("/nonexistent"))
+        })
         .await;
     assert!(ok.is_ok(), "a panicked load must not wedge the key");
 }
@@ -2595,7 +2597,13 @@ fn d41_selector_requires_dags_form() {
 /// are legal.
 #[test]
 fn d41_selector_ref_shape() {
-    for bad in ["$inputs.x", "$request", "$request.", "$request..a", "request.x"] {
+    for bad in [
+        "$inputs.x",
+        "$request",
+        "$request.",
+        "$request..a",
+        "request.x",
+    ] {
         let yaml = format!(
             "ensemble:\n  dag_selector: \"{bad}\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {{x: \"$request\"}}\n"
         );
@@ -2649,14 +2657,23 @@ fn d41_selector_resolution() {
     assert_eq!(resolve(json!({"x": 1})).unwrap(), None);
     assert_eq!(resolve(json!({"modelName": null})).unwrap(), None);
     // String → validated Some.
-    assert_eq!(resolve(json!({"modelName": "fast"})).unwrap(), Some("fast".to_string()));
+    assert_eq!(
+        resolve(json!({"modelName": "fast"})).unwrap(),
+        Some("fast".to_string())
+    );
     // Invalid charset → 400 (D22 validation reused).
     let err = resolve(json!({"modelName": "bad!"})).unwrap_err();
-    assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    assert!(
+        matches!(err, AppError::InvalidRequestBody(_)),
+        "got {err:?}"
+    );
     // Non-string non-null → 400 (D41), error names the source ref.
     for bad in [json!(123), json!(true), json!({"a": 1}), json!([1])] {
         let err = resolve(json!({"modelName": bad})).unwrap_err();
-        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "got {err:?}"
+        );
         assert!(err.to_string().contains("(D41)"), "got: {err}");
         assert!(err.to_string().contains("$request.modelName"), "got: {err}");
     }
@@ -2664,7 +2681,10 @@ fn d41_selector_resolution() {
     // build an array root from a multi-frame JSON upload — a named set field
     // is unreachable there, so fail fast instead of silently defaulting.
     let err = resolve(json!([1, 2])).unwrap_err();
-    assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    assert!(
+        matches!(err, AppError::InvalidRequestBody(_)),
+        "got {err:?}"
+    );
     assert!(err.to_string().contains("(D41)"), "got: {err}");
     assert!(err.to_string().contains("$request.modelName"), "got: {err}");
     // Scalar root → field absent → None (default), unchanged.
@@ -2672,7 +2692,12 @@ fn d41_selector_resolution() {
     // Binary / envelope roots carry no selector field → None.
     assert_eq!(
         resolve_dag_selector_from_value(
-            &EnsembleValue::Binary(Bytes::from_static(b"x"), "application/octet-stream".into(), None, None),
+            &EnsembleValue::Binary(
+                Bytes::from_static(b"x"),
+                "application/octet-stream".into(),
+                None,
+                None
+            ),
             path
         )
         .unwrap(),
@@ -3548,7 +3573,10 @@ fn audit_c1_outputs_binary_alias_path_rejected_r8() {
     let yaml = "ensemble:\n  steps:\n    - name: enc\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n          path: \"$.crop\"\n      inputs: {x: \"$request\"}\n  outputs:\n    thumb: \"$enc.crop.foo\"\n";
     let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
         .expect_err("a path projection on a declared BINARY alias must be parse-rejected (R8)");
-    assert!(err.to_string().contains("R8") || err.to_string().contains("binary"), "got: {err}");
+    assert!(
+        err.to_string().contains("R8") || err.to_string().contains("binary"),
+        "got: {err}"
+    );
 }
 
 /// AUDIT-C2 (D5/§5.5.6): build_response's null channel is for ABSENT
@@ -3571,7 +3599,12 @@ fn audit_c2_build_response_propagates_non_absence_errors() {
     // absence.
     context.insert(
         "s1".to_string(),
-        EnsembleValue::Binary(Bytes::from_static(b"\x01\x02"), "image/png".into(), None, None),
+        EnsembleValue::Binary(
+            Bytes::from_static(b"\x01\x02"),
+            "image/png".into(),
+            None,
+            None,
+        ),
     );
     let result = build_response(&plan, "demo", &context);
     assert!(
@@ -3591,7 +3624,10 @@ fn audit_c3_output_multi_segment_field_rejected() {
     let yaml = "ensemble:\n  steps:\n    - name: s1\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: s2\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$s1\"}\n  output: \"$s2.a.b\"\n";
     let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
         .expect_err("multi-segment ensemble.output field must be parse-rejected (B5 parity)");
-    assert!(err.to_string().contains("output") || err.to_string().contains("segment"), "got: {err}");
+    assert!(
+        err.to_string().contains("output") || err.to_string().contains("segment"),
+        "got: {err}"
+    );
 }
 
 /// AUDIT-C5 (§4.2 regression, batch 6 P2 — FIXED): the pipeline chunk
@@ -3617,8 +3653,7 @@ fn audit_c5_pipeline_non_json_chunk_must_not_splice_raw() {
     validate_pipeline_chunk("prev", &injected)
         .expect_err("an injection-shaped chunk must be rejected, not spliced");
     // Valid chunks pass.
-    validate_pipeline_chunk("prev", br#"{"text": "hi"}"#)
-        .expect("a valid JSON chunk must pass");
+    validate_pipeline_chunk("prev", br#"{"text": "hi"}"#).expect("a valid JSON chunk must pass");
 
     // Unary raw-residency seam: invalid JSON must not become RawJson.
     let bad = pb::SingleResponse {
@@ -3658,9 +3693,8 @@ fn audit_c7_step_named_request_is_rejected() {
 /// dropped without any signal. Must be a 400.
 #[test]
 fn audit_c6_duplicate_envelope_input_names_rejected() {
-    let decl: IndexMap<String, InputDecl> = [("text".to_string(), json_decl())]
-        .into_iter()
-        .collect();
+    let decl: IndexMap<String, InputDecl> =
+        [("text".to_string(), json_decl())].into_iter().collect();
     let dup = json!({"inputs": [
         {"name": "text", "data": 1},
         {"name": "text", "data": 2}
@@ -3678,8 +3712,10 @@ fn audit_c6_duplicate_envelope_input_names_rejected() {
 #[test]
 fn d17_binary_frames_concat_with_first_content_type() {
     let mut agg = BidiAggregator::new(1024);
-    agg.push(Bytes::from_static(b"\x01\x02"), false, Some("image/png")).unwrap();
-    agg.push(Bytes::from_static(b"\x03"), false, Some("image/jpeg")).unwrap();
+    agg.push(Bytes::from_static(b"\x01\x02"), false, Some("image/png"))
+        .unwrap();
+    agg.push(Bytes::from_static(b"\x03"), false, Some("image/jpeg"))
+        .unwrap();
     match agg.finish().unwrap() {
         EnsembleValue::Binary(b, ct, ..) => {
             assert_eq!(b.as_ref(), b"\x01\x02\x03", "byte concat (D17-1)");
@@ -3694,7 +3730,8 @@ fn d17_binary_frames_concat_with_first_content_type() {
 #[test]
 fn d17_json_frames_aggregate_to_array_single_unwrapped() {
     let mut agg = BidiAggregator::new(1024);
-    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None).unwrap();
+    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None)
+        .unwrap();
     let v = agg.finish().unwrap();
     assert!(
         matches!(&v, EnsembleValue::Json(j) if j["a"] == json!(1)),
@@ -3702,8 +3739,10 @@ fn d17_json_frames_aggregate_to_array_single_unwrapped() {
     );
 
     let mut agg = BidiAggregator::new(1024);
-    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None).unwrap();
-    agg.push(Bytes::from_static(br#"{"b":2}"#), true, None).unwrap();
+    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None)
+        .unwrap();
+    agg.push(Bytes::from_static(br#"{"b":2}"#), true, None)
+        .unwrap();
     match agg.finish().unwrap() {
         EnsembleValue::Json(Value::Array(items)) => {
             assert_eq!(items.len(), 2, "multi Json frames → array (D17-2)")
@@ -3718,7 +3757,9 @@ fn d17_json_frames_aggregate_to_array_single_unwrapped() {
 fn d3_aggregation_cap_is_payload_too_large() {
     let mut agg = BidiAggregator::new(4);
     agg.push(Bytes::from_static(b"ab"), false, None).unwrap();
-    let err = agg.push(Bytes::from_static(b"cde"), false, None).unwrap_err();
+    let err = agg
+        .push(Bytes::from_static(b"cde"), false, None)
+        .unwrap_err();
     assert!(
         matches!(err, AppError::PayloadTooLarge { .. }),
         "D3 cap breach → PayloadTooLarge, got {err:?}"
@@ -3886,21 +3927,40 @@ fn chain_consumer_harness_full(
     let handles_run = handles.clone();
     let run = Box::pin(async move {
         consume_stream_consumer(
-            &state, &plan, 1, "pre", up_rx, down_tx, &ctx, "req-1", &opts, None,
-            &handles_run, upstream_handle_id, true, &snapshot,
+            &state,
+            &plan,
+            1,
+            "pre",
+            up_rx,
+            down_tx,
+            &ctx,
+            "req-1",
+            &opts,
+            None,
+            &handles_run,
+            upstream_handle_id,
+            true,
+            &snapshot,
         )
         .await
     });
-    ConsumerHarness { up_tx, down_rx, handles, run }
+    ConsumerHarness {
+        up_tx,
+        down_rx,
+        handles,
+        run,
+    }
 }
 
 fn chunk_frame(data: &'static [u8]) -> pb::StreamResponse {
     pb::StreamResponse {
         stream_id: "s1".to_string(),
-        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-            data: Bytes::from_static(data),
-            is_final: false,
-        })),
+        payload: Some(pb::stream_response::Payload::Chunk(
+            pb::StreamChunkResponse {
+                data: Bytes::from_static(data),
+                is_final: false,
+            },
+        )),
     }
 }
 
@@ -3916,7 +3976,11 @@ async fn chain_consumer_invalid_json_chunk_emits_error_frame() {
         "a hop failure must be terminated in-band (Error frame), not propagated: {res:?}"
     );
 
-    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    let frame = h
+        .down_rx
+        .recv()
+        .await
+        .expect("an Error frame must reach downstream");
     match frame.payload {
         Some(pb::stream_response::Payload::Error(e)) => {
             assert!(
@@ -3936,7 +4000,10 @@ async fn chain_consumer_invalid_json_chunk_emits_error_frame() {
 #[tokio::test]
 async fn chain_consumer_sub_stream_open_failure_emits_error_frame() {
     let mut h = chain_consumer_harness();
-    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    h.up_tx
+        .send(chunk_frame(br#"{"text":"hi"}"#))
+        .await
+        .unwrap();
     drop(h.up_tx);
 
     let res = h.run.await;
@@ -3945,7 +4012,11 @@ async fn chain_consumer_sub_stream_open_failure_emits_error_frame() {
         "a sub-stream open failure must be terminated in-band (Error frame), not propagated: {res:?}"
     );
 
-    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    let frame = h
+        .down_rx
+        .recv()
+        .await
+        .expect("an Error frame must reach downstream");
     match frame.payload {
         Some(pb::stream_response::Payload::Error(e)) => {
             assert!(
@@ -4015,14 +4086,21 @@ async fn chain_consumer_dead_sub_model_fails_fast_with_error_frame() {
     let mut plan = chain_consumer_plan();
     plan.steps[1].version = Some("1".to_string());
     let mut h = chain_consumer_harness_with(state, plan);
-    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    h.up_tx
+        .send(chunk_frame(br#"{"text":"hi"}"#))
+        .await
+        .unwrap();
     drop(h.up_tx);
 
     tokio::time::timeout(Duration::from_secs(5), h.run)
         .await
         .expect("a dead sub-model must fail fast, not spin the readiness poll")
         .expect("hop failure terminated in-band");
-    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    let frame = h
+        .down_rx
+        .recv()
+        .await
+        .expect("an Error frame must reach downstream");
     match frame.payload {
         Some(pb::stream_response::Payload::Error(e)) => {
             assert!(
@@ -4099,9 +4177,18 @@ fn spawn_open_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                continue;
+            };
             if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
-                let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                let _ = s.send(
+                    pb::Response {
+                        uid: req.uid,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                    0,
+                );
                 continue;
             }
             let mk = |payload| pb::Response {
@@ -4112,14 +4199,19 @@ fn spawn_open_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
                 ..Default::default()
             };
             let _ = s.send(
-                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                    data: Bytes::from_static(b"{}"),
-                    is_final: false,
-                }))
+                mk(pb::stream_response::Payload::Chunk(
+                    pb::StreamChunkResponse {
+                        data: Bytes::from_static(b"{}"),
+                        is_final: false,
+                    },
+                ))
                 .encode_to_vec(),
                 0,
             );
-            let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(), 0);
+            let _ = s.send(
+                mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(),
+                0,
+            );
         }
     })
 }
@@ -4137,7 +4229,9 @@ fn spawn_open_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                continue;
+            };
             if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
                 continue;
             }
@@ -4172,7 +4266,10 @@ async fn chain_consumer_removes_sub_stream_handles_on_completion() {
     let mut h = chain_consumer_harness_with(state, plan);
 
     for _ in 0..3 {
-        h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+        h.up_tx
+            .send(chunk_frame(br#"{"text":"hi"}"#))
+            .await
+            .unwrap();
     }
     drop(h.up_tx);
 
@@ -4184,10 +4281,16 @@ async fn chain_consumer_removes_sub_stream_handles_on_completion() {
     // 3 forwarded chunks + the synthesized terminal Done.
     for _ in 0..3 {
         let frame = h.down_rx.recv().await.expect("a forwarded chunk");
-        assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Chunk(_))));
+        assert!(matches!(
+            frame.payload,
+            Some(pb::stream_response::Payload::Chunk(_))
+        ));
     }
     let frame = h.down_rx.recv().await.expect("the terminal Done");
-    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Done(_))));
+    assert!(matches!(
+        frame.payload,
+        Some(pb::stream_response::Payload::Done(_))
+    ));
 
     assert_eq!(
         h.handles.lock().unwrap().len(),
@@ -4208,7 +4311,10 @@ async fn chain_consumer_removes_sub_stream_handle_on_error() {
     plan.steps[1].version = Some("1".to_string());
     let mut h = chain_consumer_harness_with(state, plan);
 
-    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    h.up_tx
+        .send(chunk_frame(br#"{"text":"hi"}"#))
+        .await
+        .unwrap();
     drop(h.up_tx);
 
     tokio::time::timeout(Duration::from_secs(10), h.run)
@@ -4216,8 +4322,15 @@ async fn chain_consumer_removes_sub_stream_handle_on_error() {
         .expect("consumer must finish")
         .expect("hop failure terminated in-band");
 
-    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
-    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))));
+    let frame = h
+        .down_rx
+        .recv()
+        .await
+        .expect("an Error frame must reach downstream");
+    assert!(matches!(
+        frame.payload,
+        Some(pb::stream_response::Payload::Error(_))
+    ));
 
     assert_eq!(
         h.handles.lock().unwrap().len(),
@@ -4253,7 +4366,10 @@ async fn chain_consumer_removes_head_handle_when_upstream_terminates() {
     let h = chain_consumer_harness_full(state, plan, Some("head-s1".to_string()));
     seed_head_handle(&h, "head-s1");
 
-    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    h.up_tx
+        .send(chunk_frame(br#"{"text":"hi"}"#))
+        .await
+        .unwrap();
     drop(h.up_tx);
 
     tokio::time::timeout(Duration::from_secs(10), h.run)
@@ -4286,8 +4402,15 @@ async fn chain_consumer_keeps_head_handle_when_consumer_bails() {
         .expect("consumer must finish")
         .expect("hop failure terminated in-band");
 
-    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
-    assert!(matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))));
+    let frame = h
+        .down_rx
+        .recv()
+        .await
+        .expect("an Error frame must reach downstream");
+    assert!(matches!(
+        frame.payload,
+        Some(pb::stream_response::Payload::Error(_))
+    ));
 
     let ids: Vec<String> = h
         .handles
@@ -4335,9 +4458,12 @@ async fn cancel_chain_must_survive_a_poisoned_handle_list() {
     })
     .join();
 
-    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-        cancel_chain(Some(&chain), None, "fallback-stream", &client),
-    ))
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(cancel_chain(
+        Some(&chain),
+        None,
+        "fallback-stream",
+        &client,
+    )))
     .await;
     assert!(
         result.is_ok(),
@@ -4358,9 +4484,15 @@ fn spawn_request_id_recording_worker(
         s.connect(&endpoint).expect("worker connect");
         let _ = s.set_rcvtimeo(8000);
         while let Ok(bytes) = s.recv_bytes(0) {
-            let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
-            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
-            let Some(pb::stream_request::Action::Open(open)) = st.action else { continue };
+            let Ok(req) = pb::Request::decode(bytes.as_slice()) else {
+                continue;
+            };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                continue;
+            };
+            let Some(pb::stream_request::Action::Open(open)) = st.action else {
+                continue;
+            };
             let rid = open
                 .meta
                 .as_ref()
@@ -4375,10 +4507,12 @@ fn spawn_request_id_recording_worker(
                 ..Default::default()
             };
             let _ = s.send(
-                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                    data: Bytes::from_static(b"{}"),
-                    is_final: false,
-                }))
+                mk(pb::stream_response::Payload::Chunk(
+                    pb::StreamChunkResponse {
+                        data: Bytes::from_static(b"{}"),
+                        is_final: false,
+                    },
+                ))
                 .encode_to_vec(),
                 0,
             );
@@ -4409,7 +4543,10 @@ async fn test_audit_data_chain_chunk_request_id_double_suffixes_step_name() {
     plan.steps[1].version = Some("1".to_string());
     let h = chain_consumer_harness_with(state, plan);
 
-    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    h.up_tx
+        .send(chunk_frame(br#"{"text":"hi"}"#))
+        .await
+        .unwrap();
     drop(h.up_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), h.run).await;
 
@@ -4456,7 +4593,21 @@ async fn test_tail_stream_request_id_keeps_parent_step_format() {
     };
     let stream = tokio::time::timeout(
         Duration::from_secs(5),
-        open_tail_stream(&state, &plan, 0, 0, &ctx, &std::collections::HashSet::new(), "req-9", &opts, None, None, &snapshot, 0, &[]),
+        open_tail_stream(
+            &state,
+            &plan,
+            0,
+            0,
+            &ctx,
+            &std::collections::HashSet::new(),
+            "req-9",
+            &opts,
+            None,
+            None,
+            &snapshot,
+            0,
+            &[],
+        ),
     )
     .await
     .expect("tail open must not hang")
@@ -4489,14 +4640,22 @@ async fn chain_consumer_downstream_close_stops_substream_churn() {
     let mut plan = chain_consumer_plan();
     plan.steps[1].version = Some("1".to_string());
     let h = chain_consumer_harness_with(state, plan);
-    let ConsumerHarness { up_tx, mut down_rx, run, .. } = h;
+    let ConsumerHarness {
+        up_tx,
+        mut down_rx,
+        run,
+        ..
+    } = h;
 
     // The harness `run` is a cold future — drive it CONCURRENTLY with the
     // feed/drain script (reading down_rx before polling run would deadlock).
     let driver = async move {
         up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
         // Sub-stream #1's chunk arrives; close the downstream behind it.
-        let _first = down_rx.recv().await.expect("sub-stream #1 must forward a chunk");
+        let _first = down_rx
+            .recv()
+            .await
+            .expect("sub-stream #1 must forward a chunk");
         drop(down_rx);
         // More upstream chunks arrive only now — with the churn defect each
         // would open a fresh sub-stream.
@@ -4505,9 +4664,10 @@ async fn chain_consumer_downstream_close_stops_substream_churn() {
         }
         drop(up_tx);
     };
-    let (res, _) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, driver) })
-        .await
-        .expect("the consumer must unwind promptly on downstream close");
+    let (res, _) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, driver) })
+            .await
+            .expect("the consumer must unwind promptly on downstream close");
     res.expect("downstream close is a clean unwind, not an error");
 
     let mut opens = 0u32;
@@ -4540,8 +4700,12 @@ async fn chain_consumer_mid_hop_honors_client_overall_deadline() {
         s.connect(&ep).expect("worker connect");
         let _ = s.set_rcvtimeo(8000);
         while let Ok(bytes) = s.recv_bytes(0) {
-            let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
-            let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+            let Ok(req) = pb::Request::decode(bytes.as_slice()) else {
+                continue;
+            };
+            let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                continue;
+            };
             let action = match st.action {
                 Some(pb::stream_request::Action::Open(_)) => "open",
                 Some(pb::stream_request::Action::Cancel(_)) => "cancel",
@@ -4580,8 +4744,20 @@ async fn chain_consumer_mid_hop_honors_client_overall_deadline() {
     let snapshot_run = snapshot.clone();
     let run = tokio::spawn(async move {
         consume_stream_consumer(
-            &state_run, &plan_run, 1, "pre", up_rx, down_tx, &ctx, "req-1", &opts,
-            Some(client_deadline_ns), &handles_run, None, true, &snapshot_run,
+            &state_run,
+            &plan_run,
+            1,
+            "pre",
+            up_rx,
+            down_tx,
+            &ctx,
+            "req-1",
+            &opts,
+            Some(client_deadline_ns),
+            &handles_run,
+            None,
+            true,
+            &snapshot_run,
         )
         .await
     });
