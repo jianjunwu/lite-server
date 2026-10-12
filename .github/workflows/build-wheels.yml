@@ -289,9 +289,9 @@ jobs:
       # rust-toolchain.toml, so CI and local builds use the same clippy/rustc.
       # The pin lives in one place; this must not restate it.
       - name: Install the pinned toolchain
-        run: rustup show
-        with:
-          targets: ${{ matrix.target }}
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install vcpkg dependencies (Windows)
         if: runner.os == 'Windows' && matrix.vcpkg
