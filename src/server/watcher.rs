@@ -466,6 +466,7 @@ mod tests {
     use super::*;
     use crate::callback::CallbackRunner;
     use crate::inference_queue::InferenceQueue;
+    use std::path::Path;
 
     #[tokio::test]
     async fn test_file_watcher_aborts_cleanly() {
@@ -1555,7 +1556,7 @@ class TestAPI(LitAPI):
     }
 
     async fn h3_fire_config_event(
-        tmp: &PathBuf,
+        tmp: &Path,
         wm: Arc<WorkerManager>,
         registry: Arc<ModelRegistry>,
         last_reload: &mut std::collections::HashMap<(String, String), Instant>,
@@ -1566,7 +1567,7 @@ class TestAPI(LitAPI):
                 tmp.join("m").join("1").join("config.yaml"),
                 WatchEventKind::Modify,
             )],
-            tmp.clone(),
+            tmp.to_path_buf(),
             wm,
             registry,
             last_reload,

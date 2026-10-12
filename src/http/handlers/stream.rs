@@ -3809,7 +3809,7 @@ mod tests {
     /// abandon paths: a cancel control frame, and a transport drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ws_ensemble_aggregation_abandon_records_stream_rejected() {
-        use futures::{SinkExt, StreamExt};
+        use futures::SinkExt;
 
         let model = "ws_ens_agg_abandon";
         // Repo-backed ensemble plan WITHOUT declared inputs → the D17

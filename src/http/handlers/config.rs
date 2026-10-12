@@ -254,22 +254,17 @@ pub async fn server_config_handler(
 // ===== M2: PATCH (write) — plan §3.3 =====
 
 /// Write mode for the config PATCH.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigPatchMode {
     /// Write, then run the lifecycle reload chain; roll the file back when
     /// the reload fails. The default.
+    #[default]
     ApplyReload,
     /// Atomic write only; the in-memory config changes on the next reload.
     WriteOnly,
     /// Validate the merged result; nothing is written.
     DryRun,
-}
-
-impl Default for ConfigPatchMode {
-    fn default() -> Self {
-        Self::ApplyReload
-    }
 }
 
 impl ConfigPatchMode {

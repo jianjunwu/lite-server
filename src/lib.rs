@@ -313,6 +313,7 @@ impl Drop for ServeSlotGuard {
     worker_kill_timeout=None,
     hook_http_timeout=None,
 ))]
+#[allow(clippy::too_many_arguments)] // CLI-arg bundle; a struct would only rewrap the pyfunction signature
 fn serve(
     config: Option<String>,
     port: Option<u16>,
