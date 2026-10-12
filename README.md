@@ -94,7 +94,7 @@ Currently only the `empty` template is available. Use `--wizard` for interactive
 - **Decorator routing** — `@route.get("/status")` on `LitAPI` methods, served under `/v2/models/<model>/<tail>`
 - **Same channel as inference** — route handlers run in the model worker; no separate process
 - **Server context access** — `ctx.server.registry` and cross-model `ctx.server.inference.infer()` from handlers
-- **Callback chain** — model-level callbacks (auth, rate limiting, CORS, logging) cover inference and custom routes alike (Rust-side rate limiting/CORS middleware does not yet cover custom routes)
+- **Callback chain** — model-level callbacks (auth, rate limiting, CORS, logging) cover inference and custom routes alike (Rust-side per-model CORS middleware falls back to the global policy on custom routes)
 
 ### Worker Resilience
 

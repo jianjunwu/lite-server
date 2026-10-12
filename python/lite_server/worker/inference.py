@@ -455,6 +455,16 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
                 await t
             except asyncio.CancelledError:
                 pass
+            except BaseException as e:
+                # A task whose cancellation surfaces a different error (model
+                # cleanup raising through the cancel, a native lib fault
+                # escaping the dispatch path's `except Exception`) must not
+                # abort the sweep — the remaining pending tasks and the
+                # stream sessions below still need their cleanup.
+                log.warning(
+                    "pending task %s raised during shutdown cancel: %s",
+                    uid, _format_exc_brief(e),
+                )
 
     # Close bidi sessions still open at shutdown so handlers can release
     # per-session resources (on_close is exception-isolated).

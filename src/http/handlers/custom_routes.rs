@@ -109,19 +109,40 @@ pub struct ResolvedCustomRoute {
 /// that must happen BEFORE the request body is read, so an unmatched or
 /// oversized request gets 404/405/413 without paying for (or failing on)
 /// the body read.
+/// G1 (leak-gap-audit-0820): per-model `policies.auth` / `policies.rate_limit`
+/// are enforced here — BEFORE route matching — mirroring the inference path
+/// (auth first, then rate limit; F-03 unknown-model gating applies to version
+/// resolution failures). Previously custom routes bypassed both, so a model
+/// declaring auth served its @routes unauthenticated.
 pub async fn resolve_custom_route(
-    state: &AppState,
+    state: &std::sync::Arc<AppState>,
     model_name: &str,
     tail: &str,
     method: &axum::http::Method,
     headers: &HeaderMap,
+    client_ip: &str,
 ) -> Result<ResolvedCustomRoute, AppError> {
     crate::validation::validate_identifier(model_name)?;
     let (version, route_tail) = parse_route_tail(tail);
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let (resolved_version, _) = resolve_version(state, model_name, version, headers).await?;
+    let (resolved_version, _) = resolve_version(state, model_name, version, headers)
+        .await
+        .map_err(|e| auth_gate_for_unknown_model(state, headers, e))?;
+
+    let mv = state
+        .registry
+        .get(model_name, Some(&resolved_version))
+        .ok_or_else(|| {
+            auth_gate_for_unknown_model(
+                state,
+                headers,
+                AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)),
+            )
+        })?;
+    enforce_auth(mv.policies.auth.as_ref(), headers)?;
+    enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, client_ip).await?;
 
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -701,6 +722,183 @@ mod route_match_tests {
             }
             other => panic!("expected Hit, got {:?}", other),
         }
+    }
+
+    // ===== G1 (leak-gap-audit-0820): per-model policies on custom routes =====
+
+    fn make_state() -> std::sync::Arc<AppState> {
+        let cb = std::sync::Arc::new(crate::callback::CallbackRunner::new());
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let queue = std::sync::Arc::new(crate::inference_queue::InferenceQueue::new());
+        let wm = std::sync::Arc::new(crate::worker::WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        std::sync::Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cb,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// Register a ready model version declaring @route GET /status plus the
+    /// given policies.
+    async fn policy_route_state(
+        model: &str,
+        policies: crate::config::ModelPolicies,
+    ) -> std::sync::Arc<AppState> {
+        let state = make_state();
+        state
+            .registry
+            .register(
+                model,
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.set_policies(model, "1", Some(policies));
+        state.registry.mark_ready(model, "1").unwrap();
+        state.registry.activate_version(model, "1").unwrap();
+        state
+            .worker_manager
+            .upsert_routes(
+                model,
+                "1",
+                vec![RouteDecl {
+                    route: "/status".to_string(),
+                    methods: vec!["GET".to_string()],
+                }],
+            )
+            .await;
+        state
+    }
+
+    fn auth_policy() -> crate::config::ModelPolicies {
+        crate::config::ModelPolicies {
+            auth: Some(crate::config::AuthPolicy {
+                header: "x-api-key".to_string(),
+                keys: vec!["sk-route".to_string()],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// G1: a model declaring policies.auth must not serve its custom routes
+    /// unauthenticated — the dispatch path previously skipped enforce_auth.
+    #[tokio::test]
+    async fn custom_route_enforces_model_auth_policy() {
+        let model = "cr_auth";
+        let state = policy_route_state(model, auth_policy()).await;
+
+        // Missing key → 401.
+        let err = resolve_custom_route(
+            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "missing key must be 401, got {err:?}"
+        );
+
+        // Wrong key → 401.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "wrong".parse().unwrap());
+        let err = resolve_custom_route(
+            &state, model, "status", &axum::http::Method::GET, &h, "127.0.0.1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "wrong key must be 401, got {err:?}"
+        );
+
+        // Correct key → matched.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "sk-route".parse().unwrap());
+        let resolved = resolve_custom_route(
+            &state, model, "status", &axum::http::Method::GET, &h, "127.0.0.1",
+        )
+        .await
+        .expect("valid key must pass");
+        assert_eq!(resolved.route_pattern, "/status");
+    }
+
+    /// G1: auth runs BEFORE route matching — an unauthenticated probe must
+    /// get 401 even for a tail that does not exist (F-03 parity: 404/405
+    /// must not be distinguishable without credentials).
+    #[tokio::test]
+    async fn custom_route_auth_runs_before_route_match() {
+        let model = "cr_auth_order";
+        let state = policy_route_state(model, auth_policy()).await;
+
+        let err = resolve_custom_route(
+            &state, model, "no-such-route", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "unknown tail without key must be 401, got {err:?}"
+        );
+
+        // Authenticated: the same tail is the usual 404.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "sk-route".parse().unwrap());
+        let err = resolve_custom_route(
+            &state, model, "no-such-route", &axum::http::Method::GET, &h, "127.0.0.1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::RouteNotFound),
+            "unknown tail with key must be 404, got {err:?}"
+        );
+    }
+
+    /// G1: a model declaring policies.rate_limit must throttle custom-route
+    /// calls too — the dispatch path previously skipped enforce_rate_limit.
+    #[tokio::test]
+    async fn custom_route_enforces_model_rate_limit() {
+        let model = "cr_rl";
+        let state = policy_route_state(
+            model,
+            crate::config::ModelPolicies {
+                rate_limit: Some(crate::config::RateLimitPolicy {
+                    requests_per_minute: 1.0,
+                    key: "route".to_string(),
+                    burst: Some(1.0),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        resolve_custom_route(
+            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+        )
+        .await
+        .expect("first call within budget");
+        let err = resolve_custom_route(
+            &state, model, "status", &axum::http::Method::GET, &HeaderMap::new(), "127.0.0.1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::RateLimitExceeded { .. }),
+            "second call must be 429, got {err:?}"
+        );
     }
 
     /// B1 (leak-gap-audit-0821): a streaming route whose client goes away

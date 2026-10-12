@@ -1534,6 +1534,55 @@ class TestDecoupledStreaming:
         assert "s-ex" not in active
         assert not any(_is_done(r, "s-ex") for r in sock.stream_responses("s-ex"))
 
+    @pytest.mark.asyncio
+    async def test_second_cancel_inside_grace_window_fires_close_hook_once(self):
+        """A grace cancel (recycle) followed by an immediate cancel (client
+        disconnect) inside the window terminates the stream once: the message
+        path pops the session and fires on_stream_close("cancel") — the still
+        armed hard-cancel timer must be disarmed, not fire a second one."""
+        calls = []
+
+        class GraceTwiceAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                async def _push():
+                    for i in range(100):
+                        await asyncio.sleep(0.02)
+                        await sender.send({"chunk": i})
+                    await sender.close()
+
+                asyncio.create_task(_push())
+
+        sock = AsyncSocket()
+        active = {}
+        api = GraceTwiceAPI()
+
+        async def recorder(ctx, reason):
+            calls.append(reason)
+
+        inference._get_pipeline(api)._stream_hooks.append(recorder)
+
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("s-gc2"), sock, active, log
+        )
+        sender = active["s-gc2"].sender
+
+        grace = Request(stream=StreamRequest(
+            stream_id="s-gc2",
+            cancel=StreamCancel(reason="recycle", grace_ms=50),
+        ))
+        await inference._handle_stream_async(api, grace, sock, active, log)
+        assert sender.closing is True and sender.closed is False
+
+        # Client disconnect lands inside the grace window: immediate cancel.
+        immediate = Request(stream=StreamRequest(stream_id="s-gc2", cancel=StreamCancel()))
+        await inference._handle_stream_async(api, immediate, sock, active, log)
+        assert sender.closed is True
+        assert "s-gc2" not in active
+
+        # Past the would-be grace expiry: the disarmed timer must not fire.
+        await asyncio.sleep(0.3)
+        assert calls == ["cancel"], f"on_stream_close must fire exactly once, got {calls}"
+
 
 # ---------------------------------------------------------------------------
 # P-DEADLINE — worker cooperative deadline check (蓝图 §4.0.10)
@@ -2300,5 +2349,177 @@ class TestP1SyncGeneratorCloseWedge:
         assert await asyncio.to_thread(close_called.wait, 2), (
             "PY-2: generator.close() never ran — the generator's finally "
             "(file/handle resources) leaked"
+        )
+        pipe.close()
+
+
+# ---------------------------------------------------------------------------
+# Stream-source close coverage (every _consume_stream / _send_route_stream
+# exit must close the source deterministically, not leak it to GC)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamSourceClose:
+    @pytest.mark.asyncio
+    async def test_consume_stream_closes_sync_generator_on_early_error_exit(self):
+        """A mid-stream encode failure ends the stream via _process_stream_chunk
+        returning False — an early exit that must still close the source
+        generator (previously only the cancel path did)."""
+        closed_ev = threading.Event()
+
+        class EarlyFailAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            def stream_predict(self, x):
+                try:
+                    yield {"a": 1}
+                    yield {"a": 2}
+                finally:
+                    closed_ev.set()
+
+            def encode_response(self, output):
+                raise ValueError("encode boom")
+
+        api = EarlyFailAPI()
+        pipe = Pipeline.build(api, [])
+        ctx = RequestContext(
+            meta=RequestMeta(route="/", headers=Headers(), client_ip="",
+                             request_id="r1", timestamp_ns=0),
+            request={},
+        )
+        await pipe.preprocess(ctx)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
+
+        sock = AsyncSocket()
+        await inference._consume_stream(api, pipe, generator, "s-early", sock, log, ctx)
+
+        # Sync-generator close is fire-and-forget on the lite-gen thread.
+        assert await asyncio.to_thread(closed_ev.wait, 2), (
+            "early error exit must close the source generator"
+        )
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_consume_stream_closes_sync_generator_on_deadline_cut(self):
+        """A server deadline cut breaks out of the consume loop — the
+        partially-consumed generator must be closed, not leaked to GC."""
+        closed_ev = threading.Event()
+
+        class SlowDeadlineAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            def stream_predict(self, x):
+                try:
+                    yield {"a": 1}
+                    yield {"a": 2}
+                    yield {"a": 3}
+                finally:
+                    closed_ev.set()
+
+        api = SlowDeadlineAPI()
+        pipe = Pipeline.build(api, [])
+        ctx = RequestContext(
+            meta=RequestMeta(route="/", headers=Headers(), client_ip="",
+                             request_id="r1", timestamp_ns=0,
+                             deadline_unix_ns=time.time_ns() - 1),
+            request={},
+        )
+        await pipe.preprocess(ctx)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
+
+        sock = AsyncSocket()
+        await inference._consume_stream(api, pipe, generator, "s-dl", sock, log, ctx)
+
+        assert await asyncio.to_thread(closed_ev.wait, 2), (
+            "deadline-cut exit must close the source generator"
+        )
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_consume_stream_closes_async_generator_on_early_error_exit(self):
+        """Async generators get a deterministic aclose() on early exits too —
+        not a GC-dependent finalization."""
+        closed_ev = threading.Event()
+
+        class AsyncEarlyFailAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            async def stream_predict(self, x):
+                try:
+                    yield {"a": 1}
+                    yield {"a": 2}
+                finally:
+                    closed_ev.set()
+
+            def encode_response(self, output):
+                raise ValueError("encode boom")
+
+        api = AsyncEarlyFailAPI()
+        pipe = Pipeline.build(api, [])
+        ctx = RequestContext(
+            meta=RequestMeta(route="/", headers=Headers(), client_ip="",
+                             request_id="r1", timestamp_ns=0),
+            request={},
+        )
+        await pipe.preprocess(ctx)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
+
+        sock = AsyncSocket()
+        await inference._consume_stream(api, pipe, generator, "s-aearly", sock, log, ctx)
+
+        assert await asyncio.to_thread(closed_ev.wait, 2), (
+            "early error exit must aclose() the source async generator"
+        )
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_send_route_stream_cancel_fires_hook_and_closes_content(self):
+        """Cancelling a route stream (worker shutdown / abandoned route) must
+        fire on_stream_close("cancel") and close the content iterator —
+        previously CancelledError fell through every except, losing the hook
+        and leaving the generator to GC."""
+        from lite_server.response import StreamingResponse
+
+        aclosed = threading.Event()
+        calls = []
+
+        async def gen():
+            try:
+                yield {"n": 1}
+                await asyncio.sleep(60)
+                yield {"n": 2}
+            finally:
+                aclosed.set()
+
+        api = EchoAPI()
+        pipe = Pipeline.build(api, [])
+
+        async def recorder(ctx, reason):
+            calls.append(reason)
+
+        pipe._stream_hooks.append(recorder)
+
+        ctx = RequestContext(
+            meta=RequestMeta(route="/ticks", headers=Headers(), client_ip="",
+                             request_id="r1", timestamp_ns=0),
+            request={},
+        )
+        sock = AsyncSocket()
+        task = asyncio.create_task(
+            inference._send_route_stream(sock, "rs-1", StreamingResponse(content=gen()),
+                                         ctx, pipe, log)
+        )
+        # Let the start frame + first chunk go out.
+        await sock.wait_for(lambda r: r.HasField("stream") and r.stream.HasField("chunk"))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert calls == ["cancel"], f"on_stream_close must fire once with 'cancel', got {calls}"
+        assert await asyncio.to_thread(aclosed.wait, 2), (
+            "cancelled route stream must aclose() its content generator"
         )
         pipe.close()

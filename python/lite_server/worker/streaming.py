@@ -37,6 +37,35 @@ def _serialize_route_chunk(item) -> bytes:
     return serialize_body(item)
 
 
+def _close_stream_source(source, pipe, log: logging.Logger, stream_id: str) -> None:
+    """Close a stream's content source deterministically on every exit
+    (early return / error / deadline cut / cancel — close is idempotent on
+    an exhausted source).
+
+    Sync generators close on the generator thread, fire-and-forget (PY-2:
+    awaiting ``close()`` behind a blocked ``next()`` on the single lite-gen
+    thread would wedge this task); asyncgens get a detached ``aclose()``
+    task whose exception is retrieved so it never logs "never retrieved".
+    Plain iterables without ``close`` (lists, etc.) need no cleanup.
+    """
+    try:
+        if inspect.isasyncgen(source):
+            def _log_aclose(t: "asyncio.Task") -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    log.warning("stream %s source aclose failed: %s",
+                                stream_id, _format_exc_brief(exc))
+
+            asyncio.ensure_future(source.aclose()).add_done_callback(_log_aclose)
+        elif hasattr(source, "close"):
+            pipe.submit_gen_close(source)
+    except Exception as e:
+        log.warning("stream %s source close scheduling failed: %s",
+                    stream_id, _format_exc_brief(e))
+
+
 #: h2 bidi transport framing type (mirrors BIDI_CONTENT_TYPE in
 #: src/http/handlers/bidi.rs). It names the LPM frame protocol, NOT the
 #: payload: bidi clients send it on the session POST regardless of what the
@@ -106,6 +135,12 @@ async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
                                code=e.code, param=e.param).SerializeToString())
         await pipe.run_on_stream_close(ctx, "error")
         return
+    except asyncio.CancelledError:
+        # Worker shutdown / abandoned route: fire the close hook (inference
+        # stream cancel parity) — previously CancelledError fell through
+        # every except, losing the hook; the finally closes the content.
+        await pipe.run_on_stream_close(ctx, "cancel")
+        raise
     except Exception as e:
         log.warning("route stream %s failed mid-iteration: %s",
                     stream_id, _format_exc_brief(e))
@@ -113,6 +148,8 @@ async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
             _make_stream_error(stream_id, str(e)).SerializeToString())
         await pipe.run_on_stream_close(ctx, "error")
         return
+    finally:
+        _close_stream_source(content, pipe, log, stream_id)
     await socket.send(_make_stream_done(stream_id).SerializeToString())
     await pipe.run_on_stream_close(ctx, "done")
 
@@ -264,7 +301,19 @@ class _ResponseSender:
         disconnect / shutdown): immediate — subsequent send()/close() are
         no-ops. No StreamDone is sent on a hard cancel (cancel semantics
         match bidi/uni streams)."""
-        if self.closed or self.closing:
+        if self.closed:
+            return
+        if self.closing:
+            if grace_ms and grace_ms > 0:
+                return  # already inside a grace window
+            # Immediate cancel inside the grace window: terminate now and
+            # disarm the pending hard cancel — the caller (message path)
+            # fires on_stream_close for this terminal transition, so the
+            # timer must not fire a second one on expiry.
+            self.closed = True
+            if self._hard_cancel_handle is not None:
+                self._hard_cancel_handle.cancel()
+                self._hard_cancel_handle = None
             return
         if grace_ms and grace_ms > 0:
             self.closing = True
@@ -919,11 +968,9 @@ async def _consume_stream(
                     deadline_cut = True
                     break
     except asyncio.CancelledError:
-        # Propagate cancellation; close the generator fire-and-forget (PY-2).
-        # Awaiting run_blocking(generator.close) would queue the close behind
-        # a blocked next() on the single lite-gen thread and wedge this task.
-        if not inspect.isasyncgen(generator):
-            pipe.submit_gen_close(generator)
+        # Propagate cancellation; the source is closed in the finally below
+        # (fire-and-forget — PY-2: awaiting close behind a blocked next() on
+        # the single lite-gen thread would wedge this task).
         await pipe.run_on_stream_close(ctx, "cancel")
         raise
     except HTTPException as e:
@@ -937,6 +984,11 @@ async def _consume_stream(
         await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
                                     detail=str(e))
         return
+    finally:
+        # Every exit — early return, error, deadline cut, cancel, or normal
+        # exhaustion — closes the source deterministically (idempotent once
+        # exhausted), not just the cancel path.
+        _close_stream_source(generator, pipe, log, stream_id)
 
     if deadline_cut:
         # A deadline cut is an abnormal termination (server-imposed time

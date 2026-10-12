@@ -866,6 +866,9 @@ impl Admin for GrpcAdminService {
         // Optional bool: absent → true, aligning with the HTTP ?load=
         // default.
         let load = first.load.unwrap_or(true);
+        // G2 (webui-ownership §7): optional bool, absent → false, aligning
+        // with HTTP ?force= — no implicit overwrite on the gRPC surface.
+        let force = first.force.unwrap_or(false);
 
         // H3: stage everything first, commit atomically at the end — same
         // pipeline as the HTTP multipart handlers (finalize_upload below).
@@ -993,10 +996,7 @@ impl Admin for GrpcAdminService {
             &staged,
             url_version.as_deref(),
             load,
-            // The UploadModelRequest proto has no force field, so the gRPC
-            // surface keeps its historical implicit-overwrite behavior
-            // until the proto grows one (wire change, tracked separately).
-            true,
+            force,
         )
         .await
         .map_err(to_status)?;
@@ -2178,6 +2178,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: Some("1".to_string()),
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2185,6 +2186,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::copy_from_slice(&content[..split]),
                 },
@@ -2192,6 +2194,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::copy_from_slice(&content[split..]),
                 },
@@ -2436,6 +2439,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: None,
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2443,6 +2447,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::from_static(b"x = 1"),
                 },
@@ -2453,6 +2458,87 @@ mod tests {
         assert!(
             err.message().contains("versioned endpoint"),
             "the error must guide the client to the versioned endpoint: {err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// G2 (webui-ownership §7): gRPC UploadModel must align with the HTTP
+    /// surface — uploading onto an existing version without force is
+    /// AlreadyExists (no implicit overwrite); explicit force overwrites.
+    #[tokio::test]
+    async fn upload_model_existing_version_requires_force() {
+        let repo = unique_repo("e2e-upload-force");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let upload = |force: Option<bool>, data: &'static [u8]| {
+            vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    force,
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    force: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(data),
+                },
+            ]
+        };
+
+        // First upload commits v1.
+        let resp = client
+            .upload_model(tokio_stream::iter(upload(None, b"x = 1")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+
+        // Re-upload without force → FailedPrecondition (AppError::Conflict is
+        // deliberately mapped to FailedPrecondition for force-gated
+        // operations — same as delete-active-version), committed bytes stay.
+        let err = client
+            .upload_model(tokio_stream::iter(upload(None, b"x = 2")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "absent force must not implicitly overwrite: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(repo.join("mymodel").join("1").join("model.py"))
+                .await
+                .unwrap(),
+            b"x = 1"
+        );
+
+        // Explicit force → overwrite.
+        let resp = client
+            .upload_model(tokio_stream::iter(upload(Some(true), b"x = 2")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(
+            tokio::fs::read(repo.join("mymodel").join("1").join("model.py"))
+                .await
+                .unwrap(),
+            b"x = 2"
         );
 
         let _ = shutdown_tx.send(());
@@ -2509,6 +2595,7 @@ mod tests {
                     model_name: "pkgmodel".to_string(),
                     version: None,
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2516,6 +2603,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "pkgmodel_v2.lma".to_string(),
                     data: Bytes::copy_from_slice(&artifact_bytes[..mid]),
                 },
@@ -2523,6 +2611,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "pkgmodel_v2.lma".to_string(),
                     data: Bytes::copy_from_slice(&artifact_bytes[mid..]),
                 },
@@ -2591,6 +2680,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: Some("1".to_string()),
                     load: Some(false),
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::from_static(b"FIRST-"),
                 },
@@ -2598,6 +2688,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::from_static(b"SECOND"),
                 },
@@ -2756,6 +2847,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: Some("1".to_string()),
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2763,6 +2855,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::from_static(b"12345678"),
                 },
@@ -2770,6 +2863,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "model.py".to_string(),
                     data: Bytes::from_static(b"9abcdef0"), // cumulative 16 > 10
                 },
@@ -2817,6 +2911,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: Some("1".to_string()),
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2824,6 +2919,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "a.lma".to_string(),
                     data: Bytes::from_static(b"x"),
                 },
@@ -2831,6 +2927,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "b.lma".to_string(),
                     data: Bytes::from_static(b"y"),
                 },
@@ -2868,6 +2965,7 @@ mod tests {
                     model_name: "mymodel".to_string(),
                     version: Some("1".to_string()),
                     load: Some(false),
+                    force: None,
                     file_name: String::new(),
                     data: Bytes::new(),
                 },
@@ -2875,6 +2973,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "a.py".to_string(),
                     data: Bytes::from_static(b"x"),
                 },
@@ -2882,6 +2981,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "b.py".to_string(),
                     data: Bytes::from_static(b"y"),
                 },
@@ -2889,6 +2989,7 @@ mod tests {
                     model_name: String::new(),
                     version: None,
                     load: None,
+                    force: None,
                     file_name: "a.py".to_string(),
                     data: Bytes::from_static(b"z"),
                 },

@@ -98,6 +98,7 @@ MESSAGE_FIELDS = {
         "load": 3,
         "file_name": 4,
         "data": 5,
+        "force": 6,
     },
     "UploadModelResponse": {
         "success": 1,

@@ -1688,7 +1688,12 @@ async fn handle_ws_stream(
                     // A cancel control frame mid-aggregation abandons the
                     // execution (the client gave up) — it must NOT be
                     // aggregated into the DAG input as a data frame.
-                    Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => return,
+                    // S1(b): client-abandoned sessions still record once
+                    // (client-class family), like every other early exit.
+                    Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => {
+                        prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                        return;
+                    }
                     Ok(Some(Ok(Message::Text(t)))) => {
                         if let Err(e) = aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None) {
                             prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
@@ -1707,8 +1712,11 @@ async fn handle_ws_stream(
                     }
                     // WS transport close / disconnect mid-aggregation →
                     // abandon the execution (§4.4: connection gone, no
-                    // response object).
-                    Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
+                    // response object). S1(b): record once (client-class).
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                        prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
+                        return;
+                    }
                     Ok(_) => {} // Ping/Pong ignored — NOT data activity (B4)
                     // Idle/deadline fired with no close trigger.
                     Err(_) => {
@@ -3412,6 +3420,108 @@ mod tests {
             got_cancel,
             "worker must receive Cancel promptly on client disconnect (gone signal)"
         );
+    }
+
+    /// S1(b) parity: an ensemble WS aggregation abandoned mid-way must still
+    /// record exactly one stream_rejected — every other early exit in this
+    /// handler (first-frame timeout, push failure, idle/deadline) does, and
+    /// the h2 bidi aggregation abandons record via the wrapper. Covers both
+    /// abandon paths: a cancel control frame, and a transport drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_ensemble_aggregation_abandon_records_stream_rejected() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_ens_agg_abandon";
+        // Repo-backed ensemble plan WITHOUT declared inputs → the D17
+        // aggregation path (a declared-inputs plan would execute on the first
+        // frame instead).
+        let repo = std::env::temp_dir().join(format!("ws-ens-agg-{}", std::process::id()));
+        let model_dir = repo.join(model).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "ensemble:\n  steps:\n    - name: a\n      model: a\n      version: \"1\"\n      inputs:\n        text: \"$request.text\"\n",
+        )
+        .unwrap();
+
+        let cb = Arc::new(CallbackRunner::new());
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        let state = Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            crate::config::Config::default(),
+            repo.clone(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), crate::registry::types::ModelType::Ensemble, model_dir)
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state.registry.activate_version(model, "1").unwrap();
+
+        let counter = crate::metrics::prometheus::STREAM_REJECTED_TOTAL
+            .with_label_values(&[model, "1", "early_reject"]);
+        let base = spawn_ws_server(state).await;
+
+        // Path 1: cancel control frame mid-aggregation.
+        let before = counter.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"text":"hi"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"cancel"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.get() < before + 1.0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "cancel frame mid-aggregation must record one stream_rejected"
+        );
+
+        // Path 2: transport drop mid-aggregation.
+        let before = counter.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"text":"hi"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        drop(ws);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.get() < before + 1.0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "transport drop mid-aggregation must record one stream_rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// §5.5-6: terminal Error fires InferenceResponse exactly once — an

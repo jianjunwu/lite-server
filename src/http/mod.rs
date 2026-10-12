@@ -133,7 +133,7 @@ pub(crate) async fn route_fallback(
     // tail is a 404 (and a wrong method a 405) regardless of body size, and
     // an oversized body must not be read for a request that will be rejected.
     let resolved = match crate::http::handlers::resolve_custom_route(
-        &state, &model, &tail, &method, &headers,
+        &state, &model, &tail, &method, &headers, &cx.client_ip,
     )
     .await
     {

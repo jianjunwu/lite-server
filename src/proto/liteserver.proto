@@ -617,6 +617,10 @@ message UploadModelRequest {
   optional string version = 2;
   // Aligns with HTTP `?load=` (default true there). Absent → true.
   optional bool load = 3;
+  // Aligns with HTTP `?force=` (default false there): absent → uploading
+  // onto an existing version fails AlreadyExists instead of implicitly
+  // overwriting it.
+  optional bool force = 6;
   // File content — subsequent messages.
   string file_name = 4;
   bytes data = 5;

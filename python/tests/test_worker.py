@@ -1841,6 +1841,68 @@ class TestAsyncLoopEdgeCases:
         # The slow task was cancelled on shutdown, no response sent
         assert len(socket._msgs) == 0
 
+    def test_shutdown_cleanup_survives_pending_task_exception(self):
+        """A pending task whose cancellation surfaces a non-Cancelled error
+        (model cleanup raising through the cancel — e.g. a native lib fault,
+        which escapes every `except Exception` in the dispatch path) must not
+        abort the shutdown sweep: the remaining pending tasks are still
+        cancelled and the loop still exits with CancelledError."""
+
+        class CleanupBoom(BaseException):
+            pass
+
+        class FragileModel(LitAPI):
+            async def predict(self, x):
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    if x.get("input") == 1:
+                        raise CleanupBoom("cleanup exploded")
+                    raise
+                return x
+
+        socket = AsyncMockSocket()
+        for i in (1, 2):
+            req = Request(
+                uid=f"fragile-{i}",
+                single=SingleRequest(data=json.dumps({"input": i}).encode()),
+            )
+            socket.inject(req.SerializeToString())
+
+        async def runner():
+            second_cancelled = asyncio.Event()
+
+            class WatchingModel(FragileModel):
+                async def predict(self, x):
+                    try:
+                        return await super().predict(x)
+                    except asyncio.CancelledError:
+                        if x.get("input") == 2:
+                            second_cancelled.set()
+                        raise
+
+            pending: dict = {}
+            task = asyncio.create_task(
+                inference.run_async_loop(WatchingModel(), socket, "test", log, _pending=pending)
+            )
+            deadline = asyncio.get_running_loop().time() + 5
+            while len(pending) < 2 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.001)
+            assert len(pending) == 2, "both handler tasks must be in flight"
+
+            task.cancel()
+            # The loop must absorb the task's CleanupBoom and still re-raise
+            # its own CancelledError — not propagate the task's exception.
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except BaseException as e:
+                raise AssertionError(f"shutdown propagated a task exception: {e!r}")
+            assert second_cancelled.is_set(), "the second pending task was never cancelled"
+
+        asyncio.run(runner())
+
 
 # ---------------------------------------------------------------------------
 # Batch predict (batch → predict → unbatch)
