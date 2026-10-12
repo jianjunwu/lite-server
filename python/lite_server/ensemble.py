@@ -46,6 +46,9 @@ _BLOCK_DEFAULT_KEYS = (
     ("inputs", None),
     ("outputs", None),
     ("dags", None),
+    # D41: filled with None on both canonical sides so a declaration that
+    # never mentions the selector compares equal to a YAML without it.
+    ("dag_selector", None),
 )
 
 
@@ -273,6 +276,11 @@ class EnsembleDAG:
     outputs: dict[str, str] | None = None
     # E8-1: named DAG sets selected via `x-lite-dag`.
     dags: dict[str, DagSet] | None = None
+    # D41: `$request.<path>` ref naming the request-body field whose string
+    # value selects the DAG set when the `x-lite-dag` header is absent.
+    # Dags form only (R20); `$request.` prefix + non-empty segments (R21);
+    # forbidden when any set declares inputs (R22 — no anonymous root, R5).
+    dag_selector: str | None = None
 
     def __post_init__(self) -> None:
         if any(not isinstance(s, Step) for s in self.steps):
@@ -289,6 +297,24 @@ class EnsembleDAG:
                 raise ValueError("dags must be a dict of str -> DagSet")
         elif not self.steps:
             raise ValueError("steps required in the single-set form (or use dags)")
+        if self.dag_selector is not None:
+            if not isinstance(self.dag_selector, str):
+                raise ValueError("dag_selector must be a string ref")
+            if self.dags is None:
+                raise ValueError("dag_selector requires the dags form (R20)")
+            rest = self.dag_selector.removeprefix("$request.")
+            if rest == self.dag_selector or any(
+                seg == "" for seg in rest.split(".")
+            ):
+                raise ValueError(
+                    "dag_selector must be a $request.<path> ref with non-empty "
+                    f"segments, got {self.dag_selector!r} (R21)"
+                )
+            if any(s.inputs for s in self.dags.values()):
+                raise ValueError(
+                    "dag_selector requires anonymous-root sets — a set declares "
+                    "inputs (MIMO envelopes carry no $request root, R5) (R22)"
+                )
         if self.output is not None and self.outputs is not None:
             raise ValueError("output and outputs are mutually exclusive (E2/E7)")
         if self.outputs is not None and any(
@@ -302,8 +328,13 @@ class EnsembleDAG:
 
     def _block_config(self) -> dict[str, Any]:
         if self.dags is not None:
-            return {"dags": {k: v._config() for k, v in self.dags.items()}}
-        cfg: dict[str, Any] = {"steps": [s._config() for s in self.steps]}
+            cfg: dict[str, Any] = {
+                "dags": {k: v._config() for k, v in self.dags.items()}
+            }
+            if self.dag_selector is not None:
+                cfg["dag_selector"] = self.dag_selector
+            return cfg
+        cfg = {"steps": [s._config() for s in self.steps]}
         if self.output is not None:
             cfg["output"] = self.output
         if self.inputs is not None:

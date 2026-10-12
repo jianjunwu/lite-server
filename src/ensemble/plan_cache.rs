@@ -162,6 +162,12 @@ pub struct EnsemblePlan {
     /// pure container; execution resolves the set via [`select_dag_set`].
     /// None = the historical single-set form.
     pub dag_sets: Option<IndexMap<String, Arc<EnsemblePlan>>>,
+    /// D41: parsed `$request.<path>` segments of the body-field dag
+    /// selector (dags form only, R20/R21). Consulted only when the
+    /// `x-lite-dag` header/metadata is absent; None = header/default-only
+    /// selection. Only the CONTAINER plan carries this — selected set plans
+    /// always have None.
+    pub dag_selector: Option<Vec<String>>,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
     /// mtime of `config_path` captured BEFORE the file read (stat-before-read):

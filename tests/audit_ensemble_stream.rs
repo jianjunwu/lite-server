@@ -1067,6 +1067,80 @@ const ENS_DAGS_YAML: &str = r#"ensemble:
             data: "$request.text"
 "#;
 
+/// D41: body-field dag selector — `$request.modelName` selects the set when
+/// no x-lite-dag header/metadata is present. default runs `pre`, fast runs
+/// `echo` (distinct outputs make the selection observable).
+const ENS_DAGS_SEL_YAML: &str = r#"ensemble:
+  dag_selector: "$request.modelName"
+  dags:
+    default:
+      steps:
+        - name: main
+          model: pre
+          version: "1"
+          inputs:
+            text: "$request.text"
+    fast:
+      steps:
+        - name: main
+          model: echo
+          version: "1"
+          inputs:
+            data: "$request.text"
+"#;
+
+/// D41: `$request.dag` must mirror the BODY-RESOLVED set name — the guard
+/// step runs only on the fast set (observable via the dag_seen alias).
+const ENS_SEL_WHEN_YAML: &str = r#"ensemble:
+  dag_selector: "$request.modelName"
+  dags:
+    default:
+      outputs:
+        answer: "$main"
+        dag_seen: "$guard"
+      steps:
+        - name: guard
+          model: echo
+          version: "1"
+          when: "$request.dag == 'fast'"
+          inputs:
+            data: "$request.text"
+        - name: main
+          model: pre
+          version: "1"
+          inputs:
+            text: "$request.text"
+    fast:
+      outputs:
+        answer: "$main"
+        dag_seen: "$guard"
+      steps:
+        - name: guard
+          model: echo
+          version: "1"
+          when: "$request.dag == 'fast'"
+          inputs:
+            data: "$request.text"
+        - name: main
+          model: echo
+          version: "1"
+          inputs:
+            data: "$request.text"
+"#;
+
+/// D41 nested: the parent maps modelName/text through to the selector-
+/// configured child — the child selects its set from the assembled payload
+/// (nested calls carry no x-lite-dag header).
+const ENS_SEL_PARENT_YAML: &str = r#"ensemble:
+  steps:
+    - name: child
+      model: ens_dags_sel
+      version: "1"
+      inputs:
+        modelName: "$request.modelName"
+        text: "$request.text"
+"#;
+
 /// E8-2: when conditions — `dag_path` runs only when the DEFAULT set is
 /// selected ($request.dag mirrors the selected name), `maybe` runs only
 /// when the optional input is present (pre_5xx → observable 500), and its
@@ -1302,6 +1376,9 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_mimo_json_alias", ENS_MIMO_JSON_ALIAS_YAML);
     write_ensemble(repo, "ens_multisink", ENS_MULTISINK_YAML);
     write_ensemble(repo, "ens_dags", ENS_DAGS_YAML);
+    write_ensemble(repo, "ens_dags_sel", ENS_DAGS_SEL_YAML);
+    write_ensemble(repo, "ens_sel_when", ENS_SEL_WHEN_YAML);
+    write_ensemble(repo, "ens_sel_parent", ENS_SEL_PARENT_YAML);
     write_ensemble(repo, "ens_when", ENS_WHEN_YAML);
     write_ensemble(repo, "ens_mimo_bin", ENS_MIMO_BIN_YAML);
     write_ensemble(repo, "ens_mimo_cond", ENS_MIMO_COND_YAML);
@@ -1326,7 +1403,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -1742,7 +1819,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -4696,6 +4773,224 @@ async fn test_audit_e8_dag_selection_grpc_metadata() {
     let resp = client.infer(req).await.expect("dag-selected gRPC unary must succeed");
     let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
     assert!(v.get("echo").is_some(), "fast set must run echo over gRPC: {v}");
+}
+
+/// D41: the body field selects the set when no header/metadata is present —
+/// missing/null field → default; unknown name → 400 (D22, message names the
+/// source ref); invalid charset → 400; non-string → 400; an explicit header
+/// still wins over the body field.
+#[serial]
+#[tokio::test]
+async fn test_audit_d41_body_routing() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dags_sel"]).await;
+
+    let client = reqwest::Client::new();
+    let post = |body: Value, dag: Option<&str>| {
+        let mut b = client
+            .post(format!("{}/v2/models/ens_dags_sel/infer", base))
+            .header("Content-Type", "application/json");
+        if let Some(d) = dag {
+            b = b.header("x-lite-dag", d);
+        }
+        b.json(&body)
+    };
+
+    // Body selector → the fast set (echo).
+    let resp = post(json!({"modelName": "fast", "text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""echo""#), "body selector must run fast/echo: {body}");
+
+    // Missing field → default set (pre).
+    let resp = post(json!({"text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""pre""#), "missing field must fall to default: {body}");
+
+    // Null field → default set.
+    let resp = post(json!({"modelName": null, "text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""pre""#), "null field must fall to default: {body}");
+
+    // Unknown name → 400, and the message names the unknown set (D22) and
+    // the body source ref (D41 debuggability).
+    let resp = post(json!({"modelName": "nope", "text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("nope"), "must name the unknown set: {body}");
+    assert!(body.contains("$request.modelName"), "must name the source ref: {body}");
+
+    // Invalid charset → 400 (D22 validation reused).
+    let resp = post(json!({"modelName": "bad!", "text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Non-string → 400 (D41), message names the source ref.
+    let resp = post(json!({"modelName": 123, "text": "x"}), None).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("$request.modelName"), "must name the source ref: {body}");
+
+    // Header wins over the body field (D38 precedence).
+    let resp = post(json!({"modelName": "fast", "text": "x"}), Some("default"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""pre""#), "header must override the body field: {body}");
+}
+
+/// D41: `$request.dag` mirrors the BODY-RESOLVED set name — the guard step's
+/// when condition sees "fast" only when the body selected the fast set.
+#[serial]
+#[tokio::test]
+async fn test_audit_d41_request_dag_visibility() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_sel_when"]).await;
+
+    let client = reqwest::Client::new();
+    let post = |body: Value| {
+        client
+            .post(format!("{}/v2/models/ens_sel_when/infer", base))
+            .header("Content-Type", "application/json")
+            .json(&body)
+    };
+
+    // Default set: guard's when is false → dag_seen alias is null (D5).
+    let resp = post(json!({"text": "x"})).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    let outs = v["outputs"].as_array().unwrap();
+    assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "x"}}));
+    assert_eq!(outs[1], json!({"name": "dag_seen", "data": null}), "guard must skip on default");
+
+    // Body selects fast → guard runs ($request.dag == 'fast' sees the
+    // body-resolved name), main answers with echo.
+    let resp = post(json!({"modelName": "fast", "text": "x"})).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    let outs = v["outputs"].as_array().unwrap();
+    assert_eq!(outs[0], json!({"name": "answer", "data": {"echo": "x"}}));
+    assert_eq!(
+        outs[1],
+        json!({"name": "dag_seen", "data": {"echo": "x"}}),
+        "guard must RUN on the body-selected fast set"
+    );
+}
+
+/// D41: a nested selector-configured child selects its set from the
+/// assembled step payload (nested calls carry no x-lite-dag header).
+#[serial]
+#[tokio::test]
+async fn test_audit_d41_nested_child() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_sel_parent", "ens_dags_sel"]).await;
+
+    let client = reqwest::Client::new();
+    let post = |body: Value| {
+        client
+            .post(format!("{}/v2/models/ens_sel_parent/infer", base))
+            .header("Content-Type", "application/json")
+            .json(&body)
+    };
+
+    // The parent maps modelName through — the child runs its fast set.
+    let resp = post(json!({"modelName": "fast", "text": "x"})).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""echo""#), "nested child must select fast from the payload: {body}");
+
+    // Explicit "default" through nesting → the child's default set. (A
+    // missing modelName at the PARENT mapping is a plain missing-ref 400 —
+    // absence fallthrough at the child level is covered by the direct
+    // routing test above.)
+    let resp = post(json!({"modelName": "default", "text": "x"})).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""pre""#), "nested child must run its default set: {body}");
+}
+
+/// D41: the gRPC path resolves the body selector when the metadata channel
+/// carries no x-lite-dag value.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_grpc_body_selection() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_dags_sel"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    let req = tonic::Request::new(InferRequest {
+        model_name: "ens_dags_sel".into(),
+        version: "1".into(),
+        data: bytes::Bytes::from_static(br#"{"modelName": "fast", "text": "x"}"#),
+        ..Default::default()
+    });
+    let resp = client.infer(req).await.expect("body-selected gRPC unary must succeed");
+    let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
+    assert!(v.get("echo").is_some(), "body selector must run fast/echo over gRPC: {v}");
+}
+
+/// D41/D30: gRPC batch × dags-form ensemble — the streaming pre-check must
+/// consult a SELECTED set, never the (empty) container plan. With a body
+/// selector configured, each element routes by its own payload.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d41_batch_dags_form() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::BatchInferRequest;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_dags", "ens_dags_sel"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    // Regression: dags-form ensemble without a selector ran into the
+    // container plan's empty steps (index panic) before the D41 fix.
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_dags".into(),
+        version: "1".into(),
+        items: vec![br#"{"text":"a"}"#.to_vec().into()],
+        headers: Default::default(),
+    });
+    let resp = client.batch_infer(req).await.expect("batch on dags-form must not panic");
+    let items = resp.into_inner().items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status.as_ref().unwrap().code, "Ok", "element must succeed");
+    assert!(String::from_utf8_lossy(&items[0].data).contains(r#""pre""#));
+
+    // Per-element body routing: element 0 → fast (echo), element 1 → default (pre).
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_dags_sel".into(),
+        version: "1".into(),
+        items: vec![
+            br#"{"modelName":"fast","text":"a"}"#.to_vec().into(),
+            br#"{"text":"b"}"#.to_vec().into(),
+        ],
+        headers: Default::default(),
+    });
+    let resp = client.batch_infer(req).await.expect("per-element body routing must succeed");
+    let items = resp.into_inner().items;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].status.as_ref().unwrap().code, "Ok");
+    assert_eq!(items[1].status.as_ref().unwrap().code, "Ok");
+    assert!(
+        String::from_utf8_lossy(&items[0].data).contains(r#""echo""#),
+        "element 0 must route to fast: {}",
+        String::from_utf8_lossy(&items[0].data)
+    );
+    assert!(
+        String::from_utf8_lossy(&items[1].data).contains(r#""pre""#),
+        "element 1 must route to default: {}",
+        String::from_utf8_lossy(&items[1].data)
+    );
 }
 
 /// E8-2 (R16): when conditions — a when-false step is skipped (its outputs

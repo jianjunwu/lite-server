@@ -366,11 +366,24 @@ pub(crate) async fn execute_ensemble_inner(
     let plan = get_ensemble_plan(&state, model_name, version).await?;
     // §5.5.8 (R15): only the dags form tolerates superset envelopes.
     let is_dags_form = plan.dag_sets.is_some();
+    let mut opts = opts;
+    // D41: body-field selector — consulted only when the transport metadata
+    // carried no x-lite-dag value (header wins, D38 precedence). The request
+    // root is already a parsed JSON Value at this point (de-framed at the
+    // endpoint), so resolution is a field walk, not a re-parse.
+    let mut selector_source: Option<String> = None;
+    if is_dags_form && opts.dag_selector.is_none() {
+        if let Some(path) = plan.dag_selector.as_deref() {
+            opts.dag_selector = resolve_dag_selector_from_value(&payload, path)?;
+            if opts.dag_selector.is_some() {
+                selector_source = Some(format!("$request.{}", path.join(".")));
+            }
+        }
+    }
     // E8-2 (B6 fix): `$request.dag` must see the RESOLVED set name — with no
     // header the dags form selects "default", so when conditions on the
     // default set must compare against "default", not absence. Normalize
     // before selection so when-eval and select_dag_set agree.
-    let mut opts = opts;
     if is_dags_form {
         opts.dag_selector = Some(
             opts.dag_selector
@@ -379,8 +392,17 @@ pub(crate) async fn execute_ensemble_inner(
         );
     }
     // E8-1 (D38/D22): resolve the request's DAG set (dags form) — single-
-    // form plans pass through; unknown names 400 here.
-    let plan = select_dag_set(&plan, opts.dag_selector.as_deref())?;
+    // form plans pass through; unknown names 400 here. D41: a body-resolved
+    // name's 400 names the source ref (debuggability — otherwise the client
+    // cannot tell whether the value came from the header or the body).
+    let plan = select_dag_set(&plan, opts.dag_selector.as_deref()).map_err(|e| {
+        match (&e, &selector_source) {
+            (AppError::InvalidRequestBody(m), Some(src)) => AppError::InvalidRequestBody(
+                format!("{m} — resolved from body field '{src}' (D41)"),
+            ),
+            _ => e,
+        }
+    })?;
     let deadline_unix_ns = opts.deadline_unix_ns;
     // B1 (cluster A, decided 2026-08-28): the streaming step's E5 deadline
     // base is CLIENT-gated — the server.timeout fallback still bounds the
@@ -2206,6 +2228,7 @@ mod audit_0822_tests {
             step_raw_eligible: Vec::new(),
             outputs: None,
             dag_sets: None,
+            dag_selector: None,
             config_path: PathBuf::from("/audit-0822"),
             source_mtime: None,
         }

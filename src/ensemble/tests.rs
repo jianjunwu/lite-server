@@ -1088,6 +1088,7 @@ fn test_plan(path: &str) -> Arc<EnsemblePlan> {
         step_raw_eligible: Vec::new(),
         outputs: None,
         dag_sets: None,
+        dag_selector: None,
         config_path: PathBuf::from(path),
         source_mtime: None,
     })
@@ -1349,6 +1350,7 @@ async fn p0_cache_mtime_recheck_after_interval() {
                 step_raw_eligible: Vec::new(),
                 outputs: None,
                 dag_sets: None,
+                dag_selector: None,
                 config_path,
                 source_mtime: None,
             }))
@@ -1488,6 +1490,7 @@ async fn p0_cache_stat_after_read_must_not_pin_stale_plan() {
                     step_raw_eligible: Vec::new(),
                     outputs: None,
                     dag_sets: None,
+                    dag_selector: None,
                     config_path: cp,
                     source_mtime: v1_mtime,
                 }))
@@ -1516,6 +1519,7 @@ async fn p0_cache_stat_after_read_must_not_pin_stale_plan() {
                     step_raw_eligible: Vec::new(),
                     outputs: None,
                     dag_sets: None,
+                    dag_selector: None,
                     config_path: cp,
                     source_mtime: None,
                 }))
@@ -2569,6 +2573,131 @@ fn e8_per_set_inputs_independent() {
     assert!(default.inputs_decl.is_none(), "default set is legacy-form");
     let named = select_dag_set(&plan, Some("named")).unwrap();
     assert!(named.inputs_decl.is_some(), "named set declares inputs");
+}
+
+// === D41: body-field dag selector (dag_selector) ===
+
+/// D41 container yaml: selector + default/named sets (distinct steps).
+const D41_YAML: &str = "ensemble:\n  dag_selector: \"$request.modelName\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    fast:\n      steps:\n        - name: b\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n";
+
+/// R20: dag_selector requires the dags form — the single-set form has no
+/// sets to select between.
+#[test]
+fn d41_selector_requires_dags_form() {
+    let yaml = "ensemble:\n  dag_selector: \"$request.modelName\"\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("single-set form + dag_selector must be rejected (R20)");
+    assert!(err.to_string().contains("(R20)"), "got: {err}");
+}
+
+/// R21: the selector ref must be `$request.<path>` — non-empty dot
+/// segments; any JSON-key chars (incl. non-ASCII) and multi-segment paths
+/// are legal.
+#[test]
+fn d41_selector_ref_shape() {
+    for bad in ["$inputs.x", "$request", "$request.", "$request..a", "request.x"] {
+        let yaml = format!(
+            "ensemble:\n  dag_selector: \"{bad}\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {{x: \"$request\"}}\n"
+        );
+        let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("bad selector ref must be rejected (R21)");
+        assert!(err.to_string().contains("(R21)"), "ref '{bad}', got: {err}");
+    }
+    for (good, want) in [
+        ("$request.modelName", vec!["modelName"]),
+        ("$request.meta.target", vec!["meta", "target"]),
+        ("$request.模型", vec!["模型"]),
+    ] {
+        let yaml = format!(
+            "ensemble:\n  dag_selector: \"{good}\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {{x: \"$request\"}}\n"
+        );
+        let plan = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .unwrap_or_else(|e| panic!("legal ref '{good}' must parse: {e}"));
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!(plan.dag_selector.as_ref(), Some(&want), "ref '{good}'");
+    }
+    // Unconfigured plans carry no selector.
+    let plain = parse_ensemble_plan(
+        "ensemble:\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n",
+        &PathBuf::from("/nonexistent/config.yaml"),
+    )
+    .unwrap();
+    assert!(plain.dag_selector.is_none());
+}
+
+/// R22: a set declaring inputs (MIMO) has no anonymous $request root
+/// (R5) — the selector could never resolve, so the combination fails the
+/// load instead of silently defaulting.
+#[test]
+fn d41_selector_forbids_mimo_sets() {
+    let yaml = "ensemble:\n  dag_selector: \"$request.modelName\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    named:\n      inputs:\n        text:\n          type: json\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$inputs.text\"}\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("selector + declared-inputs set must be rejected (R22)");
+    assert!(err.to_string().contains("(R22)"), "got: {err}");
+}
+
+/// D41: resolution against the request root — missing/null → None
+/// (default), string → validated Some, invalid charset → 400 (D22 rules
+/// reused), non-string non-null → 400.
+#[test]
+fn d41_selector_resolution() {
+    let plan = parse_ensemble_plan(D41_YAML, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    let path = plan.dag_selector.as_deref().unwrap();
+    let resolve = |v: Value| resolve_dag_selector_from_value(&EnsembleValue::Json(v), path);
+
+    // Missing / null → None (default set).
+    assert_eq!(resolve(json!({"x": 1})).unwrap(), None);
+    assert_eq!(resolve(json!({"modelName": null})).unwrap(), None);
+    // String → validated Some.
+    assert_eq!(resolve(json!({"modelName": "fast"})).unwrap(), Some("fast".to_string()));
+    // Invalid charset → 400 (D22 validation reused).
+    let err = resolve(json!({"modelName": "bad!"})).unwrap_err();
+    assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    // Non-string non-null → 400 (D41), error names the source ref.
+    for bad in [json!(123), json!(true), json!({"a": 1}), json!([1])] {
+        let err = resolve(json!({"modelName": bad})).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        assert!(err.to_string().contains("(D41)"), "got: {err}");
+        assert!(err.to_string().contains("$request.modelName"), "got: {err}");
+    }
+    // Non-object root → field absent → None.
+    assert_eq!(resolve(json!([1, 2])).unwrap(), None);
+    // Binary / envelope roots carry no selector field → None.
+    assert_eq!(
+        resolve_dag_selector_from_value(
+            &EnsembleValue::Binary(Bytes::from_static(b"x"), "application/octet-stream".into(), None, None),
+            path
+        )
+        .unwrap(),
+        None
+    );
+    // RawJson (nested-call payload) resolves through the parse cache.
+    let raw = EnsembleValue::RawJson(Arc::new(RawJsonValue::new(Bytes::from_static(
+        br#"{"modelName":"fast"}"#,
+    ))));
+    assert_eq!(
+        resolve_dag_selector_from_value(&raw, path).unwrap(),
+        Some("fast".to_string())
+    );
+}
+
+/// D41: multi-segment selector paths resolve through nested objects.
+#[test]
+fn d41_selector_multi_segment_resolution() {
+    let yaml = "ensemble:\n  dag_selector: \"$request.meta.target\"\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    fast:\n      steps:\n        - name: b\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n";
+    let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    let path = plan.dag_selector.as_deref().unwrap();
+    let v = json!({"meta": {"target": "fast"}});
+    assert_eq!(
+        resolve_dag_selector_from_value(&EnsembleValue::Json(v), path).unwrap(),
+        Some("fast".to_string())
+    );
+    // A missing intermediate segment → None (default), never an error.
+    let v = json!({"meta": {}});
+    assert_eq!(
+        resolve_dag_selector_from_value(&EnsembleValue::Json(v), path).unwrap(),
+        None
+    );
 }
 
 // === E7 (batch 4④): multi-sink outputs ===
@@ -3689,6 +3818,7 @@ fn chain_consumer_plan() -> EnsemblePlan {
         step_raw_eligible: Vec::new(),
         outputs: None,
         dag_sets: None,
+        dag_selector: None,
         config_path: PathBuf::from("/chain-consumer-test"),
         source_mtime: None,
     }

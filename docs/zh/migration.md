@@ -256,10 +256,10 @@ ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](.
 
 - **回滚约定（D24）：** ensemble schema 拒绝未知字段。使用 0.9.0 字段
   （`stream`、`params`、`timeout_secs`、`on_error`、`retries`、`when`、
-  `outputs`、`dags`、`inputs`、`step.outputs`）的 config 在 0.8.x 服务端
-  **加载即失败**（快失败——静默吞掉 `stream:` 会让流式静默失效）。
-  因此 0.9.0 → 0.8.5 回滚须同步回滚使用这些字段的 ensemble config；
-  反向升级无需改 config。
+  `outputs`、`dags`、`dag_selector`、`inputs`、`step.outputs`）的 config
+  在 0.8.x 服务端 **加载即失败**（快失败——静默吞掉 `stream:` 会让流式
+  静默失效）。因此 0.9.0 → 0.8.5 回滚须同步回滚使用这些字段的
+  ensemble config；反向升级无需改 config。
 - **`$inputs` 保留键（D14）：** 旧 config（无 `inputs` 声明）收到顶层含
   `$inputs` 键的请求体现在返回 **400**（原为按不透明 JSON 字段透传）。
   声明多输入的 config 改用 KServe 信封 wire。

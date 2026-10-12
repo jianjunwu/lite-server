@@ -408,3 +408,77 @@ def test_canonical_ensemble_block_roundtrip_is_idempotent():
         inputs={"t": InputDecl(type="json")},
     ).to_config(full=True)["ensemble"]
     assert canonical_ensemble_block(full) == full
+
+
+# ===== D41 body-field dag selector =====
+
+
+def test_dag_selector_serializes_in_dags_form():
+    dag = EnsembleDAG(
+        dags={
+            "default": DagSet(
+                steps=[Step(name="main", model="pre", inputs={"text": "$request.text"})],
+            ),
+        },
+        dag_selector="$request.modelName",
+    )
+    assert dag.to_config() == {
+        "ensemble": {
+            "dag_selector": "$request.modelName",
+            "dags": {
+                "default": {
+                    "steps": [
+                        {"name": "main", "model": "pre", "inputs": {"text": "$request.text"}}
+                    ]
+                }
+            },
+        }
+    }
+
+
+def test_dag_selector_requires_dags_form():
+    with pytest.raises(ValueError, match="R20"):
+        EnsembleDAG(
+            steps=[Step(name="a", model="m", inputs={})],
+            dag_selector="$request.modelName",
+        )
+
+
+def test_dag_selector_ref_shape():
+    for bad in ("$inputs.x", "$request", "$request.", "$request..a", "request.x"):
+        with pytest.raises(ValueError, match="R21"):
+            EnsembleDAG(
+                dags={
+                    "default": DagSet(
+                        steps=[Step(name="a", model="m", inputs={})],
+                    ),
+                },
+                dag_selector=bad,
+            )
+    # Multi-segment and non-ASCII paths are legal.
+    for good in ("$request.meta.target", "$request.模型"):
+        EnsembleDAG(
+            dags={
+                "default": DagSet(steps=[Step(name="a", model="m", inputs={})]),
+            },
+            dag_selector=good,
+        )
+
+
+def test_dag_selector_forbids_declared_inputs_sets():
+    with pytest.raises(ValueError, match="R22"):
+        EnsembleDAG(
+            dags={
+                "named": DagSet(
+                    steps=[Step(name="a", model="m", inputs={"x": "$inputs.text"})],
+                    inputs={"text": InputDecl(type="json")},
+                ),
+            },
+            dag_selector="$request.modelName",
+        )
+
+
+def test_to_config_full_fills_dag_selector_default():
+    dag = EnsembleDAG(steps=[Step(name="a", model="m", inputs={})])
+    cfg = dag.to_config(full=True)["ensemble"]
+    assert cfg["dag_selector"] is None

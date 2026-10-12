@@ -141,6 +141,13 @@ pub struct EnsembleBlock {
     /// forbidden); absent = the historical single-set form.
     #[serde(default)]
     pub dags: Option<IndexMap<String, EnsembleDagSet>>,
+    /// D41: optional `$request.<path>` ref naming the request-body field
+    /// whose string value selects the DAG set when the `x-lite-dag`
+    /// header/metadata is absent. Dags form only (R20); the path is
+    /// validated at load (R21) and rejected alongside declared-inputs sets
+    /// (R22 — MIMO envelopes carry no anonymous `$request` root, R5).
+    #[serde(default)]
+    pub dag_selector: Option<String>,
 }
 
 /// E8-1 (batch 5): a named DAG set — the same field surface as the

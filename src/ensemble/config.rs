@@ -439,6 +439,69 @@ pub fn validate_dag_selector(value: &str) -> Result<String, AppError> {
     Ok(value.to_string())
 }
 
+/// D41 (R21): parse a `dag_selector` ref into dot-separated path segments.
+/// The ref must be `$request.<path>`; segments may carry any JSON-key chars
+/// (incl. non-ASCII) but must be non-empty. Multi-segment paths are legal —
+/// the selector resolves via direct field walks, not `resolve_ref`, so the
+/// R7 single-segment rule for step-input refs does not apply.
+fn parse_dag_selector_ref(raw: &str) -> Result<Vec<String>, AppError> {
+    let rest = raw.strip_prefix("$request.").ok_or_else(|| {
+        AppError::Config(format!(
+            "ensemble.dag_selector '{raw}' must be a $request.<path> ref (R21)"
+        ))
+    })?;
+    let segs: Vec<String> = rest.split('.').map(str::to_string).collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err(AppError::Config(format!(
+            "ensemble.dag_selector '{raw}' has an empty path segment (R21)"
+        )));
+    }
+    Ok(segs)
+}
+
+/// D41: resolve the body-field dag selector against the request root.
+/// Missing path / null / non-JSON roots (binary, envelope) → `None` (the
+/// default set applies); a string passes D22 validation; any other type is
+/// a 400 naming the source ref (never a silent default fallback).
+pub fn resolve_dag_selector_from_value(
+    payload: &EnsembleValue,
+    path: &[String],
+) -> Result<Option<String>, AppError> {
+    let source_ref = format!("$request.{}", path.join("."));
+    let root: &serde_json::Value = match payload {
+        EnsembleValue::Json(v) => v,
+        EnsembleValue::RawJson(r) => r.parse().map_err(|e| {
+            AppError::InvalidRequestBody(format!(
+                "dag_selector '{source_ref}': request body is not valid JSON: {e} (D41)"
+            ))
+        })?,
+        // Binary / envelope roots carry no addressable selector field.
+        EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. } => return Ok(None),
+    };
+    let mut cur = root;
+    for seg in path {
+        match cur.get(seg.as_str()) {
+            Some(v) => cur = v,
+            None => return Ok(None),
+        }
+    }
+    match cur {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => validate_dag_selector(s).map(Some),
+        other => Err(AppError::InvalidRequestBody(format!(
+            "dag_selector '{source_ref}' resolved to a non-string value ({}) — \
+             the body field must be a string set name (D41)",
+            match other {
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                _ => "unknown",
+            }
+        ))),
+    }
+}
+
 /// E7 (batch 4④, D31/D5): build the DAG response — priority
 /// outputs (E7) > output (E2) > steps.last() (historical). Multi-sink
 /// responses are KServe envelopes: JSON head `{model_name, outputs:
@@ -616,6 +679,11 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
                 "ensemble.dags declares no sets (E8-1)".to_string(),
             ));
         }
+        // D41 (R21): parse the body-field selector ref into dot segments.
+        let dag_selector = match config.ensemble.dag_selector.as_deref() {
+            None => None,
+            Some(raw) => Some(parse_dag_selector_ref(raw)?),
+        };
         let mut sets = IndexMap::new();
         for (name, set) in dags {
             let plan = parse_ensemble_set(
@@ -625,6 +693,16 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
                 AppError::Config(format!("dag set '{name}': {}", e))
             })?;
             sets.insert(name, Arc::new(plan));
+        }
+        // D41 (R22): a declared-inputs set has no anonymous `$request` root
+        // (R5) — the body selector could never resolve and every request
+        // would silently land on default. Fail fast instead.
+        if dag_selector.is_some() && sets.values().any(|p| p.inputs_decl.is_some()) {
+            return Err(AppError::Config(
+                "ensemble.dag_selector requires anonymous-root sets — a dag set \
+                 declares inputs (MIMO envelopes carry no $request root, R5) (R22)"
+                    .to_string(),
+            ));
         }
         return Ok(EnsemblePlan {
             // The outer plan is a pure container — execution always selects
@@ -641,9 +719,20 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
             step_raw_eligible: Vec::new(),
             outputs: None,
             dag_sets: Some(sets),
+            dag_selector,
             config_path: config_path.to_path_buf(),
             source_mtime: None,
         });
+    }
+
+    // D41 (R20): the body-field selector only makes sense with sets to
+    // select between.
+    if config.ensemble.dag_selector.is_some() {
+        return Err(AppError::Config(
+            "ensemble.dag_selector requires the dags form — the single-set form \
+             has no sets to select (R20)"
+                .to_string(),
+        ));
     }
 
     parse_ensemble_set(
@@ -827,6 +916,8 @@ fn parse_ensemble_set(
         outputs,
         // E8-1 (batch 5): a single-set plan carries no named sets.
         dag_sets: None,
+        // D41: the body-field selector lives on the container plan only.
+        dag_selector: None,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
         // load-time direct-parse path (insert_ready stats on its own).

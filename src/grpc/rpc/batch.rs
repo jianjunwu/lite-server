@@ -351,7 +351,30 @@ impl GrpcService {
         let plan = crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
             .await
             .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
-        if plan.steps[plan.output_step].stream || !plan.chains.is_empty() {
+        // D30: streaming DAGs are unsupported in batch. The dags form's
+        // container plan carries EMPTY steps — the check must consult the
+        // set the request will run: the header-selected set (D38), the
+        // UNION of all sets when a body-field selector selects per element
+        // (D41), or the default set otherwise.
+        let has_streaming = match &plan.dag_sets {
+            None => plan.steps[plan.output_step].stream || !plan.chains.is_empty(),
+            Some(sets) => match (&dag_selector, &plan.dag_selector) {
+                (Some(sel), _) => {
+                    let set = crate::ensemble::select_dag_set(&plan, Some(sel))
+                        .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
+                    set.steps[set.output_step].stream || !set.chains.is_empty()
+                }
+                (None, Some(_)) => sets
+                    .values()
+                    .any(|p| p.steps[p.output_step].stream || !p.chains.is_empty()),
+                (None, None) => {
+                    let set = crate::ensemble::select_dag_set(&plan, None)
+                        .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
+                    set.steps[set.output_step].stream || !set.chains.is_empty()
+                }
+            },
+        };
+        if has_streaming {
             return Err(err(Status::invalid_argument(
                 "ensemble DAG contains a streaming step; batch has no element-level streaming (D30)",
             )));

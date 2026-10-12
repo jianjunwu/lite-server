@@ -44,6 +44,8 @@ model_repo/
 
 对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。DAG 支持 unary 步骤、**末步流式**（输出步骤 `stream: true`）、**管道流式**（流式步骤逐 chunk 级联）、容错（`on_error: skip`、`retries`）、每步 `timeout_secs`/`params`/`when` 条件、嵌套 ensemble、命名 DAG 集合（`dags`，经 `x-lite-dag` 头选择）以及 **MIMO** 命名多输入/多输出（KServe 信封 wire、`inputs` 声明与 `step.outputs` 投影）。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](../protocol.md)的 *Ensemble 模型* 一节。
 
+**命名集合也可由请求体字段选择**（D41）：在 `dags` 旁声明 `dag_selector: "$request.<path>"`，未带 `x-lite-dag` 头的请求按该 body 字段的字符串值选择集合——典型用途是单入口中转（如 `{"modelName": "fast", ...}` 路由到 `fast` 集合）。契约与 header 逐项对齐：字段缺失或为 `null` → `default` 集合；未知集合名 → 400；非字符串值 → 400；header 存在时恒优先于 body 字段。限制：仅 `dags` 形态可用（R20）；ref 必须是 `$request.` 前缀的点分路径（R21，允许多段与任意 JSON 键字符）；任何集合声明了 `inputs`（MIMO）时禁止（R22——信封没有匿名 `$request` 根）。嵌套 ensemble 的子集合选择同样走 body 字段（嵌套调用不携带 header）。注意：body 路由字段无法被上游网关像剥离 header 那样廉价管控——可达面恒等于已声明集合的白名单，但依赖 header-stripping 做访问收敛的部署需要知情。
+
 执行模型差异：unary 步骤走常规推理队列（受 `max_queue_size` 限制）；**流式步骤绕过队列**（直连流式路径，与其它流式端点语义一致），并发流式 DAG 数由全局旋钮 `server.max_concurrent_streaming_dags` 限制（默认 128，耗尽立即 429）。
 
 DAG 也可用 **Python 声明**（E9-A）：在 `config.yaml` 旁的 `dag.py` 中用 `lite_server.ensemble` 的 `EnsembleDAG` 声明（见 [examples/05_ensemble](../../examples/05_ensemble)），序列化为等价的手写配置；`lite-server analyze` 会对声明与 `config.yaml` 做一致性检查并报告漂移（LS112）。服务端执行的是 `config.yaml`——Python 声明只是编写面，绝不执行。

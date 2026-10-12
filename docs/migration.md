@@ -301,11 +301,11 @@ are byte-identical; the new surface is opt-in via config fields.
 
 - **Rollback convention (D24):** the ensemble schema denies unknown fields.
   A config using 0.9.0 fields (`stream`, `params`, `timeout_secs`,
-  `on_error`, `retries`, `when`, `outputs`, `dags`, `inputs`,
-  `step.outputs`) **fails to load on a 0.8.x server** (fast fail — a
-  swallowed `stream:` would silently disable streaming). Rolling back
-  0.9.0 → 0.8.5 therefore requires rolling back the ensemble configs that
-  use these fields; the reverse direction needs no config change.
+  `on_error`, `retries`, `when`, `outputs`, `dags`, `dag_selector`,
+  `inputs`, `step.outputs`) **fails to load on a 0.8.x server** (fast
+  fail — a swallowed `stream:` would silently disable streaming). Rolling
+  back 0.9.0 → 0.8.5 therefore requires rolling back the ensemble configs
+  that use these fields; the reverse direction needs no config change.
 - **`$inputs` reserved key (D14):** a legacy config (no `inputs`
   declaration) receiving a request body with a top-level `$inputs` key now
   gets **400** (was: passed through as an opaque JSON field). Declared

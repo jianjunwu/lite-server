@@ -226,3 +226,54 @@ def test_dag_py_side_effects_are_never_executed(tmp_path):
     assert not marker.exists()
     # The declaration itself still cross-checks cleanly.
     assert _ls112(report) == []
+
+
+def test_drift_in_dag_selector_reports_warning(tmp_path):
+    config = (
+        "ensemble:\n"
+        "  dag_selector: \"$request.modelName\"\n"
+        "  dags:\n"
+        "    default:\n"
+        "      steps:\n"
+        "        - name: main\n"
+        "          model: pre\n"
+        "          inputs:\n"
+        "            text: \"$request.text\"\n"
+    )
+    dag_py = (
+        "from lite_server import DagSet, EnsembleDAG, Step\n\n"
+        "dag = EnsembleDAG(dags={\n"
+        "    \"default\": DagSet(steps=[Step(name=\"main\", model=\"pre\", inputs={\"text\": \"$request.text\"})]),\n"
+        "})\n"
+    )
+    repo = tmp_path / "repo"
+    _make_model(repo, config=config, dag_py=dag_py)
+    report = StaticAnalyzer(repo).analyze_model("ens")
+    assert len(_ls112(report)) == 1
+
+
+def test_matching_dag_selector_reports_no_drift(tmp_path):
+    config = (
+        "ensemble:\n"
+        "  dag_selector: \"$request.modelName\"\n"
+        "  dags:\n"
+        "    default:\n"
+        "      steps:\n"
+        "        - name: main\n"
+        "          model: pre\n"
+        "          inputs:\n"
+        "            text: \"$request.text\"\n"
+    )
+    dag_py = (
+        "from lite_server import DagSet, EnsembleDAG, Step\n\n"
+        "dag = EnsembleDAG(\n"
+        "    dags={\n"
+        "        \"default\": DagSet(steps=[Step(name=\"main\", model=\"pre\", inputs={\"text\": \"$request.text\"})]),\n"
+        "    },\n"
+        "    dag_selector=\"$request.modelName\",\n"
+        ")\n"
+    )
+    repo = tmp_path / "repo"
+    _make_model(repo, config=config, dag_py=dag_py)
+    report = StaticAnalyzer(repo).analyze_model("ens")
+    assert _ls112(report) == []

@@ -482,11 +482,32 @@ pub(crate) async fn execute_step(
         // D4: a nested ensemble must not contain streaming steps (the
         // combination is out of scope — checked before recursing so the
         // error names the offending child DAG). E8-1: a dags-form child is a
-        // pure container whose outer plan has EMPTY steps — nested calls
-        // carry no selector, so the check inspects the SELECTED default set
-        // (indexing the outer plan would panic).
-        let child_plan = get_ensemble_plan(&state, &step.model, &resolved_version).await?;
-        let child_plan = select_dag_set(&child_plan, None)?;
+        // pure container whose outer plan has EMPTY steps — the check
+        // inspects the SELECTED set (indexing the outer plan would panic).
+        let child_container = get_ensemble_plan(&state, &step.model, &resolved_version).await?;
+        // Parse the payload value once — D41 selector resolution and the
+        // child payload build below share it (binary passthrough stays
+        // unparsed; no selector field is addressable on bytes).
+        let child_value: Option<Value> = match &content_type_for_step {
+            Some(_) => None,
+            None => Some(serde_json::from_slice(&payload_bytes).map_err(|e| {
+                AppError::Internal(format!(
+                    "ensemble step {} payload reparse failed: {}",
+                    step.name, e
+                ))
+            })?),
+        };
+        // D41: nested calls carry no header selector (D38), so a child with a
+        // body-field selector resolves it against the assembled payload —
+        // the D4 check below must consult the SAME set execution selects.
+        let nested_selector = match (&child_container.dag_selector, &child_value) {
+            (Some(path), Some(v)) => resolve_dag_selector_from_value(
+                &EnsembleValue::Json(v.clone()),
+                path,
+            )?,
+            _ => None,
+        };
+        let child_plan = select_dag_set(&child_container, nested_selector.as_deref())?;
         if child_plan.steps[child_plan.output_step].stream || !child_plan.chains.is_empty() {
             return Err(AppError::InvalidRequestBody(format!(
                 "nested ensemble '{}' contains a streaming step — nested ensembles \
@@ -497,12 +518,7 @@ pub(crate) async fn execute_step(
         let child_payload = match &content_type_for_step {
             Some(ct) => EnsembleValue::Binary(payload_bytes.clone(), ct.clone(), None, None),
             None => {
-                let v: Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
-                    AppError::Internal(format!(
-                        "ensemble step {} payload reparse failed: {}",
-                        step.name, e
-                    ))
-                })?;
+                let v = child_value.expect("json payload parsed above");
                 // R17: a child declaring `inputs` consumes the parent's
                 // assembled group object as its NAMED-INPUT map (keys =
                 // input names, no $inputs wrapper) — reframe it as the
@@ -534,7 +550,10 @@ pub(crate) async fn execute_step(
             // only gates streaming steps.
             deadline_client_specified: false,
             decoupled: false, // the child is unary-only (D4)
-            dag_selector: None, // E8-1: nested ensembles are unary-only, no selector passthrough
+            // D41: the selector resolved above (None = header absent and no
+            // body-field selector configured) — execution selects the same
+            // set the D4 check consulted.
+            dag_selector: nested_selector,
         };
         let nested = execute_nested_ensemble_boxed(
             state.clone(),
