@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned minor channel: CI and local builds use the same clippy/rustfmt, so a
+# stable release cannot introduce surprise lint failures. Bump deliberately,
+# with the lint fallout handled in the same change.
+channel = "1.97"
+components = ["rustfmt", "clippy"]
