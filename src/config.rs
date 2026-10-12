@@ -1867,6 +1867,15 @@ impl Config {
             );
         }
         check_duration_secs("server.sequence_ttl_secs", self.server.sequence_ttl_secs)?;
+        // F-19: 0 would reject EVERY request body (HTTP 413 on anything
+        // non-empty, gRPC decode-fails every message) — almost certainly an
+        // operator typo. Omit the field for the 64 MiB default.
+        if self.server.max_request_body_bytes == Some(0) {
+            anyhow::bail!(
+                "config field `server.max_request_body_bytes` must be >= 1 \
+                 (0 rejects every request body); omit it for the 64 MiB default"
+            );
+        }
         if self.server.balance_rel_threshold < 0.0 || !self.server.balance_rel_threshold.is_finite() {
             anyhow::bail!(
                 "config field `server.balance_rel_threshold` must be a finite non-negative multiplier, got {}",
@@ -2301,6 +2310,30 @@ mod tests {
         assert_eq!(cfg.alerts.queue_depth_critical, 500);
         assert_eq!(cfg.alerts.p99_ms_warning, 500.0);
         assert_eq!(cfg.alerts.p99_ms_critical, 2000.0);
+    }
+
+    /// F-19: `max_request_body_bytes: 0` rejects EVERY request body (HTTP 413
+    /// on anything non-empty, gRPC decode-fails every message) — almost
+    /// certainly an operator typo. Fail fast at validation with guidance
+    /// instead of serving a server that refuses all inference traffic.
+    #[test]
+    fn validate_rejects_zero_max_request_body_bytes() {
+        let cfg: Config = serde_yaml::from_str(
+            "server:\n  max_request_body_bytes: 0\n",
+        )
+        .unwrap();
+        let err = cfg.validate().expect_err("0 must be rejected");
+        assert!(
+            err.to_string().contains("max_request_body_bytes"),
+            "error must name the field: {err}"
+        );
+        // Absent (default 64 MiB) and a positive value still pass.
+        Config::default().validate().expect("default validates");
+        let cfg: Config = serde_yaml::from_str(
+            "server:\n  max_request_body_bytes: 1048576\n",
+        )
+        .unwrap();
+        cfg.validate().expect("positive value validates");
     }
 
     #[test]

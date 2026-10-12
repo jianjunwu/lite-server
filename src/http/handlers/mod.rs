@@ -468,6 +468,19 @@ fn auth_gate_for_unknown_model(
     }
 }
 
+/// F-23: whether to emit the empty-IP-scope warning for this model — true on
+/// the first call per model, false afterwards (process-wide dedup).
+fn should_warn_empty_ip_scope(model_name: &str) -> bool {
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|mut seen| seen.insert(model_name.to_string()))
+        .unwrap_or(true) // poisoned lock: warn rather than stay silent
+}
+
 /// `scope` derives from the policy key: `"ip"` → client IP from the
 /// `RequestContext` (filled once by `context_middleware`), otherwise the
 /// constant `"/predict"` route scope so all inference paths for
@@ -488,8 +501,9 @@ async fn enforce_rate_limit(
     };
     // Empty IP scope (unix-socket path with no peer, or a proxy that sent no
     // client headers) collapses every request into one shared bucket — surface
-    // it once so per-IP limiting silently degrading to a global cap is visible.
-    if rl.key == "ip" && scope.is_empty() {
+    // it once per model so per-IP limiting silently degrading to a global cap
+    // is visible without flooding the log on every request (F-23).
+    if rl.key == "ip" && scope.is_empty() && should_warn_empty_ip_scope(model_name) {
         warn!(
             model = %model_name,
             "rate-limit key=ip resolved to empty scope; all requests share one bucket"
@@ -1267,5 +1281,17 @@ mod auth_policy_tests {
         };
         let h = headers_with("authorization", "tok");
         assert!(enforce_auth(Some(&p), &h).is_ok());
+    }
+
+    /// F-23: the empty-IP-scope warning fires once per model, not per
+    /// request — a UDS deployment with key=ip rate limiting previously got
+    /// one WARN line per request.
+    #[test]
+    fn empty_ip_scope_warns_once_per_model() {
+        assert!(should_warn_empty_ip_scope("f23-a"));
+        assert!(!should_warn_empty_ip_scope("f23-a"));
+        assert!(!should_warn_empty_ip_scope("f23-a"));
+        // A different model with the same misconfiguration gets its own warning.
+        assert!(should_warn_empty_ip_scope("f23-b"));
     }
 }

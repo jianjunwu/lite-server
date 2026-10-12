@@ -269,3 +269,113 @@ def test_should_return_499_when_client_aborts_mid_upload(upstream, monkeypatch):
 
     res = asyncio.run(_run())
     assert res.status_code == 499
+
+
+def test_record_success_failure_still_closes_upstream(monkeypatch):
+    """Leak guard: on a non-buffered mutation, an ownership bookkeeping
+    failure (e.g. SQLite fault in record_success) must still close the
+    upstream response — otherwise the connection-pool slot leaks to GC."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    from lite_server.webui import ownership, proxy
+
+    class FakeUpstream:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def __init__(self):
+            self.closed = False
+
+        async def aiter_raw(self):
+            yield b"{}"
+
+        async def aclose(self):
+            self.closed = True
+
+    class FakeClient:
+        def __init__(self, upstream):
+            self.upstream = upstream
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, req, stream=False):
+            return self.upstream
+
+    upstream = FakeUpstream()
+    inst = InstanceConfig(id="inst", name="Inst", base_url="http://upstream")
+    app = SimpleNamespace(state=SimpleNamespace(
+        registry=MapRegistry([inst]),
+        user_store=object(),
+        http=FakeClient(upstream),
+        http_long=FakeClient(upstream),
+        http_stream=FakeClient(upstream),
+    ))
+
+    # Ownership gates pass; the bookkeeping write itself fails.
+    monkeypatch.setattr(ownership, "check_model_grant", lambda *a, **k: None)
+    monkeypatch.setattr(ownership, "check_ownership", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("sqlite gone")
+
+    monkeypatch.setattr(ownership, "record_success", _boom)
+
+    async def _receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http", "method": "DELETE", "headers": [],
+        "query_string": b"", "path": "/api/i/inst/v2/models/m/versions/1",
+        "app": app, "state": {"user": {"username": "alice"}},
+    }
+    request = Request(scope, _receive)
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="sqlite gone"):
+            await proxy._proxy(request, "inst", "v2/models/m/versions/1")
+
+    asyncio.run(_run())
+    assert upstream.closed, "upstream response must be closed when record_success raises"
+
+
+def test_lifespan_closes_remaining_clients_when_one_raises():
+    """Leak guard: a failing aclose() on one http client must not skip the
+    remaining clients and the auth store during shutdown."""
+    from types import SimpleNamespace
+
+    from lite_server.webui.app import _lifespan
+
+    closed = []
+
+    class FakeClient:
+        def __init__(self, name, exc=None):
+            self.name = name
+            self.exc = exc
+
+        async def aclose(self):
+            if self.exc is not None:
+                raise self.exc
+            closed.append(self.name)
+
+    class FakeStore:
+        def close(self):
+            closed.append("store")
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        http=FakeClient("http", RuntimeError("pool stuck")),
+        http_long=FakeClient("http_long"),
+        http_stream=FakeClient("http_stream"),
+        user_store=FakeStore(),
+    ))
+
+    async def _run():
+        async with _lifespan(app):
+            pass
+
+    asyncio.run(_run())
+    assert sorted(closed) == ["http_long", "http_stream", "store"], (
+        f"shutdown must close every resource even when one fails, got {closed}"
+    )

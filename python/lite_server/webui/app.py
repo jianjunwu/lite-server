@@ -49,9 +49,13 @@ class _SpaFiles(StaticFiles):
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     yield
-    await app.state.http.aclose()
-    await app.state.http_long.aclose()
-    await app.state.http_stream.aclose()
+    # Each close is exception-isolated: one stuck pool must not skip the
+    # remaining clients (or the auth store below) during shutdown.
+    for name in ("http", "http_long", "http_stream"):
+        try:
+            await getattr(app.state, name).aclose()
+        except Exception:
+            _logger.warning("%s client close failed during shutdown", name, exc_info=True)
     # Checkpoint/close the auth SQLite (WAL) on clean shutdown. Tolerant: a
     # broken store must not turn shutdown into an error.
     store = getattr(app.state, "user_store", None)

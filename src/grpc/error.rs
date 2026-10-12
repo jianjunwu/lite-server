@@ -12,6 +12,11 @@ pub(super) fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
         401 => tonic::Code::Unauthenticated,
         403 => tonic::Code::PermissionDenied,
         404 => tonic::Code::NotFound,
+        // F-30: 405 Method Not Allowed — gRPC has no analogue; Unimplemented
+        // ("this operation shape is not supported") is the conventional
+        // mapping. It deliberately does NOT join is_client_class (locked by
+        // test_server_fault_codes_log_at_error).
+        405 => tonic::Code::Unimplemented,
         409 => tonic::Code::AlreadyExists,
         // F11b: upload size cap — align with tonic's own oversized-decode
         // behavior (ResourceExhausted) rather than falling through to Internal.
@@ -284,6 +289,10 @@ mod tests {
         assert_eq!(http_status_to_grpc_code(401), tonic::Code::Unauthenticated);
         assert_eq!(http_status_to_grpc_code(403), tonic::Code::PermissionDenied);
         assert_eq!(http_status_to_grpc_code(404), tonic::Code::NotFound);
+        // F-30: 405 Method Not Allowed is a client-class "this RPC shape is
+        // not supported" signal, not an internal server fault — gRPC has no
+        // 405 analogue; Unimplemented is the conventional mapping.
+        assert_eq!(http_status_to_grpc_code(405), tonic::Code::Unimplemented);
         assert_eq!(http_status_to_grpc_code(429), tonic::Code::ResourceExhausted);
         assert_eq!(http_status_to_grpc_code(503), tonic::Code::Unavailable);
         assert_eq!(http_status_to_grpc_code(504), tonic::Code::DeadlineExceeded);

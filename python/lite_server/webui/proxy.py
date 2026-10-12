@@ -189,7 +189,14 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
 
     if (mutation is not None and store is not None and user is not None
             and 200 <= upstream.status_code < 300):
-        ownership.record_success(store, inst_id, user, mutation, request.method)
+        try:
+            ownership.record_success(store, inst_id, user, mutation, request.method)
+        except Exception:
+            # Bookkeeping failed after the upstream responded 2xx: fail
+            # closed (the ownership row may be missing), but never leak the
+            # connection-pool slot — close the response before propagating.
+            await upstream.aclose()
+            raise
 
     async def body_iter():
         try:

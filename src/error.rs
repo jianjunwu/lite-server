@@ -286,8 +286,7 @@ impl AppError {
     /// 拒绝的 family 判定与响应状态保持一致,两处不会漂移)。
     pub fn http_status(&self) -> StatusCode {
         if let AppError::ModelError(d) = self {
-            return StatusCode::from_u16(d.status_code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return model_error_http_status(d.status_code);
         }
         if matches!(self, AppError::PayloadTooLarge { .. }) {
             return StatusCode::PAYLOAD_TOO_LARGE;
@@ -327,17 +326,26 @@ impl AppError {
     }
 }
 
+/// F-35: clamp a worker-supplied status_code to the true HTTP response range
+/// (100..=599). `StatusCode::from_u16` accepts 600..=999, so a junk code
+/// (e.g. 999) would otherwise go onto the wire as a nonstandard status line;
+/// out-of-range values collapse to 500.
+fn model_error_http_status(code: u16) -> StatusCode {
+    match code {
+        100..=599 => StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 impl AppError {
-    /// 迁移为与协议无关的错误值表(D11)。字段值按现状 `IntoResponse` 的
-    /// 映射**原样搬移**(P2.0 零行为变化,字节快照门禁),只移动 JSON 拼装
+    /// 迁移为与协议无关的错误值表(D11)。字段值按现状 `IntoResponse` 的    /// 映射**原样搬移**(P2.0 零行为变化,字节快照门禁),只移动 JSON 拼装
     /// 不移动映射逻辑;wire 拼装全部迁入 `protocol::render` 分派。
     pub(crate) fn into_canonical(self) -> CanonicalError {
         // ModelError:模型作者显式暴露的状态/消息/header(不 sanitize),
         // 日志级别 info(模型主动拒绝,非服务器故障)。
         if let AppError::ModelError(d) = &self {
             return CanonicalError {
-                status: StatusCode::from_u16(d.status_code)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                status: model_error_http_status(d.status_code),
                 error_type: d.error_type.clone(),
                 // Option 保留:模型未提供 code 时 wire 输出 "code": null
                 // (现状字节,快照门禁)。
@@ -517,6 +525,32 @@ pub(crate) fn map_body_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_error(status_code: u16) -> AppError {
+        AppError::ModelError(Box::new(ModelErrorData {
+            status_code,
+            error_type: "model_error".to_string(),
+            detail: "boom".to_string(),
+            code: None,
+            param: None,
+            headers: None,
+        }))
+    }
+
+    /// F-35: a worker-supplied status_code outside the true HTTP response
+    /// range (100..=599) must collapse to 500 — `StatusCode::from_u16`
+    /// accepts 600..=999, so a junk 999 previously went straight onto the
+    /// wire as a nonstandard status line.
+    #[test]
+    fn model_error_status_code_out_of_range_falls_back_to_500() {
+        assert_eq!(model_error(999).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(model_error(0).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(model_error(99).http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // In-range values pass through untouched.
+        assert_eq!(model_error(404).http_status(), StatusCode::NOT_FOUND);
+        assert_eq!(model_error(200).http_status(), StatusCode::OK);
+        assert_eq!(model_error(599).http_status().as_u16(), 599);
+    }
 
     #[test]
     fn test_pub_error_message_does_not_leak_paths() {

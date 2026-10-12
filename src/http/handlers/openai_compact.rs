@@ -101,7 +101,17 @@ fn parse_route(body: &RequestBody) -> Result<OpenAiRoute, AppError> {
     let model = v.get("model").and_then(|m| m.as_str()).map(String::from).ok_or_else(|| {
         AppError::InvalidRequestBody("missing required field: model".to_string())
     })?;
-    let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    // F-33: a present-but-non-boolean `stream` is a client error (400), not
+    // a silent downgrade to unary.
+    let stream = match v.get("stream") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(AppError::InvalidRequestBody(
+                "field 'stream' must be a boolean".to_string(),
+            ));
+        }
+    };
     Ok(OpenAiRoute { model, stream })
 }
 
@@ -256,6 +266,29 @@ mod audit_tests {
 
     fn v1_router(state: Arc<AppState>) -> axum::Router {
         mount(axum::Router::new()).with_state(state)
+    }
+
+    /// F-33: a non-boolean `stream` field must be rejected 400 — previously
+    /// `as_bool().unwrap_or(false)` silently downgraded it to a unary call.
+    #[test]
+    fn parse_route_rejects_non_boolean_stream() {
+        let body = |s: &str| RequestBody::Json(bytes::Bytes::from(s.to_string()));
+
+        let err = parse_route(&body(r#"{"model":"m","stream":"yes"}"#)).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "string stream must be 400, got {err:?}"
+        );
+        let err = parse_route(&body(r#"{"model":"m","stream":1}"#)).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "numeric stream must be 400, got {err:?}"
+        );
+
+        // Absent and explicit booleans keep working.
+        assert!(!parse_route(&body(r#"{"model":"m"}"#)).unwrap().stream);
+        assert!(parse_route(&body(r#"{"model":"m","stream":true}"#)).unwrap().stream);
+        assert!(!parse_route(&body(r#"{"model":"m","stream":false}"#)).unwrap().stream);
     }
 
     /// oneshot 按值消耗 router(内含唯一 state 引用)——流式测试必须保留
