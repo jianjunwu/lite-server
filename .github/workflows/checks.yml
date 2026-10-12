@@ -10,6 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  # Rust 格式与 lint 门禁（loomx 模式）：rust-toolchain.toml 固定 channel，
+  # `rustup show` 物化 pin（不重申版本）；单 ubuntu job，分钟级，先于编译
+  # 测试栈给出反馈。
+  rust-lint:
+    name: cargo fmt + clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   # 蓝图 §6.7 评审 2.4：依赖安全公告扫描（RUSTSEC）。
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)
