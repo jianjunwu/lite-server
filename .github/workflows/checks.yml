@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the pinned toolchain
         run: rustup show
+      - name: Install protoc and libzmq (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev protobuf-compiler
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
