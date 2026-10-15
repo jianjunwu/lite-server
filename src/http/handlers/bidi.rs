@@ -306,11 +306,17 @@ async fn h2_bidi_entry_impl(
             crate::ensemble::dag_selector_from_http(&headers)?.as_deref(),
         )
         .await?;
-        let value = if declared {
+        // D43: the aggregated root rides alongside the value. The declared
+        // (envelope) arm has no as-received body — and R24 forbids
+        // `passthrough` inside a declared-inputs ensemble anyway.
+        let (value, root_body) = if declared {
             post_trigger_body = Some((remainder_buf, body_stream));
             // initial_data moved into meta above — meta.payload is the same
             // bytes.
-            crate::ensemble::bidi_envelope_frame(&meta.payload, initial_is_json, ct.clone())?
+            (
+                crate::ensemble::bidi_envelope_frame(&meta.payload, initial_is_json, ct.clone())?,
+                None,
+            )
         } else {
             let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
             // initial_data moved into meta above — meta.payload is the same bytes.
@@ -425,7 +431,8 @@ async fn h2_bidi_entry_impl(
                 aggregator.total_bytes(),
                 aggregate_start.elapsed().as_secs_f64(),
             );
-            aggregator.finish()?
+            let (aggregated, root) = aggregator.finish_with_root_bytes()?;
+            (aggregated, Some(root))
         };
         // E8-1 (D38): the dag selector rides the h2 stream headers.
         let opts = crate::ensemble::EnsembleExecOpts {
@@ -434,6 +441,12 @@ async fn h2_bidi_entry_impl(
             deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
+            // D42 (R23) / D43 (R24): forwarding context — the h2 request
+            // headers, and the aggregated root a `passthrough` step forwards.
+            request_headers: crate::ensemble::header_pool_from_http(&headers),
+            request_body: root_body,
+            // D43: the aggregated root's own media type (the first frame's).
+            request_content_type: value.content_type(),
         };
         match crate::ensemble::execute_ensemble(
             state.clone(),
@@ -459,7 +472,7 @@ async fn h2_bidi_entry_impl(
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.cancel_client, s.chunk_rx, None, s.inflight_guard)
             }
-            crate::ensemble::EnsembleOutcome::Unary(_) => {
+            crate::ensemble::EnsembleOutcome::Unary(..) => {
                 return Err(AppError::InvalidRequestBody(
                     "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
                 ));

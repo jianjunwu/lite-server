@@ -317,6 +317,11 @@ async fn do_infer(
             deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector,
+            // D42 (R23) / D43 (R24): forwarding context — the HTTP request
+            // headers and the body exactly as received.
+            request_headers: crate::ensemble::header_pool_from_http(&headers),
+            request_body: Some(body.bytes()),
+            request_content_type: body.content_type(),
         };
         let result = match crate::ensemble::execute_ensemble(
             state, &model_name, &resolved_version, ensemble_input, &request_id, opts,
@@ -639,6 +644,23 @@ async fn do_infer(
     }.instrument(span).await
 }
 
+/// D44 (2026-10-15): attach the OUTPUT step's worker response metadata to the
+/// ensemble response. Headers go through `inject_response_headers_into`, which
+/// applies the same `BLOCKED_RESPONSE_HEADERS` policy as the direct unary path
+/// — a worker can add `x-tenant-id` but can never override `content-type` or
+/// `content-length`. A `status_code` of 0 keeps the transport's own.
+fn apply_step_meta(response: &mut Response, meta: Option<&crate::ensemble::StepResponseMeta>) {
+    let Some(meta) = meta else {
+        return;
+    };
+    if meta.status_code > 0 {
+        if let Ok(code) = axum::http::StatusCode::from_u16(meta.status_code) {
+            *response.status_mut() = code;
+        }
+    }
+    crate::protocol::inject_response_headers_into(response.headers_mut(), &meta.headers);
+}
+
 /// B7 (round2): ensemble unary egress — every exit records the top-level
 /// request exactly once (success 2xx; streaming-DAG-on-unary contract
 /// violation 4xx; response-build failure 5xx). Sub-model steps are not HTTP
@@ -663,77 +685,62 @@ fn ensemble_outcome_response(
         );
         resp
     };
-    match result {
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
-            finish(Ok(Json(v).into_response()))
-        }
-        // P2 (batch 6): a raw-resident whole output emits its ORIGINAL
-        // bytes — zero copy, zero re-serialize at the response boundary.
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => {
-            finish(
-                Response::builder()
-                    .status(axum::http::StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(raw.bytes.clone()))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
-            )
-        }
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(
-            data,
-            ct,
-            ..,
-        )) => {
-            // Same builder-error handling as the unary passthrough
-            // (inference.rs:291-302): a worker-supplied media_type that is
-            // not a valid header value must become a 500, never a panic.
-            finish(
-                Response::builder()
-                    .status(axum::http::StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, &ct)
-                    .body(axum::body::Body::from(data))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
-            )
-        }
+    // D44: the OUTPUT step's worker response metadata rides the Unary
+    // outcome; only unary ensembles have one.
+    let (value, meta) = match result {
+        crate::ensemble::EnsembleOutcome::Unary(value, meta) => (value, meta),
         crate::ensemble::EnsembleOutcome::Stream(_) => {
             // D1: a unary endpoint calling a streaming DAG is a client
             // contract violation — 400 (aggregating chunks would fake
             // unary semantics and hide backpressure/memory risk).
-            finish(Err(AppError::InvalidRequestBody(
+            return finish(Err(AppError::InvalidRequestBody(
                 "DAG contains a streaming step; use a streaming endpoint".to_string(),
-            )))
+            )));
         }
+    };
+    let resp = match value {
+        crate::ensemble::EnsembleValue::Json(v) => Ok(Json(v).into_response()),
+        // P2 (batch 6): a raw-resident whole output emits its ORIGINAL
+        // bytes — zero copy, zero re-serialize at the response boundary.
+        crate::ensemble::EnsembleValue::RawJson(raw) => Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(raw.bytes.clone()))
+            .map_err(|e| AppError::Internal(format!("build response: {e}"))),
+        // Same builder-error handling as the unary passthrough
+        // (inference.rs:291-302): a worker-supplied media_type that is
+        // not a valid header value must become a 500, never a panic.
+        crate::ensemble::EnsembleValue::Binary(data, ct, ..) => Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, &ct)
+            .body(axum::body::Body::from(data))
+            .map_err(|e| AppError::Internal(format!("build response: {e}"))),
         // E7 (D31): the multi-sink response — JSON head + binary tail
         // with the Inference-Header-Content-Length split header
         // (kserve.rs convention). A tail-less envelope degrades to
         // plain JSON (build_response never emits one with an empty
         // tail — the guard is defensive).
-        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope {
-            head,
-            tail,
-        }) => {
+        crate::ensemble::EnsembleValue::Envelope { head, tail } => {
             if tail.is_empty() {
-                return finish(Ok(Json(head).into_response()));
-            }
-            let head_bytes = match serde_json::to_vec(&head) {
-                Ok(b) => b,
-                Err(e) => {
-                    return finish(Err(AppError::Internal(format!(
-                        "serialize envelope head: {e}"
-                    ))))
-                }
-            };
-            let mut body = head_bytes.clone();
-            body.extend_from_slice(&tail);
-            finish(
+                Ok(Json(head).into_response())
+            } else {
+                let head_bytes = serde_json::to_vec(&head)
+                    .map_err(|e| AppError::Internal(format!("serialize envelope head: {e}")))?;
+                let mut body = head_bytes.clone();
+                body.extend_from_slice(&tail);
                 Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
                     .header("inference-header-content-length", head_bytes.len())
                     .body(axum::body::Body::from(body))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
-            )
+                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
+            }
         }
-    }
+    };
+    finish(resp.map(|mut response| {
+        apply_step_meta(&mut response, meta.as_ref());
+        response
+    }))
 }
 
 // ===== Streaming Helpers =====
@@ -1096,6 +1103,7 @@ mod rejection_metrics_tests {
         let before = requests_total("b7_ens", "1", "2xx");
         let outcome = crate::ensemble::EnsembleOutcome::Unary(
             crate::ensemble::EnsembleValue::Json(json!({"ok": true})),
+            None,
         );
         let resp = ensemble_outcome_response("b7_ens", "1", Instant::now(), outcome);
         assert!(resp.is_ok());
@@ -1107,13 +1115,70 @@ mod rejection_metrics_tests {
     fn ensemble_unary_envelope_success_records_2xx() {
         let _ = prometheus::register_metrics();
         let before = requests_total("b7_ens_env", "1", "2xx");
-        let outcome =
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope {
+        let outcome = crate::ensemble::EnsembleOutcome::Unary(
+            crate::ensemble::EnsembleValue::Envelope {
                 head: json!({"h": 1}),
                 tail: bytes::Bytes::from_static(b"\x00\x01"),
-            });
+            },
+            None,
+        );
         let resp = ensemble_outcome_response("b7_ens_env", "1", Instant::now(), outcome);
         assert!(resp.is_ok());
         assert_eq!(requests_total("b7_ens_env", "1", "2xx"), before + 1.0);
+    }
+}
+
+#[cfg(test)]
+mod d44_egress_tests {
+    use super::*;
+
+    /// D44: the ensemble egress injects the output step's status and headers,
+    /// reusing the same `BLOCKED_RESPONSE_HEADERS` policy as the direct unary
+    /// path — a worker may add headers but never override `content-type`.
+    #[test]
+    fn step_metadata_injects_status_and_filters_blocked_headers() {
+        let mut resp = Json(json!({"ok": true})).into_response();
+        let meta = crate::ensemble::StepResponseMeta {
+            status_code: 201,
+            headers: [
+                ("x-tenant-id".to_string(), "acme".to_string()),
+                // Server-owned: must be dropped, not overwritten.
+                ("content-type".to_string(), "text/evil".to_string()),
+            ]
+            .into(),
+        };
+        apply_step_meta(&mut resp, Some(&meta));
+
+        assert_eq!(resp.status().as_u16(), 201);
+        assert_eq!(
+            resp.headers().get("x-tenant-id").unwrap(),
+            "acme",
+            "a worker-supplied header must reach the client"
+        );
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json",
+            "content-type is server-owned (BLOCKED_RESPONSE_HEADERS)"
+        );
+    }
+
+    /// D44: `status_code: 0` means "the worker supplied none" — the transport
+    /// keeps its own status. `None` metadata is a complete no-op.
+    #[test]
+    fn absent_metadata_leaves_the_response_untouched() {
+        let mut resp = Json(json!({"ok": true})).into_response();
+        apply_step_meta(
+            &mut resp,
+            Some(&crate::ensemble::StepResponseMeta::default()),
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let mut resp = Json(json!({"ok": true})).into_response();
+        apply_step_meta(&mut resp, None);
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
     }
 }

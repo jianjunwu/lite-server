@@ -191,12 +191,84 @@ pub struct EnsembleExecOpts {
     /// D22-validated; the orchestration layer sees a pure string, never
     /// transport headers.
     pub dag_selector: Option<String>,
+    /// D42 (R23): the parent request's headers, names lowercased. This is the
+    /// ONLY breach of D38's "no transport headers in the orchestration layer"
+    /// boundary, and it is deliberately narrow: the pool is read exclusively
+    /// through a step's load-validated `forward_headers` allowlist, so the
+    /// reachable surface is exactly what the config names. Empty = nothing
+    /// can be forwarded.
+    pub request_headers: Arc<HashMap<String, String>>,
+    /// D43 (R24): the request root's raw bytes exactly as received — HTTP:
+    /// after decompression, before parsing; gRPC: the element's `data`. A
+    /// `passthrough` step's outbound payload IS this value, so the bytes stay
+    /// byte-identical (no parse → re-serialize). `None` only on paths that
+    /// carry no body at all.
+    pub request_body: Option<bytes::Bytes>,
+    /// D43: the media type the endpoint classified for `request_body`.
+    /// A `passthrough` step re-states it so the sub-model parses the verbatim
+    /// bytes the same way — without it a BINARY relay would reach the worker
+    /// as an untyped payload. `None` = the JSON default (and, as before, no
+    /// content-type header is sent), which matches the assembler's own JSON
+    /// shape.
+    pub request_content_type: Option<String>,
+}
+
+/// D42 (R23): build the forwarding pool from an HTTP request's headers.
+/// Names arrive already-lowercased (`http::HeaderName`), so a step's
+/// lowercased allowlist matches by plain equality.
+pub fn header_pool_from_http(headers: &axum::http::HeaderMap) -> Arc<HashMap<String, String>> {
+    let mut pool = HashMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if let Ok(v) = value.to_str() {
+            pool.insert(name.as_str().to_string(), v.to_string());
+        }
+    }
+    Arc::new(pool)
+}
+
+/// D42 (R23): build the forwarding pool from gRPC request metadata. Keys are
+/// lowercased explicitly — unlike `HeaderName`, `MetadataMap` does not
+/// normalize case on its own.
+pub fn header_pool_from_grpc(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Arc<HashMap<String, String>> {
+    let mut pool = HashMap::with_capacity(metadata.len());
+    for kv in metadata.iter() {
+        // Binary-valued keys (`-bin`) are not String-representable and are
+        // never valid forwarded headers — skipped.
+        if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = kv {
+            if let Ok(v) = value.to_str() {
+                pool.insert(key.as_str().to_ascii_lowercase(), v.to_string());
+            }
+        }
+    }
+    Arc::new(pool)
+}
+
+/// D42 (R23): seed `out` with the parent pool's entries named by the step's
+/// allowlist. Called BEFORE the assembly layer inserts `content-type` and
+/// before the telemetry injection, so a server-set value always wins over a
+/// forwarded one.
+pub(crate) fn seed_forwarded_headers(
+    out: &mut HashMap<String, String>,
+    allowlist: &[String],
+    pool: &HashMap<String, String>,
+) {
+    for name in allowlist {
+        if let Some(value) = pool.get(name) {
+            out.insert(name.clone(), value.clone());
+        }
+    }
 }
 
 /// D25: batch-0 result — Unary keeps the historical byte-identical path;
 /// Stream carries the tail stream (and, from batch 2, the whole chain).
+///
+/// D44: Unary also carries the OUTPUT step's worker response metadata (None
+/// when the worker supplied none). Streams have no such channel — a stream's
+/// response headers are the server's own (protocol::BLOCKED_RESPONSE_HEADERS).
 pub enum EnsembleOutcome {
-    Unary(EnsembleValue),
+    Unary(EnsembleValue, Option<StepResponseMeta>),
     Stream(EnsembleStream),
 }
 
@@ -458,6 +530,10 @@ pub(crate) async fn execute_ensemble_inner(
             }
         };
 
+    // D44: step-name → worker response metadata, filled by run_layers. Only
+    // the output step's entry reaches the client.
+    let mut step_metas: HashMap<String, StepResponseMeta> = HashMap::new();
+
     if !plan.steps[tail_idx].stream {
         // Historical unary path — byte-identical behaviour (E7: multi-sink
         // responses build from the same context via build_response).
@@ -475,9 +551,10 @@ pub(crate) async fn execute_ensemble_inner(
             snapshot,
             depth,
             &ancestors,
+            &mut step_metas,
         )
         .await?;
-        return build_response(&plan, model_name, &context);
+        return build_response(&plan, model_name, &context, &step_metas);
     }
 
     // §4.2 pipeline branch (batch 2): the DAG contains a chain — run the
@@ -516,6 +593,10 @@ pub(crate) async fn execute_ensemble_inner(
             snapshot,
             depth,
             &ancestors,
+            // Pre-layers of a streaming DAG produce no client-visible output
+            // (the stream replaces it), so their metadata is discarded —
+            // collected here only because run_layers has one signature.
+            &mut step_metas,
         )
         .await?;
         // P10 (D40): the permit is WEIGHTED by the chain's streaming-step
@@ -592,6 +673,9 @@ pub(crate) async fn execute_ensemble_inner(
             snapshot,
             depth,
             &ancestors,
+            // Same as the chain branch: a streaming tail replaces the client
+            // response, so pre-layer metadata has nowhere to go.
+            &mut step_metas,
         )
         .await
     };
@@ -687,6 +771,11 @@ fn build_step_fut(
     let ensemble_name = model_name.to_string();
     let request_id = request_id.to_string();
     let client_ip = opts.client_ip.clone();
+    // D42 (R23) / D43 (R24): forwarding context for the step — Arc/Bytes
+    // clones (refcount bumps), so the per-step cost stays flat.
+    let request_headers = opts.request_headers.clone();
+    let request_body = opts.request_body.clone();
+    let request_content_type = opts.request_content_type.clone();
     // E4/D15: resolve the metric label BEFORE the future runs (a failed
     // resolution aborts the layer here — the same error execute_step
     // would surface for that step). The resolved label is the truthful
@@ -712,6 +801,9 @@ fn build_step_fut(
             &ctx,
             &request_id,
             &client_ip,
+            &request_headers,
+            request_body.as_ref(),
+            request_content_type.as_deref(),
             deadline_unix_ns,
             &snapshot,
             depth,
@@ -741,13 +833,19 @@ fn handle_step_result(
     result: Result<StepResults, AppError>,
     context: &mut HashMap<String, EnsembleValue>,
     skip_set: &HashSet<&str>,
+    // D44: every completed step's response metadata is collected here; only
+    // the output step's copy is read (build_response).
+    metas: &mut HashMap<String, StepResponseMeta>,
 ) -> Result<(), AppError> {
     match result {
-        Ok(values) => {
+        Ok(step_results) => {
             // MIMO: materialized named outputs land under their
             // `step.alias` keys (undeclared steps: the single `step` key).
-            for (key, value) in values {
+            for (key, value) in step_results.values {
                 context.insert(key, value);
+            }
+            if let Some(meta) = step_results.meta {
+                metas.insert(name.to_string(), meta);
             }
             Ok(())
         }
@@ -777,12 +875,13 @@ pub(crate) async fn drive_step_futs<F>(
     mut futs: FuturesUnordered<F>,
     context: &mut HashMap<String, EnsembleValue>,
     skip_set: &HashSet<&str>,
+    metas: &mut HashMap<String, StepResponseMeta>,
 ) -> Result<(), AppError>
 where
     F: Future<Output = StepFutOutput>,
 {
     while let Some((name, result)) = futs.next().await {
-        handle_step_result(&name, result, context, skip_set)?;
+        handle_step_result(&name, result, context, skip_set, metas)?;
     }
     Ok(())
 }
@@ -809,6 +908,9 @@ async fn run_layers(
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: nesting depth — carried into execute_step for recursion
     ancestors: &[(String, String)], // E1: this branch's chain (B1: never shared across sibling branches)
+    // D44: step-name → worker response metadata, filled as steps complete.
+    // Only the output step's entry is read (build_response).
+    metas: &mut HashMap<String, StepResponseMeta>,
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
     // Arc clone is a refcount bump — the cached plan is shared, never
@@ -852,7 +954,7 @@ async fn run_layers(
                     continue;
                 };
                 let (name, result) = fut.await;
-                handle_step_result(&name, result, context, &skip_set)?;
+                handle_step_result(&name, result, context, &skip_set, metas)?;
                 continue;
             }
             let futs: FuturesUnordered<_> = FuturesUnordered::new();
@@ -874,7 +976,7 @@ async fn run_layers(
                     futs.push(fut);
                 }
             }
-            drive_step_futs(futs, context, &skip_set).await?;
+            drive_step_futs(futs, context, &skip_set, metas).await?;
         }
         Ok::<(), AppError>(())
     };
@@ -993,6 +1095,11 @@ pub(crate) async fn open_tail_stream(
             let plan_spawn = plan.clone();
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
+            // D42 (R23) / D43 (R24): same forwarding context as build_step_fut
+            // — refcount clones only.
+            let request_headers = opts.request_headers.clone();
+            let request_body = opts.request_body.clone();
+            let request_content_type = opts.request_content_type.clone();
             let opts_deadline_unix_ns = opts.deadline_unix_ns;
             let snapshot = snapshot.clone();
             let ancestors = ancestors.to_vec();
@@ -1009,6 +1116,9 @@ pub(crate) async fn open_tail_stream(
                     &ctx,
                     &request_id,
                     &client_ip,
+                    &request_headers,
+                    request_body.as_ref(),
+                    request_content_type.as_deref(),
                     opts_deadline_unix_ns,
                     &snapshot,
                     depth,
@@ -1102,6 +1212,15 @@ async fn tail_stream_preflight(
     // P-TRACE: step-level span + trace injection (content-type is patched in
     // after assembly — it depends on the payload shape).
     let mut step_headers = HashMap::new();
+    // D42 (R23): the step's allowlist seeds from the parent request pool
+    // FIRST. Everything below overwrites, so a server-set header (trace
+    // propagation, in the non-preflight path content-type) always wins over a
+    // forwarded one.
+    seed_forwarded_headers(
+        &mut step_headers,
+        &step.forward_headers,
+        &opts.request_headers,
+    );
     {
         let step_span = tracing::info_span!(
             "ensemble.step",
@@ -1913,29 +2032,38 @@ async fn execute_stream_step(
     // open time (the same formula per streaming step).
     let step_deadline = step_effective_deadline(deadline_unix_ns, step.timeout_secs);
 
-    // Resolve inputs into EnsembleValues (identical to the unary path).
-    let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
-    for (key, ref_str) in &step.inputs {
-        match resolve_ref(plan, ref_str, context)? {
-            ResolvedRef::Value(v) => {
-                resolved.insert(key.clone(), v);
-            }
-            ResolvedRef::Absent(name) => {
-                // Streaming steps cannot be conditional (D34) — reaching
-                // here is an internal inconsistency.
-                return Err(AppError::Internal(format!(
-                    "streaming step '{}' resolved absent input '{}' (D34 violation)",
-                    step.name, name
-                )));
+    // D43 (R24): passthrough bypasses assembly — the stream's body IS the
+    // request root (it rides StreamOpen.data downstream).
+    let (payload_bytes, content_type_for_step) = if step.passthrough {
+        (
+            passthrough_payload(&step.name, opts.request_body.as_ref())?,
+            opts.request_content_type.clone(),
+        )
+    } else {
+        // Resolve inputs into EnsembleValues (identical to the unary path).
+        let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
+        for (key, ref_str) in &step.inputs {
+            match resolve_ref(plan, ref_str, context)? {
+                ResolvedRef::Value(v) => {
+                    resolved.insert(key.clone(), v);
+                }
+                ResolvedRef::Absent(name) => {
+                    // Streaming steps cannot be conditional (D34) — reaching
+                    // here is an internal inconsistency.
+                    return Err(AppError::Internal(format!(
+                        "streaming step '{}' resolved absent input '{}' (D34 violation)",
+                        step.name, name
+                    )));
+                }
             }
         }
-    }
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(
-        &step.name,
-        &resolved,
-        &step.params,
-        plan.input_mode(step_idx),
-    )?;
+        assemble_step_payload(
+            &step.name,
+            &resolved,
+            &step.params,
+            plan.input_mode(step_idx),
+        )?
+    };
 
     // P7: when the preflight already routed/built meta in parallel with the
     // pre-layers, skip the serial readiness/meta/pick block.
@@ -2027,6 +2155,14 @@ async fn execute_stream_step(
             // trace and injects its context into the step headers so the
             // worker spans land as children of the step.
             let mut step_headers = HashMap::new();
+            // D42 (R23): seed from the parent pool first — content-type (below)
+            // and trace propagation (in the span block) then overwrite, so a
+            // forwarded header can never win over a server-set one.
+            seed_forwarded_headers(
+                &mut step_headers,
+                &step.forward_headers,
+                &opts.request_headers,
+            );
             if let Some(ct) = &content_type_for_step {
                 step_headers.insert("content-type".to_string(), ct.clone());
             }
@@ -2527,6 +2663,8 @@ mod audit_0822_tests {
     fn single_stream_step_plan(model: &str) -> EnsemblePlan {
         EnsemblePlan {
             steps: vec![EnsembleStep {
+                forward_headers: Vec::new(),
+                passthrough: false,
                 name: "s".to_string(),
                 model: model.to_string(),
                 version: Some("1".to_string()),
@@ -2594,6 +2732,9 @@ mod audit_0822_tests {
             deadline_client_specified: false,
             decoupled: false,
             dag_selector: None,
+            request_headers: Default::default(),
+            request_body: None,
+            request_content_type: None,
         };
         let snapshot = Arc::new(VersionSnapshot::default());
         let res = execute_stream_step(
@@ -2661,6 +2802,9 @@ mod audit_0822_tests {
             deadline_client_specified: true, // the test's short deadline stands in for a client one
             decoupled: false,
             dag_selector: None,
+            request_headers: Default::default(),
+            request_body: None,
+            request_content_type: None,
         };
         let snapshot = Arc::new(VersionSnapshot::default());
         let res = execute_stream_step(
@@ -2822,6 +2966,9 @@ mod audit_0822_tests {
             deadline_client_specified: false,
             decoupled: false,
             dag_selector: None,
+            request_headers: Default::default(),
+            request_body: None,
+            request_content_type: None,
         };
         let snapshot = Arc::new(VersionSnapshot::default());
         let start = std::time::Instant::now();

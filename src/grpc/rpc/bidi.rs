@@ -277,9 +277,15 @@ impl GrpcService {
             )
             .await
             .map_err(|e| err(app_error_to_grpc_status(&e)))?;
-            let value = if declared {
-                crate::ensemble::bidi_envelope_frame(&initial_data, is_json, ct.clone())
-                    .map_err(|e| err(app_error_to_grpc_status(&e)))?
+            // D43: the aggregated root rides alongside the value. The declared
+            // (envelope) arm has no as-received body — and R24 forbids
+            // `passthrough` inside a declared-inputs ensemble anyway.
+            let (value, root_body) = if declared {
+                (
+                    crate::ensemble::bidi_envelope_frame(&initial_data, is_json, ct.clone())
+                        .map_err(|e| err(app_error_to_grpc_status(&e)))?,
+                    None,
+                )
             } else {
             let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
             let aggregate_start = std::time::Instant::now();
@@ -353,7 +359,10 @@ impl GrpcService {
                 aggregator.total_bytes(),
                 aggregate_start.elapsed().as_secs_f64(),
             );
-            aggregator.finish().map_err(|e| err(app_error_to_grpc_status(&e)))?
+            let (aggregated, root) = aggregator
+                .finish_with_root_bytes()
+                .map_err(|e| err(app_error_to_grpc_status(&e)))?;
+            (aggregated, Some(root))
             };
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
@@ -363,6 +372,12 @@ impl GrpcService {
                 // E8-1 (D38): the dag selector rides the gRPC metadata.
                 dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
                     .map_err(|e| err(app_error_to_grpc_status(&e)))?,
+                // D42 (R23) / D43 (R24): forwarding context — the gRPC request
+                // metadata, and the aggregated root a `passthrough` step sends.
+                request_headers: crate::ensemble::header_pool_from_grpc(&grpc_metadata),
+                request_body: root_body,
+                // D43: the aggregated root's own media type (the first frame's).
+                request_content_type: value.content_type(),
             };
             match crate::ensemble::execute_ensemble(
                 self.app_state.clone(),
@@ -385,7 +400,7 @@ impl GrpcService {
                     // open inside the executor; the guard rides EnsembleStream.
                     (s.stream_id, s.chunk_rx, s.cancel_client, s.inflight_guard)
                 }
-                crate::ensemble::EnsembleOutcome::Unary(_) => {
+                crate::ensemble::EnsembleOutcome::Unary(..) => {
                     return Err(err(Status::invalid_argument(
                         "ensemble DAG has no streaming step; use a unary endpoint",
                     )));

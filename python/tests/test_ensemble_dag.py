@@ -382,6 +382,9 @@ def test_to_config_full_fills_step_defaults():
         "retries": None,
         "outputs": None,
         "when": None,
+        # D42/D43: step-level forwarding / passthrough defaults.
+        "forward_headers": None,
+        "passthrough": False,
     }
 
 
@@ -500,3 +503,64 @@ def test_dag_selector_forbids_empty_inputs_decl():
             },
             dag_selector="$request.modelName",
         )
+
+
+# ===== D42/R23 + D43/R24 (2026-10-15): header / body passthrough =====
+
+
+def test_r23_rejects_server_managed_and_transport_headers():
+    for name in ("content-type", "Content-Type", "traceparent", "content-length", "host"):
+        with pytest.raises(ValueError, match="R23"):
+            Step(name="a", model="m", inputs={"q": "$request"}, forward_headers=[name])
+
+
+def test_r23_rejects_invalid_and_duplicate_names():
+    with pytest.raises(ValueError, match="R23"):
+        Step(name="a", model="m", inputs={}, forward_headers=["not a header"])
+    # Duplicates are detected after case folding — HTTP names are
+    # case-insensitive, so these are the same header.
+    with pytest.raises(ValueError, match="R23"):
+        Step(name="a", model="m", inputs={}, forward_headers=["X-A", "x-a"])
+
+
+def test_r23_forward_headers_survive_serialization():
+    step = Step(
+        name="a", model="m", inputs={"q": "$request"}, forward_headers=["x-tenant-id"]
+    )
+    assert step._config()["forward_headers"] == ["x-tenant-id"]
+
+
+def test_d43_passthrough_omits_inputs_key():
+    step = Step(name="a", model="m", passthrough=True)
+    cfg = step._config()
+    assert cfg["passthrough"] is True
+    assert "inputs" not in cfg, "passthrough must not emit `inputs`"
+
+
+def test_r24_passthrough_forbids_inputs_and_params():
+    with pytest.raises(ValueError, match="R24"):
+        Step(name="a", model="m", inputs={"q": "$request"}, passthrough=True)
+    with pytest.raises(ValueError, match="R24"):
+        Step(name="a", model="m", params={"k": 1}, passthrough=True)
+
+
+def test_r24_empty_inputs_still_emitted_without_passthrough():
+    """The pre-change behaviour: an empty `inputs: {}` is a legal declaration
+    (call the worker with an empty object) and must keep serializing."""
+    assert Step(name="a", model="m")._config()["inputs"] == {}
+
+
+def test_new_step_keys_do_not_create_false_drift():
+    """A minimal YAML that predates D42/D43 must canonicalize equal to the
+    declaration — the defaults are filled on both sides."""
+    declaration = EnsembleDAG(steps=[Step(name="a", model="m", inputs={"q": "$request"})])
+    on_disk = yaml.safe_load(
+        "ensemble:\n"
+        "  steps:\n"
+        "    - name: a\n"
+        "      model: m\n"
+        '      inputs: {q: "$request"}\n'
+    )
+    assert canonical_ensemble_block(on_disk) == canonical_ensemble_block(
+        declaration.to_config()
+    )

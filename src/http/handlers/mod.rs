@@ -126,6 +126,19 @@ impl RequestBody {
         }
     }
 
+    /// D43 (R24): the media type the request body carries, for a `passthrough`
+    /// step to re-state alongside the verbatim bytes. `None` for a JSON body —
+    /// which matches the historical shape, where a JSON step payload is sent
+    /// with no content-type header at all (the worker's default). TritonBinary
+    /// is `None` too: the container is not a business body, and R24 forbids
+    /// `passthrough` inside the declared-inputs ensembles that carry it.
+    pub fn content_type(&self) -> Option<String> {
+        match self {
+            RequestBody::Json(_) | RequestBody::TritonBinary { .. } => None,
+            RequestBody::Raw(_, ct) => Some(ct.clone()),
+        }
+    }
+
     /// Triton Binary 切分点(仅 TritonBinary 变体有)。
     pub fn json_head_len(&self) -> Option<usize> {
         match self {
@@ -1398,5 +1411,38 @@ mod auth_policy_tests {
         assert!(!should_warn_empty_ip_scope("f23-a"));
         // A different model with the same misconfiguration gets its own warning.
         assert!(should_warn_empty_ip_scope("f23-b"));
+    }
+}
+
+#[cfg(test)]
+mod d43_content_type_tests {
+    use super::*;
+
+    /// D43: a `passthrough` step re-states the root's media type. A binary
+    /// root must carry its declared type (otherwise the sub-model would parse
+    /// opaque bytes as JSON); JSON / TritonBinary keep the historical "no
+    /// content-type header" shape.
+    #[test]
+    fn request_body_content_type_matches_the_wire_form() {
+        assert_eq!(
+            RequestBody::Json(bytes::Bytes::from_static(b"{}")).content_type(),
+            None
+        );
+        assert_eq!(
+            RequestBody::Raw(
+                bytes::Bytes::from_static(b"\x00\x01"),
+                "image/png".to_string()
+            )
+            .content_type(),
+            Some("image/png".to_string())
+        );
+        assert_eq!(
+            RequestBody::TritonBinary {
+                body: bytes::Bytes::from_static(b"{}"),
+                json_head_len: 2,
+            }
+            .content_type(),
+            None
+        );
     }
 }

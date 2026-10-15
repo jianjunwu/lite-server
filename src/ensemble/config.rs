@@ -523,19 +523,23 @@ pub(crate) fn build_response(
     plan: &EnsemblePlan,
     model_name: &str,
     context: &HashMap<String, EnsembleValue>,
+    // D44: per-step worker response metadata. Only the single-output form has
+    // a well-defined "which step" — the multi-sink envelope (E7) aggregates
+    // several, so it carries no client-visible response metadata.
+    metas: &HashMap<String, StepResponseMeta>,
 ) -> Result<EnsembleOutcome, AppError> {
     let Some(outputs) = &plan.outputs else {
         // Historical single-output path (byte-identical).
+        let output_name = &plan.steps[plan.output_step].name;
         let value = context
-            .get(&plan.steps[plan.output_step].name)
+            .get(output_name)
             .cloned()
             .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
-        let value = select_output_field(
-            &plan.steps[plan.output_step].name,
+        let value = select_output_field(output_name, value, plan.output_field.as_deref())?;
+        return Ok(EnsembleOutcome::Unary(
             value,
-            plan.output_field.as_deref(),
-        )?;
-        return Ok(EnsembleOutcome::Unary(value));
+            metas.get(output_name).cloned(),
+        ));
     };
 
     let mut head_outputs = Vec::with_capacity(outputs.len());
@@ -598,13 +602,17 @@ pub(crate) fn build_response(
         }
     }
     let head = json!({"model_name": model_name, "outputs": head_outputs});
+    // D44: multi-sink responses carry no client-visible response metadata.
     if tail.is_empty() {
-        Ok(EnsembleOutcome::Unary(EnsembleValue::Json(head)))
+        Ok(EnsembleOutcome::Unary(EnsembleValue::Json(head), None))
     } else {
-        Ok(EnsembleOutcome::Unary(EnsembleValue::Envelope {
-            head,
-            tail: Bytes::from(tail),
-        }))
+        Ok(EnsembleOutcome::Unary(
+            EnsembleValue::Envelope {
+                head,
+                tail: Bytes::from(tail),
+            },
+            None,
+        ))
     }
 }
 
@@ -758,6 +766,70 @@ pub fn parse_ensemble_plan(
     )
 }
 
+/// R23 (D42): step headers the SERVER sets itself — the assembly layer picks
+/// `content-type` per input type and the telemetry layer injects the W3C
+/// propagation keys. A `forward_headers` entry naming one of these is not a
+/// policy choice but a silent no-op: the seed order lets the server value win
+/// (so the config reads as if it worked), and for the propagation keys the
+/// outcome even varies by build (the inject is a no-op without the
+/// `telemetry` feature). Fail fast rather than ship a no-op.
+const SERVER_MANAGED_STEP_HEADERS: &[&str] =
+    &["content-type", "traceparent", "tracestate", "baggage"];
+
+/// R23 (D42): headers describing the TRANSPORT rather than the payload.
+/// Forwarding them is a guaranteed defect — the downstream body is a
+/// re-assembled payload, so a forwarded `content-length`/`transfer-encoding`
+/// contradicts it and `host`/`connection` address the wrong hop. This is a
+/// correctness guard inside the allowlist model, not a security deny-list.
+const TRANSPORT_INVALID_FORWARD_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "host",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
+/// R23 (D42): validate one step's `forward_headers` allowlist.
+///
+/// Names are lowercased — HTTP/gRPC header lookup is case-insensitive, so an
+/// un-normalized `X-Tenant-Id` would silently never match the lowercased
+/// request pool. The returned vector is the normalized allowlist the executor
+/// seeds from.
+fn validate_forward_headers(step: &str, names: &[String]) -> Result<Vec<String>, AppError> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for raw in names {
+        let name = raw.trim().to_ascii_lowercase();
+        if axum::http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(AppError::Config(format!(
+                "step '{step}': forward_headers entry '{raw}' is not a valid HTTP header \
+                 name (R23)"
+            )));
+        }
+        if SERVER_MANAGED_STEP_HEADERS.contains(&name.as_str()) {
+            return Err(AppError::Config(format!(
+                "step '{step}': forward_headers entry '{raw}' is set by the server per \
+                 step and cannot be forwarded (R23)"
+            )));
+        }
+        if TRANSPORT_INVALID_FORWARD_HEADERS.contains(&name.as_str()) {
+            return Err(AppError::Config(format!(
+                "step '{step}': forward_headers entry '{raw}' describes the transport, \
+                 not the payload — the downstream body is re-assembled (R23)"
+            )));
+        }
+        if out.contains(&name) {
+            return Err(AppError::Config(format!(
+                "step '{step}': duplicate forward_headers entry '{raw}' (R23)"
+            )));
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
 /// The single-set parse pipeline — shared by the historical single-set form
 /// and every E8-1 dag set (R15: one pipeline, per-set validation).
 fn parse_ensemble_set(
@@ -779,13 +851,42 @@ fn parse_ensemble_set(
                     )));
                 }
             }
+            // R24: passthrough is payload-free — `inputs`/`params` are the
+            // competing payload source and cannot coexist with it.
+            if s.passthrough {
+                if s.inputs.as_ref().is_some_and(|m| !m.is_empty()) {
+                    return Err(AppError::Config(format!(
+                        "step '{}': passthrough forbids 'inputs' — the payload is the \
+                         request body verbatim (R24)",
+                        s.name
+                    )));
+                }
+                if !s.params.is_empty() {
+                    return Err(AppError::Config(format!(
+                        "step '{}': passthrough forbids 'params' — the payload is the \
+                         request body verbatim (R24)",
+                        s.name
+                    )));
+                }
+            } else if s.inputs.is_none() {
+                // D43: an omitted `inputs` used to be a bare serde "missing
+                // field" error; it now only becomes legal via `passthrough`,
+                // so a forgotten mapping keeps failing fast — with a rule id.
+                return Err(AppError::Config(format!(
+                    "step '{}': missing 'inputs' mapping (or set 'passthrough: true') (R24)",
+                    s.name
+                )));
+            }
+            let forward_headers = validate_forward_headers(&s.name, &s.forward_headers)?;
             Ok(EnsembleStep {
                 name: s.name,
                 model: s.model,
                 // E4: "latest" == omitted (execution-time active resolution).
                 version: s.version.filter(|v| v != "latest"),
-                inputs: s.inputs,
+                inputs: s.inputs.unwrap_or_default(),
                 stream: s.stream,
+                forward_headers,
+                passthrough: s.passthrough,
                 params: s.params,
                 timeout_secs: s.timeout_secs,
                 on_error: s.on_error.unwrap_or_default(),
@@ -798,6 +899,16 @@ fn parse_ensemble_set(
         })
         .collect::<Result<_, AppError>>()?;
 
+    // R24: a passthrough step forwards the request ROOT verbatim. With
+    // declared `inputs` the root is the KServe envelope, not the business
+    // body — forwarding it would leak the envelope to the sub-model.
+    if inputs_decl.is_some() && steps.iter().any(|s| s.passthrough) {
+        return Err(AppError::Config(
+            "passthrough requires anonymous-root steps — an ensemble declaring 'inputs' \
+             carries KServe envelopes, whose root is not the request body (R24)"
+                .to_string(),
+        ));
+    }
     validate_dag(&steps)?;
     // E2: resolve the explicit output BEFORE chain construction / streaming
     // validation — both anchor on the output step.

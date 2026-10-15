@@ -276,6 +276,14 @@ message InferResponse {
   bytes data = 1;
   Status status = 2;
   Metrics metrics = 3;
+  // D44 (2026-10-15): worker response metadata carried through the ensemble
+  // path — the OUTPUT step's response headers and status reach the client
+  // (parity with the ZMQ-face SingleResponse, which has carried both since
+  // batch 0). Populated by the ensemble egress only; the direct unary path
+  // leaves them at their defaults (empty / 0 = "no worker metadata").
+  // Additive: an older client or worker simply sees the defaults.
+  map<string, string> headers = 4;
+  int32 status_code = 5;
 }
 
 message BatchInferRequest {

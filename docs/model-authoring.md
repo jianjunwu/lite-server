@@ -48,7 +48,36 @@ For **ensemble models**, `model.py` can be omitted — define a top-level `ensem
 
 Note the execution-model difference: unary ensemble steps go through the regular inference queue (bounded by `max_queue_size`); **streaming steps bypass the queue** (the direct streaming path, identical to every other streaming endpoint) and concurrent streaming DAGs are bounded globally by `server.max_concurrent_streaming_dags` (default 128, immediate 429 when exhausted).
 
-The DAG can also be **declared in Python** (E9-A): an optional `dag.py` next to `config.yaml` declaring an `EnsembleDAG` from `lite_server.ensemble` (see [examples/05_ensemble](../examples/05_ensemble)). It serializes to the equivalent handwritten config; `lite-server analyze` cross-checks the declaration against `config.yaml` and reports drift (LS112). The server executes `config.yaml` — the Python declaration is an authoring surface only, never executed.
+**Request-header forwarding** (per-step, opt-in): a step can name the parent request's headers it wants its sub-model to see. Nothing is forwarded by default — the allowlist *is* the security boundary, so an unlisted `Authorization` never reaches a sub-model:
+
+```yaml
+ensemble:
+  steps:
+    - name: classify
+      model: classifier
+      version: "1"
+      inputs: {x: "$request"}
+      forward_headers: ["x-tenant-id", "x-request-id"]
+```
+
+Names are matched case-insensitively (the server lowercases them at load). A few names are rejected at load with `(R23)`: `content-type` and the W3C propagation keys (`traceparent`/`tracestate`/`baggage`) because the server sets them itself per step — listing them would be silent dead config — and the transport-describing headers (`content-length`, `transfer-encoding`, `host`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`), because the body a sub-model receives is a re-assembled payload that those headers would contradict. Nested ensembles inherit the same header pool; each child step still sees only what its own allowlist names.
+
+**Body passthrough** (per-step, opt-in): `passthrough: true` makes a step ship the request body **verbatim** — the bytes the client sent are the bytes the sub-model receives, with no parse/reserialize step in between (key order, whitespace and number formatting all survive). It is mutually exclusive with `inputs` and `params` (R24), and it is rejected inside an ensemble declaring `inputs` (a KServe envelope is not the business body):
+
+```yaml
+ensemble:
+  steps:
+    - name: relay
+      model: downstream
+      version: "1"
+      passthrough: true
+```
+
+The request root is still parsed once for the DAG engine's own needs (`$request.*` refs, `dag_selector`); passthrough removes only the step-payload round trip. Combining it with `stream: true` on the tail step is the common relay shape.
+
+**Response metadata passthrough**: for a unary ensemble, the output step's worker response **headers and status code** reach the client — over HTTP through the same `content-type`/`content-length` guard every other response uses, and over gRPC through the additive `InferResponse.headers`/`status_code` fields (each batch element carries its own). Only the *output* step's metadata is used; upstream steps' headers are discarded. Streaming ensembles are unaffected: a stream's response headers belong to the server.
+
+The DAG can also be **declared in Python** (E9-A): an optional `dag.py` next to `config.yaml` declaring an `EnsembleDAG` from `lite_server.ensemble` (see [examples/05_ensemble](../examples/05_ensemble)). It serializes to the equivalent handwritten config; `lite-server analyze` cross-checks the declaration against `config.yaml` and reports drift (LS112). The server executes `config.yaml` — the Python declaration is an authoring surface only, never executed. `Step(..., forward_headers=[...])` and `Step(..., passthrough=True)` are mirrored.
 
 Run `lite-server analyze --model <ensemble-model>` for a static config/declaration check.
 

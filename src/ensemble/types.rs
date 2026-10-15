@@ -8,9 +8,51 @@ use std::sync::Arc;
 
 // ===== EnsembleValue: typed step input/output (B3, E6) =====
 
+/// D44 (2026-10-15): a worker's response metadata for one step. Only the
+/// OUTPUT step's copy has client-visible semantics — it rides
+/// `EnsembleOutcome::Unary` to the transport, which injects it the same way
+/// the direct unary path injects a worker's response headers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepResponseMeta {
+    /// The worker's HTTP status; 0 = none supplied (keep the transport's own).
+    pub status_code: u16,
+    pub headers: HashMap<String, String>,
+}
+
+impl StepResponseMeta {
+    /// D44: build from a worker's `SingleResponse` fields. `None` when the
+    /// worker supplied nothing — so the transport keeps its own default
+    /// rather than having it overwritten with an empty value.
+    pub fn from_worker(status_code: i32, headers: &HashMap<String, String>) -> Option<Self> {
+        let status_code = u16::try_from(status_code).unwrap_or(0);
+        if status_code == 0 && headers.is_empty() {
+            return None;
+        }
+        Some(Self {
+            status_code,
+            headers: headers.clone(),
+        })
+    }
+}
+
 /// The materialized outputs of one step — `(context key, value)` pairs
-/// (MIMO: `step.alias` keys; undeclared steps yield the single `step` key).
-pub(crate) type StepResults = Vec<(String, EnsembleValue)>;
+/// (MIMO: `step.alias` keys; undeclared steps yield the single `step` key)
+/// plus the D44 response metadata collected on the way.
+#[derive(Debug, PartialEq)]
+pub struct StepResults {
+    pub values: Vec<(String, EnsembleValue)>,
+    pub meta: Option<StepResponseMeta>,
+}
+
+impl StepResults {
+    /// A single unnamed output (the historical undeclared-steps shape).
+    pub fn single(key: String, value: EnsembleValue) -> Self {
+        Self {
+            values: vec![(key, value)],
+            meta: None,
+        }
+    }
+}
 
 /// A value flowing through an ensemble DAG edge.
 ///
@@ -77,6 +119,19 @@ impl RawJsonValue {
         let v = Arc::new(serde_json::from_slice(&self.bytes)?);
         let _ = self.parsed.set(v);
         Ok(self.parsed.get().unwrap())
+    }
+}
+
+impl EnsembleValue {
+    /// D43: the media type this value carries, if any — the content-type a
+    /// `passthrough` step re-states alongside the verbatim bytes. Only the
+    /// Binary form has one; JSON (and raw JSON) is a JSON payload by
+    /// construction, and an envelope never reaches a step payload.
+    pub fn content_type(&self) -> Option<String> {
+        match self {
+            EnsembleValue::Binary(_, ct, ..) => Some(ct.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -220,11 +275,27 @@ pub struct EnsembleStepRaw {
     /// never invalidates on active-version drift.
     #[serde(default)]
     pub version: Option<String>,
-    pub inputs: HashMap<String, String>,
+    /// D43 (R24): `None` = the key was omitted. Only `passthrough` steps may
+    /// omit it — R24 rejects the combination at load, so a forgotten
+    /// `inputs:` keeps failing fast (with a rule id, not a bare serde
+    /// message) instead of silently posting an empty object.
+    #[serde(default)]
+    pub inputs: Option<HashMap<String, String>>,
     /// §4.1: tail streaming. The streaming step must be the DAG output
     /// (config `steps.last()`, or the explicit `output` — E2, batch 3).
     #[serde(default)]
     pub stream: bool,
+    /// D42 (R23): request-header forwarding — an explicit per-step allowlist
+    /// of parent-request header names. Empty (default) = nothing is
+    /// forwarded; headers never leak implicitly. Names are lowercased at
+    /// load (R23) because HTTP/gRPC header lookup is case-insensitive.
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+    /// D43 (R24): body passthrough — the step's outbound payload is the
+    /// request root's raw bytes, byte-identical (no parse → re-serialize).
+    /// Mutually exclusive with `inputs` / `params` (R24).
+    #[serde(default)]
+    pub passthrough: bool,
     /// E3 (batch 3): constant step parameters merged into the assembled JSON
     /// payload (params win on key conflicts). Binary assembly has no params
     /// semantics — a non-empty params on a Binary step is rejected at
@@ -303,6 +374,12 @@ pub struct EnsembleStep {
     pub version: Option<String>,
     pub inputs: HashMap<String, String>,
     pub stream: bool,
+    /// D42 (R23): the validated, lowercased forwarding allowlist (see the
+    /// raw field).
+    pub forward_headers: Vec<String>,
+    /// D43 (R24): payload-free step — the outbound body is the request root
+    /// verbatim (see the raw field).
+    pub passthrough: bool,
     pub params: HashMap<String, Value>,
     pub timeout_secs: Option<f64>,
     /// E6 (batch 4): fault tolerance — `fail` (default) or `skip`.

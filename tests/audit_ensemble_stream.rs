@@ -1346,6 +1346,8 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_pre_5xx(repo);
     write_missing_model(repo);
     write_echo(repo);
+    write_header_echo(repo);
+    write_echo_raw(repo);
     write_pre_agg(repo);
     write_tail_upper(repo);
     write_tail_fail_chain(repo);
@@ -1364,6 +1366,9 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_dslow", ENS_DSLOW_YAML);
     write_ensemble(repo, "ens_binary", ENS_BINARY_YAML);
     write_ensemble(repo, "ens_unary", ENS_UNARY_YAML);
+    write_ensemble(repo, "ens_fwd", ENS_FWD_YAML);
+    write_ensemble(repo, "ens_nofwd", ENS_NOFWD_YAML);
+    write_ensemble(repo, "ens_relay", ENS_RELAY_YAML);
     write_ensemble(repo, "ens_pipeline", ENS_PIPELINE_YAML);
     write_ensemble(repo, "ens_bad_sub", ENS_BAD_SUB_YAML);
     write_ensemble(repo, "ens_4xx", ENS_4XX_YAML);
@@ -1452,7 +1457,7 @@ fn write_server_yaml(
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - hdr_echo\n    - echo_raw\n    - ens_fwd\n    - ens_nofwd\n    - ens_relay\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -6047,5 +6052,221 @@ async fn test_audit_when_dag_sees_resolved_default() {
         outs[0],
         json!({"name": "answer", "data": {"pre": "hello"}}),
         "guard must run for the headerless default set (dag == 'default')"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D42/R23 (2026-10-15): request-header forwarding — the allowlist IS the
+// security boundary, and only an end-to-end run proves it holds across the
+// server → worker boundary.
+// ---------------------------------------------------------------------------
+
+/// Reports the headers its sub-model actually received (`ctx.meta.headers` is
+/// the worker-side view of the step's `RequestMeta`).
+fn write_header_echo(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "hdr_echo",
+        r#"from lite_server import LitAPI
+
+
+class HeaderEchoAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request
+
+    async def predict(self, x, ctx=None):
+        return {"headers": {str(k): str(v) for k, v in ctx.meta.headers.items()}}
+
+    async def encode_response(self, output, ctx=None):
+        # D44: a worker-supplied response header the client must see.
+        ctx.response_headers["x-model-hdr"] = "yes"
+        return output
+"#,
+    );
+}
+
+/// D43: base64-echoes the RAW bytes it received — with a non-JSON
+/// content-type the worker keeps the payload opaque, so the echo is a
+/// byte-exact witness of what the step actually sent.
+fn write_echo_raw(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "echo_raw",
+        r#"import base64
+
+from lite_server import LitAPI
+
+
+class EchoRawAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request
+
+    async def predict(self, x, ctx=None):
+        payload = x if isinstance(x, (bytes, bytearray)) else repr(x).encode()
+        return {"b64": base64.b64encode(bytes(payload)).decode()}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// D42: the step names ONE header to forward.
+const ENS_FWD_YAML: &str = r#"ensemble:
+  steps:
+    - name: hdr
+      model: hdr_echo
+      version: "1"
+      inputs: {data: "$request"}
+      forward_headers: ["x-tenant-id"]
+"#;
+
+/// D43: the step ships the request body verbatim.
+const ENS_RELAY_YAML: &str = r#"ensemble:
+  steps:
+    - name: relay
+      model: echo_raw
+      version: "1"
+      passthrough: true
+"#;
+
+/// Control: the same DAG with no allowlist — nothing may be forwarded.
+const ENS_NOFWD_YAML: &str = r#"ensemble:
+  steps:
+    - name: hdr
+      model: hdr_echo
+      version: "1"
+      inputs: {data: "$request"}
+"#;
+
+/// D42 (R23): a listed header reaches the sub-model; an UNLISTED one
+/// (`authorization`) never does, even though the client sent it. The second
+/// half is the load-bearing assertion — it is what makes "the allowlist is the
+/// security boundary" a tested claim rather than a design intention.
+#[serial]
+#[tokio::test]
+async fn test_audit_d42_forward_headers_allowlist_is_the_boundary() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_fwd", "ens_nofwd"]).await;
+
+    let client = reqwest::Client::new();
+    let resp: Value = client
+        .post(format!("{}/v2/models/ens_fwd/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-tenant-id", "acme")
+        .header("authorization", "Bearer secret")
+        .json(&json!({"text": "hi"}))
+        .send()
+        .await
+        .expect("forwarding ensemble must succeed")
+        .json()
+        .await
+        .expect("valid JSON response");
+    let headers = &resp["headers"];
+    assert_eq!(
+        headers["x-tenant-id"], "acme",
+        "a listed header must reach the sub-model: {resp}"
+    );
+    assert!(
+        headers.get("authorization").is_none(),
+        "an UNLISTED header must never be forwarded: {resp}"
+    );
+
+    // Control: the same request against the allowlist-free DAG.
+    let resp: Value = client
+        .post(format!("{}/v2/models/ens_nofwd/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-tenant-id", "acme")
+        .json(&json!({"text": "hi"}))
+        .send()
+        .await
+        .expect("control ensemble must succeed")
+        .json()
+        .await
+        .expect("valid JSON response");
+    assert!(
+        resp["headers"].get("x-tenant-id").is_none(),
+        "no allowlist means nothing is forwarded: {resp}"
+    );
+}
+
+/// D44: the OUTPUT step's worker response header reaches the client, while the
+/// server-owned `content-type` stays the server's own.
+#[serial]
+#[tokio::test]
+async fn test_audit_d44_output_step_response_header_reaches_the_client() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_fwd"]).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v2/models/ens_fwd/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hi"}))
+        .send()
+        .await
+        .expect("ensemble must succeed");
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let model_hdr = resp
+        .headers()
+        .get("x-model-hdr")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    assert!(status.is_success(), "expected 2xx, got {status}");
+    assert_eq!(
+        model_hdr.as_deref(),
+        Some("yes"),
+        "the output step's worker header must reach the client (D44)"
+    );
+    assert!(
+        content_type.starts_with("application/json"),
+        "content-type stays the server's own, got {content_type:?}"
+    );
+}
+
+/// D43 (R24): `passthrough: true` ships the request body BYTE-EXACT — the
+/// sub-model receives the very bytes the client sent. The body below is
+/// deliberately JSON-shaped but sent as `application/octet-stream`, so the
+/// worker keeps it opaque and the echo is an exact witness: any
+/// parse→re-serialize on the step-payload path would change the formatting.
+#[serial]
+#[tokio::test]
+async fn test_audit_d43_passthrough_keeps_the_body_byte_exact() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_relay"]).await;
+
+    // Unusual spacing + key order: a round trip through serde_json would
+    // normalize it.
+    let raw = br#"{ "b" : 2,   "a":  [ 1,   2 ] }"#;
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{}/v2/models/ens_relay/infer", base))
+        .header("Content-Type", "application/octet-stream")
+        .body(raw.to_vec())
+        .send()
+        .await
+        .expect("relay must succeed")
+        .json()
+        .await
+        .expect("valid JSON response");
+
+    use base64::Engine as _;
+    let expected = base64::engine::general_purpose::STANDARD.encode(raw);
+    assert_eq!(
+        resp["b64"].as_str(),
+        Some(expected.as_str()),
+        "the sub-model must receive the request bytes verbatim (D43): {resp}"
     );
 }
