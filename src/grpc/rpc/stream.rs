@@ -179,6 +179,11 @@ impl GrpcService {
                 dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata).map_err(
                     |e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)),
                 )?,
+                // D42 (R23) / D43 (R24): forwarding context — the gRPC request
+                // metadata and the element's data as received.
+                request_headers: crate::ensemble::header_pool_from_grpc(&grpc_metadata),
+                request_body: Some(req.data.clone()),
+                request_content_type: req.headers.get("content-type").cloned(),
             };
             match crate::ensemble::execute_ensemble(
                 self.app_state.clone(),
@@ -208,7 +213,7 @@ impl GrpcService {
                     // open inside the executor; the guard rides EnsembleStream.
                     (s.stream_id, s.chunk_rx, s.cancel_client, s.inflight_guard)
                 }
-                crate::ensemble::EnsembleOutcome::Unary(_) => {
+                crate::ensemble::EnsembleOutcome::Unary(..) => {
                     return Err(err(Status::invalid_argument(
                         "ensemble DAG has no streaming step; use a unary endpoint",
                     )));

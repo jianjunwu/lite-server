@@ -103,6 +103,28 @@ impl BidiAggregator {
         Ok(())
     }
 
+    /// D43: the aggregated root as `(value, bytes)` — the bytes being exactly
+    /// what a `passthrough` step forwards. A multi-frame transport has no
+    /// as-received body, so "verbatim" is defined against this synthesized
+    /// root: the Binary arm hands back the buffer it already concatenated
+    /// (refcount clone), the Json arm serializes the value it just built.
+    pub fn finish_with_root_bytes(self) -> Result<(EnsembleValue, bytes::Bytes), AppError> {
+        let value = self.finish()?;
+        let bytes = match &value {
+            EnsembleValue::Binary(b, ..) => b.clone(),
+            EnsembleValue::Json(v) => bytes::Bytes::from(serde_json::to_vec(v).map_err(|e| {
+                AppError::Internal(format!("bidi aggregate re-serialization failed: {e}"))
+            })?),
+            // finish() only ever yields Json or Binary — type-level backstop.
+            other => {
+                return Err(AppError::Internal(format!(
+                    "bidi aggregation produced an unexpected value: {other:?}"
+                )))
+            }
+        };
+        Ok((value, bytes))
+    }
+
     /// Trigger time (D33): produce the aggregated root input. Single Json
     /// frame → the value itself (not wrapped); multiple → `[f0, f1, ...]`;
     /// Binary → concatenated bytes with the first frame's content-type.

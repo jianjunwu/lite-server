@@ -16,6 +16,8 @@ use super::*;
 fn test_validate_dag_ok() {
     let steps = vec![
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "step1".to_string(),
             model: "m1".to_string(),
             version: Some("1".to_string()),
@@ -31,6 +33,8 @@ fn test_validate_dag_ok() {
             inputs: [("input".to_string(), "$request".to_string())].into(),
         },
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "step2".to_string(),
             model: "m2".to_string(),
             version: Some("1".to_string()),
@@ -53,6 +57,8 @@ fn test_validate_dag_ok() {
 fn test_validate_dag_cycle() {
     let steps = vec![
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "step1".to_string(),
             model: "m1".to_string(),
             version: Some("1".to_string()),
@@ -68,6 +74,8 @@ fn test_validate_dag_cycle() {
             inputs: [("input".to_string(), "$step2".to_string())].into(),
         },
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "step2".to_string(),
             model: "m2".to_string(),
             version: Some("1".to_string()),
@@ -89,6 +97,8 @@ fn test_validate_dag_cycle() {
 #[test]
 fn test_validate_dag_unknown_ref() {
     let steps = vec![EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: "step1".to_string(),
         model: "m1".to_string(),
         version: Some("1".to_string()),
@@ -110,6 +120,8 @@ fn test_validate_dag_unknown_ref() {
 fn test_topological_layers() {
     let steps = vec![
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "a".to_string(),
             model: "m1".to_string(),
             version: Some("1".to_string()),
@@ -125,6 +137,8 @@ fn test_topological_layers() {
             inputs: [("x".to_string(), "$request".to_string())].into(),
         },
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "b".to_string(),
             model: "m2".to_string(),
             version: Some("1".to_string()),
@@ -140,6 +154,8 @@ fn test_topological_layers() {
             inputs: [("x".to_string(), "$request".to_string())].into(),
         },
         EnsembleStep {
+            forward_headers: Vec::new(),
+            passthrough: false,
             name: "c".to_string(),
             model: "m3".to_string(),
             version: Some("1".to_string()),
@@ -469,6 +485,8 @@ fn p2_declared_step_materializes_nested_raw_outcome() {
     // A declared parent step over a nested child whose outcome is
     // raw-resident must parse before projecting (never panic).
     let step = EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: "parent".to_string(),
         model: "child".to_string(),
         version: Some("1".to_string()),
@@ -494,10 +512,10 @@ fn p2_declared_step_materializes_nested_raw_outcome() {
     let raw = EnsembleValue::RawJson(Arc::new(RawJsonValue::new(Bytes::from_static(
         br#"{"out": 7}"#,
     ))));
-    let out = materialize_step_outputs(&step, raw).unwrap();
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, "parent.out");
-    assert_eq!(out[0].1, EnsembleValue::Json(json!(7)));
+    let out = materialize_step_outputs(&step, raw, None).unwrap();
+    assert_eq!(out.values.len(), 1);
+    assert_eq!(out.values[0].0, "parent.out");
+    assert_eq!(out.values[0].1, EnsembleValue::Json(json!(7)));
 }
 
 #[test]
@@ -510,7 +528,7 @@ fn p2_unary_response_raw_eligible_requires_valid_json() {
         media_type: "application/json".to_string(),
         ..Default::default()
     };
-    let value = unary_response_to_value(
+    let (value, _) = unary_response_to_value(
         "s",
         pb::Response {
             payload: Some(pb::response::Payload::Single(good)),
@@ -554,7 +572,7 @@ fn p2_raw_empty_body_keeps_historical_empty_object() {
         media_type: "application/json".to_string(),
         ..Default::default()
     };
-    let value = unary_response_to_value(
+    let (value, _) = unary_response_to_value(
         "s",
         pb::Response {
             payload: Some(pb::response::Payload::Single(single)),
@@ -625,7 +643,7 @@ async fn p11_first_error_drops_remaining_layer_futures() {
         // The slow sibling completes only if it is never dropped.
         let _guard = DropFlag(d);
         tokio::time::sleep(Duration::from_secs(3600)).await;
-        ("slow".to_string(), Ok(Vec::new()))
+        ("slow".to_string(), Ok(steps(Vec::new())))
     }));
     futs.push(Box::pin(async {
         (
@@ -635,7 +653,7 @@ async fn p11_first_error_drops_remaining_layer_futures() {
     }));
     let mut context = HashMap::new();
     let skip_set = HashSet::new();
-    let err = drive_step_futs(futs, &mut context, &skip_set)
+    let err = drive_step_futs(futs, &mut context, &skip_set, &mut HashMap::new())
         .await
         .unwrap_err();
     assert!(
@@ -656,12 +674,15 @@ async fn p11_layer_success_inserts_outputs_into_context() {
     futs.push(Box::pin(async {
         (
             "a".to_string(),
-            Ok(vec![("a".to_string(), EnsembleValue::Json(json!(1)))]),
+            Ok(steps(vec![(
+                "a".to_string(),
+                EnsembleValue::Json(json!(1)),
+            )])),
         )
     }));
     let mut context = HashMap::new();
     let skip_set = HashSet::new();
-    drive_step_futs(futs, &mut context, &skip_set)
+    drive_step_futs(futs, &mut context, &skip_set, &mut HashMap::new())
         .await
         .unwrap();
     assert!(
@@ -682,7 +703,7 @@ async fn p11_skip_step_failure_continues_the_layer() {
     }));
     let mut context = HashMap::new();
     let skip_set: HashSet<&str> = ["may"].into_iter().collect();
-    drive_step_futs(futs, &mut context, &skip_set)
+    drive_step_futs(futs, &mut context, &skip_set, &mut HashMap::new())
         .await
         .expect("a skip step's failure must not fail the layer");
     assert!(
@@ -960,6 +981,8 @@ fn pipeline_orphan_streaming_step_not_output_rejected() {
 
 fn sstep(name: &str, inputs: &[(&str, &str)], stream: bool) -> EnsembleStep {
     EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: name.to_string(),
         model: format!("m_{}", name),
         version: Some("1".to_string()),
@@ -1798,6 +1821,8 @@ ensemble:
 
 fn snapshot_step(model: &str, version: Option<&str>) -> EnsembleStep {
     EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: "s".to_string(),
         model: model.to_string(),
         version: version.map(|v| v.to_string()),
@@ -2312,6 +2337,8 @@ fn mimo2_json_alias_projection() {
 
     // Materialize: explicit nested path + default `$.<alias>` path.
     let step = EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: "a".to_string(),
         model: "m1".to_string(),
         version: Some("1".to_string()),
@@ -2347,10 +2374,12 @@ fn mimo2_json_alias_projection() {
     let out = materialize_step_outputs(
         &step,
         EnsembleValue::Json(json!({"out": {"score": 0.9}, "whole": {"a": 1}})),
+        None,
     )
     .unwrap();
-    assert_eq!(out.len(), 2);
-    let map: HashMap<&str, &EnsembleValue> = out.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    assert_eq!(out.values.len(), 2);
+    let map: HashMap<&str, &EnsembleValue> =
+        out.values.iter().map(|(k, v)| (k.as_str(), v)).collect();
     assert_eq!(map["a.score"], &EnsembleValue::Json(json!(0.9)));
     assert_eq!(
         map["a.whole"],
@@ -2359,8 +2388,8 @@ fn mimo2_json_alias_projection() {
     );
 
     // Missing path → step error (I3: declared contract unmet).
-    let err =
-        materialize_step_outputs(&step, EnsembleValue::Json(json!({"other": 1}))).unwrap_err();
+    let err = materialize_step_outputs(&step, EnsembleValue::Json(json!({"other": 1})), None)
+        .unwrap_err();
     assert!(
         err.to_string().contains("score"),
         "missing projection path must error naming the alias, got: {err}"
@@ -2455,6 +2484,9 @@ fn e8_when_eval_semantics() {
         deadline_client_specified: false,
         decoupled: false,
         dag_selector: Some("fast".into()),
+        request_headers: Default::default(),
+        request_body: None,
+        request_content_type: None,
     };
     assert!(
         eval_when(plan.steps[0].when.as_ref().unwrap(), &opts, &context).unwrap(),
@@ -2822,8 +2854,8 @@ fn e7_build_response_envelope() {
     );
     context.insert("inputs.a".to_string(), EnsembleValue::Json(json!("in")));
     // opt absent → maybe → null.
-    let outcome = build_response(&plan, "demo", &context).unwrap();
-    let EnsembleOutcome::Unary(EnsembleValue::Envelope { head, tail }) = outcome else {
+    let outcome = build_response(&plan, "demo", &context, &HashMap::new()).unwrap();
+    let EnsembleOutcome::Unary(EnsembleValue::Envelope { head, tail }, _) = outcome else {
         panic!("multi-sink with a binary alias must be an envelope");
     };
     assert_eq!(tail.as_ref(), b"\x01\x02");
@@ -3295,6 +3327,8 @@ fn mimo_r7_r8_binary_alias_disambiguation() {
 #[test]
 fn mimo_materialize_binary_outputs() {
     let step = EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: "det".to_string(),
         model: "m".to_string(),
         version: Some("1".to_string()),
@@ -3332,7 +3366,7 @@ fn mimo_materialize_binary_outputs() {
         "thumb": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}
     }));
     // (path-less alias needs the BINARY response form — separate case)
-    let err = materialize_step_outputs(&step, raw).unwrap_err();
+    let err = materialize_step_outputs(&step, raw, None).unwrap_err();
     assert!(
         err.to_string().contains("binary"),
         "path-less binary alias on a JSON response must error, got: {err}"
@@ -3345,13 +3379,15 @@ fn mimo_materialize_binary_outputs() {
         None,
         None,
     );
-    let err = materialize_step_outputs(&step, raw).unwrap_err();
+    let err = materialize_step_outputs(&step, raw, None).unwrap_err();
     assert!(
         err.to_string().contains("JSON"),
         "marker alias on a binary response must error, got: {err}"
     );
     // Mixed response case: whole-response alias only.
     let step_whole = EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         outputs_decl: Some(
             [(
                 "raw",
@@ -3374,11 +3410,12 @@ fn mimo_materialize_binary_outputs() {
             None,
             None,
         ),
+        None,
     )
     .unwrap();
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, "det.raw");
-    match &out[0].1 {
+    assert_eq!(out.values.len(), 1);
+    assert_eq!(out.values[0].0, "det.raw");
+    match &out.values[0].1 {
         EnsembleValue::Binary(b, ct, _, _) => {
             assert_eq!(b.as_ref(), b"\x00\x01");
             assert_eq!(ct, "image/png");
@@ -3387,6 +3424,8 @@ fn mimo_materialize_binary_outputs() {
     }
     // Marker decode happy path (JSON response, marker alias only).
     let step_marker = EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         outputs_decl: Some(
             [(
                 "thumb",
@@ -3406,9 +3445,10 @@ fn mimo_materialize_binary_outputs() {
         EnsembleValue::Json(
             json!({"thumb": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}}),
         ),
+        None,
     )
     .unwrap();
-    match &out[0].1 {
+    match &out.values[0].1 {
         EnsembleValue::Binary(b, ct, _, _) => {
             assert_eq!(b.as_ref(), b"\x00\x01\x02");
             assert_eq!(ct, "image/jpeg");
@@ -3606,7 +3646,7 @@ fn audit_c2_build_response_propagates_non_absence_errors() {
             None,
         ),
     );
-    let result = build_response(&plan, "demo", &context);
+    let result = build_response(&plan, "demo", &context, &HashMap::new());
     assert!(
         result.is_err(),
         "a type error on an outputs alias must fail the request, not emit data:null (D5 covers absence only); got Ok"
@@ -3857,6 +3897,8 @@ fn chain_consumer_state() -> Arc<crate::http::state::AppState> {
 /// registered — version resolution fails inside execute_stream_step).
 fn chain_consumer_plan() -> EnsemblePlan {
     let mk_step = |name: &str, model: &str| EnsembleStep {
+        forward_headers: Vec::new(),
+        passthrough: false,
         name: name.to_string(),
         model: model.to_string(),
         version: None,
@@ -3923,6 +3965,9 @@ fn chain_consumer_harness_full(
         deadline_client_specified: false,
         decoupled: false,
         dag_selector: None,
+        request_headers: Default::default(),
+        request_body: None,
+        request_content_type: None,
     };
     let handles_run = handles.clone();
     let run = Box::pin(async move {
@@ -4590,6 +4635,9 @@ async fn test_tail_stream_request_id_keeps_parent_step_format() {
         deadline_client_specified: false,
         decoupled: false,
         dag_selector: None,
+        request_headers: Default::default(),
+        request_body: None,
+        request_content_type: None,
     };
     let stream = tokio::time::timeout(
         Duration::from_secs(5),
@@ -4737,6 +4785,9 @@ async fn chain_consumer_mid_hop_honors_client_overall_deadline() {
         deadline_client_specified: true,
         decoupled: false,
         dag_selector: None,
+        request_headers: Default::default(),
+        request_body: None,
+        request_content_type: None,
     };
     let state_run = state.clone();
     let plan_run = plan.clone();
@@ -4796,5 +4847,307 @@ async fn chain_consumer_mid_hop_honors_client_overall_deadline() {
     assert!(
         actions.iter().any(|a| a == "cancel"),
         "the hop must cancel its worker on the deadline, got {actions:?}"
+    );
+}
+
+// D44: wrap a step's materialized `(key, value)` pairs — the metadata slot is
+// irrelevant to these layer-engine tests.
+fn steps(values: Vec<(String, EnsembleValue)>) -> StepResults {
+    StepResults { values, meta: None }
+}
+
+// ===== D42/R23 + D43/R24 (2026-10-15): header / body passthrough =====
+
+/// A minimal plan YAML with one step, parameterized by the step body's extra
+/// lines — shared by the R23/R24 load-rule tests below.
+fn single_step_yaml(extra_step_lines: &str) -> String {
+    format!(
+        "ensemble:\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n{extra_step_lines}"
+    )
+}
+
+/// R23: a legal allowlist is accepted and NORMALIZED to lowercase — HTTP/gRPC
+/// header lookup is case-insensitive, so an un-normalized `X-Tenant-Id` would
+/// silently never match the lowercased request pool.
+#[test]
+fn r23_forward_headers_are_lowercased() {
+    let yaml = single_step_yaml(
+        "      inputs: {x: \"$request\"}\n      forward_headers: [\"X-Tenant-Id\", \" TraceParent \"]\n",
+    );
+    // TraceParent is server-managed → rejected; use two plain names instead.
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("traceparent is server-managed (R23)");
+    assert!(err.to_string().contains("(R23)"), "got: {err}");
+
+    let yaml = single_step_yaml(
+        "      inputs: {x: \"$request\"}\n      forward_headers: [\"X-Tenant-Id\", \"X-Trace-Id\"]\n",
+    );
+    let plan = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    assert_eq!(
+        plan.steps[0].forward_headers,
+        vec!["x-tenant-id".to_string(), "x-trace-id".to_string()]
+    );
+}
+
+/// R23: names the server sets per step cannot be forwarded — the seed order
+/// lets the server value win, so such an entry would be a silent no-op.
+#[test]
+fn r23_rejects_server_managed_headers() {
+    for name in [
+        "content-type",
+        "Content-Type",
+        "traceparent",
+        "tracestate",
+        "baggage",
+    ] {
+        let yaml = single_step_yaml(&format!(
+            "      inputs: {{x: \"$request\"}}\n      forward_headers: [\"{name}\"]\n"
+        ));
+        let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err(&format!("{name} must be rejected (R23)"));
+        assert!(err.to_string().contains("(R23)"), "{name}: got {err}");
+    }
+}
+
+/// R23: transport-describing headers make the downstream request malformed —
+/// the body the worker receives is a re-assembled payload.
+#[test]
+fn r23_rejects_transport_headers() {
+    for name in ["content-length", "transfer-encoding", "host", "connection"] {
+        let yaml = single_step_yaml(&format!(
+            "      inputs: {{x: \"$request\"}}\n      forward_headers: [\"{name}\"]\n"
+        ));
+        let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err(&format!("{name} must be rejected (R23)"));
+        assert!(err.to_string().contains("(R23)"), "{name}: got {err}");
+    }
+}
+
+/// R23: malformed names and duplicates fail fast.
+#[test]
+fn r23_rejects_invalid_and_duplicate_names() {
+    let yaml = single_step_yaml(
+        "      inputs: {x: \"$request\"}\n      forward_headers: [\"not a header\"]\n",
+    );
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("space is not a token char (R23)");
+    assert!(err.to_string().contains("(R23)"), "got: {err}");
+
+    let yaml = single_step_yaml(
+        "      inputs: {x: \"$request\"}\n      forward_headers: [\"X-A\", \"x-a\"]\n",
+    );
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("case-folded duplicates must be rejected (R23)");
+    assert!(err.to_string().contains("(R23)"), "got: {err}");
+}
+
+/// R24: the seed step only ever receives names its own allowlist lists.
+#[test]
+fn r24_seed_forwarded_headers_selects_only_allowlisted() {
+    let pool: HashMap<String, String> = [
+        ("x-tenant-id".to_string(), "acme".to_string()),
+        ("authorization".to_string(), "Bearer secret".to_string()),
+        ("x-trace-id".to_string(), "abc".to_string()),
+    ]
+    .into();
+
+    let mut out = HashMap::new();
+    seed_forwarded_headers(
+        &mut out,
+        &["x-tenant-id".to_string(), "x-missing".to_string()],
+        &pool,
+    );
+
+    assert_eq!(out.get("x-tenant-id").map(String::as_str), Some("acme"));
+    assert!(
+        !out.contains_key("authorization"),
+        "a header outside the allowlist must never be seeded"
+    );
+    assert!(
+        !out.contains_key("x-missing"),
+        "absent pool entries are skipped"
+    );
+}
+
+/// D43: `passthrough: true` alone is a complete step — no `inputs` required.
+#[test]
+fn d43_passthrough_accepts_omitted_inputs() {
+    let yaml = single_step_yaml("      passthrough: true\n");
+    let plan = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    assert!(plan.steps[0].passthrough);
+    assert!(plan.steps[0].inputs.is_empty());
+}
+
+/// R24: passthrough is payload-free — `inputs` / `params` are the competing
+/// payload source.
+#[test]
+fn r24_passthrough_forbids_inputs_and_params() {
+    let yaml = single_step_yaml("      passthrough: true\n      inputs: {x: \"$request\"}\n");
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("passthrough × inputs must be rejected (R24)");
+    assert!(err.to_string().contains("(R24)"), "got: {err}");
+
+    let yaml = single_step_yaml("      passthrough: true\n      params: {k: 1}\n");
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("passthrough × params must be rejected (R24)");
+    assert!(err.to_string().contains("(R24)"), "got: {err}");
+}
+
+/// R24: omitting `inputs` without passthrough keeps failing fast (it used to
+/// be a serde "missing field" error; it must not silently become `{}`).
+#[test]
+fn r24_omitted_inputs_without_passthrough_is_rejected() {
+    let yaml = single_step_yaml("");
+    let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("a missing inputs mapping must be rejected (R24)");
+    assert!(err.to_string().contains("(R24)"), "got: {err}");
+}
+
+/// R24: an EMPTY `inputs: {}` stays legal without passthrough — the pre-change
+/// behaviour (R22's parity test depends on it).
+#[test]
+fn r24_empty_inputs_map_stays_legal() {
+    let yaml = single_step_yaml("      inputs: {}\n");
+    let plan = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    assert!(!plan.steps[0].passthrough);
+    assert!(plan.steps[0].inputs.is_empty());
+}
+
+/// R24: a declared-inputs ensemble carries KServe envelopes — the root is not
+/// the business body, so forwarding it verbatim would leak the envelope.
+#[test]
+fn r24_passthrough_forbids_declared_inputs_ensemble() {
+    let yaml = "ensemble:\n  inputs:\n    img:\n      type: json\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n      passthrough: true\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("passthrough × declared inputs must be rejected (R24)");
+    assert!(err.to_string().contains("(R24)"), "got: {err}");
+}
+
+/// D43: passthrough combines with streaming (a relay tail is the common case).
+#[test]
+fn d43_passthrough_tail_stream_step_is_legal() {
+    let yaml = single_step_yaml("      passthrough: true\n      stream: true\n");
+    let plan = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    assert!(plan.steps[0].passthrough);
+    assert!(plan.steps[0].stream);
+}
+
+/// D44: the Ok path captures the worker's response metadata — the mirror of
+/// the error path, which has carried it via `ModelErrorData.headers` all along.
+#[test]
+fn d44_unary_response_captures_ok_metadata() {
+    let single = pb::SingleResponse {
+        data: Bytes::from_static(br#"{"ok": 1}"#),
+        media_type: "application/json".to_string(),
+        status_code: 201,
+        headers: [("x-tenant-id".to_string(), "acme".to_string())].into(),
+        ..Default::default()
+    };
+    let (_value, meta) = unary_response_to_value(
+        "s",
+        pb::Response {
+            payload: Some(pb::response::Payload::Single(single)),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    let meta = meta.expect("the Ok path must capture the worker's metadata (D44)");
+    assert_eq!(meta.status_code, 201);
+    assert_eq!(
+        meta.headers.get("x-tenant-id").map(String::as_str),
+        Some("acme")
+    );
+}
+
+/// D44: a worker that supplies nothing yields `None` — so the transport keeps
+/// its own defaults instead of having them overwritten with empty values.
+#[test]
+fn d44_absent_metadata_stays_none() {
+    let single = pb::SingleResponse {
+        data: Bytes::from_static(br#"{"ok": 1}"#),
+        media_type: "application/json".to_string(),
+        ..Default::default()
+    };
+    let (_value, meta) = unary_response_to_value(
+        "s",
+        pb::Response {
+            payload: Some(pb::response::Payload::Single(single)),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    assert!(meta.is_none(), "no worker metadata → None, got {meta:?}");
+}
+
+/// D44: `from_worker` normalizes an out-of-range/negative status to 0
+/// ("none supplied") rather than truncating it into a bogus HTTP code.
+#[test]
+fn d44_from_worker_normalizes_out_of_range_status() {
+    assert!(StepResponseMeta::from_worker(0, &HashMap::new()).is_none());
+    assert!(StepResponseMeta::from_worker(-1, &HashMap::new()).is_none());
+    assert!(StepResponseMeta::from_worker(70000, &HashMap::new()).is_none());
+    let headers: HashMap<String, String> = [("x-a".to_string(), "1".to_string())].into();
+    // Headers alone (no status) still count as metadata.
+    assert_eq!(
+        StepResponseMeta::from_worker(0, &headers)
+            .unwrap()
+            .headers
+            .len(),
+        1
+    );
+}
+
+/// D44: only the OUTPUT step's metadata reaches the client — an upstream
+/// step's headers must not leak into the response.
+#[test]
+fn d44_build_response_uses_only_the_output_step_metadata() {
+    let yaml = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a\"}\n";
+    let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+    let mut context = HashMap::new();
+    context.insert("a".to_string(), EnsembleValue::Json(json!({"v": 1})));
+    context.insert("b".to_string(), EnsembleValue::Json(json!({"v": 2})));
+    let mut metas = HashMap::new();
+    metas.insert(
+        "a".to_string(),
+        StepResponseMeta {
+            status_code: 201,
+            headers: HashMap::new(),
+        },
+    );
+    metas.insert(
+        "b".to_string(),
+        StepResponseMeta {
+            status_code: 202,
+            headers: [("x-out".to_string(), "yes".to_string())].into(),
+        },
+    );
+
+    match build_response(&plan, "demo", &context, &metas).unwrap() {
+        EnsembleOutcome::Unary(EnsembleValue::Json(v), meta) => {
+            assert_eq!(v, json!({"v": 2}));
+            let meta = meta.expect("the output step's metadata must ride the outcome");
+            assert_eq!(meta.status_code, 202, "step a's metadata must NOT be used");
+            assert_eq!(meta.headers.get("x-out").map(String::as_str), Some("yes"));
+        }
+        _ => panic!("expected a Unary Json outcome"),
+    }
+}
+
+/// D43: only the Binary form carries a media type — the source a `passthrough`
+/// step uses at the aggregated (WS/bidi) transports, where the handshake
+/// header belongs to the upgrade rather than the body.
+#[test]
+fn d43_ensemble_value_content_type_only_for_binary() {
+    assert_eq!(
+        EnsembleValue::Json(json!({"a": 1})).content_type(),
+        None,
+        "a JSON payload needs no content-type header (historical shape)"
+    );
+    assert_eq!(
+        EnsembleValue::Binary(Bytes::from_static(b"\x00"), "image/png".into(), None, None)
+            .content_type(),
+        Some("image/png".to_string())
     );
 }

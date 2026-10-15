@@ -7,7 +7,7 @@ use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::err;
 use crate::grpc::interceptor;
-use crate::grpc::metadata::inject_grpc_metadata;
+use crate::grpc::metadata::response_headers_for_grpc;
 use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
@@ -72,12 +72,25 @@ fn d30_element_error(e: &AppError) -> pb::InferResponse {
             message: format!("{} {}", e.http_status().as_u16(), e),
         }),
         metrics: None,
+        // D44/D46: this path's own status rides Status.message (above); no
+        // worker metadata is attached.
+        headers: HashMap::new(),
+        status_code: 0,
     }
 }
 
 /// D30: success element — Json serialized back to bytes; Binary passed
 /// through verbatim (InferResponse carries no per-item content-type field).
-fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
+///
+/// D44/D46: the element's worker response metadata rides the same
+/// `InferResponse` fields the DIRECT batch path fills. Per ELEMENT — which is
+/// exactly why the channel is a message field and not response metadata: the
+/// latter is per-RPC and could never express one batch carrying two different
+/// sets, and this is the batch item type.
+fn d30_element_ok(
+    value: crate::ensemble::EnsembleValue,
+    meta: Option<crate::ensemble::StepResponseMeta>,
+) -> pb::InferResponse {
     let data = match value {
         crate::ensemble::EnsembleValue::Json(v) => {
             bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
@@ -98,6 +111,11 @@ fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
             message: String::new(),
         }),
         metrics: None,
+        headers: meta
+            .as_ref()
+            .map(|m| response_headers_for_grpc(&m.headers))
+            .unwrap_or_default(),
+        status_code: meta.as_ref().map_or(0, |m| i32::from(m.status_code)),
     }
 }
 
@@ -222,6 +240,9 @@ impl GrpcService {
                     &req_ctx,
                     Instant::now(),
                     dag_selector,
+                    // D42 (R23): the header pool is built here — grpc_metadata
+                    // lives at the caller, and all elements share one pool.
+                    crate::ensemble::header_pool_from_grpc(&grpc_metadata),
                 )
                 .await;
         }
@@ -332,10 +353,15 @@ impl GrpcService {
                         data: item.data,
                         status: item.status,
                         metrics: None,
+                        // D44/D46: per-ELEMENT worker metadata. The direct
+                        // batch path used to drop these (it injected only the
+                        // deprecated, never-populated batch-level map); the
+                        // ensemble path already fills them, so both agree now.
+                        headers: response_headers_for_grpc(&item.headers),
+                        status_code: item.status_code,
                     })
                     .collect();
-                let mut response = Response::new(pb::BatchInferResponse { items });
-                inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
+                let response = Response::new(pb::BatchInferResponse { items });
                 // Fire InferenceResponse callback (aligned with unary infer_impl).
                 crate::callback::fire_inference_response(&self.callback_runner, &req_ctx, start);
                 Ok(response)
@@ -364,6 +390,10 @@ impl GrpcService {
         // E8-1 (D38): extracted + D22-validated at the caller (grpc_metadata
         // lives there).
         dag_selector: Option<String>,
+        // D42 (R23): the shared request-header pool, also built at the caller.
+        // The per-element `request_body` is filled inside the loop (each
+        // element's own bytes are its request root, D43).
+        request_headers: Arc<HashMap<String, String>>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
         let plan =
             crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
@@ -404,6 +434,10 @@ impl GrpcService {
             deadline_client_specified: deadline.client_specified,
             decoupled: false,
             dag_selector,
+            request_headers,
+            // Filled per element below — an element's own bytes are its root.
+            request_body: None,
+            request_content_type: None,
         };
         // D15: ONE request-scope version snapshot shared by every element —
         // a batch is one logical request, so elements resolve sub-model
@@ -444,7 +478,13 @@ impl GrpcService {
             let model = model_name.clone();
             let version = resolved_version.clone();
             let request_id_elem = format!("{}:{}", request_id, i);
-            let opts = opts.clone();
+            let mut opts = opts.clone();
+            // D43 (R24): this element's own bytes are its request root — the
+            // D41 body selector already made one batch able to route elements
+            // to different sets, so a passthrough element follows the same
+            // per-element rule.
+            opts.request_body = Some(item.clone());
+            opts.request_content_type = req.headers.get("content-type").cloned();
             let snapshot = Arc::clone(&snapshot);
             set.spawn(async move {
                 let resp = match crate::ensemble::execute_ensemble_inner(
@@ -460,7 +500,7 @@ impl GrpcService {
                 )
                 .await
                 {
-                    Ok(crate::ensemble::EnsembleOutcome::Unary(v)) => d30_element_ok(v),
+                    Ok(crate::ensemble::EnsembleOutcome::Unary(v, meta)) => d30_element_ok(v, meta),
                     Ok(crate::ensemble::EnsembleOutcome::Stream(_)) => {
                         d30_element_error(&AppError::Internal(
                             "ensemble returned a stream from batch (D30 violation)".to_string(),
@@ -560,19 +600,49 @@ mod tests {
     /// through verbatim (InferResponse carries no per-item content-type).
     #[test]
     fn d30_element_ok_shapes() {
-        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Json(
-            serde_json::json!({"x": 1}),
-        ));
+        let resp = d30_element_ok(
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 1})),
+            None,
+        );
         assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
         assert_eq!(resp.data.as_ref(), &br#"{"x":1}"#[..]);
 
-        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Binary(
-            bytes::Bytes::from_static(b"raw"),
-            "image/png".to_string(),
+        let resp = d30_element_ok(
+            crate::ensemble::EnsembleValue::Binary(
+                bytes::Bytes::from_static(b"raw"),
+                "image/png".to_string(),
+                None,
+                None,
+            ),
             None,
-            None,
-        ));
+        );
         assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
         assert_eq!(resp.data.as_ref(), b"raw");
+    }
+
+    /// D44/D46: one batch can carry DIFFERENT metadata per element — the
+    /// property response metadata (per-RPC) could not express, and the reason
+    /// the channel is a message field.
+    #[test]
+    fn d44_d46_element_metadata_is_per_element() {
+        let first = d30_element_ok(
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 1})),
+            Some(crate::ensemble::StepResponseMeta {
+                status_code: 201,
+                headers: [("x-tenant-id".to_string(), "acme".to_string())].into(),
+            }),
+        );
+        let second = d30_element_ok(
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 2})),
+            None,
+        );
+
+        assert_eq!(first.status_code, 201);
+        assert_eq!(
+            first.headers.get("x-tenant-id").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(second.status_code, 0);
+        assert!(second.headers.is_empty(), "elements are independent");
     }
 }

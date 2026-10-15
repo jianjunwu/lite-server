@@ -18,6 +18,7 @@ drift as a warning finding (see `lite_server/analyzer/static.py`).
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,33 @@ import yaml
 
 #: InputDecl / StepOutputDecl declared types (R1/R6: mandatory field).
 _INPUT_TYPES = ("json", "binary")
+
+#: D42 (R23): headers the server sets per step — the assembly layer writes
+#: `content-type` and the telemetry layer injects the W3C propagation keys.
+#: A `forward_headers` entry naming one is a silent no-op (the server value
+#: wins), so it is rejected rather than shipped as dead config.
+_SERVER_MANAGED_STEP_HEADERS = frozenset(
+    {"content-type", "traceparent", "tracestate", "baggage"}
+)
+
+#: D42 (R23): headers describing the transport rather than the payload — the
+#: downstream body is a re-assembled payload, so forwarding these is a defect
+#: rather than a policy choice.
+_TRANSPORT_INVALID_FORWARD_HEADERS = frozenset(
+    {
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+    }
+)
+
+#: R23: the RFC 7230 token grammar — HTTP header names.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 #: E6 fault-tolerance modes (Rust OnErrorKind).
 _ON_ERROR_KINDS = (None, "fail", "skip")
 
@@ -40,6 +68,16 @@ _STEP_DEFAULT_KEYS = (
     ("retries", None),
     ("outputs", None),
     ("when", None),
+    # D42/D43: filled on both canonical sides so a declaration that never
+    # mentions them compares equal to a YAML without them (the exact dict
+    # equality would otherwise report false drift on every existing dag.py).
+    # `forward_headers` defaults to `[]`, not `None`: the Rust field is a
+    # `Vec<String>` with `#[serde(default)]`, where "the key is absent" and
+    # "the list is empty" are the same plan — a `None` default would report
+    # drift against a config.yaml writing `forward_headers: []` (the same
+    # reason `params` defaults to `{}`).
+    ("forward_headers", []),
+    ("passthrough", False),
 )
 _BLOCK_DEFAULT_KEYS = (
     ("output", None),
@@ -143,7 +181,7 @@ class Step:
 
     name: str
     model: str
-    inputs: dict[str, str]
+    inputs: dict[str, str] = field(default_factory=dict)
     # E4: omitted or "latest" resolves at execution time (registry active).
     version: str | None = None
     # §4.1: tail streaming.
@@ -160,6 +198,14 @@ class Step:
     outputs: dict[str, StepOutput] | None = None
     # E8-2: when condition — false skips the step at runtime.
     when: str | None = None
+    # D42 (R23): request-header forwarding allowlist — names lowercased (the
+    # server normalizes at load, and this mirror stores the normalized form so
+    # the serialized declaration cannot report drift on a case-only
+    # difference). None / empty = nothing forwarded.
+    forward_headers: list[str] | None = None
+    # D43 (R24): the step's outbound payload is the request root verbatim.
+    # Mutually exclusive with `inputs` / `params`.
+    passthrough: bool = False
 
     def __post_init__(self) -> None:
         for attr in ("name", "model"):
@@ -201,13 +247,70 @@ class Step:
             raise ValueError("outputs must be a dict of str -> StepOutput")
         if self.when is not None and not isinstance(self.when, str):
             raise ValueError(f"when must be a string, got {self.when!r}")
+        if not isinstance(self.passthrough, bool):
+            raise ValueError(f"passthrough must be a bool, got {self.passthrough!r}")
+        if self.forward_headers is not None:
+            if not isinstance(self.forward_headers, list) or any(
+                not isinstance(h, str) for h in self.forward_headers
+            ):
+                raise ValueError("forward_headers must be a list of str")
+            seen: set[str] = set()
+            for raw in self.forward_headers:
+                name = raw.strip().lower()
+                if not _HEADER_NAME_RE.match(name):
+                    raise ValueError(
+                        f"forward_headers entry {raw!r} is not a valid HTTP header "
+                        "name (R23)"
+                    )
+                if name in _SERVER_MANAGED_STEP_HEADERS:
+                    raise ValueError(
+                        f"forward_headers entry {raw!r} is set by the server per step "
+                        "and cannot be forwarded (R23)"
+                    )
+                if name in _TRANSPORT_INVALID_FORWARD_HEADERS:
+                    raise ValueError(
+                        f"forward_headers entry {raw!r} describes the transport, not "
+                        "the payload — the downstream body is re-assembled (R23)"
+                    )
+                if name in seen:
+                    raise ValueError(f"duplicate forward_headers entry {raw!r} (R23)")
+                seen.add(name)
+            # R23: store the normalized names — the Rust loader lowercases at
+            # load and keeps the normalized form, so emitting the raw spelling
+            # would report drift for a declaration the server executes
+            # identically (`["X-Tenant-Id"]` vs `[x-tenant-id]`).
+            normalized = [raw.strip().lower() for raw in self.forward_headers]
+            object.__setattr__(self, "forward_headers", normalized)
+        # R24: passthrough is payload-free — inputs/params are the competing
+        # payload source and cannot coexist with it.
+        if self.passthrough:
+            if self.inputs:
+                raise ValueError(
+                    "passthrough forbids 'inputs' — the payload is the request body "
+                    "verbatim (R24)"
+                )
+            if self.params:
+                raise ValueError(
+                    "passthrough forbids 'params' — the payload is the request body "
+                    "verbatim (R24)"
+                )
 
     def _config(self) -> dict[str, Any]:
         cfg: dict[str, Any] = {
             "name": self.name,
             "model": self.model,
-            "inputs": dict(self.inputs),
         }
+        # D43 (R24): the server's `inputs` is optional ONLY for passthrough
+        # steps — every other step must carry the key (an empty `{}` is the
+        # legal "call the worker with an empty object" form).
+        if not self.passthrough:
+            cfg["inputs"] = dict(self.inputs)
+        if self.passthrough:
+            cfg["passthrough"] = True
+        # An empty allowlist is omitted (the key is noise) — legal only because
+        # the canonical default is `[]`, so the two forms compare equal.
+        if self.forward_headers:
+            cfg["forward_headers"] = list(self.forward_headers)
         if self.version is not None:
             cfg["version"] = self.version
         if self.stream:

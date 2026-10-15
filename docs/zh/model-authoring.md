@@ -48,7 +48,36 @@ model_repo/
 
 执行模型差异：unary 步骤走常规推理队列（受 `max_queue_size` 限制）；**流式步骤绕过队列**（直连流式路径，与其它流式端点语义一致），并发流式 DAG 数由全局旋钮 `server.max_concurrent_streaming_dags` 限制（默认 128，耗尽立即 429）。
 
-DAG 也可用 **Python 声明**（E9-A）：在 `config.yaml` 旁的 `dag.py` 中用 `lite_server.ensemble` 的 `EnsembleDAG` 声明（见 [examples/05_ensemble](../../examples/05_ensemble)），序列化为等价的手写配置；`lite-server analyze` 会对声明与 `config.yaml` 做一致性检查并报告漂移（LS112）。服务端执行的是 `config.yaml`——Python 声明只是编写面，绝不执行。
+**请求头透传**（逐 step、默认关）：step 可以点名它希望子模型看到的父请求头。默认一个都不转发——白名单本身就是安全边界，未列出的 `Authorization` 永远不会到达子模型：
+
+```yaml
+ensemble:
+  steps:
+    - name: classify
+      model: classifier
+      version: "1"
+      inputs: {x: "$request"}
+      forward_headers: ["x-tenant-id", "x-request-id"]
+```
+
+名称大小写不敏感（服务端加载期统一小写）。以下名称加载期即拒绝（`(R23)`）：`content-type` 与 W3C 传播键（`traceparent`/`tracestate`/`baggage`）——服务端每步自己设置，写进白名单只是静默死配置；以及描述传输而非载荷的头（`content-length`、`transfer-encoding`、`host`、`connection`、`keep-alive`、`upgrade`、`te`、`trailer`）——子模型收到的是**重装配**后的载荷，这些头与之矛盾。嵌套 ensemble 继承同一份 header 池，但每个子 step 仍只拿到自己白名单点名的部分。
+
+**请求体原样透传**（逐 step、默认关）：`passthrough: true` 让该 step **逐字节**送出请求体——客户端发什么字节，子模型就收什么字节，中间没有 parse/重序列化（键序、空白、数字格式全部保留）。它与 `inputs` / `params` 互斥（R24），且在声明了 `inputs` 的 ensemble 中禁止（KServe 信封不是业务 body）：
+
+```yaml
+ensemble:
+  steps:
+    - name: relay
+      model: downstream
+      version: "1"
+      passthrough: true
+```
+
+请求根仍会被解析一次供 DAG 引擎自用（`$request.*` 引用、`dag_selector`）；passthrough 省掉的只是 step 载荷的那一次往返。与末步 `stream: true` 组合即最常见的中转形态。
+
+**响应元数据回传**：unary ensemble 的输出 step 的 worker **响应头与状态码**会到达客户端。HTTP 侧经与其它响应完全相同的 `content-type`/`content-length` 护栏注入。gRPC 侧走 `InferResponse.headers`/`status_code`——这是 gRPC 面**所有路径**（含直连 `Infer`/`BatchInfer`）回传 worker 响应元数据的唯一通道，客户端读同一组字段即可，不必关心响应由哪条路径产生（且**逐元素**：同一 batch 的不同元素可携带不同元数据）。只有**输出** step 的元数据被采用，上游 step 的响应头丢弃。流式 ensemble 不受影响：流的响应头属于服务端。
+
+DAG 也可用 **Python 声明**（E9-A）：在 `config.yaml` 旁的 `dag.py` 中用 `lite_server.ensemble` 的 `EnsembleDAG` 声明（见 [examples/05_ensemble](../../examples/05_ensemble)），序列化为等价的手写配置；`lite-server analyze` 会对声明与 `config.yaml` 做一致性检查并报告漂移（LS112）。服务端执行的是 `config.yaml`——Python 声明只是编写面，绝不执行。`Step(..., forward_headers=[...])` 与 `Step(..., passthrough=True)` 已镜像。
 
 模型根目录（`{model_name}/`）下还可以放置 `requirements.txt`（Python 依赖）和 `README.md`，打包为 `.lma` 时会自动包含。
 

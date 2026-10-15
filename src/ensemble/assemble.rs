@@ -23,6 +23,21 @@ pub(crate) fn retry_sleep_budget(
     }
 }
 
+/// D43 (R24): the outbound payload of a `passthrough` step — the request root
+/// verbatim (see `EnsembleExecOpts.request_body`). Every endpoint fills that
+/// field, so the error arm is a type-level backstop.
+pub(crate) fn passthrough_payload(
+    step_name: &str,
+    request_body: Option<&bytes::Bytes>,
+) -> Result<bytes::Bytes, AppError> {
+    request_body.cloned().ok_or_else(|| {
+        AppError::Internal(format!(
+            "step '{step_name}': passthrough requires a request body, but the request \
+             carried none"
+        ))
+    })
+}
+
 /// Shared step RequestMeta (unary + streaming): request_id `{parent}:{step}`
 /// suffix, trace-injected headers, deadline cascade, content-type passthrough
 /// (B3/E7). `payload` is the serialized body — empty for streaming, where the
@@ -284,9 +299,13 @@ pub(crate) fn parse_step_output(
 pub(crate) fn materialize_step_outputs(
     step: &EnsembleStep,
     raw: EnsembleValue,
-) -> Result<Vec<(String, EnsembleValue)>, AppError> {
+    meta: Option<StepResponseMeta>,
+) -> Result<StepResults, AppError> {
     let Some(decl) = &step.outputs_decl else {
-        return Ok(vec![(step.name.clone(), raw)]);
+        return Ok(StepResults {
+            values: vec![(step.name.clone(), raw)],
+            meta,
+        });
     };
     // P2 (batch 6): a declared step over a NESTED child's raw-resident
     // outcome parses before projection (unary workers never produce raw for
@@ -369,7 +388,7 @@ pub(crate) fn materialize_step_outputs(
             }
         }
     }
-    Ok(out)
+    Ok(StepResults { values: out, meta })
 }
 
 /// E6 (batch 4): retry classification — only transient worker-side failures
@@ -394,11 +413,19 @@ pub(crate) async fn execute_step(
     context: &HashMap<String, EnsembleValue>,
     request_id: &str,
     client_ip: &str,
+    // D42 (R23): the parent request's header pool (see `EnsembleExecOpts`) —
+    // consulted only through `step.forward_headers`. An `Arc` so a nested
+    // ensemble can inherit the very same pool (D45) without a deep copy.
+    request_headers: &Arc<HashMap<String, String>>,
+    // D43 (R24): the request root's raw bytes — a `passthrough` step's payload
+    // — plus the media type the endpoint classified for them.
+    request_body: Option<&bytes::Bytes>,
+    request_content_type: Option<&str>,
     deadline_unix_ns: Option<i64>,
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: nesting depth — +1 on recursion into an ensemble step
     ancestors: &[(String, String)], // E1: THIS branch's nesting chain (B1: never shared across sibling branches)
-) -> Result<Vec<(String, EnsembleValue)>, AppError> {
+) -> Result<StepResults, AppError> {
     // E4/D15: resolve the sub-model version at execution time — explicit
     // versions as-is, unresolved ("latest"/omitted) via the request-scoped
     // snapshot (first resolution per model wins; registry active is the only
@@ -420,31 +447,44 @@ pub(crate) async fn execute_step(
         }
     }
 
-    // Resolve inputs into EnsembleValues.
-    let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
-    for (key, ref_str) in &step.inputs {
-        match resolve_ref(plan, ref_str, context)? {
-            ResolvedRef::Value(v) => {
-                resolved.insert(key.clone(), v);
-            }
-            ResolvedRef::Absent(name) => {
-                return Err(AppError::Internal(format!(
-                    "step '{}' resolved absent input '{}' — conditional steps \
-                     are skipped before execution (R4)",
-                    step.name, name
-                )));
+    // D43 (R24): a passthrough step ships the request root verbatim. The
+    // assembler is bypassed entirely — no input resolution, no re-serialize —
+    // so key order, whitespace and number formatting reach the sub-model
+    // exactly as the client sent them.
+    let (payload_bytes, content_type_for_step) = if step.passthrough {
+        // The verbatim bytes carry the root's own media type: without it a
+        // BINARY relay would reach the sub-model as an untyped payload.
+        (
+            passthrough_payload(&step.name, request_body)?,
+            request_content_type.map(str::to_string),
+        )
+    } else {
+        // Resolve inputs into EnsembleValues.
+        let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
+        for (key, ref_str) in &step.inputs {
+            match resolve_ref(plan, ref_str, context)? {
+                ResolvedRef::Value(v) => {
+                    resolved.insert(key.clone(), v);
+                }
+                ResolvedRef::Absent(name) => {
+                    return Err(AppError::Internal(format!(
+                        "step '{}' resolved absent input '{}' — conditional steps \
+                         are skipped before execution (R4)",
+                        step.name, name
+                    )));
+                }
             }
         }
-    }
 
-    // MIMO (R11/R12): static input-mode dispatch in declared configs; legacy
-    // configs keep the dynamic runtime dispatch (byte-identical).
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(
-        &step.name,
-        &resolved,
-        &step.params,
-        plan.input_mode(step_idx),
-    )?;
+        // MIMO (R11/R12): static input-mode dispatch in declared configs; legacy
+        // configs keep the dynamic runtime dispatch (byte-identical).
+        assemble_step_payload(
+            &step.name,
+            &resolved,
+            &step.params,
+            plan.input_mode(step_idx),
+        )?
+    };
 
     // Ensure sub-model is ready (shared autoload; unary readiness predicate)
     ensure_sub_model_loaded(&state, &step.model, &resolved_version).await?;
@@ -581,6 +621,16 @@ pub(crate) async fn execute_step(
             // body-field selector configured) — execution selects the same
             // set the D4 check consulted.
             dag_selector: nested_selector,
+            // D45 (R23): the child inherits the SAME header pool. The
+            // reachable surface does not widen — each child step still only
+            // receives what its own `forward_headers` allowlist names.
+            request_headers: Arc::clone(request_headers),
+            // D43: the child's request root is the payload this step just
+            // assembled, so a grandchild `passthrough` step forwards THAT,
+            // not the outer request body — and its media type is the one this
+            // step's own assembly classified.
+            request_body: Some(payload_bytes.clone()),
+            request_content_type: content_type_for_step.clone(),
         };
         let nested = execute_nested_ensemble_boxed(
             state.clone(),
@@ -611,7 +661,9 @@ pub(crate) async fn execute_step(
             None => nested.await?,
         };
         return match outcome {
-            EnsembleOutcome::Unary(v) => materialize_step_outputs(step, v),
+            // D44: a nested ensemble's output meta floats up as THIS step's
+            // meta — the child's output step is the step's real worker.
+            EnsembleOutcome::Unary(v, meta) => materialize_step_outputs(step, v, meta),
             // Unreachable under D4 (child plans with streaming are rejected
             // above) — kept as the type-level backstop.
             EnsembleOutcome::Stream(_) => Err(AppError::Internal(
@@ -635,6 +687,9 @@ pub(crate) async fn execute_step(
     // worker spans land as children of the step (request_id is already
     // `{parent}:{step}`, trace follows the same shape).
     let mut step_headers = HashMap::new();
+    // D42 (R23): seed from the parent request pool FIRST — the two blocks
+    // below overwrite, so a server-set header always wins over a forwarded one.
+    seed_forwarded_headers(&mut step_headers, &step.forward_headers, request_headers);
     // B3 (E7): when the step input is binary, tell the worker via content-type.
     if let Some(ref ct) = content_type_for_step {
         step_headers.insert("content-type".to_string(), ct.clone());
@@ -746,7 +801,7 @@ pub(crate) async fn execute_step(
         .await;
 
         match result {
-            Ok(value) => return materialize_step_outputs(step, value),
+            Ok((value, meta)) => return materialize_step_outputs(step, value, meta),
             Err(e) => {
                 if attempt < step.retries && is_retryable_error(&e) {
                     // E6: don't sleep past the step budget — the next attempt
@@ -777,7 +832,7 @@ pub(crate) fn unary_response_to_value(
     step_name: &str,
     response: pb::Response,
     raw_eligible: bool,
-) -> Result<EnsembleValue, AppError> {
+) -> Result<(EnsembleValue, Option<StepResponseMeta>), AppError> {
     match response.payload {
         Some(pb::response::Payload::Single(single)) => {
             let code = single
@@ -785,6 +840,11 @@ pub(crate) fn unary_response_to_value(
                 .as_ref()
                 .map(|s| s.code.as_str())
                 .unwrap_or("Ok");
+            // D44: the Ok-path mirror of the error path's `ModelErrorData`
+            // headers (below) — the worker's response metadata is captured
+            // rather than dropped, so the OUTPUT step's copy can reach the
+            // client.
+            let meta = StepResponseMeta::from_worker(single.status_code, &single.headers);
             match code {
                 "Ok" => {
                     // P2 (batch 6): a raw-eligible (pass-through schema)
@@ -803,12 +863,13 @@ pub(crate) fn unary_response_to_value(
                         && serde_json::from_slice::<&serde_json::value::RawValue>(&single.data)
                             .is_ok()
                     {
-                        Ok(EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
-                            single.data,
-                        ))))
+                        Ok((
+                            EnsembleValue::RawJson(Arc::new(RawJsonValue::new(single.data))),
+                            meta,
+                        ))
                     } else {
                         // B3 (E8): typed output (see parse_step_output).
-                        parse_step_output(step_name, single)
+                        parse_step_output(step_name, single).map(|v| (v, meta))
                     }
                 }
                 "Error" => {

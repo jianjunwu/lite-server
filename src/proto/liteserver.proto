@@ -276,6 +276,21 @@ message InferResponse {
   bytes data = 1;
   Status status = 2;
   Metrics metrics = 3;
+  // D44/D46 (2026-10-15): worker response metadata — the ONE channel for it
+  // on the gRPC face (replaces the response-metadata injection the direct
+  // path used, which is now gone). Both the direct and the ensemble egress
+  // populate these fields, so a client reads one thing regardless of which
+  // path produced the response.
+  //
+  // A message field rather than response metadata because the two shapes are
+  // not equivalent: this is PER ELEMENT (InferResponse is the batch item
+  // type, so one batch can carry different metadata for different elements),
+  // it accepts arbitrary header names, and it carries the worker's status —
+  // per-RPC metadata can express none of the three.
+  //
+  // Additive: an older client simply sees the defaults (empty / 0).
+  map<string, string> headers = 4;
+  int32 status_code = 5;
 }
 
 message BatchInferRequest {

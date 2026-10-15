@@ -564,6 +564,11 @@ async fn sse_infer_impl(
             deadline_client_specified: deadline.client_specified,
             decoupled,
             dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
+            // D42 (R23) / D43 (R24): forwarding context — the HTTP request
+            // headers and the body exactly as received.
+            request_headers: crate::ensemble::header_pool_from_http(&headers),
+            request_body: Some(body.bytes()),
+            request_content_type: body.content_type(),
         };
         match crate::ensemble::execute_ensemble(
             state.clone(),
@@ -591,7 +596,7 @@ async fn sse_infer_impl(
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
             }
-            crate::ensemble::EnsembleOutcome::Unary(_) => {
+            crate::ensemble::EnsembleOutcome::Unary(..) => {
                 return Err(AppError::InvalidRequestBody(
                     "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
                 ));
@@ -1820,6 +1825,9 @@ async fn handle_ws_stream(
                 return;
             }
         };
+        // D43: the aggregated root rides alongside the value. The declared
+        // (envelope) arm has no as-received body — and R24 forbids
+        // `passthrough` inside a declared-inputs ensemble anyway.
         let value = if declared {
             match &first_frame {
                 FirstFrame::Json(text) => crate::ensemble::bidi_envelope_frame(
@@ -1831,6 +1839,7 @@ async fn handle_ws_stream(
                     crate::ensemble::bidi_envelope_frame(bin, false, ct.clone())
                 }
             }
+            .map(|v| (v, None))
         } else {
             let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
             let push_first = match &first_frame {
@@ -1984,10 +1993,12 @@ async fn handle_ws_stream(
                 aggregator.total_bytes(),
                 ws_start.elapsed().as_secs_f64(),
             );
-            aggregator.finish()
+            aggregator
+                .finish_with_root_bytes()
+                .map(|(v, b)| (v, Some(b)))
         };
-        let value = match value {
-            Ok(v) => v,
+        let (value, root_body) = match value {
+            Ok(pair) => pair,
             Err(e) => {
                 prometheus::record_stream_rejected(
                     &model_name,
@@ -2006,6 +2017,13 @@ async fn handle_ws_stream(
             deadline_client_specified: deadline.client_specified,
             decoupled,
             dag_selector,
+            // D42 (R23) / D43 (R24): forwarding context — the WS handshake
+            // headers, and the aggregated root a `passthrough` step forwards.
+            request_headers: crate::ensemble::header_pool_from_http(&headers),
+            request_body: root_body,
+            // D43: the aggregated root's own media type (the first frame's),
+            // NOT the WS handshake header — that one belongs to the upgrade.
+            request_content_type: value.content_type(),
         };
         match crate::ensemble::execute_ensemble(
             state.clone(),
@@ -2033,7 +2051,7 @@ async fn handle_ws_stream(
                 // open inside the executor; the guard rides EnsembleStream.
                 (s.stream_id, s.cancel_client, s.chunk_rx, s.inflight_guard)
             }
-            Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
+            Ok(crate::ensemble::EnsembleOutcome::Unary(..)) => {
                 prometheus::record_stream_rejected(
                     &model_name,
                     &resolved_version,

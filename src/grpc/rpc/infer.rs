@@ -11,7 +11,7 @@ use crate::grpc::error::{
     try_parse_model_error, with_retry_after,
 };
 use crate::grpc::interceptor;
-use crate::grpc::metadata::inject_grpc_metadata;
+use crate::grpc::metadata::response_headers_for_grpc;
 use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
@@ -137,6 +137,11 @@ impl GrpcService {
                     decoupled: false,
                     dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
                         .map_err(|e| err(app_error_to_grpc_status(&e)))?,
+                    // D42 (R23) / D43 (R24): forwarding context — the gRPC
+                    // request metadata and the element's data as received.
+                    request_headers: crate::ensemble::header_pool_from_grpc(&grpc_metadata),
+                    request_body: Some(req.data.clone()),
+                    request_content_type: req.headers.get("content-type").cloned(),
                 };
                 let result = crate::ensemble::execute_ensemble(
                     self.app_state.clone(),
@@ -152,23 +157,30 @@ impl GrpcService {
                 // Binary → raw bytes (CT dropped, gRPC has no media_type field;
                 // client must know the model contract, consistent with gRPC
                 // unary semantics).
-                let data = match result {
+                let (data, meta) = match result {
                     crate::ensemble::EnsembleOutcome::Unary(
                         crate::ensemble::EnsembleValue::Json(v),
-                    ) => bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
+                        meta,
+                    ) => (
+                        bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
+                        meta,
+                    ),
                     // P2 (batch 6): raw-resident output → original bytes.
                     crate::ensemble::EnsembleOutcome::Unary(
                         crate::ensemble::EnsembleValue::RawJson(raw),
-                    ) => raw.bytes.clone(),
+                        meta,
+                    ) => (raw.bytes.clone(), meta),
                     crate::ensemble::EnsembleOutcome::Unary(
                         crate::ensemble::EnsembleValue::Binary(b, _ct, ..),
-                    ) => b,
-                    // E7 (D32): the multi-sink response — InferResponse has
-                    // no headers map, so the LSBE-1 container is the
-                    // self-describing carrier (head + tail).
+                        meta,
+                    ) => (b, meta),
+                    // E7 (D32): the multi-sink response rides the LSBE-1
+                    // container — the binary tail has no InferResponse field.
+                    // The head+tail form carries no D44 response metadata.
                     crate::ensemble::EnsembleOutcome::Unary(
                         crate::ensemble::EnsembleValue::Envelope { head, tail },
-                    ) => crate::ensemble::encode_lsbe1(&head, &tail),
+                        _,
+                    ) => (crate::ensemble::encode_lsbe1(&head, &tail), None),
                     crate::ensemble::EnsembleOutcome::Stream(_) => {
                         // D1: a unary endpoint calling a streaming DAG is a
                         // client contract violation — InvalidArgument (parity
@@ -181,10 +193,17 @@ impl GrpcService {
                         )));
                     }
                 };
+                // D44/D46: the OUTPUT step's worker response metadata rides
+                // the same `InferResponse` fields as the direct path's.
                 return Ok(Response::new(pb::InferResponse {
                     data,
                     status: None,
                     metrics: None,
+                    headers: meta
+                        .as_ref()
+                        .map(|m| response_headers_for_grpc(&m.headers))
+                        .unwrap_or_default(),
+                    status_code: meta.as_ref().map_or(0, |m| i32::from(m.status_code)),
                 }));
             }
         }
@@ -367,13 +386,18 @@ impl GrpcService {
                         Err(err(Status::internal(msg)))
                     }
                     _ => {
-                        let headers = single.headers.clone();
-                        let mut response = Response::new(pb::InferResponse {
+                        // D44/D46: the worker's response metadata rides the
+                        // InferResponse fields — the ONE channel, shared with
+                        // the ensemble egress (previously this was injected as
+                        // response metadata instead, so the two paths carried
+                        // the same data in different places).
+                        let response = Response::new(pb::InferResponse {
                             data: single.data,
                             status: grpc_status,
                             metrics: resp.metrics,
+                            headers: response_headers_for_grpc(&single.headers),
+                            status_code: single.status_code,
                         });
-                        inject_grpc_metadata(response.metadata_mut(), &headers);
 
                         // Fire InferenceResponse callback
                         crate::callback::fire_inference_response(
