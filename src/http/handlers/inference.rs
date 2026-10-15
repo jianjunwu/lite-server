@@ -666,6 +666,12 @@ fn apply_step_meta(response: &mut Response, meta: Option<&crate::ensemble::StepR
 /// violation 4xx; response-build failure 5xx). Sub-model steps are not HTTP
 /// requests and are not counted: one request = one count, matching the
 /// non-ensemble unary path.
+///
+/// D44: the recorded family comes from the FINAL response status, not from
+/// `Ok(_)`: the output step's worker may override the status (`apply_step_meta`),
+/// so "the egress succeeded" no longer implies "the client got a 2xx". The
+/// direct path does the same (`status_family(single.status_code)` alongside its
+/// own override) — one worker status must land in one family on both paths.
 fn ensemble_outcome_response(
     model_name: &str,
     resolved_version: &str,
@@ -674,7 +680,7 @@ fn ensemble_outcome_response(
 ) -> Result<Response, AppError> {
     let finish = |resp: Result<Response, AppError>| {
         let family = match &resp {
-            Ok(_) => "2xx",
+            Ok(response) => status_family(response.status().as_u16() as i32),
             Err(e) => status_family(e.http_status().as_u16() as i32),
         };
         prometheus::record_request_end(
@@ -1179,6 +1185,54 @@ mod d44_egress_tests {
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_d44_metrics_tests {
+    //! /audit (2026-10-15): D44 lets the worker's `status_code` override the
+    //! ensemble egress' HTTP status (`apply_step_meta`), so the metric family
+    //! must be read off the FINAL response — `Ok(_) => "2xx"` counted a 503
+    //! response as 2xx, putting the same worker metadata in a different family
+    //! than the direct path (inference.rs:489 / :612, which records
+    //! `status_family(single.status_code)` next to its own override).
+    //! Regression pin for the `finish` fix.
+
+    use super::*;
+
+    fn requests_total(model: &str, version: &str, family: &str) -> f64 {
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, family])
+            .get()
+    }
+
+    #[test]
+    fn ensemble_worker_status_is_recorded_in_the_matching_family() {
+        let _ = prometheus::register_metrics();
+        let before_5xx = requests_total("audit_d44_fam", "1", "5xx");
+        let before_2xx = requests_total("audit_d44_fam", "1", "2xx");
+        let outcome = crate::ensemble::EnsembleOutcome::Unary(
+            crate::ensemble::EnsembleValue::Json(json!({"ok": true})),
+            Some(crate::ensemble::StepResponseMeta {
+                status_code: 503,
+                headers: Default::default(),
+            }),
+        );
+        let resp = ensemble_outcome_response("audit_d44_fam", "1", Instant::now(), outcome)
+            .expect("the JSON egress builds");
+        // The worker's status IS applied to the response (D44) …
+        assert_eq!(resp.status().as_u16(), 503);
+        // … so the recorded family must describe the response the client got.
+        assert_eq!(
+            requests_total("audit_d44_fam", "1", "5xx"),
+            before_5xx + 1.0,
+            "a 503 response must be counted as 5xx (direct-path parity)"
+        );
+        assert_eq!(
+            requests_total("audit_d44_fam", "1", "2xx"),
+            before_2xx,
+            "the same request must not also be counted as 2xx"
         );
     }
 }

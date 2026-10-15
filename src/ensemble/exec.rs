@@ -248,7 +248,10 @@ pub fn header_pool_from_grpc(
 /// D42 (R23): seed `out` with the parent pool's entries named by the step's
 /// allowlist. Called BEFORE the assembly layer inserts `content-type` and
 /// before the telemetry injection, so a server-set value always wins over a
-/// forwarded one.
+/// forwarded one. The order lives at the three call sites (the unary
+/// `execute_step`, the streaming pair), not here — the streaming one is pinned
+/// by `exec::audit_d42_d43_streaming_tests` (it bypasses R23, which is the only
+/// way to reach the clash).
 pub(crate) fn seed_forwarded_headers(
     out: &mut HashMap<String, String>,
     allowlist: &[String],
@@ -3058,6 +3061,229 @@ mod audit_0822_tests {
         assert!(
             matches!(outcome, ForwardOutcome::Error),
             "a hop-deadline expiry must end the chain as error-terminated, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_d42_d43_streaming_tests {
+    //! /audit (2026-10-15): D42/D43 streaming wiring had NO test at all —
+    //! `request_headers` is `Default::default()` in every streaming lib test
+    //! and `passthrough` only had a "the config parses" assertion. This test
+    //! drives `execute_stream_step` for real and reads back the StreamOpen's
+    //! `data` and `meta.headers` as the worker received them:
+    //!   - D43: the payload IS the request root's bytes (streaming fidelity);
+    //!   - D42: an allowlisted header reaches the worker;
+    //!   - R23's double insurance: the assembly-owned content-type wins over
+    //!     a forwarded one.
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::proto::liteserver as pb;
+    use prost::Message;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::time::Duration;
+
+    /// (open payload, open meta headers) of the first StreamOpen the worker sees.
+    type OpenFrame = (Vec<u8>, HashMap<String, String>);
+
+    fn audit_state() -> Arc<AppState> {
+        let cb = Arc::new(CallbackRunner::new());
+        let registry = Arc::new(crate::registry::ModelRegistry::new());
+        let queue = Arc::new(crate::inference_queue::InferenceQueue::new());
+        let wm = Arc::new(crate::worker::WorkerManager::new(
+            registry.clone(),
+            PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            crate::config::Config::default(),
+            PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// Register `model` v1 ready with one ZMQ client (streaming permit cap 1).
+    async fn register_streaming_model(state: &Arc<AppState>, model: &str, endpoint: String) {
+        state
+            .registry
+            .register(
+                model,
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client.clone()])
+            .await;
+        let config = crate::config::ModelConfig {
+            max_concurrent_streams: 1,
+            ..Default::default()
+        };
+        state.inference_queue.register_model(
+            model,
+            "1",
+            &config,
+            vec![],
+            vec![client],
+            Arc::new(crate::inference_queue::OutlierState::new(1)),
+            None,
+        );
+    }
+
+    /// Silent PAIR worker that reports the first StreamOpen's payload + headers
+    /// and never replies (the stream stays in-flight until the test drops it).
+    fn spawn_open_recording_worker(
+        endpoint: String,
+        seen: std::sync::mpsc::Sender<OpenFrame>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else {
+                    continue;
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    continue;
+                };
+                if let Some(pb::stream_request::Action::Open(open)) = st.action {
+                    let headers = open.meta.map(|m| m.headers).unwrap_or_default();
+                    let _ = seen.send((open.data.to_vec(), headers));
+                }
+            }
+        })
+    }
+
+    /// D43 on the streaming path: a `passthrough` tail step ships the request
+    /// root's bytes verbatim as the StreamOpen payload (no assemble →
+    /// re-serialize), and D42's allowlist reaches the worker's RequestMeta —
+    /// while the endpoint-classified content-type beats a forwarded one.
+    #[tokio::test]
+    async fn d43_passthrough_stream_payload_and_d42_forwarded_headers() {
+        let state = audit_state();
+        let endpoint = {
+            let sock = std::env::temp_dir()
+                .join(format!("lite-server-audit-d43-{}.sock", std::process::id()));
+            format!("ipc://{}", sock.display())
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _worker = spawn_open_recording_worker(endpoint.clone(), tx);
+        register_streaming_model(&state, "d43m", endpoint).await;
+
+        let mut plan = EnsemblePlan {
+            steps: vec![EnsembleStep {
+                forward_headers: Vec::new(),
+                passthrough: false,
+                name: "s".to_string(),
+                model: "d43m".to_string(),
+                version: Some("1".to_string()),
+                inputs: HashMap::new(),
+                stream: true,
+                params: HashMap::new(),
+                timeout_secs: None,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
+                outputs_decl: None,
+                when: None,
+            }],
+            layers: vec![vec![0]],
+            output_step: 0,
+            output_field: None,
+            chains: Vec::new(),
+            inputs_decl: None,
+            input_modes: Vec::new(),
+            conditional_refs: Vec::new(),
+            step_dep_keys: vec![Vec::new()],
+            step_raw_eligible: Vec::new(),
+            outputs: None,
+            dag_sets: None,
+            dag_selector: None,
+            config_path: PathBuf::from("/audit-d42-d43"),
+            source_mtime: None,
+        };
+        plan.steps[0].passthrough = true;
+        plan.steps[0].forward_headers = vec![
+            "x-tenant-id".to_string(),
+            // Bypasses R23 on purpose: the allowlist CANNOT name content-type
+            // in a validated config, so this is the "double insurance" — the
+            // seeding order must still let the assembly win.
+            "content-type".to_string(),
+        ];
+
+        // Deliberately un-normalized bytes: any parse → re-serialize changes them.
+        let raw = bytes::Bytes::from_static(br#"{ "b" : 2,   "a": [ 1,   2 ] }"#);
+        let mut pool: HashMap<String, String> = HashMap::new();
+        pool.insert("x-tenant-id".to_string(), "acme".to_string());
+        pool.insert("content-type".to_string(), "text/pool-evil".to_string());
+
+        let opts = EnsembleExecOpts {
+            client_ip: String::new(),
+            deadline_unix_ns: None,
+            deadline_client_specified: false,
+            decoupled: false,
+            dag_selector: None,
+            request_headers: Arc::new(pool),
+            request_body: Some(raw.clone()),
+            request_content_type: Some("application/octet-stream".to_string()),
+        };
+        let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+        let snapshot = Arc::new(VersionSnapshot::default());
+        let stream = execute_stream_step(
+            &state, &plan, 0, &ctx, "req-d43", &opts, None, None, &snapshot,
+        )
+        .await
+        .expect("the passthrough stream step must open");
+
+        let (data, headers) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must observe the StreamOpen");
+        drop(stream);
+
+        assert_eq!(
+            data,
+            raw.to_vec(),
+            "D43: the stream payload must be the request root's exact bytes"
+        );
+        assert_eq!(
+            headers.get("x-tenant-id").map(String::as_str),
+            Some("acme"),
+            "D42: an allowlisted header must reach the worker on the streaming path"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/octet-stream"),
+            "the endpoint-classified content-type must beat a forwarded one"
         );
     }
 }

@@ -766,13 +766,18 @@ pub fn parse_ensemble_plan(
     )
 }
 
-/// R23 (D42): step headers the SERVER sets itself — the assembly layer picks
-/// `content-type` per input type and the telemetry layer injects the W3C
-/// propagation keys. A `forward_headers` entry naming one of these is not a
-/// policy choice but a silent no-op: the seed order lets the server value win
-/// (so the config reads as if it worked), and for the propagation keys the
-/// outcome even varies by build (the inject is a no-op without the
-/// `telemetry` feature). Fail fast rather than ship a no-op.
+/// R23 (D42): step headers the SERVER owns — listing one in `forward_headers`
+/// is a mislabelled payload, not a policy choice:
+/// - `content-type` describes the payload the step actually ships. For a binary
+///   root the assembler states its own media type, so a forwarded value would
+///   be overwritten (dead config); for a JSON step the assembler states none at
+///   all, so a forwarded value — e.g. the client's `text/plain` — would survive
+///   and describe the re-assembled JSON body wrongly.
+/// - the W3C propagation keys are injected per step by the telemetry layer, so
+///   a forwarded value is dropped (and the outcome even varies by build: the
+///   inject is a no-op without the `telemetry` feature).
+///
+/// Fail fast rather than ship either shape.
 const SERVER_MANAGED_STEP_HEADERS: &[&str] =
     &["content-type", "traceparent", "tracestate", "baggage"];
 

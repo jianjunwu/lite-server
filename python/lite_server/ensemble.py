@@ -71,7 +71,12 @@ _STEP_DEFAULT_KEYS = (
     # D42/D43: filled on both canonical sides so a declaration that never
     # mentions them compares equal to a YAML without them (the exact dict
     # equality would otherwise report false drift on every existing dag.py).
-    ("forward_headers", None),
+    # `forward_headers` defaults to `[]`, not `None`: the Rust field is a
+    # `Vec<String>` with `#[serde(default)]`, where "the key is absent" and
+    # "the list is empty" are the same plan — a `None` default would report
+    # drift against a config.yaml writing `forward_headers: []` (the same
+    # reason `params` defaults to `{}`).
+    ("forward_headers", []),
     ("passthrough", False),
 )
 _BLOCK_DEFAULT_KEYS = (
@@ -193,9 +198,10 @@ class Step:
     outputs: dict[str, StepOutput] | None = None
     # E8-2: when condition — false skips the step at runtime.
     when: str | None = None
-    # D42 (R23): request-header forwarding allowlist — names lowercased by the
-    # SERVER at load (an un-normalized name would never match the lowercased
-    # pool). None / empty = nothing forwarded.
+    # D42 (R23): request-header forwarding allowlist — names lowercased (the
+    # server normalizes at load, and this mirror stores the normalized form so
+    # the serialized declaration cannot report drift on a case-only
+    # difference). None / empty = nothing forwarded.
     forward_headers: list[str] | None = None
     # D43 (R24): the step's outbound payload is the request root verbatim.
     # Mutually exclusive with `inputs` / `params`.
@@ -269,6 +275,12 @@ class Step:
                 if name in seen:
                     raise ValueError(f"duplicate forward_headers entry {raw!r} (R23)")
                 seen.add(name)
+            # R23: store the normalized names — the Rust loader lowercases at
+            # load and keeps the normalized form, so emitting the raw spelling
+            # would report drift for a declaration the server executes
+            # identically (`["X-Tenant-Id"]` vs `[x-tenant-id]`).
+            normalized = [raw.strip().lower() for raw in self.forward_headers]
+            object.__setattr__(self, "forward_headers", normalized)
         # R24: passthrough is payload-free — inputs/params are the competing
         # payload source and cannot coexist with it.
         if self.passthrough:
@@ -295,6 +307,8 @@ class Step:
             cfg["inputs"] = dict(self.inputs)
         if self.passthrough:
             cfg["passthrough"] = True
+        # An empty allowlist is omitted (the key is noise) — legal only because
+        # the canonical default is `[]`, so the two forms compare equal.
         if self.forward_headers:
             cfg["forward_headers"] = list(self.forward_headers)
         if self.version is not None:

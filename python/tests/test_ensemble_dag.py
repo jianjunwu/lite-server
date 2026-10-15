@@ -382,8 +382,11 @@ def test_to_config_full_fills_step_defaults():
         "retries": None,
         "outputs": None,
         "when": None,
-        # D42/D43: step-level forwarding / passthrough defaults.
-        "forward_headers": None,
+        # D42/D43: step-level forwarding / passthrough defaults. The allowlist
+        # default is `[]` (Rust's `Vec` + `serde(default)`: an absent key and an
+        # empty list are the same plan, so canonicalizing either to `None` would
+        # report drift against a YAML writing `forward_headers: []`).
+        "forward_headers": [],
         "passthrough": False,
     }
 
@@ -552,7 +555,13 @@ def test_r24_empty_inputs_still_emitted_without_passthrough():
 
 def test_new_step_keys_do_not_create_false_drift():
     """A minimal YAML that predates D42/D43 must canonicalize equal to the
-    declaration — the defaults are filled on both sides."""
+    declaration — the defaults are filled on both sides.
+
+    Both sides are the `ensemble:` BLOCK (`to_config(full=True)["ensemble"]`,
+    the analyzer's own form): comparing the whole `{"ensemble": {...}}` wrapper
+    would collapse both sides to an empty step list and the assertion could
+    never fail.
+    """
     declaration = EnsembleDAG(steps=[Step(name="a", model="m", inputs={"q": "$request"})])
     on_disk = yaml.safe_load(
         "ensemble:\n"
@@ -561,6 +570,14 @@ def test_new_step_keys_do_not_create_false_drift():
         "      model: m\n"
         '      inputs: {q: "$request"}\n'
     )
-    assert canonical_ensemble_block(on_disk) == canonical_ensemble_block(
-        declaration.to_config()
+    declared_block = canonical_ensemble_block(
+        declaration.to_config(full=True)["ensemble"]
     )
+    disk_block = canonical_ensemble_block(on_disk["ensemble"])
+    # The comparison must carry the step, otherwise it proves nothing.
+    assert len(declared_block["steps"]) == 1
+    assert len(disk_block["steps"]) == 1
+    assert disk_block == declared_block
+    # The new keys are filled on BOTH sides (the point of the test).
+    assert declared_block["steps"][0]["forward_headers"] == []
+    assert declared_block["steps"][0]["passthrough"] is False

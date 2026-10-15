@@ -4969,27 +4969,6 @@ fn r24_seed_forwarded_headers_selects_only_allowlisted() {
     );
 }
 
-/// D42: the allowlist seeds FIRST, so a server-set value wins. Called in the
-/// same order as `execute_step` / the streaming paths.
-#[test]
-fn r24_server_headers_win_over_forwarded_ones() {
-    let pool: HashMap<String, String> = [("x-tenant-id".to_string(), "acme".to_string())].into();
-    let mut headers = HashMap::new();
-    seed_forwarded_headers(&mut headers, &["x-tenant-id".to_string()], &pool);
-    // The assembly layer then writes its own content-type and the probe
-    // writes its own request id — both must overwrite.
-    headers.insert(
-        "content-type".to_string(),
-        "application/octet-stream".to_string(),
-    );
-
-    assert_eq!(headers.get("x-tenant-id").map(String::as_str), Some("acme"));
-    assert_eq!(
-        headers.get("content-type").map(String::as_str),
-        Some("application/octet-stream")
-    );
-}
-
 /// D43: `passthrough: true` alone is a complete step — no `inputs` required.
 #[test]
 fn d43_passthrough_accepts_omitted_inputs() {
