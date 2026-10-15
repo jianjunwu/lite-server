@@ -1,0 +1,11 @@
+# The ensemble end-to-end suite boots a real server per test and every test is
+# `#[serial]` (they share machine-global resources: ports, the metrics
+# registry, temp repos). Under libtest's default pool of N threads, N-1 threads
+# sit parked on the serial-test lock for the whole run — pure waste, and worse,
+# libtest's "has been running for over 60 seconds" warning counts that queue
+# time as execution time, so it fires on tests that are doing nothing.
+#
+# `cargo audit-stream` pins the pool to one thread: same result, no phantom
+# queue, no false 60s warnings.
+[alias]
+audit-stream = "test --test audit_ensemble_stream -- --test-threads=1"

@@ -3,6 +3,12 @@
 //! 真 server 子进程 + 模型夹具;端口段 19700(开工时核对全仓:在用段
 //! 180xx-183xx / 18992 / 19000 / 19600,19700 段无冲突)。
 //! 命名 test_audit_<维度>_<场景>;每测试独立 repo + server,防跨测试状态泄漏。
+//!
+//! Run it with `cargo audit-stream` (single-threaded): every test is
+//! `#[serial]`, so libtest's default thread pool only parks waiters on the
+//! suite lock — and then reports that queue time as "running for over 60
+//! seconds". Each test boots only the models it names (`boot_server(&[...])`),
+//! which is what keeps a full run at ~4.5 min instead of ~20.
 
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -1443,6 +1449,7 @@ fn write_server_yaml(
     http_port: u16,
     extra: &str,
     orch_extra: &str,
+    models: &[&str],
 ) -> std::path::PathBuf {
     // Port-suffixed dir: tests run concurrently and must not share files.
     let dir = std::env::temp_dir().join(format!(
@@ -1452,12 +1459,15 @@ fn write_server_yaml(
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("server.yaml");
+    // `load_models` is the CALLING TEST's set (see `boot_server`): the server
+    // loads exactly these at boot, so a test pays only for what it uses.
+    let load_models: String = models.iter().map(|m| format!("    - {m}\n")).collect();
     std::fs::write(
         &path,
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - hdr_echo\n    - echo_raw\n    - ens_fwd\n    - ens_nofwd\n    - ens_relay\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n{load_models}",
             repo.display()
         ),
     )
@@ -1478,12 +1488,20 @@ fn write_server_yaml(
 }
 
 /// Boot a server with the fixture repo; returns (base, guard, repo).
-async fn boot_server(extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
-    boot_server_orch(extra, "").await
+///
+/// `models` is the test's `load_models` set — the server loads exactly these at
+/// boot. It used to be a hardcoded 91-model list shared by every test, so each
+/// of the 90 boots spawned ~91 Python workers even though a test waits on a
+/// median of ONE model (a 91-model boot costs ~15s; a 3-model boot ~3s).
+/// A model a test does not name is still reachable: ensemble steps autoload
+/// their own sub-models at first use.
+async fn boot_server(models: &[&str], extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
+    boot_server_orch(models, extra, "").await
 }
 
 /// boot_server + orchestration-scope extras (per-model strategies).
 async fn boot_server_orch(
+    models: &[&str],
     extra: &str,
     orch_extra: &str,
 ) -> (String, ServerGuard, std::path::PathBuf) {
@@ -1497,11 +1515,11 @@ async fn boot_server_orch(
     ));
     let _ = std::fs::remove_dir_all(&repo);
     write_all_fixtures(&repo);
-    let server_yaml = write_server_yaml(&repo, http_port, extra, orch_extra);
+    let server_yaml = write_server_yaml(&repo, http_port, extra, orch_extra, models);
     let log_path = repo.join("server.log");
     let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()], &log_path);
-    // 90s: a loaded machine (whole suite booting ~90 models per server)
-    // regularly exceeded the old 30s budget.
+    // 90s: the budget was sized for a whole suite booting ~90 models per
+    // server; it stays generous now that a boot loads only the test's models.
     wait_for_server(http_port, 90, &log_path).await;
     (format!("http://127.0.0.1:{}", http_port), guard, repo)
 }
@@ -1525,7 +1543,7 @@ async fn wait_ready_all(base: &str, models: &[&str]) {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_ensemble_sse_happy() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     let body = sse_post(
@@ -1552,7 +1570,7 @@ async fn test_audit_stream_ensemble_sse_happy() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_unary_dag_on_stream_endpoint_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_unary", "pre"], "").await;
     wait_ready_all(&base, &["ens_unary"]).await;
 
     let err = sse_post(&base, "/v2/models/ens_unary/events", json!({"text": "x"}))
@@ -1566,7 +1584,7 @@ async fn test_audit_stream_unary_dag_on_stream_endpoint_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_unary_endpoint_on_stream_dag_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     let client = reqwest::Client::new();
@@ -1596,7 +1614,7 @@ async fn test_audit_stream_unary_endpoint_on_stream_dag_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_form_rejected_batch0() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_pipeline", "pre", "tail"], "").await;
     // ens_pipeline must NOT be ready (config validation failed at load).
     assert!(
         !wait_model_ready(&base, "ens_pipeline", 5).await,
@@ -1620,7 +1638,7 @@ async fn test_audit_stream_pipeline_form_rejected_batch0() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_binary_output_flag_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     let client = reqwest::Client::new();
@@ -1647,7 +1665,7 @@ async fn test_audit_stream_binary_output_flag_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_binary_chunk_type_mismatch() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_binary", "pre", "tail_binary"], "").await;
     wait_ready_all(&base, &["ens_binary"]).await;
 
     let body = sse_post(&base, "/v2/models/ens_binary/events", json!({"text": "x"}))
@@ -1669,7 +1687,7 @@ async fn test_audit_stream_binary_chunk_type_mismatch() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_autoload_failure_503() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_bad_sub", "ghost", "pre"], "").await;
     wait_ready_all(&base, &["ens_bad_sub"]).await;
 
     let client = reqwest::Client::new();
@@ -1691,7 +1709,7 @@ async fn test_audit_stream_autoload_failure_503() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_step_4xx_passthrough() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_4xx", "pre_bad", "tail"], "").await;
     wait_ready_all(&base, &["ens_4xx"]).await;
 
     let client = reqwest::Client::new();
@@ -1718,7 +1736,7 @@ async fn test_audit_stream_step_4xx_passthrough() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_step_5xx_500() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_5xx", "pre_5xx", "tail"], "").await;
     wait_ready_all(&base, &["ens_5xx"]).await;
 
     let client = reqwest::Client::new();
@@ -1740,7 +1758,7 @@ async fn test_audit_stream_step_5xx_500() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_midstream_failure_error_frame() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_fail", "pre", "tail_fail"], "").await;
     wait_ready_all(&base, &["ens_fail"]).await;
 
     let body = sse_post(
@@ -1765,7 +1783,11 @@ async fn test_audit_stream_midstream_failure_error_frame() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_p10_capacity_429() {
-    let (base, _guard, _repo) = boot_server("  max_concurrent_streaming_dags: 1").await;
+    let (base, _guard, _repo) = boot_server(
+        &["ens_slow", "pre", "tail_slow"],
+        "  max_concurrent_streaming_dags: 1",
+    )
+    .await;
     wait_ready_all(&base, &["ens_slow"]).await;
 
     let client = reqwest::Client::new();
@@ -1846,7 +1868,7 @@ async fn test_audit_stream_p10_capacity_429() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_p0_reload_uses_new_plan() {
-    let (base, _guard, repo) = boot_server("").await;
+    let (base, _guard, repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     // Baseline: tail (no suffix).
@@ -1905,7 +1927,11 @@ async fn test_audit_stream_p0_reload_uses_new_plan() {
 // ---------------------------------------------------------------------------
 
 /// Boot a server with gRPC enabled (batch-1 gRPC tests).
-async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::PathBuf) {
+/// See [`boot_server`] for `models`.
+async fn boot_server_grpc(
+    models: &[&str],
+    extra: &str,
+) -> (String, u16, ServerGuard, std::path::PathBuf) {
     let http_port = next_test_port();
     let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
@@ -1924,13 +1950,14 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let server_yaml = dir.join("server.yaml");
+    let load_models: String = models.iter().map(|m| format!("    - {m}\n")).collect();
     std::fs::write(
         &server_yaml,
         format!(
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain3\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_dags_sel\n    - ens_dags_stream_sel\n    - ens_sel_when\n    - ens_sel_parent\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n{load_models}",
             repo.display()
         ),
     )
@@ -1966,7 +1993,8 @@ async fn test_audit_stream_grpc_server_streaming_parity() {
     use lite_server::proto::liteserver::StreamInferRequest;
     use std::collections::HashMap;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     // SSE reference sequence.
@@ -2023,7 +2051,8 @@ async fn test_audit_stream_grpc_bidi_json_aggregation() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiData, BidiOpen};
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["ens_agg", "pre_agg", "tail"], "").await;
     wait_ready_all(&base, &["ens_agg"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -2089,7 +2118,7 @@ async fn test_audit_stream_grpc_bidi_json_aggregation() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_ws_bidi_aggregation() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_agg", "pre_agg", "tail"], "").await;
     wait_ready_all(&base, &["ens_agg"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2162,7 +2191,7 @@ async fn test_audit_stream_h2_bidi_aggregation() {
     use lite_server::proto::liteserver as pb;
     use lite_server::streaming::lpm;
 
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_agg", "pre_agg", "tail"], "").await;
     wait_ready_all(&base, &["ens_agg"]).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(16);
@@ -2238,7 +2267,7 @@ async fn test_audit_stream_h2_bidi_aggregation() {
 #[serial]
 async fn test_audit_stream_ws_bidi_multi_round_rejected() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2322,7 +2351,7 @@ async fn test_audit_stream_ws_bidi_multi_round_rejected() {
 #[serial]
 async fn test_audit_stream_ws_bidi_mixed_frames_rejected() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2369,7 +2398,11 @@ async fn test_audit_stream_ws_bidi_mixed_frames_rejected() {
 #[serial]
 async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    let (base, _guard, _repo) = boot_server(
+        &["ens_stream", "pre", "tail"],
+        "  decoupled_idle_timeout_secs: 1.0",
+    )
+    .await;
     wait_ready_all(&base, &["ens_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2428,7 +2461,7 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
 #[serial]
 async fn test_audit_stream_ws_decoupled_cancel_frame_is_not_multi_round() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_dslow", "pre", "tail_dslow"], "").await;
     wait_ready_all(&base, &["ens_dslow"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2497,7 +2530,7 @@ async fn test_audit_stream_ws_decoupled_cancel_frame_is_not_multi_round() {
 #[serial]
 async fn test_audit_stream_ws_decoupled_close_frame_cancels_stream() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_dslow", "pre", "tail_dslow"], "").await;
     wait_ready_all(&base, &["ens_dslow"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2569,7 +2602,11 @@ async fn test_audit_stream_h2_bidi_aggregation_stall_reclaimed() {
     use lite_server::proto::liteserver as pb;
     use lite_server::streaming::lpm;
 
-    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    let (base, _guard, _repo) = boot_server(
+        &["ens_agg", "pre_agg", "tail"],
+        "  decoupled_idle_timeout_secs: 1.0",
+    )
+    .await;
     wait_ready_all(&base, &["ens_agg"]).await;
 
     // Body yields the Open frame, then never yields and never EOFs.
@@ -2611,7 +2648,7 @@ async fn test_audit_stream_h2_bidi_aggregation_stall_reclaimed() {
 #[serial]
 async fn test_audit_stream_ws_bidi_error_close_code_is_contractual() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2659,7 +2696,11 @@ async fn test_audit_stream_ws_bidi_error_close_code_is_contractual() {
 #[serial]
 async fn test_audit_stream_ws_bidi_aggregation_idle_despite_client_deadline() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    let (base, _guard, _repo) = boot_server(
+        &["ens_stream", "pre", "tail"],
+        "  decoupled_idle_timeout_secs: 1.0",
+    )
+    .await;
     wait_ready_all(&base, &["ens_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -2712,7 +2753,7 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_despite_client_deadline() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_split_utf8_chunks_not_type_mismatch() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_split", "pre", "tail_split"], "").await;
     wait_ready_all(&base, &["ens_split"]).await;
 
     let body = sse_post(&base, "/v2/models/ens_split/events", json!({"text": "x"}))
@@ -2732,7 +2773,7 @@ async fn test_audit_stream_split_utf8_chunks_not_type_mismatch() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_step_latency_covers_streaming_step() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_stream"]).await;
 
     let _ = sse_post(
@@ -3044,7 +3085,7 @@ const ENS_CHAIN_SIBLING_YAML: &str = r#"ensemble:
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_chain_sse() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_chain", "tail", "tail_upper"], "").await;
     wait_ready_all(&base, &["ens_chain"]).await;
 
     let body = sse_post(
@@ -3075,7 +3116,7 @@ async fn test_audit_stream_pipeline_chain_sse() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_three_node_chain_completes() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_chain3", "tail", "tail_upper"], "").await;
     wait_ready_all(&base, &["ens_chain3"]).await;
 
     let fut = sse_post(
@@ -3102,7 +3143,8 @@ async fn test_audit_stream_pipeline_three_node_chain_completes() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_midchain_failure() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["ens_chain_fail", "tail", "tail_fail_chain"], "").await;
     wait_ready_all(&base, &["ens_chain_fail"]).await;
 
     let body = sse_post(
@@ -3129,7 +3171,8 @@ async fn test_audit_stream_pipeline_midchain_failure() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_chain_tail_timeout() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["chain_slow_head", "ens_chain_deadline", "tail"], "").await;
     wait_ready_all(&base, &["ens_chain_deadline"]).await;
 
     let start = std::time::Instant::now();
@@ -3165,7 +3208,8 @@ async fn test_audit_stream_ws_chain_disconnect_cancels_head_worker() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let (base, _guard, repo) = boot_server("").await;
+    let (base, _guard, repo) =
+        boot_server(&["chain_slow_head", "ens_chain_slow", "tail_upper"], "").await;
     wait_ready_all(&base, &["ens_chain_slow"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -3228,7 +3272,11 @@ async fn test_audit_stream_ws_chain_disconnect_cancels_head_worker() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_pipeline_head_failure_emits_error_frame() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(
+        &["chain_head_fail", "ens_chain_head_fail", "tail_upper"],
+        "",
+    )
+    .await;
     wait_ready_all(&base, &["ens_chain_head_fail"]).await;
 
     let body = sse_post(
@@ -3255,7 +3303,8 @@ async fn test_audit_stream_pipeline_head_failure_emits_error_frame() {
 #[tokio::test]
 #[serial]
 async fn test_audit_stream_pipeline_same_layer_unary_sibling_runs() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["echo", "ens_chain_sibling", "tail", "tail_upper"], "").await;
     wait_ready_all(&base, &["ens_chain_sibling"]).await;
 
     let _ = sse_post(
@@ -3651,7 +3700,11 @@ class DriftAPI(LitAPI):
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e1_nested_happy() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(
+        &["echo", "ens_nested_child", "ens_nested_parent", "pre"],
+        "",
+    )
+    .await;
     wait_ready_all(&base, &["ens_nested_parent"]).await;
 
     let client = reqwest::Client::new();
@@ -3680,7 +3733,16 @@ async fn test_audit_stream_e1_nested_happy() {
 #[serial]
 #[tokio::test]
 async fn test_audit_r17_nested_named_inputs_mapping() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(
+        &[
+            "echo",
+            "ens_nested_mimo_child",
+            "ens_nested_mimo_parent",
+            "pre",
+        ],
+        "",
+    )
+    .await;
     wait_ready_all(&base, &["ens_nested_mimo_parent"]).await;
 
     let client = reqwest::Client::new();
@@ -3709,7 +3771,16 @@ async fn test_audit_r17_nested_named_inputs_mapping() {
 #[serial]
 #[tokio::test]
 async fn test_audit_r17_nested_unknown_key_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(
+        &[
+            "echo",
+            "ens_nested_mimo_badkey",
+            "ens_nested_mimo_child",
+            "pre",
+        ],
+        "",
+    )
+    .await;
     wait_ready_all(&base, &["ens_nested_mimo_badkey"]).await;
 
     let client = reqwest::Client::new();
@@ -3733,7 +3804,7 @@ async fn test_audit_r17_nested_unknown_key_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e1_self_loop_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_self"], "").await;
     wait_ready_all(&base, &["ens_self"]).await;
 
     let client = reqwest::Client::new();
@@ -3761,7 +3832,7 @@ async fn test_audit_stream_e1_self_loop_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e1_mutual_recursion_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_mut_a", "ens_mut_b"], "").await;
     wait_ready_all(&base, &["ens_mut_a"]).await;
 
     let client = reqwest::Client::new();
@@ -3789,7 +3860,8 @@ async fn test_audit_stream_e1_mutual_recursion_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e1_child_streaming_d4_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["ens_child_stream", "ens_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_child_stream"]).await;
 
     let client = reqwest::Client::new();
@@ -3816,7 +3888,8 @@ async fn test_audit_stream_e1_child_streaming_d4_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e2_output_mid_and_field() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["echo", "ens_out_field", "ens_out_mid", "pre"], "").await;
     wait_ready_all(&base, &["ens_out_mid", "ens_out_field"]).await;
 
     let client = reqwest::Client::new();
@@ -3854,7 +3927,7 @@ async fn test_audit_stream_e2_output_mid_and_field() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e2_output_missing_field_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_out_missing", "pre"], "").await;
     wait_ready_all(&base, &["ens_out_missing"]).await;
 
     let client = reqwest::Client::new();
@@ -3877,7 +3950,7 @@ async fn test_audit_stream_e2_output_missing_field_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e3_params_merged() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_params"], "").await;
     wait_ready_all(&base, &["ens_params"]).await;
 
     let client = reqwest::Client::new();
@@ -3906,7 +3979,7 @@ async fn test_audit_stream_e3_params_merged() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e3_params_binary_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_params"], "").await;
     wait_ready_all(&base, &["ens_params"]).await;
 
     let client = reqwest::Client::new();
@@ -3931,7 +4004,7 @@ async fn test_audit_stream_e3_params_binary_400() {
 async fn test_audit_stream_e4_snapshot_active_drift() {
     // drift must hold TWO loaded versions (v1 active, v2 pre-loaded for the
     // mid-request activation) — default max_loaded_versions=1 would 409.
-    let (base, _guard, _repo) = boot_server_orch("", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
+    let (base, _guard, _repo) = boot_server_orch(&["drift", "ens_drift"], "", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
     wait_ready_all(&base, &["ens_drift"]).await;
 
     let client = reqwest::Client::new();
@@ -4050,7 +4123,7 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e4_snapshot_nested_d36() {
-    let (base, _guard, _repo) = boot_server_orch("", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
+    let (base, _guard, _repo) = boot_server_orch(&["drift", "ens_drift_child", "ens_drift_parent"], "", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
     wait_ready_all(&base, &["ens_drift_parent"]).await;
 
     let client = reqwest::Client::new();
@@ -4141,7 +4214,7 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e5_stream_timeout_error_frame() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_e5_stream", "pre", "tail_slow"], "").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
 
     let body = sse_post(
@@ -4167,7 +4240,7 @@ async fn test_audit_stream_e5_stream_timeout_error_frame() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e5_autoload_timeout_504() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_e5_autoload", "pre"], "").await;
     wait_ready_all(&base, &["ens_e5_autoload"]).await;
 
     let err = sse_post(
@@ -4195,7 +4268,8 @@ async fn test_audit_stream_e5_stream_timeout_grpc_deadline_exceeded() {
     use lite_server::proto::liteserver::StreamInferRequest;
     use std::collections::HashMap;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["ens_e5_stream", "pre", "tail_slow"], "").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -4242,7 +4316,7 @@ async fn test_audit_stream_e5_stream_timeout_grpc_deadline_exceeded() {
 #[serial]
 async fn test_audit_stream_e5_stream_timeout_ws_error_close() {
     use futures::{SinkExt, StreamExt};
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_e5_stream", "pre", "tail_slow"], "").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -4306,7 +4380,7 @@ async fn test_audit_stream_e5_stream_timeout_h2_bidi_error_frame() {
     use lite_server::proto::liteserver as pb;
     use lite_server::streaming::lpm;
 
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_e5_stream", "pre", "tail_slow"], "").await;
     wait_ready_all(&base, &["ens_e5_stream"]).await;
 
     // Single Open frame (single frame = the original value, D17) + body EOF
@@ -4393,7 +4467,8 @@ async fn test_audit_stream_e5_stream_timeout_h2_bidi_error_frame() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e1_sibling_same_child_not_recursion() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["drift", "ens_drift_child", "ens_sibling_race"], "").await;
     wait_ready_all(&base, &["ens_sibling_race", "ens_drift_child"]).await;
 
     let client = reqwest::Client::new();
@@ -4425,7 +4500,8 @@ async fn test_audit_stream_e1_sibling_same_child_not_recursion() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e5_nested_step_timeout_enforced() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["drift", "ens_e5_nested_timeout", "ens_e5_slow_child"], "").await;
     wait_ready_all(&base, &["ens_e5_nested_timeout"]).await;
 
     let client = reqwest::Client::new();
@@ -4457,7 +4533,7 @@ async fn test_audit_stream_e5_nested_step_timeout_enforced() {
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_e4_metric_version_label_normalized_to_latest() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["drift", "ens_drift"], "").await;
     wait_ready_all(&base, &["ens_drift"]).await;
 
     let client = reqwest::Client::new();
@@ -4509,7 +4585,7 @@ async fn test_audit_stream_e4_metric_version_label_normalized_to_latest() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_skip_step_sibling_continues() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_skip", "pre", "pre_5xx"], "").await;
     wait_ready_all(&base, &["ens_skip"]).await;
 
     let client = reqwest::Client::new();
@@ -4536,7 +4612,7 @@ async fn test_audit_e6_skip_step_sibling_continues() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_unary_retry_recovers() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_retry", "pre_flaky"], "").await;
     wait_ready_all(&base, &["ens_retry"]).await;
 
     let client = reqwest::Client::new();
@@ -4560,7 +4636,7 @@ async fn test_audit_e6_unary_retry_recovers() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_retry_default_off_is_500() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_retry_off", "pre_flaky"], "").await;
     wait_ready_all(&base, &["ens_retry_off"]).await;
 
     let client = reqwest::Client::new();
@@ -4582,7 +4658,7 @@ async fn test_audit_e6_retry_default_off_is_500() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_retry_exhausted_is_500() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_retry_exhaust", "pre_5xx"], "").await;
     wait_ready_all(&base, &["ens_retry_exhaust"]).await;
 
     let client = reqwest::Client::new();
@@ -4605,7 +4681,7 @@ async fn test_audit_e6_retry_exhausted_is_500() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_stream_build_retry_recovers() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_stream_retry", "pre", "tail_flaky"], "").await;
     wait_ready_all(&base, &["ens_stream_retry"]).await;
 
     let body = sse_post(
@@ -4629,7 +4705,8 @@ async fn test_audit_e6_stream_build_retry_recovers() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_stream_retry_exhausted_error_frame() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["ens_stream_retry_exhaust", "pre", "tail_fail_always"], "").await;
     wait_ready_all(&base, &["ens_stream_retry_exhaust"]).await;
 
     let body = sse_post(
@@ -4651,7 +4728,8 @@ async fn test_audit_e6_stream_retry_exhausted_error_frame() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e6_stream_committed_no_replay() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["ens_stream_committed", "pre", "tail_fail"], "").await;
     wait_ready_all(&base, &["ens_stream_committed"]).await;
 
     let body = sse_post(
@@ -4682,7 +4760,7 @@ async fn test_audit_e6_stream_committed_no_replay() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_envelope_happy_http_unary() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_mimo", "pre"], "").await;
     wait_ready_all(&base, &["ens_mimo"]).await;
 
     let client = reqwest::Client::new();
@@ -4709,7 +4787,7 @@ async fn test_audit_mimo_envelope_happy_http_unary() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_missing_required_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_mimo", "pre"], "").await;
     wait_ready_all(&base, &["ens_mimo"]).await;
 
     let client = reqwest::Client::new();
@@ -4731,7 +4809,7 @@ async fn test_audit_mimo_missing_required_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_unknown_input_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_mimo", "pre"], "").await;
     wait_ready_all(&base, &["ens_mimo"]).await;
 
     let client = reqwest::Client::new();
@@ -4758,7 +4836,8 @@ async fn test_audit_mimo_unknown_input_400() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_binary_passthrough_chain() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["classifier", "cropper", "ens_mimo_bin", "vis_enc"], "").await;
     wait_ready_all(&base, &["ens_mimo_bin"]).await;
 
     let head = json!({"id": "r1", "inputs": [
@@ -4815,7 +4894,7 @@ async fn test_audit_mimo_binary_passthrough_chain() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_conditional_skip() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_mimo_cond", "pre", "pre_5xx"], "").await;
     wait_ready_all(&base, &["ens_mimo_cond"]).await;
 
     let client = reqwest::Client::new();
@@ -4840,7 +4919,7 @@ async fn test_audit_mimo_conditional_skip() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo_r19_reserved_namespace_400() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_unary", "pre"], "").await;
     wait_ready_all(&base, &["ens_unary"]).await;
 
     let client = reqwest::Client::new();
@@ -4867,7 +4946,7 @@ async fn test_audit_mimo_grpc_lsbe1_container() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc(&["echo", "ens_mimo", "pre"], "").await;
     wait_ready_all(&base, &["ens_mimo"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -4923,7 +5002,7 @@ async fn test_audit_mimo_ws_bidi_envelope_frame_immediate() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_mimo_stream", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_mimo_stream"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -4974,7 +5053,7 @@ async fn test_audit_mimo_ws_bidi_envelope_frame_immediate() {
 #[serial]
 #[tokio::test]
 async fn test_audit_mimo2_json_alias_projection() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_mimo_json_alias", "pre"], "").await;
     wait_ready_all(&base, &["ens_mimo_json_alias"]).await;
 
     let client = reqwest::Client::new();
@@ -5004,7 +5083,8 @@ async fn test_audit_mimo2_json_alias_projection() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e7_multisink_envelope_response() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["ens_multisink", "pre", "pre_5xx", "vis_enc"], "").await;
     wait_ready_all(&base, &["ens_multisink"]).await;
 
     let image_bytes: &[u8] = b"\x00\x01\x02";
@@ -5076,7 +5156,8 @@ async fn test_audit_e7_multisink_grpc_lsbe1_response() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["ens_multisink", "pre", "pre_5xx", "vis_enc"], "").await;
     wait_ready_all(&base, &["ens_multisink"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5128,7 +5209,7 @@ async fn test_audit_e7_multisink_grpc_lsbe1_response() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e8_dag_selection_http_header() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_dags", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags"]).await;
 
     let client = reqwest::Client::new();
@@ -5199,7 +5280,7 @@ async fn test_audit_e8_dag_selection_grpc_metadata() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc(&["echo", "ens_dags", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5231,7 +5312,7 @@ async fn test_audit_e8_dag_selection_grpc_metadata() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d41_body_routing() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_dags_sel", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags_sel"]).await;
 
     let client = reqwest::Client::new();
@@ -5329,7 +5410,7 @@ async fn test_audit_d41_body_routing() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d41_request_dag_visibility() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_sel_when", "pre"], "").await;
     wait_ready_all(&base, &["ens_sel_when"]).await;
 
     let client = reqwest::Client::new();
@@ -5374,7 +5455,8 @@ async fn test_audit_d41_request_dag_visibility() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d41_nested_child() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["echo", "ens_dags_sel", "ens_sel_parent", "pre"], "").await;
     wait_ready_all(&base, &["ens_sel_parent", "ens_dags_sel"]).await;
 
     let client = reqwest::Client::new();
@@ -5420,7 +5502,8 @@ async fn test_audit_d41_nested_child() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d41_nested_unknown_set_names_ref() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["echo", "ens_dags_sel", "ens_sel_parent", "pre"], "").await;
     wait_ready_all(&base, &["ens_sel_parent", "ens_dags_sel"]).await;
 
     let client = reqwest::Client::new();
@@ -5449,7 +5532,8 @@ async fn test_audit_d41_grpc_body_selection() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["echo", "ens_dags_sel", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags_sel"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5482,7 +5566,8 @@ async fn test_audit_d41_batch_dags_form() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::BatchInferRequest;
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["echo", "ens_dags", "ens_dags_sel", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags", "ens_dags_sel"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5573,7 +5658,7 @@ async fn test_audit_d41_batch_dags_form() {
 #[tokio::test]
 #[serial]
 async fn test_audit_d41_ws_body_routing() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_dags_stream_sel", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_dags_stream_sel"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -5642,7 +5727,7 @@ async fn test_audit_d41_ws_body_routing() {
 #[tokio::test]
 #[serial]
 async fn test_audit_d41_ws_multi_frame_array_root_rejected() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_dags_sel", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags_sel"]).await;
     let http_port = base
         .trim_start_matches("http://127.0.0.1:")
@@ -5711,7 +5796,8 @@ async fn test_audit_d41_grpc_bidi_body_routing() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiOpen};
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["ens_dags_stream_sel", "pre", "tail"], "").await;
     wait_ready_all(&base, &["ens_dags_stream_sel"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5773,7 +5859,8 @@ async fn test_audit_d41_grpc_bidi_multi_frame_array_root_rejected() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiData, BidiOpen};
 
-    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    let (base, grpc_port, _guard, _repo) =
+        boot_server_grpc(&["echo", "ens_dags_sel", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags_sel"]).await;
 
     let channel = grpc_tcp_channel(grpc_port).await;
@@ -5819,7 +5906,7 @@ async fn test_audit_d41_grpc_bidi_multi_frame_array_root_rejected() {
 #[serial]
 #[tokio::test]
 async fn test_audit_e8_when_skip_and_dag_condition() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_when", "pre", "pre_5xx"], "").await;
     wait_ready_all(&base, &["ens_when"]).await;
 
     let client = reqwest::Client::new();
@@ -5967,7 +6054,8 @@ const ENS_WHEN_DAG_OBS_YAML: &str = r#"ensemble:
 #[serial]
 #[tokio::test]
 async fn test_audit_nested_dags_child_executes_default_set() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) =
+        boot_server(&["echo", "ens_dags", "ens_nested_dags_parent", "pre"], "").await;
     wait_ready_all(&base, &["ens_nested_dags_parent"]).await;
 
     let client = reqwest::Client::new();
@@ -5997,7 +6085,7 @@ async fn test_audit_nested_dags_child_executes_default_set() {
 #[serial]
 #[tokio::test]
 async fn test_audit_dags_superset_envelope_tolerated() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_dags_inputs", "pre"], "").await;
     wait_ready_all(&base, &["ens_dags_inputs"]).await;
 
     let client = reqwest::Client::new();
@@ -6034,7 +6122,7 @@ async fn test_audit_dags_superset_envelope_tolerated() {
 #[serial]
 #[tokio::test]
 async fn test_audit_when_dag_sees_resolved_default() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo", "ens_when_dag_obs", "pre"], "").await;
     wait_ready_all(&base, &["ens_when_dag_obs"]).await;
 
     let client = reqwest::Client::new();
@@ -6152,7 +6240,7 @@ const ENS_NOFWD_YAML: &str = r#"ensemble:
 #[serial]
 #[tokio::test]
 async fn test_audit_d42_forward_headers_allowlist_is_the_boundary() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_fwd", "ens_nofwd", "hdr_echo"], "").await;
     wait_ready_all(&base, &["ens_fwd", "ens_nofwd"]).await;
 
     let client = reqwest::Client::new();
@@ -6201,7 +6289,7 @@ async fn test_audit_d42_forward_headers_allowlist_is_the_boundary() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d44_output_step_response_header_reaches_the_client() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["ens_fwd", "hdr_echo"], "").await;
     wait_ready_all(&base, &["ens_fwd"]).await;
 
     let resp = reqwest::Client::new()
@@ -6245,7 +6333,7 @@ async fn test_audit_d44_output_step_response_header_reaches_the_client() {
 #[serial]
 #[tokio::test]
 async fn test_audit_d43_passthrough_keeps_the_body_byte_exact() {
-    let (base, _guard, _repo) = boot_server("").await;
+    let (base, _guard, _repo) = boot_server(&["echo_raw", "ens_relay"], "").await;
     wait_ready_all(&base, &["ens_relay"]).await;
 
     // Unusual spacing + key order: a round trip through serde_json would
