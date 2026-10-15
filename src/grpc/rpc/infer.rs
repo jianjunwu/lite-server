@@ -11,7 +11,7 @@ use crate::grpc::error::{
     try_parse_model_error, with_retry_after,
 };
 use crate::grpc::interceptor;
-use crate::grpc::metadata::inject_grpc_metadata;
+use crate::grpc::metadata::response_headers_for_grpc;
 use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
@@ -193,12 +193,16 @@ impl GrpcService {
                         )));
                     }
                 };
+                // D44/D46: the OUTPUT step's worker response metadata rides
+                // the same `InferResponse` fields as the direct path's.
                 return Ok(Response::new(pb::InferResponse {
                     data,
                     status: None,
                     metrics: None,
-                    // D44: the OUTPUT step's worker response metadata.
-                    headers: meta.as_ref().map(|m| m.headers.clone()).unwrap_or_default(),
+                    headers: meta
+                        .as_ref()
+                        .map(|m| response_headers_for_grpc(&m.headers))
+                        .unwrap_or_default(),
                     status_code: meta.as_ref().map_or(0, |m| i32::from(m.status_code)),
                 }));
             }
@@ -382,20 +386,18 @@ impl GrpcService {
                         Err(err(Status::internal(msg)))
                     }
                     _ => {
-                        let headers = single.headers.clone();
-                        let mut response = Response::new(pb::InferResponse {
+                        // D44/D46: the worker's response metadata rides the
+                        // InferResponse fields — the ONE channel, shared with
+                        // the ensemble egress (previously this was injected as
+                        // response metadata instead, so the two paths carried
+                        // the same data in different places).
+                        let response = Response::new(pb::InferResponse {
                             data: single.data,
                             status: grpc_status,
                             metrics: resp.metrics,
-                            // D44: the DIRECT unary path keeps its historical
-                            // channel — the worker's headers ride the response
-                            // metadata (inject_grpc_metadata below) — so the
-                            // new fields stay at their defaults. Only the
-                            // ensemble egress fills them.
-                            headers: HashMap::new(),
-                            status_code: 0,
+                            headers: response_headers_for_grpc(&single.headers),
+                            status_code: single.status_code,
                         });
-                        inject_grpc_metadata(response.metadata_mut(), &headers);
 
                         // Fire InferenceResponse callback
                         crate::callback::fire_inference_response(

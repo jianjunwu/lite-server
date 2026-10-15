@@ -7,7 +7,7 @@ use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::err;
 use crate::grpc::interceptor;
-use crate::grpc::metadata::inject_grpc_metadata;
+use crate::grpc::metadata::response_headers_for_grpc;
 use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
@@ -72,8 +72,8 @@ fn d30_element_error(e: &AppError) -> pb::InferResponse {
             message: format!("{} {}", e.http_status().as_u16(), e),
         }),
         metrics: None,
-        // D44: the error's own status rides Status.message (below); no worker
-        // metadata is attached on this path.
+        // D44/D46: this path's own status rides Status.message (above); no
+        // worker metadata is attached.
         headers: HashMap::new(),
         status_code: 0,
     }
@@ -82,9 +82,11 @@ fn d30_element_error(e: &AppError) -> pb::InferResponse {
 /// D30: success element — Json serialized back to bytes; Binary passed
 /// through verbatim (InferResponse carries no per-item content-type field).
 ///
-/// D44 (2026-10-15): the element's worker response metadata now rides the two
-/// additive `InferResponse` fields — one batch can therefore carry different
-/// metadata per element, matching the per-element payload routing (D41).
+/// D44/D46: the element's worker response metadata rides the same
+/// `InferResponse` fields the DIRECT batch path fills. Per ELEMENT — which is
+/// exactly why the channel is a message field and not response metadata: the
+/// latter is per-RPC and could never express one batch carrying two different
+/// sets, and this is the batch item type.
 fn d30_element_ok(
     value: crate::ensemble::EnsembleValue,
     meta: Option<crate::ensemble::StepResponseMeta>,
@@ -109,7 +111,10 @@ fn d30_element_ok(
             message: String::new(),
         }),
         metrics: None,
-        headers: meta.as_ref().map(|m| m.headers.clone()).unwrap_or_default(),
+        headers: meta
+            .as_ref()
+            .map(|m| response_headers_for_grpc(&m.headers))
+            .unwrap_or_default(),
         status_code: meta.as_ref().map_or(0, |m| i32::from(m.status_code)),
     }
 }
@@ -348,16 +353,15 @@ impl GrpcService {
                         data: item.data,
                         status: item.status,
                         metrics: None,
-                        // D44: the DIRECT batch path keeps the historical
-                        // channel — headers ride the response metadata
-                        // (inject_grpc_metadata below); the new fields stay
-                        // at their defaults. Only the ensemble path fills them.
-                        headers: HashMap::new(),
-                        status_code: 0,
+                        // D44/D46: per-ELEMENT worker metadata. The direct
+                        // batch path used to drop these (it injected only the
+                        // deprecated, never-populated batch-level map); the
+                        // ensemble path already fills them, so both agree now.
+                        headers: response_headers_for_grpc(&item.headers),
+                        status_code: item.status_code,
                     })
                     .collect();
-                let mut response = Response::new(pb::BatchInferResponse { items });
-                inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
+                let response = Response::new(pb::BatchInferResponse { items });
                 // Fire InferenceResponse callback (aligned with unary infer_impl).
                 crate::callback::fire_inference_response(&self.callback_runner, &req_ctx, start);
                 Ok(response)
@@ -614,5 +618,31 @@ mod tests {
         );
         assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
         assert_eq!(resp.data.as_ref(), b"raw");
+    }
+
+    /// D44/D46: one batch can carry DIFFERENT metadata per element — the
+    /// property response metadata (per-RPC) could not express, and the reason
+    /// the channel is a message field.
+    #[test]
+    fn d44_d46_element_metadata_is_per_element() {
+        let first = d30_element_ok(
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 1})),
+            Some(crate::ensemble::StepResponseMeta {
+                status_code: 201,
+                headers: [("x-tenant-id".to_string(), "acme".to_string())].into(),
+            }),
+        );
+        let second = d30_element_ok(
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 2})),
+            None,
+        );
+
+        assert_eq!(first.status_code, 201);
+        assert_eq!(
+            first.headers.get("x-tenant-id").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(second.status_code, 0);
+        assert!(second.headers.is_empty(), "elements are independent");
     }
 }

@@ -75,7 +75,7 @@ ensemble:
 
 请求根仍会被解析一次供 DAG 引擎自用（`$request.*` 引用、`dag_selector`）；passthrough 省掉的只是 step 载荷的那一次往返。与末步 `stream: true` 组合即最常见的中转形态。
 
-**响应元数据回传**：unary ensemble 的输出 step 的 worker **响应头与状态码**会到达客户端——HTTP 侧经与其它响应完全相同的 `content-type`/`content-length` 护栏注入；gRPC 侧经新增的 `InferResponse.headers`/`status_code` 字段（batch 逐元素各自携带）。只有**输出** step 的元数据被采用，上游 step 的响应头丢弃。流式 ensemble 不受影响：流的响应头属于服务端。
+**响应元数据回传**：unary ensemble 的输出 step 的 worker **响应头与状态码**会到达客户端。HTTP 侧经与其它响应完全相同的 `content-type`/`content-length` 护栏注入。gRPC 侧走 `InferResponse.headers`/`status_code`——这是 gRPC 面**所有路径**（含直连 `Infer`/`BatchInfer`）回传 worker 响应元数据的唯一通道，客户端读同一组字段即可，不必关心响应由哪条路径产生（且**逐元素**：同一 batch 的不同元素可携带不同元数据）。只有**输出** step 的元数据被采用，上游 step 的响应头丢弃。流式 ensemble 不受影响：流的响应头属于服务端。
 
 DAG 也可用 **Python 声明**（E9-A）：在 `config.yaml` 旁的 `dag.py` 中用 `lite_server.ensemble` 的 `EnsembleDAG` 声明（见 [examples/05_ensemble](../../examples/05_ensemble)），序列化为等价的手写配置；`lite-server analyze` 会对声明与 `config.yaml` 做一致性检查并报告漂移（LS112）。服务端执行的是 `config.yaml`——Python 声明只是编写面，绝不执行。`Step(..., forward_headers=[...])` 与 `Step(..., passthrough=True)` 已镜像。
 

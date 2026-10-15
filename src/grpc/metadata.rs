@@ -5,7 +5,7 @@
 use super::error::grpc_code_to_status_family;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Response, Status};
 
 /// P2-3：从入站 metadata 取 request_id（span 字段用；与 interceptor 同源）。
@@ -109,20 +109,21 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// Inject custom response headers into tonic gRPC metadata,
-/// blocking hop-by-hop and transport headers.
-pub(super) fn inject_grpc_metadata(metadata: &mut MetadataMap, headers: &HashMap<String, String>) {
-    for (k, v) in headers {
-        let lower = k.to_ascii_lowercase();
-        if BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {
-            continue;
-        }
-        if let Ok(mk) = MetadataKey::from_bytes(k.as_bytes()) {
-            if let Ok(mv) = MetadataValue::try_from(v.as_str()) {
-                metadata.insert(mk, mv);
-            }
-        }
-    }
+/// D46: the worker response headers a gRPC client should see, as they go into
+/// `InferResponse.headers`.
+///
+/// Still filters `BLOCKED_RESPONSE_HEADERS`: those describe the HTTP hop (or
+/// are set by the server on every other face), so a worker may not put them on
+/// the response — the same policy the HTTP egress applies via
+/// `protocol::inject_response_headers_into`.
+pub(super) fn response_headers_for_grpc(
+    headers: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(k, _)| !BLOCKED_RESPONSE_HEADERS.contains(&k.to_ascii_lowercase().as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 #[cfg(test)]
