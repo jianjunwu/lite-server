@@ -30,7 +30,6 @@ _RELOAD_COST_ORDER = ("workers_per_device", "max_batch_size", "batch_timeout")
 # Default grids when batching is not declared (workers_per_device + concurrency only)
 DEFAULT_WORKERS_GRID = (1, 2, 4)
 DEFAULT_BATCH_GRID = (2, 4, 8, 16)
-DEFAULT_BATCH_TIMEOUTS_MS = (0, 5, 20)
 DEFAULT_CONCURRENCY = (1, 2, 4, 8, 16)
 
 
@@ -152,11 +151,19 @@ def default_knobs(
     batching_declared: bool | None,
     continuous_batching: bool,
 ) -> dict[str, list]:
-    """v1 default grid (§2.3): decided by declaration state, no conflicting keys."""
+    """v1 default grid (§2.3): decided by declaration state, no conflicting keys.
+
+    Bounded so that the shipped defaults compose (§2.3: total trials ≤
+    `--max-trials`): the widest default grid is 4 (`max_batch_size`) × 3
+    (`workers_per_device`) = 12 config points, and 12 × the 5 default
+    concurrency levels = 60 ≤ 64. `batch_timeout` is therefore *not* part of
+    the default sweep — it is the finest-grained axis and tripling the run for
+    it would put the default invocation over the cap. Sweep it explicitly
+    when it matters: `--sweep-knob batch_timeout=0,0.005,0.02`.
+    """
     knobs: dict[str, list] = {}
     if batching_declared is True:
         knobs["max_batch_size"] = list(DEFAULT_BATCH_GRID)
-        knobs["batch_timeout"] = [t / 1000.0 for t in DEFAULT_BATCH_TIMEOUTS_MS]
     if not continuous_batching:
         knobs["workers_per_device"] = list(DEFAULT_WORKERS_GRID)
     return knobs

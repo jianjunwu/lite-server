@@ -25,6 +25,9 @@ from lite_server.context import RequestContext
 _MAX_ACCELERATOR_DEVICES = 64
 
 
+_METRIC_TYPES = frozenset({"gauge", "counter", "histogram"})
+
+
 @dataclass
 class _MetricSpec:
     """Internal: pre-registered metric specification."""
@@ -281,7 +284,20 @@ class LitAPI:
 
         Returns:
             Numeric metric ID.
+
+        Raises:
+            ValueError: If ``metric_type`` is not one of the three above.
+                Validated here because nothing downstream rejects it: the
+                Python collector and the Rust registrar both *skip* an
+                unknown type silently, so a typo (``"counters"``) returns an
+                id, ``report_metric`` keeps accepting values, and the metric
+                just never appears anywhere.
         """
+        if metric_type not in _METRIC_TYPES:
+            raise ValueError(
+                f"unknown metric_type {metric_type!r}: must be one of "
+                + ", ".join(repr(t) for t in sorted(_METRIC_TYPES))
+            )
         idx = len(self._metric_specs)
         per_type_id = sum(
             1 for s in self._metric_specs if s.metric_type == metric_type

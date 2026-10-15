@@ -66,11 +66,20 @@ pub(crate) fn normalize_origin(raw: &str) -> Option<NormalizedOrigin> {
         return None;
     }
     let host = host.to_ascii_lowercase();
-    let port = match (scheme.as_str(), port) {
-        ("https", Some(443)) | ("http", Some(80)) => None,
-        (_, p) => p,
-    };
+    let port = port.filter(|p| Some(*p) != default_port(&scheme));
     Some(NormalizedOrigin { scheme, host, port })
+}
+
+/// The port a browser omits from `Origin` for `scheme` (`None` for schemes
+/// with no default). Single source for the normalization above and for the
+/// wildcard port comparison below — they must agree, or an allowlist entry
+/// written with an explicit default port silently stops matching.
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    }
 }
 
 /// `host` / `host:port` / `[ipv6]:port` → (host, Option<port>)。
@@ -162,11 +171,25 @@ impl WildcardOrigin {
         if self.scheme != "*" && self.scheme != o.scheme {
             return false;
         }
-        if self.port != o.port {
+        if !self.matches_port(o) {
             return false;
         }
         // host 须以 suffix 结尾且更长相邻（apex `example.com` 不被 `*.example.com` 命中）。
         o.host.ends_with(&self.suffix) && o.host.len() > self.suffix.len()
+    }
+
+    /// 端口比较（与 `normalize_origin` 同一套归一约定）：条目写明端口时，它比对
+    /// Origin 的**有效**端口——Origin 显式带的端口，或（浏览器恒省略的）该 scheme
+    /// 默认端口，故 `https://*.example.com:443` 命中 `https://app.example.com`。
+    /// 条目没写端口时只有限定了 scheme 才约束（裸 `*.example.com` 对端口不表态）。
+    fn matches_port(&self, o: &NormalizedOrigin) -> bool {
+        let Some(pattern_port) = self.port else {
+            return self.scheme == "*" || o.port.is_none();
+        };
+        match o.port {
+            Some(p) => p == pattern_port,
+            None => default_port(&o.scheme) == Some(pattern_port),
+        }
     }
 }
 
@@ -418,6 +441,33 @@ mod tests {
         // 也不应误匹配一个无关 origin。
         let o = norm("https://evil-example.com");
         assert_eq!(resolve_acao(&o, &["https://example.com".into()]), None);
+    }
+
+    /// BUG: `normalize_origin` maps an explicit default port to `None`
+    /// (`https://a.example.com:443` → no port), and `normalize_strips_default_port`
+    /// pins that. But `parse_wildcard` keeps the port taken straight from the
+    /// pattern, so the wildcard `https://*.example.com:443` carries
+    /// `Some(443)` and `WildcardOrigin::matches` requires `self.port ==
+    /// o.port`.
+    ///
+    /// Browsers never send `:443` in `Origin`, so every subdomain under an
+    /// allowlist entry written with the explicit default port is rejected —
+    /// the documented exact-entry form works, so the same convention silently
+    /// breaks only for wildcards.
+    #[test]
+    fn subdomain_wildcard_with_explicit_default_port_matches() {
+        let allow = &["https://*.example.com:443".into()];
+        assert!(
+            resolve_acao(&norm("https://app.example.com"), allow).is_some(),
+            "`https://*.example.com:443` must match `https://app.example.com` \
+             (the explicit entry form drops the default port, the wildcard \
+             form does not)"
+        );
+        let allow_http = &["http://*.example.com:80".into()];
+        assert!(
+            resolve_acao(&norm("http://app.example.com"), allow_http).is_some(),
+            "`http://*.example.com:80` must match `http://app.example.com`"
+        );
     }
 
     #[test]

@@ -7,7 +7,11 @@ type StatusKind = 'ready' | 'loading' | 'warning' | 'error' | 'offline';
 export function statusKind(status: string | null | undefined): StatusKind {
   const s = (status ?? '').toLowerCase();
   if (['ready', 'loaded', 'ok', 'healthy', 'running', 'active'].includes(s)) return 'ready';
-  if (['loading', 'starting', 'initializing', 'pending'].includes(s)) return 'loading';
+  // `warming_up` is the server's P-WARM phase (VersionStatus::WarmingUp):
+  // workers handshaked but explicitly NOT serving yet. It must not fall
+  // through to 'offline', which the model list then promotes to a green
+  // "Ready" badge for a version that is not serving.
+  if (['loading', 'starting', 'initializing', 'pending', 'warming_up'].includes(s)) return 'loading';
   if (['degraded', 'warning', 'unloading', 'draining'].includes(s)) return 'warning';
   if (['failed', 'error', 'unhealthy'].includes(s)) return 'error';
   return 'offline';

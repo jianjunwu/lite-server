@@ -74,10 +74,18 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
     // UnsupportedMediaType / Unauthorized) carry client-safe detail — the
     // same message contract as the HTTP JSON `error` field.
     let status = Status::new(http_status_to_grpc_code(http_status), e.client_message());
-    // §4.0.9 收口:queue-full → Unavailable + retry-after(对齐 HTTP 侧
-    // QueueFull 恒挂 Retry-After: 1,以及直连路径的 with_retry_after;
-    // ensemble 子步骤 QueueFull 经此集中映射)。
-    if matches!(e, AppError::QueueFull(_)) {
+    // §4.0.9 收口:瞬态错误 → retry-after(对齐 HTTP 侧 Retry-After: 1 的同一
+    // 集合,src/error.rs AppError::canonical:QueueFull / BadGateway /
+    // WorkerRecycling / StreamingCapacityExceeded,以及直连路径的
+    // with_retry_after)。这几个变体在 HTTP 与 gRPC 上是同一个瞬态事件,客户端的
+    // 退避决策不能因协议而异。
+    if matches!(
+        e,
+        AppError::QueueFull(_)
+            | AppError::BadGateway(_)
+            | AppError::WorkerRecycling(_)
+            | AppError::StreamingCapacityExceeded(_)
+    ) {
         with_retry_after(status, 1)
     } else {
         status
@@ -213,6 +221,37 @@ pub(crate) fn with_retry_after(mut status: Status, secs: u32) -> Status {
 mod tests {
     use super::*;
     use tonic_types::StatusExt;
+
+    /// BUG: `app_error_to_grpc_status` attaches `retry-after` for `QueueFull`
+    /// only, while the HTTP sibling (`AppError::canonical`'s header map in
+    /// src/error.rs) attaches `Retry-After: 1` for `QueueFull | BadGateway |
+    /// WorkerRecycling | StreamingCapacityExceeded` — with a comment claiming
+    /// that set exists precisely to "align with gRPC Unavailable +
+    /// retry-after metadata".
+    ///
+    /// So the same transient condition (worker recycled, ensemble DAG
+    /// capacity valve exhausted) tells an HTTP client to back off and leaves
+    /// a gRPC client with no retry hint at all.
+    #[test]
+    fn transient_errors_carry_retry_after_on_grpc_like_they_do_on_http() {
+        for e in [
+            AppError::BadGateway("upstream worker gone".into()),
+            AppError::WorkerRecycling("worker recycling".into()),
+            AppError::StreamingCapacityExceeded("ensemble dag valve".into()),
+            AppError::QueueFull("queue full".into()),
+        ] {
+            let status = app_error_to_grpc_status(&e);
+            assert_eq!(
+                status
+                    .metadata()
+                    .get("retry-after")
+                    .map(|v| v.to_str().unwrap()),
+                Some("1"),
+                "{e:?} must carry retry-after metadata on gRPC (HTTP sends \
+                 Retry-After: 1 for the same condition)"
+            );
+        }
+    }
 
     // --- P1-1: graded error logging (client-class → info, server faults → error) ---
 

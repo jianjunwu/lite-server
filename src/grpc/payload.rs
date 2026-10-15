@@ -16,7 +16,15 @@ const BIDI_FRAMING_CONTENT_TYPE: &str = "application/x-lite-bidi";
 /// (pipeline.py:82). Returns true when the payload MUST be valid JSON; false
 /// when it MUST be treated as opaque bytes.
 pub(crate) fn grpc_payload_is_json(headers: &HashMap<String, String>) -> bool {
-    let Some(ct) = headers.get("content-type") else {
+    // Header names are case-insensitive and the proto map holds whatever the
+    // client spelled, so the lookup must be too: a literal `get("content-type")`
+    // reads `Content-Type: image/png` as "no header" and validates binary bytes
+    // as JSON. grpc/auth.rs compares the same map the same way.
+    let Some(ct) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+    else {
         return true; // missing → JSON default (D2 parity)
     };
     let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
@@ -72,6 +80,32 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// BUG: the proto `headers` map is looked up with the literal lowercase
+    /// key `"content-type"`, so a client that spells the header with HTTP
+    /// casing (`Content-Type`) is treated as "no content-type" and falls into
+    /// the JSON default.
+    ///
+    /// The same request's auth fallback (`grpc/auth.rs`) deliberately compares
+    /// header names with `eq_ignore_ascii_case` "per HTTP header semantics",
+    /// and the Python mirror (`_payload_content_type` via `Headers`) is
+    /// case-insensitive — so the gateway diverges from both the worker and
+    /// its own auth rule. A REST→gRPC bridge sending `Content-Type: image/png`
+    /// with binary bytes gets `invalid JSON payload`, and in the ensemble
+    /// branch the declared content type is dropped before the sub-model sees
+    /// it.
+    #[test]
+    fn payload_is_json_is_case_insensitive_on_the_header_name() {
+        assert!(
+            !grpc_payload_is_json(&h(&[("Content-Type", "application/octet-stream")])),
+            "a capitalized `Content-Type: application/octet-stream` must dispatch \
+             as raw, not fall through to the missing-header JSON default"
+        );
+        assert!(
+            !grpc_payload_is_json(&h(&[("Content-Type", "image/png")])),
+            "`Content-Type: image/png` must dispatch as raw"
+        );
     }
 
     /// Dispatch truth table — mirrors the Python `_payload_content_type` /

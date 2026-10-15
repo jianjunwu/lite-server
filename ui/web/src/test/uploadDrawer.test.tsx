@@ -65,7 +65,14 @@ describe('UploadDrawer overwrite flow', () => {
     const conflict = new ApiError(
       409,
       null,
-      { code: 'conflict', message: 'version 1 of model m already exists; pass ?force=true to overwrite' },
+      {
+        error: {
+          type: 'conflict_error',
+          code: 'conflict',
+          message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+          param: null,
+        },
+      },
       'conflict',
     );
     vi.mocked(uploadModelFilesResumable)
@@ -89,7 +96,14 @@ describe('UploadDrawer overwrite flow', () => {
     const conflict = new ApiError(
       409,
       null,
-      { code: 'conflict', message: 'version 1 of model m already exists; pass ?force=true to overwrite' },
+      {
+        error: {
+          type: 'conflict_error',
+          code: 'conflict',
+          message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+          param: null,
+        },
+      },
       'conflict',
     );
     vi.mocked(uploadModelFilesResumable).mockImplementationOnce(() =>

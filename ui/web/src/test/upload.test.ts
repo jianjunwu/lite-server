@@ -280,8 +280,12 @@ describe('uploadModelChunked', () => {
         conflicted = true;
         return new Response(
           JSON.stringify({
-            code: 'conflict',
-            message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+            error: {
+              type: 'conflict_error',
+              code: 'conflict',
+              message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+              param: null,
+            },
           }),
           { status: 409, headers: { 'content-type': 'application/json' } },
         );
@@ -313,13 +317,32 @@ describe('error classification', () => {
     const conflict = new ApiError(
       409,
       null,
-      { code: 'conflict', message: 'version 1 of model m already exists; pass ?force=true to overwrite' },
+      {
+        error: {
+          type: 'conflict_error',
+          code: 'conflict',
+          message: 'version 1 of model m already exists; pass ?force=true to overwrite',
+          param: null,
+        },
+      },
       'conflict',
     );
     expect(isVersionExistsConflict(conflict)).toBe(true);
     // Other 409s (missing chunks, session completing, too many sessions)
     // must NOT trigger the overwrite flow.
-    const other = new ApiError(409, null, { code: 'conflict', message: "file 'w.bin' is missing 2 chunks" }, 'conflict');
+    const other = new ApiError(
+      409,
+      null,
+      {
+        error: {
+          type: 'conflict_error',
+          code: 'conflict',
+          message: "file 'w.bin' is missing 2 chunks",
+          param: null,
+        },
+      },
+      'conflict',
+    );
     expect(isVersionExistsConflict(other)).toBe(false);
     expect(isVersionExistsConflict(new ApiError(500, null, null, 'boom'))).toBe(false);
     expect(isVersionExistsConflict(new Error('nope'))).toBe(false);

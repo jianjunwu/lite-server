@@ -81,6 +81,13 @@ async def _proxy(request: Request, inst_id: str, tail: str = ""):
     if inst is None:
         return JSONResponse({"error": "unknown_instance", "instance": inst_id}, status_code=404)
 
+    # Resolve dot segments BEFORE the policy gates below (and before the
+    # upstream URL is rebuilt from `tail`), so every gate and the instance
+    # itself see one path: `v2/models/alpha/../beta/infer` must not pass the
+    # whitelist for `alpha` while the instance is asked for `beta`, and
+    # `.../versions/1/../2` must not skip the version-ownership rule.
+    tail = ownership.normalize_tail(tail)
+
     # Ownership policy (M2): version/session-scoped authorization, run after
     # the auth guard has populated request.state.user. Inactive when the app
     # has no user store (single-user local mode).

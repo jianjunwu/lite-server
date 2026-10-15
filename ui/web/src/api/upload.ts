@@ -34,12 +34,16 @@ export interface ChunkedUploadOptions {
  */
 export function isVersionExistsConflict(err: unknown): boolean {
   if (!(err instanceof ApiError) || err.status !== 409) return false;
-  const body = err.body as { code?: unknown; message?: unknown } | null;
-  return (
-    body?.code === 'conflict' &&
-    typeof body?.message === 'string' &&
-    body.message.includes('already exists')
-  );
+  // The instance renders every error through its protocol envelope —
+  // `{"error": {type, message, code, param}}` for the default protocol,
+  // `{"error": "<message>"}` for KServe — so the conflict fields live one
+  // level down. Reading them off the top level (as this used to) never
+  // matches the real wire shape.
+  const body = err.body as { error?: unknown } | null;
+  const detail = body?.error;
+  if (!detail || typeof detail !== 'object') return false;
+  const { code, message } = detail as { code?: unknown; message?: unknown };
+  return code === 'conflict' && typeof message === 'string' && message.includes('already exists');
 }
 
 export interface OwnershipDenial {

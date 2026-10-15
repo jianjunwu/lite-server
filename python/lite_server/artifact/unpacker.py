@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import shutil
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional, Tuple
@@ -117,7 +118,27 @@ class ModelUnpacker:
                     if filter_func(info):
                         zf.extract(info, target_dir)
             else:
-                zf.extractall(target_dir)
+                # Extract exactly what the manifest declares. `extractall()`
+                # would also write members the manifest never listed — bytes
+                # that `validate()` therefore neither hashed nor signed, so
+                # appending an entry to an otherwise-valid (even signed)
+                # artifact smuggles a file past both gates. The server shells
+                # out to this for repository auto-unpack and for untrusted
+                # uploads, and the worker puts the model dir on `sys.path`, so
+                # an unlisted `1/json.py` shadows a stdlib import and runs.
+                for rel_path in self._ensure_manifest().files:
+                    out_path = _safe_out_path(target_dir, rel_path)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(rel_path) as src, open(out_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                # The manifest ships as part of the artifact and the server
+                # reads it back after unpacking (model version, declared
+                # files). It cannot list itself in `files`, so it is written
+                # explicitly — the bytes `validate()` verified the checksums
+                # and signature against.
+                manifest_out = target_dir / "manifest.json"
+                with zf.open("manifest.json") as src, open(manifest_out, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
         return target_dir
 

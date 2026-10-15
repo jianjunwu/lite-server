@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import uuid
@@ -36,14 +37,26 @@ class ArtifactCache:
         mtime = str(artifact_path.stat().st_mtime)
         return f"{artifact_path.resolve()}:{mtime}"
 
-    def _cached_path(self, model_name: str) -> Path:
-        return self.cache_dir / model_name
+    def _cached_path(self, artifact_path: Path, model_name: str) -> Path:
+        """Extraction dir for one artifact: the model name for readability,
+        qualified by the artifact's own path.
+
+        The model name alone is not an identity — two different artifacts for
+        one model name would share a directory, so extracting B would swap B's
+        content into the dir A's index entry still points at and a later
+        lookup of A would serve B (this cache re-checks no checksum or
+        signature of its own). Deliberately not qualified by mtime: a re-packed
+        artifact at the same path must re-extract in place instead of leaking
+        a second directory.
+        """
+        digest = hashlib.sha256(str(artifact_path.resolve()).encode()).hexdigest()[:16]
+        return self.cache_dir / f"{model_name}-{digest}"
 
     def get_or_unpack(self, artifact_path: Path | str, model_name: str) -> Path:
         """Return cached extraction path, or extract if missing/outdated."""
         artifact_path = Path(artifact_path)
         cache_key = self._cache_key(artifact_path)
-        cached_path = self._cached_path(model_name)
+        cached_path = self._cached_path(artifact_path, model_name)
 
         if cache_key in self._index:
             stored_path = Path(self._index[cache_key])

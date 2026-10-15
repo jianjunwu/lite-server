@@ -33,7 +33,26 @@ from lite_server.exceptions import HTTPException
 
 
 def _request_id(request_id: str | None) -> str:
-    return request_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    return request_id or _new_id()
+
+
+def _new_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+
+# Every chunk of one stream must carry the same `id` — clients key stream
+# assembly and message identity on it. `build_chat_chunk` is called once per
+# token with nowhere to hold that id, so the fallback (no `request_id`) is
+# minted once per model and reused. Pass `request_id` (e.g.
+# `ctx.meta.request_id`) when concurrent completions of one model must stay
+# distinguishable.
+_chunk_ids: dict[str, str] = {}
+
+
+def _chunk_id(request_id: str | None, model: str) -> str:
+    if request_id:
+        return request_id
+    return _chunk_ids.setdefault(model, _new_id())
 
 
 def parse_chat_request(request: dict) -> dict:
@@ -88,9 +107,9 @@ def build_chat_chunk(
     finish_reason: str | None = None,
 ) -> dict:
     """SSE chunk:`chat.completion.chunk` 形状(`data: {json}` 逐 chunk,
-    server 追加 `data: [DONE]`)。"""
+    server 追加 `data: [DONE]`)。同一条流的每个 chunk 共享 `id`。"""
     return {
-        "id": _request_id(request_id),
+        "id": _chunk_id(request_id, model),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,

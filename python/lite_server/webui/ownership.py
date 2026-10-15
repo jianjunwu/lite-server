@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+import httpx
 from fastapi.responses import JSONResponse
 
 
@@ -59,9 +60,21 @@ _LIST_FILTERS: dict[str, list[tuple[str, str | None]]] = {
 }
 
 
+def normalize_tail(tail: str) -> str:
+    """`tail` with dot segments resolved, percent-encoding preserved.
+
+    The ACL has to read the path the instance will actually be asked for.
+    httpx normalizes the upstream URL it is handed, so
+    `v2/models/alpha/../beta/infer` is served as `v2/models/beta/infer`; a
+    policy read of the *raw* tail would authorize `alpha` and hand the
+    instance `beta`.
+    """
+    return httpx.URL(f"http://instance.invalid/{tail}").raw_path.decode().lstrip("/")
+
+
 def parse_model_path(tail: str) -> str | None:
     """Model name carried by a model-scoped proxied path, or None."""
-    segs = [s for s in tail.split("/") if s]
+    segs = [s for s in normalize_tail(tail).split("/") if s]
     if len(segs) >= 3 and segs[:2] == ["v2", "models"]:
         return segs[2]
     if len(segs) >= 4 and segs[:3] == ["v2", "repository", "models"]:
@@ -72,7 +85,7 @@ def parse_model_path(tail: str) -> str | None:
 
 
 def is_inference_tail(tail: str) -> bool:
-    return bool(_INFER_TAIL_RE.search(tail))
+    return bool(_INFER_TAIL_RE.search(normalize_tail(tail)))
 
 
 def list_filter_for(tail: str) -> list[tuple[str, str | None]] | None:
@@ -136,7 +149,7 @@ def filter_list_response(store, inst_id: str, user: dict, tail: str, payload):
 
 def parse_model_mutation(tail: str) -> Mutation | None:
     """Classify a proxied path tail as a model/version mutation, or None."""
-    segs = [s for s in tail.split("/") if s]
+    segs = [s for s in normalize_tail(tail).split("/") if s]
     # v2/repository/models/{m}/versions/{v}/upload
     # v2/repository/models/{m}/versions/{v}/upload-sessions[/{sid}[/complete|files/...]]
     # v2/repository/models/{m}/upload

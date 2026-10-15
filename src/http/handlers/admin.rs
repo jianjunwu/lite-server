@@ -1173,7 +1173,6 @@ pub async fn delete_versions_handler(
 /// actually removed (for the audit record).
 async fn remove_model_artifacts(repo_path: &std::path::Path, model_name: &str) -> Vec<String> {
     let mut removed = Vec::new();
-    let prefix = format!("{}_v", model_name);
     for dir in [repo_path.to_path_buf(), repo_path.join(".artifacts")] {
         let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
             continue;
@@ -1186,15 +1185,34 @@ async fn remove_model_artifacts(repo_path: &std::path::Path, model_name: &str) -
             let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
                 continue;
             };
-            if fname.starts_with(&prefix)
-                && fname.ends_with(".lma")
-                && tokio::fs::remove_file(&path).await.is_ok()
-            {
+            if !artifact_belongs_to(&fname, model_name) {
+                continue;
+            }
+            if tokio::fs::remove_file(&path).await.is_ok() {
                 removed.push(path.display().to_string());
             }
         }
     }
     removed
+}
+
+/// True when `fname` follows the packer convention `{name}_v{version}.lma`
+/// with `model_name` as the name. Both identifiers may contain `_`
+/// (validation.rs IDENTIFIER_RE), so the convention is ambiguous on its own:
+/// `llama_v2_v3.lma` parses either as model `llama` version `2_v3` or as
+/// model `llama_v2` version `3`. Ownership is resolved the way the name is
+/// built back up — the *last* `_v` in the stem is the separator — so a stem
+/// is ours only when no `_v` follows ours. A plain prefix match would take
+/// `llama_v2`'s artifacts away with `llama`'s delete, and a root `.lma` is
+/// exactly the resurrection vector G5 removes.
+fn artifact_belongs_to(fname: &str, model_name: &str) -> bool {
+    let Some(stem) = fname.strip_suffix(".lma") else {
+        return false; // not a packer artifact
+    };
+    let Some(version) = stem.strip_prefix(&format!("{}_v", model_name)) else {
+        return false;
+    };
+    !version.is_empty() && !version.contains("_v")
 }
 
 /// E1 shared whole-model delete core (HTTP handler + gRPC DeleteModel
@@ -1900,6 +1918,43 @@ pub(super) mod audit_tests {
 #[cfg(test)]
 mod delete_model_tests {
     use super::*;
+
+    /// BUG: `remove_model_artifacts` matches retained artifacts by the
+    /// *prefix* `"{model_name}_v"`. Artifact filenames are
+    /// `{name}_v{version}.lma` and model names may contain `_`
+    /// (`IDENTIFIER_RE = ^[a-zA-Z0-9_-]+$`), so deleting model `llama` also
+    /// deletes `llama_v2_v3.lma` — the retained artifact of the unrelated
+    /// model `llama_v2` (it starts with `llama_v` and ends with `.lma`).
+    /// The version-level path (`remove_linked_artifacts`) uses the exact
+    /// name; only this model-level path is prefix-matched.
+    #[tokio::test]
+    async fn deleting_a_model_does_not_delete_a_similarly_named_models_artifacts() {
+        let repo =
+            std::env::temp_dir().join(format!("lite-artifacts-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".artifacts")).unwrap();
+
+        std::fs::write(repo.join("llama_v1.lma"), b"own").unwrap();
+        std::fs::write(repo.join("llama_v2_v3.lma"), b"other").unwrap();
+        std::fs::write(repo.join(".artifacts").join("llama_v2_v3.lma"), b"other").unwrap();
+
+        remove_model_artifacts(&repo, "llama").await;
+
+        assert!(
+            repo.join("llama_v2_v3.lma").exists(),
+            "deleting model `llama` removed `llama_v2`'s artifact (prefix match)"
+        );
+        assert!(
+            repo.join(".artifacts").join("llama_v2_v3.lma").exists(),
+            "deleting model `llama` removed `llama_v2`'s retained artifact copy"
+        );
+        assert!(
+            !repo.join("llama_v1.lma").exists(),
+            "`llama`'s own artifact must still be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     /// E1: model-level delete must emit a `control_plane` audit record with
     /// action=delete_model (version is None — whole model).

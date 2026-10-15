@@ -85,12 +85,23 @@ def write_trials(export_dir: Path, trials: list[TrialRecord], summary: dict) -> 
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
+    taken: set[int] = set()
     for t in trials:
         key = trial_key(t)
         if key in seen:
             continue
         seen.add(key)
-        (export_dir / f"trial-{t.index:03d}.json").write_text(
+        # Filenames come from `index`, but a `--resume` run is written as
+        # `resumed + newly measured`, and the fresh engine's `_trial_index`
+        # restarts at 0 — so the resumed trials and the new ones claim the same
+        # filenames and the resumed ones are overwritten. Identity is what
+        # dedupes here, so step past any index already claimed by a different
+        # trial.
+        idx = t.index
+        while idx in taken:
+            idx += 1
+        taken.add(idx)
+        (export_dir / f"trial-{idx:03d}.json").write_text(
             json.dumps(t.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8",
         )
     (export_dir / "summary.json").write_text(

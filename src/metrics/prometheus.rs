@@ -1852,6 +1852,31 @@ pub fn record_worker_metrics(
 
 // ===== Pre-registered custom metrics (numeric ID path) =====
 
+/// Slot held for a worker-declared metric whose Prometheus family could not be
+/// registered (invalid name). `Vec::get` never resolves it, so records for that
+/// metric are dropped while the worker's per-type declaration ordinals stay
+/// aligned with the metrics declared after it.
+const UNREGISTERED_CUSTOM_METRIC: usize = usize::MAX;
+
+/// Prometheus `Desc` name grammar (`[a-zA-Z_:][a-zA-Z0-9_:]*`) — the rule
+/// `Desc::new` enforces with an `Err` the registration path unwraps.
+fn is_valid_metric_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Registered family name for a declaration — the name the `Opts::new` /
+/// `HistogramOpts::new` calls below would otherwise build inline. `None` for an
+/// unknown metric type, which the worker counts in no per-type ordinal either.
+fn custom_family_name(name: &str, metric_type: &str) -> Option<String> {
+    match metric_type {
+        "gauge" | "histogram" => Some(format!("lite_server_{}", name)),
+        "counter" => Some(format!("lite_server_{}_total", name)),
+        _ => None,
+    }
+}
+
 /// Pre-register custom metric objects during model setup.
 /// Each spec is (name, type) where type is "gauge", "counter", or "histogram".
 /// Objects are stored in order — the index IS the numeric ID used at record time.
@@ -1884,6 +1909,30 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
         histograms: Vec::new(),
     };
     for (name, metric_type) in specs {
+        let Some(family) = custom_family_name(name, metric_type) else {
+            continue; // unknown type — the worker counts no per-type ordinal for it
+        };
+        // `register_metric` (python api.py) validates nothing, so a model
+        // author can hand us a name outside the Prometheus grammar (a dash in
+        // `cache-hit-rate` is legal in model/version identifiers and reads as
+        // natural). `Opts::new(..).unwrap()` would then panic on the
+        // worker-load path; skip that family with a warning instead.
+        if !is_valid_metric_name(&family) {
+            tracing::warn!(
+                model, version, metric = %name, metric_type,
+                "skipping custom metric with an invalid Prometheus name"
+            );
+            // The worker DOES count this declaration in its per-type ordinal,
+            // so hold its slot with a sentinel `record_custom_metrics` can
+            // never resolve (Vec::get) — otherwise every later metric of the
+            // same type would land in the wrong family.
+            match *metric_type {
+                "gauge" => ids.gauges.push(UNREGISTERED_CUSTOM_METRIC),
+                "counter" => ids.counters.push(UNREGISTERED_CUSTOM_METRIC),
+                _ => ids.histograms.push(UNREGISTERED_CUSTOM_METRIC),
+            }
+            continue;
+        }
         let key = format!("{}:{}", name, metric_type);
         refs.entry(key.clone())
             .or_default()
@@ -1894,10 +1943,7 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                 "gauge" => {
                     let idx = gauges.len();
                     let g = GaugeVec::new(
-                        prometheus::Opts::new(
-                            format!("lite_server_{}", name),
-                            format!("Custom gauge: {}", name),
-                        ),
+                        prometheus::Opts::new(family.clone(), format!("Custom gauge: {}", name)),
                         &["model", "version"],
                     )
                     .unwrap();
@@ -1909,10 +1955,7 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                 "counter" => {
                     let idx = counters.len();
                     let c = CounterVec::new(
-                        prometheus::Opts::new(
-                            format!("lite_server_{}_total", name),
-                            format!("Custom counter: {}", name),
-                        ),
+                        prometheus::Opts::new(family.clone(), format!("Custom counter: {}", name)),
                         &["model", "version"],
                     )
                     .unwrap();
@@ -1924,13 +1967,11 @@ pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)
                 "histogram" => {
                     let idx = histograms.len();
                     let h = HistogramVec::new(
-                        HistogramOpts::new(
-                            format!("lite_server_{}", name),
-                            format!("Custom histogram: {}", name),
-                        )
-                        .buckets(vec![
-                            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-                        ]),
+                        HistogramOpts::new(family.clone(), format!("Custom histogram: {}", name))
+                            .buckets(vec![
+                                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                                10.0,
+                            ]),
                         &["model", "version"],
                     )
                     .unwrap();
@@ -2220,6 +2261,26 @@ pub fn record_shutdown_streams_evicted(model: &str, version: &str, count: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG: `register_custom_metrics` feeds the model author's metric name
+    /// straight into `prometheus::Opts::new` and `.unwrap()`s the result.
+    /// `Desc::new` rejects any name outside `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a
+    /// name containing a dash — legal in model/version identifiers here, and
+    /// accepted without validation by `LitAPI.register_metric` — makes the
+    /// constructor return `Err` and the unwrap panic inside the worker-load
+    /// path instead of degrading to "metric skipped + warn".
+    #[test]
+    fn custom_metric_with_an_invalid_prometheus_name_is_skipped_not_fatal() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            register_custom_metrics("m", "1", &[("cache-hit-rate", "gauge")]);
+        }));
+        assert!(
+            result.is_ok(),
+            "registering a custom metric named `cache-hit-rate` panicked — an \
+             invalid Prometheus name must be skipped with a warning, not abort \
+             model loading"
+        );
+    }
 
     #[test]
     fn test_record_stream_ttft_records_value() {

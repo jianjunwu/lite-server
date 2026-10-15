@@ -44,12 +44,31 @@ fn find_in_path(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf
     for dir in std::env::split_paths(path) {
         for cand in exe_candidates(name) {
             let full = dir.join(&cand);
-            if full.is_file() {
+            if is_runnable(&full) {
                 return Some(full);
             }
         }
     }
     None
+}
+
+/// `shutil.which` wants a runnable file, not merely an existing one
+/// (`os.access(path, os.X_OK)`), so a non-executable `python3` earlier on PATH
+/// does not shadow the real interpreter later on it.
+#[cfg(unix)]
+fn is_runnable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// Windows has no execute bit — PATHEXT (see [`exe_candidates`]) is the
+/// equivalent gate, and it was already applied to the candidate name.
+#[cfg(not(unix))]
+fn is_runnable(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(windows)]
@@ -78,9 +97,10 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// Create a temp PATH entry containing only the named files (empty regular
-    /// files — `is_file()` is all the resolver checks). Unique per call so the
-    /// parallel lib tests never share a directory.
+    /// Create a temp PATH entry containing only the named files, each an empty
+    /// *runnable* regular file — that is all `shutil.which` (and now
+    /// [`find_in_path`]) accepts as a PATH hit. Unique per call so the parallel
+    /// lib tests never share a directory.
     fn path_entry_with(files: &[&str]) -> OsString {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir: PathBuf =
@@ -88,10 +108,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in files {
-            std::fs::write(dir.join(f), b"").unwrap();
+            let p = dir.join(f);
+            std::fs::write(&p, b"").unwrap();
+            set_mode(&p, 0o755);
         }
         dir.into_os_string()
     }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_path: &std::path::Path, _mode: u32) {}
 
     #[test]
     fn prefers_python3_when_only_python3_present() {
@@ -120,6 +151,34 @@ mod tests {
                 Some(&path)
             ),
             "/opt/pinned/python"
+        );
+    }
+
+    /// BUG: `find_in_path` is documented as mirroring `shutil.which` and
+    /// "honours PATHEXT on Windows", but on Unix it only checks `is_file()`
+    /// and never the executable bit. `shutil.which` checks `os.access(path,
+    /// os.X_OK)`.
+    ///
+    /// A non-executable file named `python3` earlier on PATH therefore wins
+    /// over a real, executable `python` later on PATH, and every
+    /// subprocess spawn (worker, `.lma` unpack/pack) fails with EACCES or
+    /// runs the wrong interpreter.
+    /// Unix-only: Windows has no execute bit (the PATHEXT filter already ran).
+    #[cfg(unix)]
+    #[test]
+    fn skips_a_non_executable_python3_in_favour_of_an_executable_python() {
+        let non_exec_dir = path_entry_with(&["python3"]);
+        let exec_dir = path_entry_with(&["python"]);
+        // Strip the execute bit back off `python3` — a PATH entry that exists
+        // but cannot be run must not shadow the executable `python` behind it.
+        set_mode(&std::path::Path::new(&non_exec_dir).join("python3"), 0o644);
+
+        let path = std::env::join_paths([&non_exec_dir, &exec_dir]).unwrap();
+        assert_eq!(
+            resolve_with(None, Some(&path)),
+            "python",
+            "a non-executable `python3` on PATH must be skipped, as \
+             shutil.which would"
         );
     }
 

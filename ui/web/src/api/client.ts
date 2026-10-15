@@ -53,8 +53,10 @@ async function parseErrorBody(res: Response): Promise<unknown> {
 }
 
 /** Human-readable message out of an upstream error envelope: `error` may be a
- * plain string (BFF) or an object `{code, message, ...}` (instance server). */
-function errorMessage(body: unknown, status: number): string {
+ * plain string (BFF) or an object `{code, message, ...}` (instance server).
+ * Exported for the raw-fetch callers (playground) so they report the same
+ * message instead of stringifying the envelope into "[object Object]". */
+export function errorMessage(body: unknown, status: number): string {
   if (body && typeof body === 'object' && 'error' in body) {
     const err = (body as { error: unknown }).error;
     if (err === 'forbidden' && (body as { reason?: unknown }).reason === 'model_denied') {

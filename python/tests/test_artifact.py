@@ -595,20 +595,28 @@ class TestArtifactCacheAudit:
     """Audit: cache re-extraction must not serve stale files from a previous artifact."""
 
     def test_reextract_into_same_dir_does_not_mix_stale_files(self, tmp_path):
+        """A re-packed artifact at the same path re-extracts in place; the
+        swapped-in directory must carry only the new artifact's files."""
         import os as _os
 
         cache = ArtifactCache(tmp_path / "cache")
-        a = tmp_path / "a.lma"
-        with zipfile.ZipFile(a, "w") as zf:
-            zf.writestr("a.txt", "A")
-        b = tmp_path / "b.lma"
-        with zipfile.ZipFile(b, "w") as zf:
-            zf.writestr("b.txt", "B")
-        _os.utime(b, (b.stat().st_atime, b.stat().st_mtime + 5))
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "a.txt").write_text("A")
+        a = ModelPacker(model_dir, version="1").pack(tmp_path / "out")
 
-        cache.get_or_unpack(a, "m")
-        cache.get_or_unpack(b, "m")
+        first = cache.get_or_unpack(a, "m")
+        assert sorted(p.name for p in (first / "1").iterdir()) == ["a.txt"]
 
-        extracted = sorted(p.name for p in (tmp_path / "cache" / "m").iterdir())
-        assert extracted == ["b.txt"], \
+        # Re-pack the same path with different content.
+        (vdir / "a.txt").unlink()
+        (vdir / "b.txt").write_text("B")
+        ModelPacker(model_dir, version="1").pack(tmp_path / "out")
+        _os.utime(a, (a.stat().st_atime, a.stat().st_mtime + 5))
+
+        second = cache.get_or_unpack(a, "m")
+
+        assert second == first
+        assert sorted(p.name for p in (second / "1").iterdir()) == ["b.txt"], \
             "the cache dir must not serve files from a previous artifact"

@@ -354,18 +354,36 @@ pub(super) fn matches_patterns(filename: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true; // no patterns = match all
     }
-    patterns.iter().any(|p| {
-        if let Some(suffix) = p.strip_prefix("*.") {
-            // Simple suffix match: "*.py" matches "foo.py"
-            filename.ends_with(&format!(".{}", suffix))
-        } else if let Some(prefix) = p.strip_suffix(".*") {
-            // Prefix match: "model_.*" matches "model_abc"
-            filename.starts_with(prefix)
-        } else {
-            // Exact match
-            filename == p
+    patterns.iter().any(|p| glob_match(filename, p))
+}
+
+/// `*` matches any run of characters (including none and the empty pattern,
+/// so a bare `*` matches everything); every other character is literal.
+fn glob_match(filename: &str, pattern: &str) -> bool {
+    if !pattern.contains('*') {
+        return filename == pattern; // exact match
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    // The literal head is a prefix and the literal tail a suffix; the segments
+    // between them must appear in order in the window they leave behind.
+    if first.len() + last.len() > filename.len()
+        || !filename.starts_with(first)
+        || !filename.ends_with(last)
+    {
+        return false;
+    }
+    let mut rest = &filename[first.len()..filename.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        if part.is_empty() {
+            continue; // "**" — nothing to find
         }
-    })
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -488,6 +506,26 @@ mod tests {
         assert!(matches_patterns("model.py", &patterns));
         assert!(matches_patterns("config.yaml", &patterns));
         assert!(!matches_patterns("data.json", &patterns));
+    }
+
+    /// BUG: `matches_patterns` is documented as supporting "simple `*`
+    /// wildcard (e.g., `*.py`, `model_*.yaml`)" and the scaffold template
+    /// (python/lite_server/init/generator.py) ships `model_*.yaml` as the
+    /// example value for `hot_reload_patterns`. But a wildcard that is
+    /// neither a `*.` prefix nor a `.*` suffix falls through to the literal
+    /// `filename == p` branch, so `model_*.yaml` (and a bare `*`) match
+    /// nothing: hot reload silently never fires for them.
+    #[test]
+    fn test_matches_patterns_mid_string_wildcard() {
+        assert!(
+            matches_patterns("model_v2.yaml", &["model_*.yaml".to_string()]),
+            "`model_*.yaml` — the value advertised by the scaffold template — \
+             must match `model_v2.yaml`, not fall through to literal equality"
+        );
+        assert!(
+            matches_patterns("anything.txt", &["*".to_string()]),
+            "a bare `*` must match every filename"
+        );
     }
 
     // ===== B1 regression guard: ensemble detection in scan_repo_models =====

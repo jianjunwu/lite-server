@@ -496,6 +496,13 @@ class StaticAnalyzer:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
+            if stripped.startswith("-"):
+                # pip option line (`-r base.txt`, `--extra-index-url …`,
+                # `-e .`) — valid input to `pip install -r` but not a PEP 508
+                # requirement, so flagging it would turn --strict /
+                # --fail-severity warning red on a requirements file the
+                # project's own Dockerfile installs.
+                continue
             try:
                 Requirement(stripped)
             except InvalidRequirement:
@@ -1074,7 +1081,13 @@ def _build_alias_table(tree: ast.Module) -> dict[str, str]:
     for node in tree.body:
         if isinstance(node, ast.Import):
             for a in node.names:
-                aliases[a.asname or a.name.split(".")[0]] = a.name
+                # `import a.b` binds `a` — the first segment is the name
+                # actually defined here, so `a.func()` must keep resolving to
+                # `a.func`. Mapping it to `a.b` turns `os.system()` into
+                # `os.path.system()` for `import os.path`, which matches no
+                # dangerous-call rule and blinds the whole LS3xx scan.
+                bound = a.asname or a.name.split(".")[0]
+                aliases[bound] = a.name if a.asname else bound
         elif isinstance(node, ast.ImportFrom) and node.module:
             for a in node.names:
                 aliases[a.asname or a.name] = f"{node.module}.{a.name}"

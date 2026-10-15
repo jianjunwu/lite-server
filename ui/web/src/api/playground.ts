@@ -1,4 +1,4 @@
-import { ApiError, getAdminKey, notifyBffUnauthorized } from './client';
+import { ApiError, errorMessage, getAdminKey, notifyBffUnauthorized } from './client';
 
 const enc = encodeURIComponent;
 
@@ -124,12 +124,12 @@ export async function inferUnary(
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
     try {
-      const parsed = JSON.parse(raw) as { error?: unknown };
+      const parsed: unknown = JSON.parse(raw);
       // Raw fetch bypasses client.ts — report an expired BFF session here.
       notifyBffUnauthorized(res.status, parsed);
-      if (parsed.error) message = String(parsed.error);
+      message = errorMessage(parsed, res.status);
     } catch {
-      // Keep default.
+      // Non-JSON error body: keep the status line.
     }
     throw new ApiError(res.status, res.headers.get('x-request-id'), raw, message);
   }
@@ -165,13 +165,17 @@ export function streamEvents(
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      // Raw fetch bypasses client.ts — report an expired BFF session here.
+      let message = `HTTP ${res.status}`;
+      // Raw fetch bypasses client.ts — report an expired BFF session and
+      // surface the instance's own message here, not just the status line.
       try {
-        notifyBffUnauthorized(res.status, JSON.parse(text));
+        const parsed: unknown = JSON.parse(text);
+        notifyBffUnauthorized(res.status, parsed);
+        message = errorMessage(parsed, res.status);
       } catch {
         // Non-JSON error body: never a BFF session marker.
       }
-      throw new ApiError(res.status, res.headers.get('x-request-id'), text, `HTTP ${res.status}`);
+      throw new ApiError(res.status, res.headers.get('x-request-id'), text, message);
     }
     cb.onHeaders?.(Object.fromEntries(res.headers.entries()));
     const reader = res.body!.getReader();

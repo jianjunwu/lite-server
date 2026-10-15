@@ -434,6 +434,24 @@ class EnsembleDAG:
 
     def _block_config(self) -> dict[str, Any]:
         if self.dags is not None:
+            # E8-1: the dags form carries no top-level steps/output/outputs/
+            # inputs — each set declares its own. Dropping them here would
+            # silently emit a different model than the one declared (the
+            # declared output is ignored and the server falls back to the last
+            # step) while the server, which rejects exactly this combination,
+            # never gets the chance to object.
+            forbidden = [
+                key for key, value in (
+                    ("output", self.output),
+                    ("outputs", self.outputs),
+                    ("inputs", self.inputs),
+                ) if value is not None
+            ]
+            if forbidden:
+                raise ValueError(
+                    f"ensemble.dags forbids top-level {'/'.join(forbidden)} "
+                    "(E8-1) — declare them inside each set instead"
+                )
             cfg: dict[str, Any] = {
                 "dags": {k: v._config() for k, v in self.dags.items()}
             }
@@ -474,11 +492,13 @@ def canonical_ensemble_block(block: dict[str, Any]) -> dict[str, Any]:
     unequal and surfaces as drift in the analyzer).
     """
     result: dict[str, Any] = {}
-    if "dags" in block and block["dags"] is not None:
-        result["dags"] = {
-            name: _canonical_dag_set(set_cfg)
-            for name, set_cfg in block["dags"].items()
-        }
+    dags = block.get("dags")
+    if dags is not None:
+        result["dags"] = (
+            {name: _canonical_dag_set(set_cfg) for name, set_cfg in dags.items()}
+            if isinstance(dags, dict)
+            else dags  # malformed: left as-is so it compares unequal (LS112)
+        )
     else:
         result["steps"] = [_canonical_step(s) for s in block.get("steps", [])]
     for key, default in _BLOCK_DEFAULT_KEYS:
@@ -489,7 +509,9 @@ def canonical_ensemble_block(block: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _canonical_dag_set(set_cfg: dict[str, Any]) -> dict[str, Any]:
+def _canonical_dag_set(set_cfg: dict[str, Any]) -> Any:
+    if not isinstance(set_cfg, dict):
+        return set_cfg  # malformed: left as-is so it compares unequal (LS112)
     result = {"steps": [_canonical_step(s) for s in set_cfg.get("steps", [])]}
     for key, default in _BLOCK_DEFAULT_KEYS:
         if key not in result:
@@ -499,22 +521,31 @@ def _canonical_dag_set(set_cfg: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _canonical_step(step: dict[str, Any]) -> dict[str, Any]:
+def _canonical_step(step: dict[str, Any]) -> Any:
+    # Malformed input is returned unchanged rather than raising: this function
+    # only normalizes, and the analyzer call site has no handler — an
+    # exception here kills `lite-server analyze` with a traceback instead of
+    # surfacing the intended LS112 drift finding.
+    if not isinstance(step, dict):
+        return step
     result = dict(step)
     for key, default in _STEP_DEFAULT_KEYS:
         if key not in result:
             result[key] = default
-    if result["outputs"] is not None:
+    outputs = result["outputs"]
+    if isinstance(outputs, dict):
         result["outputs"] = {
             alias: {"type": decl.get("type"), "path": decl.get("path")}
-            for alias, decl in result["outputs"].items()
+            for alias, decl in outputs.items()
         }
     return result
 
 
-def _canonical_inputs(inputs: dict[str, Any] | None) -> dict[str, Any] | None:
+def _canonical_inputs(inputs: dict[str, Any] | None) -> Any:
     if inputs is None:
         return None
+    if not isinstance(inputs, dict):
+        return inputs  # malformed: left as-is (see `_canonical_step`)
     return {
         name: {
             "type": decl.get("type"),
