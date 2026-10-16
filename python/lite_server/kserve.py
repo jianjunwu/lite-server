@@ -107,12 +107,24 @@ def parse_inputs(ctx) -> dict[str, np.ndarray | list[bytes]]:
                 400, f"unsupported datatype {datatype!r} for input {name}",
                 error_type="invalid_request_error", code="invalid_triton_binary_head",
             )
+        # shape must be an array of ints. The Triton head parser only
+        # deserialises name/data/parameters.binary_data_size, so shape and
+        # datatype arrive here verbatim; a non-int dimension (e.g. ["2"])
+        # made reshape raise TypeError and escape as a 500.
+        shape = inp.get("shape")
+        if shape is not None and (
+            not isinstance(shape, list)
+            or not all(isinstance(d, int) and not isinstance(d, bool) for d in shape)
+        ):
+            raise HTTPException(
+                400, f"input {name}: shape must be an array of integers, got {shape!r}",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
         try:
             arr = np.frombuffer(mv, dtype=dtype)  # 零拷贝视图
-            shape = inp.get("shape")
-            if isinstance(shape, list):
+            if shape is not None:
                 arr = arr.reshape(shape)  # 视图
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             raise HTTPException(
                 400, f"input {name} data does not match declared datatype/shape: {e}",
                 error_type="invalid_request_error", code="invalid_triton_binary_head",

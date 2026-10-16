@@ -274,6 +274,89 @@ class TestRouteStreaming:
         assert "boom" in frames[-1].stream.error.message
 
 
+class TestRouteBodyParsing:
+    """The worker is the only parser of a route body (the Rust edge forwards
+    raw bytes), so a malformed body must surface as a client 400 — not the
+    generic 500 server_error. A declared non-JSON content type is delivered
+    to the handler as raw bytes, mirroring Pipeline.run_single (D9)."""
+
+    @staticmethod
+    def _inst():
+        from lite_server.pipeline import Pipeline
+        from lite_server.worker.inference import _discover_routes
+
+        class M(LitAPI):
+            def setup(self, device):
+                pass
+
+            def predict(self, x):
+                return x
+
+            @route.post("/echo")
+            def echo(self, ctx):
+                body = ctx.request
+                if isinstance(body, bytes):
+                    return {"kind": "bytes", "value": body.decode()}
+                return {"kind": "json", "value": body}
+
+        inst = M(max_batch_size=1, batch_timeout=0.0, stream=False)
+        _discover_routes(inst)
+        inst._route_pipeline = Pipeline.for_route([])
+        return inst
+
+    @staticmethod
+    def _request(data: bytes, content_type: str | None):
+        from lite_server import Headers, RequestMeta
+        from lite_server.proto import liteserver_pb2 as pb
+
+        req = pb.Request(uid="u1")
+        req.meta.route = "/echo"
+        req.meta.method = "POST"
+        req.route_call.data = data
+        headers = Headers({}) if content_type is None else Headers({"content-type": content_type})
+        meta = RequestMeta(
+            route="/echo", headers=headers, client_ip="",
+            request_id="", timestamp_ns=0, method="POST",
+        )
+        return req, meta
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_body_raises_400_not_500(self):
+        import logging
+
+        from lite_server.exceptions import HTTPException
+        from lite_server.worker.inference import _handle_route_call
+
+        req, meta = self._request(b"{bad", "application/json")
+        with pytest.raises(HTTPException) as ei:
+            await _handle_route_call(
+                self._inst(), "u1", req, meta, None, logging.getLogger("test"))
+        assert ei.value.status_code == 400
+        assert ei.value.error_type == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_valid_json_body_is_parsed(self):
+        import logging
+
+        from lite_server.worker.inference import _handle_route_call
+
+        req, meta = self._request(b'{"a": 1}', "application/json")
+        resp = await _handle_route_call(
+            self._inst(), "u1", req, meta, None, logging.getLogger("test"))
+        assert json.loads(resp.single.data) == {"kind": "json", "value": {"a": 1}}
+
+    @pytest.mark.asyncio
+    async def test_non_json_content_type_body_is_raw_bytes(self):
+        import logging
+
+        from lite_server.worker.inference import _handle_route_call
+
+        req, meta = self._request(b"hello", "text/plain")
+        resp = await _handle_route_call(
+            self._inst(), "u1", req, meta, None, logging.getLogger("test"))
+        assert json.loads(resp.single.data) == {"kind": "bytes", "value": "hello"}
+
+
 class TestRouterDecorator:
     """``@route`` attaches ``__route_defs__`` to the wrapped function only —
     the ``route`` object is a stateless namespace (no process-global list)."""

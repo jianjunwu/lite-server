@@ -85,7 +85,11 @@ def _make_error_response(uid: str, message: str,
     }
     data = _json.dumps({"error": error_dict})
     status = Status(code="Error", message=str(status_code))
-    single = SingleResponse(data=data, status=status)
+    # Unary parity with the batch path (_make_batch_item_error, B3): the
+    # numeric HTTP status code also goes in the ``status_code`` field. The
+    # Rust classifier keys on that field to forward a 4xx verbatim (no retry,
+    # not counted as a worker error); ``Status.message`` alone left it at 0.
+    single = SingleResponse(data=data, status=status, status_code=status_code)
     if headers:
         single.headers.update({str(k): str(v) for k, v in headers.items()})
     return Response(uid=uid, single=single)

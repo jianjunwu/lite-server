@@ -980,6 +980,18 @@ class TestMakeErrorResponse:
         assert body["error"]["type"] == "server_error"
         assert body["error"]["message"] == "something broke"
 
+    def test_error_response_carries_numeric_status_code_field(self):
+        """The numeric status code must land in ``SingleResponse.status_code``
+        (field 4), not only in ``Status.message``: the Rust classifier keys on
+        the field to forward a 4xx verbatim (no retry, not a worker error)."""
+        resp = inference._make_error_response("uid-1", "bad input", status_code=400)
+        assert resp.single.status_code == 400, (
+            "unary error frame dropped the numeric status code; the Rust side "
+            f"then retries a deterministic 4xx (got status_code={resp.single.status_code})"
+        )
+        # Default (unexpected worker failure) still reports 500.
+        assert inference._make_error_response("uid-2", "boom").single.status_code == 500
+
     def test_error_response_with_code_and_param(self):
         resp = inference._make_error_response(
             "uid-1", "bad input", status_code=400,

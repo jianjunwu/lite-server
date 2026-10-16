@@ -459,7 +459,8 @@
       "revokeConfirm": "Revoke this invite?",
       "revoked": "Invite revoked",
       "created": "Invite created",
-      "create": "Create invite"
+      "create": "Create invite",
+      "invalidNumber": "Max uses and hours must be whole numbers"
     },
     "totp": {
       "title": "Two-factor authentication (TOTP)",

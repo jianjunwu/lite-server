@@ -61,6 +61,20 @@ class TestParseInputs:
             parse_inputs(ctx)
         assert ei.value.status_code == 400
 
+    def test_parse_inputs_non_integer_shape_400(self):
+        """A non-int shape dimension must be a 400, not a TypeError → 500.
+
+        The Triton head parser ignores ``shape``/``datatype``, so malformed
+        values reach the worker verbatim (e.g. shape ["2"])."""
+        head = {"inputs": [
+            {"name": "a", "datatype": "FP32", "shape": ["2"],
+             "parameters": {"binary_data_size": 8}},
+        ]}
+        ctx = _ctx(head, {"a": memoryview(b"\x00" * 8)})
+        with pytest.raises(HTTPException) as ei:
+            parse_inputs(ctx)
+        assert ei.value.status_code == 400
+
     def test_parse_inputs_bf16_view(self):
         """BF16 无原生 dtype → uint16 位模式视图。"""
         head = {"inputs": [

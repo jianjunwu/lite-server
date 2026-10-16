@@ -72,7 +72,17 @@ async def _handle_route_call(
             uid, f"No route handler for {meta.route!r}", status_code=404
         )
     handler, _methods = entry
-    body = _json.loads(rc.data) if rc.data else {}
+    # Route bodies are JSON by contract (ctx.request is the parsed body — see
+    # examples/06_custom_route). The Rust edge forwards the route body as raw
+    # bytes with no JSON validation (src/http/handlers/custom_routes.rs), so
+    # this is the only parser: a malformed body must be a client error, not a
+    # 500. _parse_json_payload raises HTTPException(400) on bad JSON; a
+    # declared non-JSON content type is delivered as raw bytes, mirroring
+    # Pipeline.run_single (D9), and a missing content type defaults to JSON.
+    if rc.data and not _is_json_content_type(meta.headers.get("content-type", "application/json")):
+        body = rc.data
+    else:
+        body = _parse_json_payload(rc.data)
     ctx = RequestContext(meta=meta, request=body)
     ctx.state["path_params"] = (
         dict(request.meta.path_params) if request.HasField("meta") else {}

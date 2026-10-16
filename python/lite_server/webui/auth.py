@@ -202,6 +202,24 @@ class UserStore:
             raise AuthError("invalid", f"invalid role: {role!r}")
         return role
 
+    @staticmethod
+    def _validate_int(value, field: str, *, minimum: int | None = None) -> int:
+        """Reject a JSON value that is not an integer (bools are not ints
+        here). Without this, a numeric-string form value reached int() and
+        timedelta() and surfaced as an HTTP 500 instead of a client error."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AuthError("invalid", f"{field} must be an integer")
+        if minimum is not None and value < minimum:
+            raise AuthError("invalid", f"{field} must be >= {minimum}")
+        return value
+
+    @classmethod
+    def _validate_optional_int(cls, value, field: str,
+                               *, minimum: int | None = None) -> int | None:
+        if value is None:
+            return None
+        return cls._validate_int(value, field, minimum=minimum)
+
     def create(self, raw: dict) -> dict:
         username = self._validate_username(raw.get("username"))
         password = self._validate_password(raw.get("password"))
@@ -303,6 +321,9 @@ class UserStore:
     def create_invite(self, *, role: str = "viewer", max_uses: int = 1,
                       expires_in_hours: int | None = 72, created_by: str) -> dict:
         self._validate_role(role)
+        max_uses = self._validate_int(max_uses, "maxUses", minimum=1)
+        expires_in_hours = self._validate_optional_int(
+            expires_in_hours, "expiresInHours", minimum=0)
         code = secrets.token_urlsafe(12)
         expires_at = (
             (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()

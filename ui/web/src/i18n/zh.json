@@ -454,7 +454,8 @@
       "revokeConfirm": "撤销该邀请码?",
       "revoked": "邀请码已撤销",
       "created": "邀请码已创建",
-      "create": "创建邀请码"
+      "create": "创建邀请码",
+      "invalidNumber": "最大使用次数和有效期必须是整数"
     },
     "totp": {
       "title": "两步验证(TOTP)",

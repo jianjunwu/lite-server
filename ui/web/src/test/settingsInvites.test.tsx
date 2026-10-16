@@ -78,6 +78,49 @@ describe('SettingsPage invites tab', () => {
     );
   });
 
+  it('should_send_max_uses_and_expires_in_hours_as_numbers', async () => {
+    installFetch();
+    renderSettings();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Invites' }));
+    await screen.findByText('code-aaa');
+    fireEvent.click(screen.getByRole('button', { name: /New invite/ }));
+    const [maxUsesInput, expiresInput] = (await screen.findAllByRole('spinbutton')) as HTMLInputElement[];
+    fireEvent.change(maxUsesInput, { target: { value: '50' } });
+    fireEvent.change(expiresInput, { target: { value: '24' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create invite' }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === 'POST' && c.url.includes('/api/invites'))).toBe(true),
+    );
+    const posted = calls.find((c) => c.method === 'POST' && c.url.includes('/api/invites'))!;
+    const body = JSON.parse(posted.body ?? '{}');
+    // The BFF parses raw JSON and calls int()/timedelta() on these, so a
+    // numeric input that arrives as a string is an internal error there.
+    expect(typeof body.maxUses, `maxUses must be a number, got ${posted.body}`).toBe('number');
+    expect(typeof body.expiresInHours, `expiresInHours must be a number, got ${posted.body}`).toBe('number');
+  });
+
+  it('should_not_forward_a_non_integer_numeric_entry_as_a_string', async () => {
+    installFetch();
+    renderSettings();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Invites' }));
+    await screen.findByText('code-aaa');
+    fireEvent.click(screen.getByRole('button', { name: /New invite/ }));
+    const [maxUsesInput] = (await screen.findAllByRole('spinbutton')) as HTMLInputElement[];
+    fireEvent.change(maxUsesInput, { target: { value: '1e3' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create invite' }));
+    // Wait for the form to either submit or reject the entry client-side.
+    await waitFor(() => {
+      const posted = calls.some((c) => c.method === 'POST' && c.url.includes('/api/invites'));
+      const rejected = document.querySelectorAll('.ant-form-item-explain-error').length > 0;
+      expect(posted || rejected).toBe(true);
+    });
+    const posted = calls.find((c) => c.method === 'POST' && c.url.includes('/api/invites'));
+    if (posted) {
+      const body = JSON.parse(posted.body ?? '{}');
+      expect(typeof body.maxUses, `1e3 must not reach the BFF as a string: ${posted.body}`).toBe('number');
+    }
+  });
+
   it('should_revoke_an_invite_after_confirmation', async () => {
     installFetch();
     renderSettings();

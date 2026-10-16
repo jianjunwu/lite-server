@@ -133,6 +133,31 @@ def test_should_let_admin_manage_invites(ctx):
     assert next(i for i in listing if i["code"] == code)["revokedAt"] is not None
 
 
+@pytest.mark.parametrize("body", [
+    {"role": "viewer", "maxUses": "1e3", "expiresInHours": "24"},
+    {"role": "viewer", "maxUses": "5", "expiresInHours": "24"},
+    {"role": "viewer", "maxUses": 2, "expiresInHours": "1e3"},
+])
+def test_should_reject_string_numeric_invite_fields_as_client_error(ctx, body):
+    """A JSON string where an int is expected is malformed input: the route
+    must answer 4xx, not surface int()/timedelta() errors as HTTP 500."""
+    register(ctx.client, "founder", "Founder-pass-1")
+    res = ctx.client.post("/api/invites", headers=CSRF, json=body)
+    assert 400 <= res.status_code < 500, (
+        f"malformed invite fields {body} must be a client error, got {res.status_code}"
+    )
+
+
+def test_should_create_invite_with_integer_fields(ctx):
+    register(ctx.client, "founder", "Founder-pass-1")
+    res = ctx.client.post(
+        "/api/invites", headers=CSRF,
+        json={"role": "viewer", "maxUses": 7, "expiresInHours": 24},
+    )
+    assert res.status_code == 201
+    assert res.json()["invite"]["maxUses"] == 7
+
+
 def test_should_forbid_invite_management_for_non_admin(ctx):
     register(ctx.client, "founder", "Founder-pass-1")
     invite = _make_invite(ctx.store)

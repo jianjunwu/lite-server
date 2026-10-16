@@ -728,22 +728,41 @@ function AuditTab() {
   );
 }
 
+// <Input type="number"> hands the form a STRING even for a numeric field, so
+// the value type is string OR number (initialValues seed a number); `create`
+// coerces to an integer before it reaches the API client / JSON.stringify.
+type InviteFormValues = {
+  role: string;
+  maxUses: number | string;
+  expiresInHours: number | string;
+};
+
 function InvitesTab() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [form] = Form.useForm<{ role: string; maxUses: number; expiresInHours: number }>();
+  const [form] = Form.useForm<InviteFormValues>();
   const [busy, setBusy] = useState(false);
 
   const invitesQuery = useQuery({ queryKey: ['bff', 'invites'], queryFn: invitesApi.list });
 
-  const create = async (values: { role: string; maxUses: number; expiresInHours: number }) => {
+  const create = async (values: InviteFormValues) => {
+    // Coerce at the form boundary: the BFF parses raw JSON and calls int() /
+    // timedelta() on these, so a string (or a non-integer like "1.5") must
+    // never be forwarded.
+    const maxUses = Number(values.maxUses);
+    const expiresInHours = Number(values.expiresInHours);
+    if (!Number.isInteger(maxUses) || maxUses < 1
+        || !Number.isInteger(expiresInHours) || expiresInHours < 0) {
+      message.error(t('settings.invites.invalidNumber'));
+      return;
+    }
     setBusy(true);
     try {
       await invitesApi.create({
         role: values.role as InviteInfo['role'],
-        maxUses: values.maxUses,
-        expiresInHours: values.expiresInHours > 0 ? values.expiresInHours : null,
+        maxUses,
+        expiresInHours: expiresInHours > 0 ? expiresInHours : null,
       });
       message.success(t('settings.invites.created'));
       await invitesQuery.refetch();
