@@ -385,9 +385,10 @@ impl LiteServer {
             info!("Hot reload: no models with hot_reload enabled — watcher active for lifecycle events only");
         }
 
-        let repo_path = PathBuf::from(&self.config.model_repository.path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(&self.config.model_repository.path));
+        // Single source of truth for the repo root spelling (B1): the watcher,
+        // the reconcile task and the scanner all key on this, and it must agree
+        // with what `AppState` / `WorkerManager` hold.
+        let repo_path = crate::config::resolve_repo_path(&self.config.model_repository.path);
 
         // Create shared shutdown state for pending request tracking
         let shutdown_state = Arc::new(ShutdownState::new());
@@ -457,10 +458,28 @@ impl LiteServer {
             &self.config.server.host,
         );
 
+        // The dedicated metrics listener serves `/metrics` with NO
+        // authentication, and its default bind follows `server.host` — which
+        // defaults to `0.0.0.0`. So the out-of-the-box posture is "every metric,
+        // including model names, versions and queue depths, is world-readable",
+        // the opposite of the main port's unconfigured-admin default
+        // (loopback-only). Keeping remote Prometheus scraping working is why the
+        // default is not changed here; the exposure is ANNOUNCED instead, and
+        // `metrics.host` gives operators the control.
+        let metrics_host = self.config.metrics_bind_host(&tcp_host);
+        if self.config.metrics.enabled && crate::preflight::bind_is_remote(&metrics_host) {
+            warn!(
+                host = %metrics_host, port = self.config.server.metrics_port,
+                "Metrics listener binds a non-loopback address and requires no credentials — \
+                 /metrics is readable by anyone who can route to it. Set `metrics.host` to a \
+                 loopback address (and scrape through a proxy) if that is not intended."
+            );
+        }
+
         // Start metrics server if enabled
         let mut metrics_handle = if self.config.metrics.enabled {
             Some(tokio::spawn(start_metrics_server(
-                tcp_host.clone(),
+                metrics_host,
                 self.config.server.metrics_port,
             )))
         } else {
@@ -869,7 +888,7 @@ impl LiteServer {
         // worker_manager.shutdown() unloads everything (registry.remove empties
         // the version table). A failure here must never block shutdown.
         if self.config.server.cache_registry {
-            let repo_path = PathBuf::from(&self.config.model_repository.path);
+            let repo_path = crate::config::resolve_repo_path(&self.config.model_repository.path);
             if let Err(e) = crate::registry::cache::save(&self.registry, &repo_path).await {
                 warn!("registry cache snapshot failed: {e}");
             }
@@ -897,7 +916,7 @@ impl LiteServer {
     async fn load_initial_models(
         &self,
     ) -> Result<HashSet<(PathBuf, std::time::SystemTime)>, AppError> {
-        let repo_path = PathBuf::from(&self.config.model_repository.path);
+        let repo_path = crate::config::resolve_repo_path(&self.config.model_repository.path);
         let orch = &self.config.orchestration;
 
         // cache_registry: restore strategy + active-version pins from the on-disk

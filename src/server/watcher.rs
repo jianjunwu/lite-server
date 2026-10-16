@@ -1562,12 +1562,20 @@ class TestAPI(LitAPI):
         last_reload: &mut std::collections::HashMap<(String, String), Instant>,
     ) {
         let flag = AtomicBool::new(true);
+        // Resolve the root the way `start_file_watcher` does in production
+        // (`server/mod.rs`, `config::resolve_repo_path`): `process_watch_events`
+        // strips this prefix off every event path, so a raw root paired with a
+        // canonical event path would silently drop the event — and this test
+        // would pass for the wrong reason. Both spellings must come from the
+        // same resolved root, exactly as the live watcher and the PATCH's
+        // ledger entry do.
+        let root = crate::config::resolve_repo_path(tmp);
         process_watch_events(
             vec![(
-                tmp.join("m").join("1").join("config.yaml"),
+                root.join("m").join("1").join("config.yaml"),
                 WatchEventKind::Modify,
             )],
-            tmp.to_path_buf(),
+            root,
             wm,
             registry,
             last_reload,

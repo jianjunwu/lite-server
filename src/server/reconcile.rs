@@ -122,7 +122,7 @@ pub(super) async fn reconcile_models(
             }
         }
 
-        // Activate default version
+        // Activate the configured default version, if this round loaded it.
         let default_version = strategy.and_then(|s| s.default_version.clone());
         if let Some(ref dv) = default_version {
             if versions_loaded.contains(dv) {
@@ -137,13 +137,29 @@ pub(super) async fn reconcile_models(
                         dv, name, e
                     ),
                 }
+            } else {
+                warn!(
+                    "Configured default version {} for {} was not loaded this round; \
+                     falling back to a loaded version",
+                    dv, name
+                );
             }
-        } else if !versions_loaded.is_empty() && !registry.active_version_is_ready(name) {
-            // No default_version: auto-activate the first loaded version, but
-            // only when no usable active version remains. A stale pin seeded
-            // by cache_registry restore (force_pin) — pointing at a version
-            // that failed to reload — must read as "no active version" here,
-            // or the model is stuck unusable after restart (B1).
+        }
+
+        // Fallback: auto-activate the first loaded version, but only when no
+        // usable active version remains. A stale pin seeded by
+        // cache_registry restore (force_pin) — pointing at a version that
+        // failed to reload — must read as "no active version" here, or the
+        // model is stuck unusable after restart (B1).
+        //
+        // Deliberately NOT an `else` branch: whenever the configured default
+        // could not be activated (its config.yaml failed to load, it was not in
+        // the load target, or it was not Ready), leaving the model Ready with no
+        // active version makes every request without an explicit version 404
+        // until an operator intervenes. Serving the first loaded version is the
+        // strictly better failure mode, and the warning above records that the
+        // default was not honoured.
+        if !versions_loaded.is_empty() && !registry.active_version_is_ready(name) {
             match registry.activate_version(name, &versions_loaded[0]) {
                 Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
                 Ok(false) => warn!(
@@ -171,8 +187,8 @@ fn compute_target_versions(
     let load_policy = strategy
         .map(|s| s.load_policy.as_str())
         .unwrap_or("explicit");
-    match load_policy {
-        "all" => all,
+    let mut target = match load_policy {
+        "all" => all.clone(),
         "latest" => pick_latest_version(&all).into_iter().collect(),
         _ => match strategy {
             Some(s) => models
@@ -180,9 +196,29 @@ fn compute_target_versions(
                 .filter(|m| s.versions_to_load.contains(&m.version))
                 .map(|m| m.version.clone())
                 .collect(),
-            None => all,
+            None => all.clone(),
         },
+    };
+
+    // The configured default version must always be loaded: it is the version
+    // the activation branch below is asked to make active, and a version that is
+    // never loaded can never be activated. Without this, `load_policy:
+    // explicit` with an empty `versions_to_load` (the default), or `latest` with
+    // a default that is not the newest, left the model Ready with NO active
+    // version — every request without an explicit version 404s, permanently,
+    // because an already-loaded version is never re-activated on a later round.
+    //
+    // `configured_versions` (`http/handlers/admin.rs`) already counts
+    // `default_version` as part of a model's configured set; this brings the
+    // load target in line with it. Only versions present on disk are added, so a
+    // default pointing at a version that was deleted does not turn into a
+    // load failure.
+    if let Some(dv) = strategy.and_then(|s| s.default_version.as_ref()) {
+        if all.contains(dv) && !target.contains(dv) {
+            target.push(dv.clone());
+        }
     }
+    target
 }
 // ===== Hot Reload File Watcher =====
 
@@ -340,6 +376,52 @@ mod tests {
         assert_eq!(
             compute_target_versions(&models, Some(&strategy)),
             vec!["2".to_string()]
+        );
+    }
+
+    /// Two functions answer "which versions does this model need", and they
+    /// disagree. `compute_target_versions` (below) builds the load set from
+    /// `load_policy` alone and never consults `strategy.default_version`, while
+    /// `configured_versions` (`http/handlers/admin.rs:799`, "the explicit
+    /// references (versions_to_load / default_version / weights keys)") DOES
+    /// insert it. Only this one drives the load.
+    ///
+    /// Consequence at `reconcile.rs:126-141`: the activation branch is entered
+    /// because `default_version` is `Some`, but its guard
+    /// `versions_loaded.contains(dv)` is false (the version was never loaded),
+    /// and the `else if` auto-activate fallback is unreachable because the
+    /// `if let Some(ref dv)` arm was taken. The model loads and reports Ready
+    /// with NO active version, so every request without an explicit version
+    /// 404s — permanently, since already-loaded versions are never
+    /// re-activated on later rounds.
+    ///
+    /// Reachable on the default `load_policy: "explicit"` with an empty
+    /// `versions_to_load`, and on `"latest"` whenever the configured default is
+    /// not the newest disk version.
+    ///
+    /// NOTE: this assertion encodes "a configured default version must be
+    /// loadable". If the fix instead makes the activation branch tolerate a
+    /// default that was never loaded (falling back to a loaded version), move
+    /// this pin to that path rather than deleting it — the contract to keep is
+    /// that a named default_version never strands the model without an active
+    /// version.
+    #[test]
+    fn test_compute_target_versions_covers_the_configured_default_version() {
+        let models = vec![rm("m", "1"), rm("m", "2"), rm("m", "3")];
+        let strategy = ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "explicit".to_string(),
+            versions_to_load: vec![],
+            default_version: Some("3".to_string()),
+            ..Default::default()
+        };
+
+        let target = compute_target_versions(&models, Some(&strategy));
+        assert!(
+            target.contains(&"3".to_string()),
+            "the configured default_version must be in the load target — it is the version the \
+             reconciler is asked to activate, so omitting it can only yield a Ready model with no \
+             active version; got {target:?}"
         );
     }
 

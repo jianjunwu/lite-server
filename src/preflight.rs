@@ -98,7 +98,9 @@ fn check_remote_admin_bind_open(cfg: &Config, warnings: &mut Vec<String>) {
 
 /// 判定绑定地址是否远程可达（非 loopback TCP）。UDS 判 false；主机名等无法
 /// 解析为 IP 的形态保守判 false——宁可漏报不误报。
-fn bind_is_remote(host: &str) -> bool {
+/// Public so the metrics-listener startup check can reuse the same
+/// classification rather than duplicating "what counts as remotely reachable".
+pub(crate) fn bind_is_remote(host: &str) -> bool {
     if unix_socket_path(host).is_some() {
         return false;
     }

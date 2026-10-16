@@ -60,6 +60,14 @@ impl AppState {
         has_hot_reload: Arc<AtomicBool>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
+        // Canonicalized here, at the boundary where this path becomes an
+        // identity: the H3 config-write suppression ledger keys on
+        // `repo_path.join(model).join(version).join("config.yaml")` while the
+        // watcher looks the entry back up under ITS canonicalized root. Taking
+        // the configured path verbatim (a relative `./model_repo` by default)
+        // made the two spellings differ, so the suppression never fired. See
+        // `config::resolve_repo_path`.
+        let repo_path = crate::config::resolve_repo_path(repo_path);
         let admission = AdmissionCounter::new(config.server.max_inflight);
         // Round2 B5: thresholds from config.alerts (defaults = legacy hardcoded).
         let alert_thresholds = AlertThresholds {

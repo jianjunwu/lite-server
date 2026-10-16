@@ -57,7 +57,7 @@ pub struct WorkerManager {
     // Callback runner for lifecycle events
     callback_runner: Arc<CallbackRunner>,
     // Status coordinator tasks per model version (phase 3). Reconciles
-    // Ready/Degraded from the outlier-ejection state at the version's
+    // Ready/Impaired/Degraded from the outlier-ejection + worker-death state at the version's
     // health_check_interval cadence; no task when the interval is 0
     // (status then stays purely event-driven).
     status_coordinators: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
@@ -131,6 +131,12 @@ impl WorkerManager {
         log_level: String,
         callback_runner: Arc<CallbackRunner>,
     ) -> Self {
+        // Canonicalized at the boundary (see `config::resolve_repo_path`): this
+        // path is the key of the H3 control-plane write ledger, which the
+        // watcher — which canonicalizes its own copy — has to match. Taking the
+        // configured path verbatim made the two spellings differ and the
+        // suppression never fired.
+        let repo_path = crate::config::resolve_repo_path(repo_path);
         let (respawn_tx, respawn_rx) = mpsc::channel::<RespawnSignal>(8);
         Self {
             registry,
@@ -400,6 +406,111 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(pending.len(), 100);
+    }
+
+    // ===== H3 config-write ledger: path identity =====
+
+    /// The H3 suppression ledger is keyed by path string, but its two ends
+    /// disagree on how to spell that path — and this is not an exotic edge
+    /// case, it is the DEFAULT configuration.
+    ///
+    /// Writer: the PATCH records `state.repo_path.join(model).join(version)`
+    /// (`http/handlers/config.rs:720`), where `AppState::repo_path` is
+    /// `PathBuf::from(&config.model_repository.path)` verbatim
+    /// (`server/mod.rs:142`) — default `"./model_repo"` (`config.rs:716`),
+    /// never canonicalized.
+    ///
+    /// Reader: the watcher looks the entry up under a canonicalized repo root
+    /// (`server/mod.rs:388-390` canonicalizes; `watcher.rs:160`/`:171` join and
+    /// look up from that), so its keys are absolute and symlink-resolved.
+    ///
+    /// `PathBuf` equality is component-wise and literal, so `"./model_repo/…"`
+    /// never equals `"/abs/cwd/model_repo/…"` — `take_config_write` never
+    /// matches, and the suppression is dead code. A `mode=write_only` PATCH
+    /// therefore still triggers a watcher reload, which is exactly the outcome
+    /// H3 exists to prevent.
+    ///
+    /// The same writer/reader asymmetry exists for the `.lma` dedup set
+    /// (`server/scanner.rs:61` filled from the raw path at `server/mod.rs:900`,
+    /// read back from the canonical path by the reconcile task), so a shared
+    /// fix is the point of this pin.
+    fn test_manager_with_repo(repo_path: std::path::PathBuf) -> WorkerManager {
+        WorkerManager::new(
+            Arc::new(ModelRegistry::new()),
+            repo_path,
+            Arc::new(InferenceQueue::new()),
+            "info".to_string(),
+            Arc::new(CallbackRunner::new()),
+        )
+    }
+
+    /// Every subsystem must resolve the configured repo root to ONE spelling.
+    ///
+    /// `PathBuf` equality is literal and component-wise, so a repo root spelled
+    /// two ways gives the same file two identities in every keyed structure.
+    /// The old code took `config.model_repository.path` verbatim here (a
+    /// RELATIVE `./model_repo` by default) while only the watcher canonicalized
+    /// its copy.
+    #[test]
+    fn repo_root_is_resolved_to_one_spelling() {
+        let base =
+            std::env::temp_dir().join(format!("lite-server-reporoot-{}", std::process::id()));
+        let nested = base.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // The same directory, spelled with a `..` that still resolves to it —
+        // the shape a relative or symlinked config value takes.
+        let spelled_from_parent = nested.join("..").join("nested");
+
+        let wm = test_manager_with_repo(spelled_from_parent.clone());
+        assert_eq!(
+            wm.repo_path,
+            nested.canonicalize().expect("the directory exists"),
+            "the worker manager must hold the resolved repo root, not the configured spelling"
+        );
+
+        // And a caller that resolves the same configured value on its own (the
+        // watcher) lands on that identical path.
+        assert_eq!(
+            crate::config::resolve_repo_path(&spelled_from_parent),
+            wm.repo_path,
+            "two subsystems given the same configured value must agree"
+        );
+    }
+
+    /// The property the H3 suppression actually needs: a ledger entry written
+    /// by the PATCH path must be found by the watcher's lookup, when both were
+    /// handed the same configured repo root.
+    #[test]
+    fn config_write_ledger_matches_across_subsystems_for_one_configured_root() {
+        let base = std::env::temp_dir().join(format!("lite-server-ledger-{}", std::process::id()));
+        let nested = base.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config_path = nested.join("config.yaml");
+        let bytes = b"name: m\n";
+        std::fs::write(&config_path, bytes).unwrap();
+        let etag = crate::http::handlers::config::content_etag(bytes);
+
+        let spelled_from_parent = nested.join("..").join("nested");
+
+        // Writer: the PATCH builds its path from the state's repo root.
+        let writer = test_manager_with_repo(spelled_from_parent.clone());
+        let written = writer.repo_path.join("m").join("1").join("config.yaml");
+        writer.note_config_write(&written, etag.clone());
+
+        // Reader: the watcher builds the same path from ITS resolved root.
+        let reader = test_manager_with_repo(spelled_from_parent);
+        let looked_up = crate::config::resolve_repo_path(&reader.repo_path)
+            .join("m")
+            .join("1")
+            .join("config.yaml");
+
+        assert!(
+            writer.take_config_write(&looked_up, &etag),
+            "the watcher's lookup must find the PATCH's ledger entry: otherwise the \
+             suppression never fires and a `mode=write_only` PATCH still triggers a reload, \
+             which is the exact outcome H3 exists to prevent"
+        );
     }
 
     // ===== Key format: underscore in model name / version =====
