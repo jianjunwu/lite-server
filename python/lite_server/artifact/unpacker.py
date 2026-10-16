@@ -41,6 +41,38 @@ def _safe_out_path(extract_dir: Path, rel_path: str) -> Path:
     return out_path
 
 
+def _copy_verified(src, dst, declared_size: int, rel_path: str) -> int:
+    """Stream `src` into `dst`, requiring exactly `declared_size` bytes.
+
+    `size` and `sha256` are INDEPENDENT manifest fields. An attacker builds
+    an artifact whose manifest under-declares `size` (say 1 byte for a
+    10 GiB member) while `sha256` is computed over the real payload — the
+    checksum pass in :meth:`ModelUnpacker.validate` says nothing about the
+    declared size, so the server's unpacked-size cap (derived from those
+    declarations) is bypassed unless the declaration is checked against
+    reality. The copy therefore aborts as soon as more bytes than declared
+    arrive (the write stays bounded by the declaration) and rejects a
+    short stream too.
+
+    Returns the number of bytes written.
+    """
+    written = 0
+    while chunk := src.read(65536):
+        written += len(chunk)
+        if written > declared_size:
+            raise ArtifactCorruptedError(
+                f"Size mismatch for {rel_path}: manifest declares "
+                f"{declared_size} bytes, archive holds more"
+            )
+        dst.write(chunk)
+    if written != declared_size:
+        raise ArtifactCorruptedError(
+            f"Size mismatch for {rel_path}: manifest declares "
+            f"{declared_size} bytes, archive holds {written}"
+        )
+    return written
+
+
 class ModelUnpacker:
     """Unpack and validate a .lma artifact."""
 
@@ -73,6 +105,13 @@ class ModelUnpacker:
                     raise ArtifactCorruptedError(
                         f"Checksum mismatch for {rel_path}: "
                         f"expected {entry.sha256[:16]}..., got {actual[:16]}..."
+                    )
+                # Declared size is a separate (unhashed) field: verify it
+                # against the bytes actually shipped.
+                if len(content) != entry.size:
+                    raise ArtifactCorruptedError(
+                        f"Size mismatch for {rel_path}: manifest declares "
+                        f"{entry.size} bytes, archive holds {len(content)}"
                     )
 
             # Verify signature (recompute HMAC over manifest without signature field)
@@ -126,11 +165,11 @@ class ModelUnpacker:
                 # out to this for repository auto-unpack and for untrusted
                 # uploads, and the worker puts the model dir on `sys.path`, so
                 # an unlisted `1/json.py` shadows a stdlib import and runs.
-                for rel_path in self._ensure_manifest().files:
+                for rel_path, entry in self._ensure_manifest().files.items():
                     out_path = _safe_out_path(target_dir, rel_path)
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(rel_path) as src, open(out_path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                        _copy_verified(src, dst, entry.size, rel_path)
                 # The manifest ships as part of the artifact and the server
                 # reads it back after unpacking (model version, declared
                 # files). It cannot list itself in `files`, so it is written
@@ -191,10 +230,12 @@ class ModelUnpacker:
 
                 # Single pass: stream-read, hash, and write
                 h = hashlib.sha256()
+                written = 0
                 out_path = _safe_out_path(extract_dir, rel_path)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(out_path, "wb") as dst:
                     while chunk := src.read(65536):
+                        written += len(chunk)
                         h.update(chunk)
                         dst.write(chunk)
 
@@ -203,6 +244,13 @@ class ModelUnpacker:
                     raise ArtifactCorruptedError(
                         f"Checksum mismatch for {rel_path}: "
                         f"expected {entry.sha256[:16]}..., got {actual[:16]}..."
+                    )
+                # Declared size is a separate (unhashed) field: verify it
+                # against the bytes actually shipped (see `_copy_verified`).
+                if written != entry.size:
+                    raise ArtifactCorruptedError(
+                        f"Size mismatch for {rel_path}: manifest declares "
+                        f"{entry.size} bytes, archive holds {written}"
                     )
 
             # Verify signature

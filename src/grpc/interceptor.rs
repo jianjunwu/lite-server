@@ -397,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn finalize_trusted_proxy_without_xff_does_not_consult_proto_map() {
+        // A TRUSTED proxy that adds no transport XFF: the peer anchor decides
+        // (the proxy itself) — `extract_client_ip` already returned a
+        // non-empty ip, so the client-settable proto map is never consulted.
+        // The proto-header fallback is therefore gated by the SAME trust rule
+        // the HTTP side applies (`http_client_ip` → `extract_client_ip`), not
+        // unconditional.
+        let proto = headers_with(&[("x-forwarded-for", "10.0.0.99")]);
+        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
+        let cx = finalize_context(
+            None,
+            &MetadataMap::new(),
+            &proto,
+            addr("10.0.0.1"),
+            &trusted,
+        );
+        assert_eq!(cx.client_ip, "10.0.0.1");
+    }
+
+    #[test]
     fn finalize_respects_interceptor_filled_context() {
         // interceptor 已填充（生产路径）：finalize 不覆盖已定案字段。request
         // 无 remote_addr（UDS）→ metadata 缺 XFF 时 client_ip 留空，finalize

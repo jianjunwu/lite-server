@@ -331,6 +331,13 @@ pub async fn get_upload_session(
 /// PUT .../upload-sessions/{sid}/files/{fi}/chunks/{ci} — one chunk, raw
 /// body. Idempotent: re-PUTting a chunk index overwrites it (client retry
 /// after an ambiguous failure is always safe).
+///
+/// Serialized with `complete` (and the delete handler) on the per-session
+/// lock, which is therefore held for the whole body read: two concurrent
+/// PUTs of the same chunk index would otherwise `File::create` (truncate)
+/// and write the same inode, and an interleaved pair leaves a MIXTURE of
+/// the two bodies at exactly the expected length — invisible to the
+/// byte-count check and, without a client-supplied sha256, committed.
 pub async fn put_session_chunk(
     State(state): State<Arc<AppState>>,
     Path((model_name, version, sid, file_index, chunk_index)): Path<(
@@ -344,7 +351,18 @@ pub async fn put_session_chunk(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    let (staging, meta) = load_session(&state, &model_name, &version, &sid).await?;
+    let (staging, _meta) = load_session(&state, &model_name, &version, &sid).await?;
+
+    let lock = complete_locks()
+        .entry(staging.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    // Re-read under the lock: the pre-lock state check was a TOCTOU against
+    // a complete that assembles from these very chunk files (and against a
+    // delete that removes the staging dir).
+    let meta = read_meta(&staging).await?;
     if meta.state != SessionState::Uploading {
         return Err(AppError::Conflict(
             "session is completing; no further chunks accepted".to_string(),
@@ -362,8 +380,9 @@ pub async fn put_session_chunk(
         )));
     }
     // Strict per-chunk length: non-final chunks are exactly chunk_size, the
-    // final one the remainder — then the received bitmap alone proves
-    // completeness and `complete` only re-verifies the declared hash.
+    // final one the remainder. `complete` re-verifies these lengths from
+    // disk (a bitmap entry only proves a chunk-shaped NAME exists) and, when
+    // the client declared one, the whole-file hash.
     let want = if chunk_index + 1 == expected {
         file.size - chunk_index * meta.chunk_size
     } else {
@@ -466,8 +485,11 @@ pub async fn complete_upload_session(
         ));
     }
 
-    // Every declared chunk must be on disk (strict lengths were enforced at
-    // PUT time, so presence implies well-formedness).
+    // Every declared chunk must be on disk, WITH its strict length. The
+    // bitmap reports names only, and the whole-file check in `assemble_file`
+    // compares a total: two torn chunks whose lengths happen to add up to
+    // the declared size would be assembled and committed as a silent
+    // corruption.
     for (i, f) in meta.files.iter().enumerate() {
         let expected = expected_chunks(f.size, meta.chunk_size);
         let received = scan_received(&staging, i).await;
@@ -478,6 +500,7 @@ pub async fn complete_upload_session(
                 expected - received.len() as u64
             )));
         }
+        verify_chunk_lengths(&staging, i, f, meta.chunk_size).await?;
     }
 
     let mut completing = meta.clone();
@@ -617,6 +640,36 @@ async fn assemble_and_finalize(
         response["load_error"] = json!(error);
     }
     Ok(FinalizedResponse(Json(response), outcome.version))
+}
+
+/// The strict length every chunk of `file` must have on disk: exactly
+/// `chunk_size` per chunk, the final one carrying the remainder.
+async fn verify_chunk_lengths(
+    staging: &std::path::Path,
+    file_index: usize,
+    file: &SessionFile,
+    chunk_size: u64,
+) -> Result<(), AppError> {
+    let expected = expected_chunks(file.size, chunk_size);
+    let dir = chunks_dir(staging, file_index);
+    for ci in 0..expected {
+        let want = if ci + 1 == expected {
+            file.size - ci * chunk_size
+        } else {
+            chunk_size
+        };
+        let got = tokio::fs::metadata(dir.join(ci.to_string()))
+            .await
+            .map_err(AppError::Io)?
+            .len();
+        if got != want {
+            return Err(AppError::InvalidRequestBody(format!(
+                "chunk {} of '{}' holds {} bytes, expected {} — re-upload it",
+                ci, file.name, got, want
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Stream-concatenate one file's chunks in order into `dest`, verifying the
@@ -1056,6 +1109,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, vec![b'y'; 64]);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// A body delivered in many small frames, so two concurrent PUTs of the
+    /// same chunk index interleave at the write level (a single-piece body
+    /// tends to land whole and hide the race).
+    fn piecewise_body(data: Vec<u8>) -> Body {
+        let frames: Vec<Result<axum::body::Bytes, std::io::Error>> = data
+            .into_iter()
+            .map(|b| Ok(axum::body::Bytes::from(vec![b])))
+            .collect();
+        Body::from_stream(futures::stream::iter(frames))
+    }
+
+    async fn put_chunk_body(
+        app: &Router,
+        model: &str,
+        version: &str,
+        sid: &str,
+        fi: usize,
+        ci: u64,
+        body: Body,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/v2/repository/models/{}/versions/{}/upload-sessions/{}/files/{}/chunks/{}",
+                        model, version, sid, fi, ci
+                    ))
+                    .header("content-type", "application/octet-stream")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Two concurrent PUTs of the SAME chunk index must leave one client's
+    /// chunk, never a byte-level mixture of both: without the per-session
+    /// lock they both `File::create` (truncate) and write the same inode,
+    /// and an interleaved pair produces a torn file of exactly the expected
+    /// length — which every downstream length check accepts.
+    #[tokio::test]
+    async fn test_concurrent_same_chunk_puts_never_commit_a_mixture() {
+        let tmp = unique_tmp("race");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 64 }]),
+        )
+        .await;
+
+        let first = vec![b'A'; 64];
+        let second = vec![b'B'; 64];
+        let (r1, r2) = tokio::join!(
+            put_chunk_body(
+                &app,
+                "mymodel",
+                "1",
+                &sid,
+                0,
+                0,
+                piecewise_body(first.clone())
+            ),
+            put_chunk_body(
+                &app,
+                "mymodel",
+                "1",
+                &sid,
+                0,
+                0,
+                piecewise_body(second.clone())
+            ),
+        );
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r2.status(), StatusCode::OK);
+
+        let response = complete(&app, "mymodel", "1", &sid).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = tokio::fs::read(tmp.join("mymodel").join("1").join("w.bin"))
+            .await
+            .unwrap();
+        assert!(
+            content == first || content == second,
+            "the committed chunk must be one of the two bodies, not a mixture \
+             (got {} A-bytes and {} B-bytes)",
+            content.iter().filter(|b| **b == b'A').count(),
+            content.iter().filter(|b| **b == b'B').count()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// `complete` must not trust the bitmap alone: a chunk file can carry the
+    /// right name and the wrong length (racing PUTs truncating each other's
+    /// inode, an interrupted rename). Two torn chunks whose lengths happen to
+    /// add up to the declared size used to assemble and commit silently.
+    #[tokio::test]
+    async fn test_complete_rejects_torn_chunks_that_sum_to_the_declared_size() {
+        let tmp = unique_tmp("torn");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 128 }]),
+        )
+        .await;
+
+        // Torn chunk files: 32 + 96 = 128 = the declared size, so the
+        // whole-file check in assemble_file cannot see the damage.
+        let chunks = tmp
+            .join(format!(".tmp-upload-{}", sid))
+            .join(".chunks")
+            .join("0");
+        tokio::fs::create_dir_all(&chunks).await.unwrap();
+        tokio::fs::write(chunks.join("0"), vec![b'A'; 32])
+            .await
+            .unwrap();
+        tokio::fs::write(chunks.join("1"), vec![b'B'; 96])
+            .await
+            .unwrap();
+
+        let response = complete(&app, "mymodel", "1", &sid).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a torn chunk set must be rejected"
+        );
+        assert!(
+            !tmp.join("mymodel").join("1").join("w.bin").exists(),
+            "nothing may be committed from torn chunks"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

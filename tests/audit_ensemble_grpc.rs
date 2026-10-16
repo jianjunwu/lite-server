@@ -771,3 +771,185 @@ async fn test_audit_grpc_decoupled_ensemble_friendly_error() {
         status.message()
     );
 }
+
+// ---------------------------------------------------------------------------
+// FIX 5（D43/R24 维度）: gRPC / HTTP 对 "JSON 根是否算二进制" 必须一致
+// ---------------------------------------------------------------------------
+//
+// 缺陷:gRPC 侧把客户端声明的 content-type 原样喂给
+// `EnsembleExecOpts.request_content_type`（infer.rs:144），即使负载是 JSON；
+// HTTP 侧对 JSON 体故意返回 None（http/handlers/mod.rs `RequestBody::content_type`）。
+// 于是 `passthrough: true` 且目标是"声明 inputs 的嵌套 ensemble"的步骤，
+// gRPC 把 JSON 根当成不透明二进制 → 子 ensemble 以 R18（"raw binary bodies
+// have no envelope semantics"）拒绝 → InvalidArgument；同一请求走 HTTP 成功。
+
+/// 恒等回显子模型：assembled 输入原样回传在 {"got": ...}。
+fn write_fix5_echo_model(repo: &std::path::Path) {
+    let dir = repo.join("fix5_echo/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class Fix5EchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request, ctx):
+        return request
+
+    def predict(self, x):
+        return {"got": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// 子 ensemble 声明 `inputs`（R17/R18 信封）——原始二进制体会被 R18 拒绝，
+/// 因此只有"被解析成 JSON 的根"才能通过。
+fn write_fix5_decl_child(repo: &std::path::Path) {
+    let dir = repo.join("ens_fix5_child/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"
+ensemble:
+  inputs:
+    text:
+      type: json
+  steps:
+    - name: e
+      model: fix5_echo
+      version: "1"
+      inputs:
+        x: "$inputs.text"
+"#,
+    )
+    .unwrap();
+}
+
+/// 父 ensemble 唯一步骤为 `passthrough: true`，目标是声明 inputs 的子 ensemble
+/// ——客户端的 JSON 根必须"解析后"抵达子 ensemble。
+fn write_fix5_pt_parent(repo: &std::path::Path) {
+    let dir = repo.join("ens_fix5_parent/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: child
+      model: ens_fix5_child
+      passthrough: true
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_http_json_passthrough_root_parity() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir().join(format!("lite-server-audit-fix5-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_fix5_echo_model(&repo);
+    write_fix5_decl_child(&repo);
+    write_fix5_pt_parent(&repo);
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-audit-fix5-yaml-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "fix5_echo", "1").await;
+    load_model(&base, "ens_fix5_child", "1").await;
+    load_model(&base, "ens_fix5_parent", "1").await;
+
+    let body = serde_json::to_vec(&json!({"text": "hello"})).unwrap();
+
+    // HTTP parity 基准（应先通过）: JSON 根 → 子 ensemble 收到解析后的信封。
+    let http_resp = reqwest::Client::new()
+        .post(format!("{}/v2/models/ens_fix5_parent/infer", base))
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("http ensemble infer failed");
+    let http_status = http_resp.status();
+    let http_text = http_resp.text().await.unwrap();
+    assert_eq!(
+        http_status, 200,
+        "HTTP baseline: JSON root passthrough must succeed, got body: {http_text}"
+    );
+    assert!(
+        http_text.contains("hello"),
+        "HTTP baseline: the child echo must carry the input, got: {http_text}"
+    );
+
+    // gRPC: 同一请求形状（JSON content-type）必须一致地成功。
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let result = client
+        .infer(InferRequest {
+            model_name: "ens_fix5_parent".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(body.clone()),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            ..Default::default()
+        })
+        .await;
+
+    let resp = match result {
+        Ok(r) => r.into_inner(),
+        Err(e) => panic!(
+            "FIX 5 parity defect: gRPC treated the JSON root as opaque binary, so the \
+             declared-inputs child rejected it (R18) while the identical HTTP request \
+             succeeds; got {:?}: {}",
+            e.code(),
+            e.message()
+        ),
+    };
+    let got: Value = serde_json::from_slice(&resp.data).expect("gRPC response must be JSON");
+    assert!(
+        got.to_string().contains("hello"),
+        "gRPC response must match the HTTP baseline, got: {got}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

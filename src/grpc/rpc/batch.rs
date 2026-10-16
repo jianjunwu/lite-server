@@ -3,9 +3,9 @@
 //! resolved deadline (B2 audit fix).
 
 use crate::error::AppError;
-use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
+use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit, gate_unknown_model_grpc};
 use crate::grpc::canary::canary_pin;
-use crate::grpc::error::err;
+use crate::grpc::error::{app_error_to_grpc_status, err};
 use crate::grpc::interceptor;
 use crate::grpc::metadata::response_headers_for_grpc;
 use crate::grpc::GrpcService;
@@ -47,9 +47,10 @@ fn d30_element_payload(
             serde_json::from_slice(data).map_err(|e| format!("element is not valid JSON: {e}"))?;
         Ok(crate::ensemble::EnsembleValue::Json(v))
     } else {
-        let ct = headers
-            .get("content-type")
-            .cloned()
+        // Case-insensitive lookup — a literal `get("content-type")` would drop
+        // a client's `Content-Type` spelling and fall back to octet-stream.
+        let ct = crate::grpc::payload::header_value(headers, "content-type")
+            .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
         Ok(crate::ensemble::EnsembleValue::Binary(
             data.clone(),
@@ -166,23 +167,23 @@ impl GrpcService {
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
                     .ok_or_else(|| {
-                        err(Status::not_found(format!(
-                            "{} has no active version",
-                            model_name
-                        )))
+                        // F-03: gate unknown-model probes (see
+                        // gate_unknown_model_grpc) — unary `infer` parity.
+                        err(gate_unknown_model_grpc(
+                            &self.registry,
+                            &grpc_metadata,
+                            &req.headers,
+                            Status::not_found(format!("{} has no active version", model_name)),
+                        ))
                     })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
+        // F-03: policy checks BEFORE the readiness check — an unauthenticated
+        // probe must get Unauthenticated whether the model is missing, not
+        // ready, or fine (auth first, then rate limit). Unary `infer` parity.
         let mv = self.registry.get(model_name, Some(&resolved_version));
         if let Some(mv) = &mv {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
@@ -192,6 +193,13 @@ impl GrpcService {
                 model_name,
                 &client_ip,
             )?;
+        }
+
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
         }
 
         // Fire InferenceRequest callback — batch_infer now mirrors unary
@@ -318,7 +326,13 @@ impl GrpcService {
         let resp = match crate::deadline::remaining(deadline.unix_ns) {
             Some(t) => match tokio::time::timeout(t, client.send(internal_req)).await {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(err(Status::internal(format!("worker error: {}", e)))),
+                Ok(Err(e)) => {
+                    // D4: the transport error's Display carries internal
+                    // detail (the ZMQ endpoint) — keep it server-side only and
+                    // let the sanitizing mapper build the client Status.
+                    tracing::warn!(error = %e, "batch worker send failed");
+                    return Err(err(app_error_to_grpc_status(&e)));
+                }
                 Err(_) => {
                     return Err(err(Status::deadline_exceeded(format!(
                         "inference timed out after {:.1}s",
@@ -327,10 +341,10 @@ impl GrpcService {
                 }
             },
             // No deadline (no client spec AND server.timeout<=0): unbounded.
-            None => client
-                .send(internal_req)
-                .await
-                .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?,
+            None => client.send(internal_req).await.map_err(|e| {
+                tracing::warn!(error = %e, "batch worker send failed");
+                err(app_error_to_grpc_status(&e))
+            })?,
         };
 
         // Task A: record worker-reported metrics. The top-level Response.metrics
@@ -458,9 +472,10 @@ impl GrpcService {
                     break;
                 };
                 let (j, resp) = joined.map_err(|e| {
-                    err(Status::internal(format!(
-                        "batch element task join error: {e}"
-                    )))
+                    // D4: a JoinError's Display (panic payload) must not reach
+                    // the client — log it, return a generic Status.
+                    tracing::error!(error = %e, "batch element task join failed");
+                    err(Status::internal("batch element task join error"))
                 })?;
                 items[j] = Some(resp);
             }
@@ -484,7 +499,9 @@ impl GrpcService {
             // to different sets, so a passthrough element follows the same
             // per-element rule.
             opts.request_body = Some(item.clone());
-            opts.request_content_type = req.headers.get("content-type").cloned();
+            // D43 (R24): None for a JSON content-type (HTTP parity) — a
+            // passthrough element must not be treated as opaque binary.
+            opts.request_content_type = crate::grpc::payload::request_content_type(&req.headers);
             let snapshot = Arc::clone(&snapshot);
             set.spawn(async move {
                 let resp = match crate::ensemble::execute_ensemble_inner(
@@ -515,9 +532,10 @@ impl GrpcService {
         // Drain the remaining in-flight element tasks.
         while let Some(joined) = set.join_next().await {
             let (i, resp) = joined.map_err(|e| {
-                err(Status::internal(format!(
-                    "batch element task join error: {e}"
-                )))
+                // D4: a JoinError's Display (panic payload) must not reach the
+                // client — log it, return a generic Status.
+                tracing::error!(error = %e, "batch element task join failed");
+                err(Status::internal("batch element task join error"))
             })?;
             items[i] = Some(resp);
         }

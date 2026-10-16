@@ -119,7 +119,10 @@ impl GrpcService {
                     &req.data,
                     // 审计 E-B1 修复:保留 proto headers 声明的 content-type
                     // (HTTP parity:Raw(bytes, ct) 保留声明值);未声明才回退。
-                    req.headers.get("content-type").cloned(),
+                    // Header names are case-insensitive (proto map holds the
+                    // client's spelling) — look up through the shared helper.
+                    crate::grpc::payload::header_value(&req.headers, "content-type")
+                        .map(str::to_string),
                 )
                 .map_err(|e| err(app_error_to_grpc_status(&e)))?;
                 // P-DEADLINE: resolve here (grpc_metadata still in scope) and
@@ -141,7 +144,11 @@ impl GrpcService {
                     // request metadata and the element's data as received.
                     request_headers: crate::ensemble::header_pool_from_grpc(&grpc_metadata),
                     request_body: Some(req.data.clone()),
-                    request_content_type: req.headers.get("content-type").cloned(),
+                    // D43 (R24): JSON must not be re-stated as opaque-binary
+                    // media type — `request_content_type` returns None for a
+                    // JSON content-type (HTTP `RequestBody::content_type`
+                    // parity), so a passthrough step parses it as JSON.
+                    request_content_type: crate::grpc::payload::request_content_type(&req.headers),
                 };
                 let result = crate::ensemble::execute_ensemble(
                     self.app_state.clone(),

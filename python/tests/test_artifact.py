@@ -471,6 +471,56 @@ class TestModelUnpacker:
         with pytest.raises(FileNotFoundError):
             unpacker.validate()
 
+    # ===== declared-size verification (zip-bomb cap input) =====
+    #
+    # `size` and `sha256` are independent manifest fields. The server derives
+    # its unpacked-size cap (server.max_upload_bytes) from the sum of the
+    # declared sizes, and used to compare it against values the attacker
+    # writes — so an artifact declaring `size: 1` for a huge member passed
+    # the cap while the unpacker wrote the full payload. The declared size
+    # must be checked against the bytes actually shipped.
+
+    def _rewrite_manifest(self, artifact, tmp_path, mutate):
+        """Rebuild `artifact` with manifest.json passed through `mutate`."""
+        rewritten = tmp_path / "rewritten.lma"
+        with zipfile.ZipFile(artifact, "r") as src:
+            manifest = json.loads(src.read("manifest.json").decode("utf-8"))
+            mutate(manifest)
+            with zipfile.ZipFile(rewritten, "w") as dst:
+                dst.writestr("manifest.json", json.dumps(manifest))
+                for info in src.infolist():
+                    if info.filename != "manifest.json":
+                        dst.writestr(info, src.read(info.filename))
+        return rewritten
+
+    def test_unpack_rejects_under_declared_size(self, artifact, tmp_path):
+        """A manifest that under-declares `size` (while `sha256` matches the
+        real payload) must fail the unpack: the declaration is the only input
+        the server's size cap has, and nothing else verifies it."""
+
+        def lie(manifest):
+            for entry in manifest["files"].values():
+                entry["size"] = 1  # real content is much larger
+
+        lying = self._rewrite_manifest(artifact, tmp_path, lie)
+        unpacker = ModelUnpacker(lying)
+        with pytest.raises(ArtifactCorruptedError, match="Size mismatch"):
+            unpacker.unpack(tmp_path / "extracted", prepend_name=False)
+
+    def test_unpack_rejects_missing_declared_size(self, artifact, tmp_path):
+        """An entry with no `size` field defaults to 0 — that is not evidence
+        the entry is empty, so the unpack must reject it rather than let the
+        cap read it as 'under the limit'."""
+
+        def drop_size(manifest):
+            for entry in manifest["files"].values():
+                entry.pop("size", None)
+
+        sizeless = self._rewrite_manifest(artifact, tmp_path, drop_size)
+        unpacker = ModelUnpacker(sizeless)
+        with pytest.raises(ArtifactCorruptedError, match="Size mismatch"):
+            unpacker.unpack(tmp_path / "extracted", prepend_name=False)
+
 
 class TestArtifactCache:
     """Unpack caching."""

@@ -467,76 +467,122 @@ fn build_route_stream_http_response(
     // (client disconnect, deadline/idle reclaim, unexpected frame) — the
     // guard drops armed unless a terminal frame or channel close disarms it.
     let guard = crate::streaming::StreamCancelGuard::armed(cancel_client, stream_id);
-    let body = futures::stream::unfold(
-        (chunk_rx, false, callback_runner, req_ctx, open_time, guard),
-        move |(mut rx, ended, cb, ctx, t0, mut guard)| {
-            // RN-13 (D9-A): force-capture the admission guard into this
-            // closure's environment — the unfold stream owns the closure, so
-            // the slot is released exactly when the body stream ends/drops.
-            let _hold = &admission_guard;
-            // G1/G3: same for the per-slot in-flight stream count.
-            let _hold_inflight = &inflight_guard;
-            async move {
-                if ended {
-                    return None;
+
+    // The guards and the TIME LIMITS live in this forward task — the task that
+    // consumes the stream's chunks — never in the response body.
+    //
+    // That placement IS the fix for a resource pin. hyper only polls a response
+    // body while it can write to the client, so timers living inside the body
+    // future are unreachable once the client stops reading: a stalled reader
+    // pinned the admission slot, the per-slot in-flight count and the
+    // worker-side generator for as long as the connection was held, and neither
+    // the idle budget nor the client's own deadline could fire. Every other
+    // streaming adapter (SSE, WS, gRPC server-stream/bidi/decoupled) already
+    // splits it exactly this way — a detached task reads from the worker and
+    // bounds its SEND with `send_bounded(deadline, idle)`, while the body is a
+    // plain channel stream. Backpressure from a stalled reader now lands on
+    // `send_bounded` here, where the same bound applies, instead of freezing
+    // the timers. (`StreamInflightGuard`'s doc states the invariant.)
+    //
+    // The channel is bounded so the task cannot buffer without limit; a full
+    // channel parks the task in `send_bounded` until that bound fires.
+    let (out_tx, out_rx) = mpsc::channel::<Result<bytes::Bytes, Infallible>>(64);
+    tokio::spawn(async move {
+        // Held for this task's lifetime and dropped on every exit shape — a
+        // panic unwinds out of here and drops them too, and the armed
+        // cancel guard drops with them, so the worker-side generator is
+        // cancelled either way.
+        let _admission_guard = admission_guard;
+        let _inflight_guard = inflight_guard;
+        let mut guard = guard;
+        let mut rx = chunk_rx;
+        loop {
+            // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
+            // A reclaim is NOT a channel close: the worker may still be
+            // generating, so it keeps the guard armed (cancel on drop).
+            //
+            // `closed()` races the receive so a client that goes away is noticed
+            // IMMEDIATELY — the body dropping closes the channel — rather than
+            // whenever the worker next speaks. Without it a silent worker would
+            // park this task in `recv_chunk` and the cancel-on-disconnect
+            // contract (B1) would only be honoured on a later frame or when the
+            // recv bound fired, which is never when both bounds are disabled.
+            let (frame, reclaimed) = tokio::select! {
+                biased;
+                _ = out_tx.closed() => {
+                    break;
                 }
-                // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
-                // A reclaim is NOT a channel close: the worker may still be
-                // generating, so it keeps the guard armed (cancel on drop).
-                let (frame, reclaimed) =
-                    match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+                received = crate::streaming::recv_chunk(&mut rx, deadline, idle) => {
+                    match received {
                         Ok(Some(f)) => (Some(f), false),
                         Ok(None) => (None, false), // worker closed the stream
                         Err(elapsed) => {
                             tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
                             (None, true)
                         }
-                    };
-                match frame.map(|f| f.payload) {
-                    Some(Some(pb::stream_response::Payload::Chunk(c))) => {
-                        let data = if is_sse {
-                            sse_frame(&c.data)
-                        } else {
-                            c.data.to_vec()
-                        };
-                        Some((
-                            Ok::<_, Infallible>(bytes::Bytes::from(data)),
-                            (rx, false, cb, ctx, t0, guard),
-                        ))
-                    }
-                    Some(Some(pb::stream_response::Payload::Error(e))) => {
-                        warn!("route stream error: {}", e.message);
-                        // Terminal frame → fire the response callback (full elapsed).
-                        guard.disarm();
-                        crate::callback::fire_inference_response(&cb, &ctx, t0);
-                        if is_sse {
-                            let event = sse_frame(e.message.as_bytes());
-                            Some((
-                                Ok(bytes::Bytes::from(event)),
-                                (rx, true, cb, ctx, t0, guard),
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    // Done or channel closed: the worker already ended its side —
-                    // disarm, no cancel.
-                    Some(Some(pb::stream_response::Payload::Done(_))) | None if !reclaimed => {
-                        guard.disarm();
-                        crate::callback::fire_inference_response(&cb, &ctx, t0);
-                        None
-                    }
-                    // Deadline/idle reclaim or an unexpected frame — terminal for
-                    // us, but the worker may still be generating: the armed
-                    // guard cancels on drop.
-                    _ => {
-                        crate::callback::fire_inference_response(&cb, &ctx, t0);
-                        None
                     }
                 }
+            };
+
+            // Bytes to deliver (if any) and whether the stream ends after them.
+            let (out, terminal) = match frame.map(|f| f.payload) {
+                Some(Some(pb::stream_response::Payload::Chunk(c))) => {
+                    let data = if is_sse {
+                        sse_frame(&c.data)
+                    } else {
+                        c.data.to_vec()
+                    };
+                    (Some(bytes::Bytes::from(data)), false)
+                }
+                Some(Some(pb::stream_response::Payload::Error(e))) => {
+                    warn!("route stream error: {}", e.message);
+                    // Terminal frame → fire the response callback (full elapsed).
+                    guard.disarm();
+                    crate::callback::fire_inference_response(&callback_runner, &req_ctx, open_time);
+                    let out = is_sse.then(|| bytes::Bytes::from(sse_frame(e.message.as_bytes())));
+                    (out, true)
+                }
+                // Done or channel closed: the worker already ended its side —
+                // disarm, no cancel.
+                Some(Some(pb::stream_response::Payload::Done(_))) | None if !reclaimed => {
+                    guard.disarm();
+                    crate::callback::fire_inference_response(&callback_runner, &req_ctx, open_time);
+                    (None, true)
+                }
+                // Deadline/idle reclaim or an unexpected frame — terminal for us,
+                // but the worker may still be generating: the armed guard
+                // cancels on drop.
+                _ => {
+                    crate::callback::fire_inference_response(&callback_runner, &req_ctx, open_time);
+                    (None, true)
+                }
+            };
+
+            if let Some(out) = out {
+                // Bound the SEND by the same min(deadline, idle) the receive
+                // uses: a reader that stops draining must trip the same reclaim
+                // as a worker that stops producing.
+                let delivered = matches!(
+                    crate::streaming::send_bounded(deadline, idle, out_tx.send(Ok(out))).await,
+                    crate::streaming::SendOutcome::Sent(Ok(()))
+                );
+                if !delivered {
+                    break;
+                }
             }
-        },
-    );
+            if terminal {
+                break;
+            }
+        }
+        // `out_tx` drops here, which ends the body stream.
+    });
+
+    // No timers and no guards in the body on purpose — see above. A stalled
+    // reader can only block this receive, which is harmless: the forward task
+    // owns the lifetime.
+    let body = futures::stream::unfold(out_rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
     let mut builder = Response::builder().header("content-type", content_type);
     if start.status_code > 0 {
         if let Ok(sc) = axum::http::StatusCode::from_u16(start.status_code as u16) {
@@ -1007,6 +1053,143 @@ mod route_match_tests {
         assert!(
             matches!(err, AppError::RateLimitExceeded { .. }),
             "second call must be 429, got {err:?}"
+        );
+    }
+
+    /// A stalled reader must not pin a streaming route's resources.
+    ///
+    /// Every other streaming adapter runs a DETACHED forward task that reads
+    /// from the worker and bounds its SEND with `send_bounded(deadline, idle)`
+    /// (`streaming/mod.rs`; SSE `stream.rs:893`, WS `:2426`, gRPC `rpc/stream.rs:435`,
+    /// `rpc/bidi.rs:703`, `rpc/decoupled.rs:362`). The route path instead puts
+    /// `recv_chunk(deadline, idle)` — and both RAII guards — inside the response
+    /// body's `unfold` closure, and hyper only polls that closure when it can
+    /// write to the client. A client that reads the headers and then stops
+    /// reading therefore never re-enters the closure, so neither the idle budget
+    /// nor the client's own deadline can fire, and the admission slot, the
+    /// per-slot in-flight count and the worker-side generator stay pinned for as
+    /// long as the connection is held.
+    ///
+    /// `StreamInflightGuard`'s own doc states the invariant this test enforces:
+    /// the guard "must live in the task/future that consumes the stream's
+    /// chunks … NOT in the handler scope".
+    #[tokio::test]
+    async fn route_stream_releases_its_guards_when_the_client_stops_reading() {
+        use prost::Message;
+        let sock = std::env::temp_dir().join(format!("route-stall-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let endpoint = format!("ipc://{}", sock.display());
+
+        // Fake worker: Start, then silence (a long generator).
+        std::thread::spawn({
+            let endpoint = endpoint.clone();
+            move || {
+                let ctx = zmq::Context::new();
+                let s = ctx.socket(zmq::PAIR).expect("worker socket");
+                s.connect(&endpoint).expect("worker connect");
+                let _ = s.set_rcvtimeo(10000);
+                while let Ok(bytes) = s.recv_bytes(0) {
+                    let req = match pb::Request::decode(bytes.as_slice()) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    if let Some(pb::request::Payload::RouteCall(_)) = req.payload {
+                        let resp = pb::Response {
+                            payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                stream_id: req.uid.clone(),
+                                payload: Some(pb::stream_response::Payload::Start(
+                                    pb::StreamStart {
+                                        media_type: "application/octet-stream".to_string(),
+                                        ..Default::default()
+                                    },
+                                )),
+                            })),
+                            ..Default::default()
+                        };
+                        if s.send(resp.encode_to_vec(), 0).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let client = std::sync::Arc::new(crate::transport::zmq::WorkerZmqClient::new(
+            endpoint.clone(),
+        ));
+        let uid = format!("route_m_1-stall-{}", uuid::Uuid::new_v4());
+        let request = pb::Request {
+            uid: uid.clone(),
+            meta: None,
+            payload: Some(pb::request::Payload::RouteCall(pb::SingleRequest {
+                data: bytes::Bytes::new(),
+            })),
+        };
+        let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await.unwrap();
+        let start =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), chunk_rx.recv()).await {
+                Ok(Some(f)) => match f.payload {
+                    Some(pb::stream_response::Payload::Start(s)) => s,
+                    other => panic!("expected Start, got {other:?}"),
+                },
+                r => panic!("no Start frame: {r:?}"),
+            };
+        drop(resp_rx);
+
+        // The resources a stalled reader would pin, made observable.
+        let counter = crate::admission::AdmissionCounter::new(4);
+        let admission = counter.try_acquire().expect("admission slot");
+        assert_eq!(counter.current(), 1, "precondition: the slot is held");
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(1));
+        let inflight = crate::streaming::StreamInflightGuard::new(outlier.clone(), 0);
+        assert_eq!(
+            outlier.stream_inflight(0),
+            1,
+            "precondition: the slot's stream count is 1"
+        );
+
+        let resp = build_route_stream_http_response(
+            start,
+            chunk_rx,
+            None,
+            // A short idle so the test does not wait 300s.
+            Some(std::time::Duration::from_millis(200)),
+            std::sync::Arc::new(crate::callback::CallbackRunner::new()),
+            crate::callback::InferenceContext {
+                model_name: "m".to_string(),
+                version: "1".to_string(),
+                route: "/stream".to_string(),
+                protocol: crate::callback::Protocol::Http,
+                request_id: "rid".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                elapsed_us: None,
+            },
+            std::time::Instant::now(),
+            Some(admission),
+            client.clone(),
+            uid.clone(),
+            Some(inflight),
+        )
+        .expect("stream response builds");
+
+        // The client holds the body but never reads it: hyper stops polling the
+        // body future, so the closure holding the guards never runs again.
+        let held_body = resp.into_body();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let slot_still_held = counter.current();
+        let count_still_held = outlier.stream_inflight(0);
+        drop(held_body);
+        let _ = std::fs::remove_file(&sock);
+
+        assert_eq!(
+            slot_still_held, 0,
+            "the admission slot must be released once the idle budget elapses, even though \
+             the client never read the body"
+        );
+        assert_eq!(
+            count_still_held, 0,
+            "the stream's in-flight count must be released once the idle budget elapses"
         );
     }
 

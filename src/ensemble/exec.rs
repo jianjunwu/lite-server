@@ -458,8 +458,6 @@ pub(crate) async fn execute_ensemble_inner(
     // concurrent sibling branch never sees this entry (B1: the flat shared
     // Vec misread sibling fan-out as recursion).
     let ancestors = extend_ancestor_chain(ancestors, model_name, version);
-    // P10 (§6.3.3): rejection observability needs a request-age baseline.
-    let request_start = Instant::now();
     // P0 (D6): plan comes from the cache — parse/validate/layers run once per
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
@@ -607,19 +605,13 @@ pub(crate) async fn execute_ensemble_inner(
         // chain length). Acquire BEFORE spawning the chain: a 429-rejected
         // request must be side-effect-free on sub-model workers (no worker
         // stream is opened without a permit).
+        //
+        // §6.3.3: the rejection is counted ONCE, by the adapter wrapper (the
+        // layer that owns the request-level outcome) — it maps this
+        // `StreamingCapacityExceeded` to the "concurrency_limit" reason.
+        // Recording here as well double-counted one 429.
         let permit = match state.worker_manager.streaming_capacity() {
-            Some(capacity) => Some(capacity.try_acquire_many(chain.nodes.len()).inspect_err(
-                |_| {
-                    // §6.3.3: every P10 rejection is observable.
-                    crate::metrics::prometheus::record_stream_rejected(
-                        model_name,
-                        version,
-                        "4xx",
-                        request_start.elapsed().as_secs_f64(),
-                        "concurrency_limit",
-                    );
-                },
-            )?),
+            Some(capacity) => Some(capacity.try_acquire_many(chain.nodes.len())?),
             None => None,
         };
         let mut stream = spawn_chain(
@@ -690,17 +682,12 @@ pub(crate) async fn execute_ensemble_inner(
     // already waited in the queue once), and a rejected request never opens
     // a sub-model worker stream. The owned permit rides the stream and
     // releases when the adapter's forward task ends (D18 teardown path).
+    //
+    // §6.3.3: the rejection is counted ONCE, by the adapter wrapper (see the
+    // chain branch above) — it maps this `StreamingCapacityExceeded` to the
+    // "concurrency_limit" reason.
     let permit = match state.worker_manager.streaming_capacity() {
-        Some(capacity) => Some(capacity.try_acquire().inspect_err(|_| {
-            // §6.3.3: every P10 rejection is observable.
-            crate::metrics::prometheus::record_stream_rejected(
-                model_name,
-                version,
-                "4xx",
-                request_start.elapsed().as_secs_f64(),
-                "concurrency_limit",
-            );
-        })?),
+        Some(capacity) => Some(capacity.try_acquire()?),
         None => None,
     };
     let mut stream = open_tail_stream(

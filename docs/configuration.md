@@ -133,6 +133,11 @@ metrics:
                                # plaintext — see TLS notes below). Scope note: the main-port
                                # /metrics route is ALWAYS mounted (Admin endpoint class) and is
                                # NOT affected by this switch.
+  host: 127.0.0.1              # Bind address for that listener. UNSET = follow server.host,
+                               # which defaults to 0.0.0.0 — so by default /metrics is readable
+                               # by anyone who can route to the port, with NO authentication
+                               # (the listener has none by design, so Prometheus can scrape it).
+                               # Startup warns whenever the resolved address is not loopback.
   # GIE/EPP-compatible metric namespace: exposes
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization on /metrics
   # (vllm-compatible naming for the Kubernetes LLM-autoscaler ecosystem).
@@ -536,7 +541,7 @@ policies:
                                  #   version = keep the configured total, round-robin across workers
     respawn: true                #   re-warm a replacement worker after respawn (default true); the
                                  #   re-warm runs in the background (respawn never blocks crash
-                                 #   recovery); a failed re-warm force-ejects the slot (version → Degraded)
+                                 #   recovery); a failed re-warm force-ejects the slot (version → Impaired)
     samples:                     #   dummy inputs, consumed in order — one file per input
                                  #   shape/batch (M7; legacy dummy_input_ref/iterations removed)
       - input_ref: warmup/batch1.json   # dummy request-body JSON, relative to the model dir

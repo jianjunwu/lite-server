@@ -4909,6 +4909,34 @@ fn r23_rejects_server_managed_headers() {
     }
 }
 
+/// R23 + security: the server's `x-lite-*` control namespace cannot be
+/// forwarded — those headers are read back as scheduling/deadline controls, so
+/// an allowlisted `x-lite-worker-id` would let a client pin a DAG node to a
+/// worker index of its choosing.
+#[test]
+fn r23_rejects_server_control_namespace() {
+    for name in [
+        "x-lite-worker-id",
+        "x-lite-affinity-key",
+        "x-lite-priority",
+        "x-lite-timeout",
+        "x-lite-dag",
+        "X-Lite-Worker-Id",
+    ] {
+        let yaml = single_step_yaml(&format!(
+            "      inputs: {{x: \"$request\"}}\n      forward_headers: [\"{name}\"]\n"
+        ));
+        let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err(&format!(
+                "{name} must be rejected (server control namespace)"
+            ));
+        assert!(
+            err.to_string().contains("(R23)") && err.to_string().contains("x-lite-*"),
+            "{name}: the error must name the reserved namespace, got {err}"
+        );
+    }
+}
+
 /// R23: transport-describing headers make the downstream request malformed —
 /// the body the worker receives is a re-assembled payload.
 #[test]

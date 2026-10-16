@@ -12,19 +12,39 @@ use tonic::Status;
 /// `_BIDI_FRAMING_CONTENT_TYPE` in python/lite_server/worker/streaming.py).
 const BIDI_FRAMING_CONTENT_TYPE: &str = "application/x-lite-bidi";
 
+/// Case-insensitive header lookup over the proto `headers` map.
+///
+/// The map holds whatever key the client spelled (`Content-Type` vs
+/// `content-type`), so a literal `get` misses the capitalized spelling —
+/// every consumer of this map must look up through here. `grpc/auth.rs`
+/// compares header names the same way.
+pub(crate) fn header_value<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// D43 (R24): the media type the request root carries, for a `passthrough`
+/// step to re-state alongside the verbatim bytes — `None` for a JSON (or
+/// absent) content-type, mirroring HTTP's `RequestBody::content_type`.
+/// Both transports must agree that a JSON payload is never opaque binary.
+pub(crate) fn request_content_type(headers: &HashMap<String, String>) -> Option<String> {
+    let ct = header_value(headers, "content-type")?;
+    if grpc_payload_is_json(headers) {
+        return None;
+    }
+    Some(ct.to_string())
+}
+
 /// Mirror Python `_payload_content_type` + `_is_json_content_type`
 /// (pipeline.py:82). Returns true when the payload MUST be valid JSON; false
 /// when it MUST be treated as opaque bytes.
 pub(crate) fn grpc_payload_is_json(headers: &HashMap<String, String>) -> bool {
-    // Header names are case-insensitive and the proto map holds whatever the
-    // client spelled, so the lookup must be too: a literal `get("content-type")`
-    // reads `Content-Type: image/png` as "no header" and validates binary bytes
-    // as JSON. grpc/auth.rs compares the same map the same way.
-    let Some(ct) = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.as_str())
-    else {
+    let Some(ct) = header_value(headers, "content-type") else {
         return true; // missing → JSON default (D2 parity)
     };
     let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
@@ -143,6 +163,42 @@ mod tests {
             "content-type",
             "not-a-valid/content-type!!!"
         )])));
+    }
+
+    /// FIX 4: the case-insensitive lookup the ensemble call sites must use —
+    /// a literal `get("content-type")` misses a capitalized spelling.
+    #[test]
+    fn header_value_is_case_insensitive() {
+        assert_eq!(
+            header_value(&h(&[("Content-Type", "image/png")]), "content-type"),
+            Some("image/png")
+        );
+        assert_eq!(header_value(&h(&[]), "content-type"), None);
+    }
+
+    /// FIX 5: `request_content_type` is JSON-aware — `None` for a JSON (or
+    /// absent) content-type, like HTTP's `RequestBody::content_type`, so a
+    /// passthrough step never treats a JSON root as opaque binary.
+    #[test]
+    fn request_content_type_is_none_for_json() {
+        assert_eq!(request_content_type(&h(&[])), None);
+        assert_eq!(
+            request_content_type(&h(&[("content-type", "application/json")])),
+            None
+        );
+        assert_eq!(
+            request_content_type(&h(&[("Content-Type", "application/json")])),
+            None
+        );
+        assert_eq!(
+            request_content_type(&h(&[("Content-Type", "image/png")])).as_deref(),
+            Some("image/png"),
+            "a binary media type keeps the declared value, any casing"
+        );
+        assert_eq!(
+            request_content_type(&h(&[("content-type", "application/octet-stream")])).as_deref(),
+            Some("application/octet-stream")
+        );
     }
 
     #[test]

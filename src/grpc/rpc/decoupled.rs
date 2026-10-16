@@ -5,11 +5,11 @@
 //! chunks; only the idle-timeout wrapper and the DecoupledResponse mapping
 //! differ from stream_infer.
 
-use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
+use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit, gate_unknown_model_grpc};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::{
-    err, error_type_to_grpc_code, grpc_code_to_status_family, model_error_status,
-    try_parse_model_error,
+    app_error_to_grpc_status, err, error_type_to_grpc_code, grpc_code_to_status_family,
+    model_error_status, try_parse_model_error,
 };
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
@@ -79,24 +79,37 @@ impl GrpcService {
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
                     .ok_or_else(|| {
-                        err(Status::not_found(format!(
-                            "{} has no active version",
-                            model_name
-                        )))
+                        // F-03: gate unknown-model probes (see
+                        // gate_unknown_model_grpc) — unary `infer` parity.
+                        err(gate_unknown_model_grpc(
+                            &self.registry,
+                            &grpc_metadata,
+                            &req.headers,
+                            Status::not_found(format!("{} has no active version", model_name)),
+                        ))
                     })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
+        // F-03: policy checks BEFORE the readiness check — an unauthenticated
+        // probe must get Unauthenticated whether the model is missing, not
+        // ready, or fine (auth first, then rate limit). Unary `infer` parity.
+        // The ensemble-contract rejection rides along: it is a client-contract
+        // error, independent of readiness.
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            // F-03: the policy gates run BEFORE the model-type check — an
+            // unauthenticated probe must not learn that a model is an
+            // ensemble, and the rate-limit bucket is consulted for every
+            // request (unary `infer` parity).
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(
+                &self.rate_limiter,
+                mv.policies.rate_limit.as_ref(),
+                model_name,
+                &client_ip,
+            )?;
             // §4.4: an ensemble has no workers — DecoupledInfer has no
             // ensemble branch (the §4.5 target matrix does not list it), so
             // fail with the friendly InvalidArgument instead of falling
@@ -107,13 +120,13 @@ impl GrpcService {
                      supported for ensembles; use StreamInfer or BidiStream"
                 ))));
             }
-            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(
-                &self.rate_limiter,
-                mv.policies.rate_limit.as_ref(),
-                model_name,
-                &client_ip,
-            )?;
+        }
+
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
         }
 
         // FD-1: gateway-side JSON validation (HTTP ApiBody/B1 parity) —
@@ -210,7 +223,12 @@ impl GrpcService {
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
             .await
-            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+            .map_err(|e| {
+                // D4: the transport error's Display carries the internal ZMQ
+                // endpoint — log it, return the sanitized Status.
+                tracing::warn!(error = %e, "worker decoupled stream open failed");
+                err(app_error_to_grpc_status(&e))
+            })?;
         // G3: count the stream toward the slot's max_requests budget.
         self.app_state.inference_queue.record_stream_served(
             model_name,
@@ -681,6 +699,144 @@ mod tests {
              end-of-stream indistinguishable from the worker's normal EOF \
              (gRPC stream.rs:316-321 already sends Err(deadline_exceeded)). \
              items: {items:?}"
+        );
+    }
+
+    // ===== D4 (leak): transport errors must not reach the client ============
+
+    /// GrpcService with one ready model whose single worker client is bound to
+    /// an UNBINDABLE endpoint — the actor records a fatal
+    /// `AppError::Transport("Failed to bind ZMQ PAIR to <endpoint>: ...")` and
+    /// every send fails fast with it.
+    async fn make_service_broken_worker(model: &str, endpoint: String) -> GrpcService {
+        let cb = Arc::new(CallbackRunner::new());
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        registry
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        registry
+            .set_workers(
+                model,
+                "1",
+                vec![WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        registry.activate_version(model, "1").unwrap();
+
+        // Let the actor attempt (and fail) the bind so `fatal_err()` is set.
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wm.insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            queue,
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(RateLimiter::default()),
+        ));
+        GrpcService::new(GrpcServiceDeps {
+            registry,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: app_state.callback_runner.clone(),
+            shutdown_state: app_state.shutdown_state.clone(),
+            server_timeout: Duration::ZERO,
+            rate_limiter: app_state.rate_limiter.clone(),
+            decoupled_idle_timeout: None,
+            app_state,
+            trusted: Arc::new(Vec::new()),
+        })
+    }
+
+    /// D4 (leak): a worker open failure's Display names the internal ZMQ
+    /// endpoint ("Failed to bind ZMQ PAIR to ipc://…"). The client-visible
+    /// Status must be the sanitized mapper output ("transport error"), not the
+    /// hand-rolled `Status::internal(format!("worker stream error: {e}"))`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_error_status_must_not_leak_endpoint() {
+        // A directory that does not exist → the ipc bind fails with ENOENT and
+        // the endpoint lands verbatim in the transport error's Display.
+        let endpoint = format!(
+            "ipc://{}/lite-leak-{}/worker.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let svc = make_service_broken_worker("leak_dec", endpoint.clone()).await;
+
+        // Self-check: the raw transport error DOES name the endpoint — so the
+        // assertion below proves the sanitizing mapper is doing the work, not
+        // that the failure happens to be detail-free.
+        let probe = WorkerZmqClient::new(endpoint.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let raw = probe
+            .send(pb::Request::default())
+            .await
+            .expect_err("binding an impossible ipc path must fail");
+        assert!(
+            raw.to_string().contains(&endpoint),
+            "test premise: the transport error must name the endpoint; got: {raw}"
+        );
+
+        let request = Request::new(pb::DecoupledInferRequest {
+            model_name: "leak_dec".to_string(),
+            version: String::new(),
+            data: Bytes::from_static(b"{}"),
+            headers: HashMap::new(),
+            sequence_id: None,
+        });
+        let mut version_label = String::new();
+        let mut request_id_out = String::new();
+        let err = svc
+            .decoupled_infer_impl(
+                request,
+                &mut version_label,
+                &mut request_id_out,
+                std::time::Instant::now(),
+                tracing::Span::current(),
+                crate::admission::AdmissionCounter::new(0)
+                    .try_acquire()
+                    .expect("cap 0 always admits"),
+            )
+            .await
+            .expect_err("an unbindable worker endpoint must fail the stream open");
+        assert!(
+            !err.message().contains(&endpoint),
+            "D4: the client-visible Status must not leak the internal endpoint; got: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("ipc://"),
+            "D4: no transport endpoint may appear in the Status message; got: {}",
+            err.message()
         );
     }
 }

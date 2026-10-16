@@ -230,7 +230,17 @@ pub(crate) async fn auto_load_uploaded(
     }
     let load_dir = state.repo_path.join(model_name).join(version);
     let config_path = load_dir.join("config.yaml");
-    let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+    // A config.yaml that fails to load must be visible (same rule as
+    // reconcile and the ensemble sub-model load): silently substituting
+    // ModelConfig::default() drops `policies`, which leaves the version
+    // with NO auth/rate-limit gate while reporting a successful load.
+    let mut config = match crate::config::load_model_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Auto-load after upload failed: invalid config.yaml: {}", e);
+            return Some(format!("invalid config.yaml for {version}: {e}"));
+        }
+    };
     state.config.apply_model_defaults(&mut config);
     if let Err(e) = state
         .worker_manager
@@ -242,7 +252,26 @@ pub(crate) async fn auto_load_uploaded(
     }
     let active = state.registry.get_active_version(model_name);
     if active.is_none() {
-        let _ = state.registry.activate_version(model_name, version);
+        // A discarded activation result reports success while the version
+        // is not actually active (Ok(false) = not Ready; Err = unknown
+        // model/version). Surface both instead of returning None.
+        match state.registry.activate_version(model_name, version) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "Auto-load after upload: version {} is not Ready; active version unchanged",
+                    version
+                );
+                return Some(format!(
+                    "version {} loaded but is not Ready; no active version was set",
+                    version
+                ));
+            }
+            Err(e) => {
+                warn!("Auto-activation after upload failed: {}", e);
+                return Some(e.to_string());
+            }
+        }
     }
     None
 }
@@ -289,6 +318,50 @@ async fn unpack_artifact(
         )));
     }
     Ok(())
+}
+
+/// The unpacked total an artifact manifest declares, or None when the
+/// manifest yields no usable size (no `files` object, or every entry
+/// declaring 0). `size` and `sha256` are INDEPENDENT manifest fields, and
+/// the unpacker verifies each declared size against the bytes it writes —
+/// so a usable declaration is evidence, while a missing/zero one is not
+/// evidence of an empty unpack and must never read as "under the cap".
+fn declared_unpacked_bytes(manifest: &Value) -> Option<u64> {
+    let total: u64 = manifest["files"]
+        .as_object()?
+        .values()
+        .filter_map(|e| e["size"].as_u64())
+        .sum();
+    (total > 0).then_some(total)
+}
+
+/// F11b: reject an upload whose declared unpacked size exceeds `max`, and
+/// fail closed when the declaration is unusable — a cap that silently
+/// passes what it cannot measure is no cap (max_upload_bytes defaults to
+/// None and the upload routes disable the body limit, so when an operator
+/// configures it, this is the only real bound).
+async fn enforce_unpacked_size_cap(
+    manifest_path: &std::path::Path,
+    max: u64,
+) -> Result<(), AppError> {
+    let unusable = |detail: &str| {
+        AppError::Validation(format!(
+            "cannot enforce max_upload_bytes={max}: artifact manifest {detail}"
+        ))
+    };
+    let raw = tokio::fs::read_to_string(manifest_path)
+        .await
+        .map_err(|e| unusable(&format!("unreadable ({e})")))?;
+    let manifest: Value =
+        serde_json::from_str(&raw).map_err(|e| unusable(&format!("invalid ({e})")))?;
+    match declared_unpacked_bytes(&manifest) {
+        Some(declared) if declared > max => Err(AppError::PayloadTooLarge {
+            max_size: max as usize,
+            actual_size: Some(declared),
+        }),
+        Some(_) => Ok(()),
+        None => Err(unusable("declares no usable unpacked size")),
+    }
 }
 
 /// Shared upload tail — unpack staged .lma artifacts (with manifest
@@ -374,24 +447,15 @@ pub(crate) async fn finalize_upload(
 
     // F11b (zip-bomb guard): max_upload_bytes counts COMPRESSED upload
     // bytes — a small archive can unpack to an unbounded tree. The
-    // manifest's checksum-verified file sizes declare the unpacked total;
-    // reject when it exceeds the cap too. None = no check (default).
+    // manifest's declared file sizes are the only statement of the unpacked
+    // total; the unpacker verifies every declaration against the bytes it
+    // actually wrote (so a usable declaration is trustworthy, not just
+    // attacker-asserted), and a manifest that yields NO usable size fails
+    // the upload instead of passing as "smaller than the cap". None = no
+    // check (default).
     if has_lma {
         if let Some(max) = state.config.server.max_upload_bytes {
-            if let Ok(raw) = tokio::fs::read_to_string(staging.join("manifest.json")).await {
-                if let Ok(manifest) = serde_json::from_str::<Value>(&raw) {
-                    let declared: u64 = manifest["files"]
-                        .as_object()
-                        .map(|files| files.values().filter_map(|e| e["size"].as_u64()).sum())
-                        .unwrap_or(0);
-                    if declared > max {
-                        return Err(AppError::PayloadTooLarge {
-                            max_size: max as usize,
-                            actual_size: Some(declared),
-                        });
-                    }
-                }
-            }
+            enforce_unpacked_size_cap(&staging.join("manifest.json"), max).await?;
         }
     }
 
@@ -996,8 +1060,14 @@ pub async fn download_model_handler(
 pub(crate) struct DownloadSource {
     pub(crate) path: std::path::PathBuf,
     pub(crate) size: u64,
-    /// File mtime (unix secs) — ETag input for If-Range resume validation.
-    pub(crate) mtime_secs: u64,
+    /// ETag for If-Range resume validation — the content hash of a
+    /// representation whose bytes are stable (a single file, a retained
+    /// artifact). None when the bytes are NOT stable: the repacked temp .lma
+    /// gets a fresh `created_at` from the packer on every request, so
+    /// identical model content packs to different bytes and no validator can
+    /// be honoured. Such a source advertises neither ETag nor Accept-Ranges
+    /// (and serves no range) so a client cannot splice two representations.
+    pub(crate) etag: Option<String>,
     /// Content-disposition file name.
     pub(crate) file_name: String,
     pub(crate) content_type: &'static str,
@@ -1055,7 +1125,6 @@ pub(crate) async fn resolve_download_source(
             .await
             .map_err(AppError::Io)?;
         let size = md.len();
-        let mtime_secs = file_mtime_secs(&md);
         let content_type = if file_name.ends_with(".py")
             || file_name.ends_with(".yaml")
             || file_name.ends_with(".yml")
@@ -1067,10 +1136,11 @@ pub(crate) async fn resolve_download_source(
         } else {
             "application/octet-stream"
         };
+        let etag = Some(content_hash(&canonical_file).await?);
         return Ok(DownloadSource {
             path: canonical_file,
             size,
-            mtime_secs,
+            etag,
             file_name: file_name.to_string(),
             content_type,
             audit_detail: format!("file={}", file_name),
@@ -1094,10 +1164,11 @@ pub(crate) async fn resolve_download_source(
             let md = tokio::fs::metadata(&candidate)
                 .await
                 .map_err(AppError::Io)?;
+            let etag = Some(content_hash(&candidate).await?);
             return Ok(DownloadSource {
                 path: candidate,
                 size: md.len(),
-                mtime_secs: file_mtime_secs(&md),
+                etag,
                 file_name: artifact_name,
                 content_type: "application/octet-stream",
                 audit_detail: "full (original artifact)".to_string(),
@@ -1168,7 +1239,12 @@ pub(crate) async fn resolve_download_source(
     Ok(DownloadSource {
         path: lma_path,
         size,
-        mtime_secs: file_mtime_secs(&md),
+        // No validator: this .lma was packed on the fly, and the packer
+        // stamps `created_at` into the archive, so the same model content
+        // yields different bytes — and hence a different hash — on every
+        // request. Tagging it would let a resuming client splice two
+        // different representations together.
+        etag: None,
         file_name: artifact_name,
         content_type: "application/octet-stream",
         audit_detail: "full".to_string(),
@@ -1176,14 +1252,44 @@ pub(crate) async fn resolve_download_source(
     })
 }
 
-/// Unix-secs mtime for ETag construction; 0 when the platform can't say
-/// (ETag stays size-only — still collision-safe for swap/repack semantics).
-fn file_mtime_secs(md: &std::fs::Metadata) -> u64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// SHA-256 (hex) of a file's content — the ETag input for the download
+/// representations whose bytes are stable under the path (a single file, a
+/// retained artifact), so a matching `If-Range` really does mean the client's
+/// prefix belongs to this representation. The on-the-fly repacked `.lma` has no
+/// such claim and is served without a validator (see `DownloadSource::etag`).
+///
+/// Runs on the blocking pool. The cost is a full read per request, and that is
+/// DELIBERATE — do not add a metadata-keyed memo here. It was tried and the
+/// existing test caught it: two different files of equal length written
+/// back-to-back received the same mtime, so a cache keyed on
+/// (path, size, mtime) returned the first file's hash for the second, i.e. two
+/// representations sharing one validator — exactly the `If-Range` splice this
+/// content hash exists to prevent. Filesystem timestamp granularity is coarser
+/// than the write interval, so that false hit is easy to produce, and a
+/// metadata-keyed cache re-imports the very assumption the content hash
+/// removed. If this read ever needs to become cheap, the fix is to ETag from a
+/// digest the server already RECORDED at upload time, not to re-derive identity
+/// from metadata.
+async fn content_hash(path: &std::path::Path) -> Result<String, AppError> {
+    use sha2::{Digest, Sha256};
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("etag hashing task failed: {e}")))?
+    .map_err(AppError::Io)
 }
 
 /// Shared download core (versioned endpoint + F9's model-level endpoint).
@@ -1201,7 +1307,6 @@ async fn download_version_impl(
     use crate::http::range::{self, ByteRange};
 
     let src = resolve_download_source(state, model_name, version, file).await?;
-    let etag = range::make_etag(src.size, src.mtime_secs);
 
     let range_header = headers
         .get(axum::http::header::RANGE)
@@ -1209,10 +1314,15 @@ async fn download_version_impl(
     let if_range = headers
         .get(axum::http::header::IF_RANGE)
         .and_then(|v| v.to_str().ok());
-    let byte_range = if range::if_range_allows(if_range, &etag) {
-        range::parse_range(range_header, src.size)
-    } else {
-        ByteRange::Full
+    // A source without a validator is not resumable: no range is honoured
+    // (so nothing can be spliced), and the response advertises neither ETag
+    // nor Accept-Ranges.
+    let etag = src.etag.as_deref().map(range::make_etag);
+    let byte_range = match etag.as_deref() {
+        Some(tag) if range::if_range_allows(if_range, tag) => {
+            range::parse_range(range_header, src.size)
+        }
+        _ => ByteRange::Full,
     };
 
     let (status, start, len, audit_suffix) = match byte_range {
@@ -1266,9 +1376,12 @@ async fn download_version_impl(
         .header(
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", src.file_name),
-        )
-        .header(axum::http::header::ACCEPT_RANGES, "bytes")
-        .header(axum::http::header::ETAG, &etag);
+        );
+    if let Some(tag) = &etag {
+        builder = builder
+            .header(axum::http::header::ACCEPT_RANGES, "bytes")
+            .header(axum::http::header::ETAG, tag);
+    }
     if let ByteRange::Single { start, end } = byte_range {
         builder = builder.header(
             axum::http::header::CONTENT_RANGE,
@@ -1832,6 +1945,134 @@ mod upload_download_tests {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
+    /// Two DIFFERENT representations of equal byte length, written in the
+    /// same second, must not share a validator: the old size+mtime tag made
+    /// them identical, so a resuming client spliced version A's prefix onto
+    /// version B's tail under an `If-Range` that "matched".
+    #[tokio::test]
+    async fn test_download_etag_distinguishes_two_representations_of_equal_size() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-rg-tag-{}", std::process::id()));
+        let app = range_test_app(&tmp).await;
+
+        // Pin the mtime: with whole-second size+mtime tags these two files
+        // would be indistinguishable even without the same-second luck.
+        let mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let weights = tmp.join("mymodel").join("1").join("weights.bin");
+        std::fs::File::open(&weights)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let etag_a = download_etag(&app).await;
+        assert!(!etag_a.is_empty(), "a stable representation must be tagged");
+
+        // Same length, different bytes, same mtime.
+        tokio::fs::write(&weights, b"fedcba9876543210")
+            .await
+            .unwrap();
+        std::fs::File::open(&weights)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let etag_b = download_etag(&app).await;
+
+        assert_ne!(
+            etag_a, etag_b,
+            "different content of equal size must not share a validator"
+        );
+
+        // The stale tag must restart the transfer, never resume into a splice.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download?file=weights.bin")
+                    .header("range", "bytes=8-")
+                    .header("if-range", &etag_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "If-Range naming the OLD representation must not serve a range"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            b"fedcba9876543210",
+            "the restart must deliver the CURRENT representation"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// The repacked temp .lma is not a stable representation (the packer
+    /// stamps `created_at` into the bytes), so it must advertise no
+    /// validator and serve no range — otherwise a client could resume across
+    /// two different packings of the same content.
+    #[tokio::test]
+    async fn test_repacked_lma_download_advertises_no_validator() {
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-rg-repack-{}", std::process::id()));
+        let model_dir = tmp.join("mymodel").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+
+        let app = test_router(test_app_state(tmp.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download")
+                    .header("range", "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an untaggable representation must not answer 206"
+        );
+        assert!(
+            response.headers().get("etag").is_none(),
+            "no ETag may be advertised for a representation whose bytes change per request"
+        );
+        assert!(
+            response.headers().get("accept-ranges").is_none(),
+            "no Accept-Ranges may be advertised for a representation that cannot be resumed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// GET the single-file download and return its ETag header.
+    async fn download_etag(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(download_req(
+                "/v2/repository/models/mymodel/versions/1/download?file=weights.bin",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     // ===== Upload Tests =====
 
     #[tokio::test]
@@ -1999,6 +2240,42 @@ mod upload_download_tests {
         tokio::fs::write(version_dir.join("config.yaml"), "max_batch_size: 1\n")
             .await
             .unwrap();
+
+        let pkgs_dir = tmp.join("pkgs");
+        tokio::fs::create_dir_all(&pkgs_dir).await.unwrap();
+
+        let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
+            .args([
+                "-m",
+                "lite_server.cli",
+                "pack",
+                tmp.join("src").join(name).to_str().unwrap(),
+                "--version",
+                version,
+                "--output",
+                pkgs_dir.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .expect("failed to run lite-server pack");
+        assert!(
+            output.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        pkgs_dir.join(format!("{}_v{}.lma", name, version))
+    }
+
+    /// Pack a model version directory holding NO files (the artifact's
+    /// manifest therefore lists an empty file set).
+    async fn pack_empty_fixture_lma(
+        tmp: &std::path::Path,
+        name: &str,
+        version: &str,
+    ) -> std::path::PathBuf {
+        let version_dir = tmp.join("src").join(name).join(version);
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
 
         let pkgs_dir = tmp.join("pkgs");
         tokio::fs::create_dir_all(&pkgs_dir).await.unwrap();
@@ -2803,6 +3080,135 @@ mod upload_download_tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "oversized upload must be 413, got {:?}",
             response.status()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// F11b: the declared unpacked total must be USABLE, not merely parsed.
+    #[test]
+    fn declared_unpacked_bytes_requires_a_usable_size() {
+        let manifest: Value = serde_json::from_str(
+            r#"{"files":{"1/a":{"size":10,"sha256":"x"},"1/b":{"size":5,"sha256":"y"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared_unpacked_bytes(&manifest), Some(15));
+
+        // No `files` object, an empty one, or entries declaring no bytes: the
+        // unpacked total is unknown — not zero.
+        assert_eq!(declared_unpacked_bytes(&json!({})), None);
+        assert_eq!(declared_unpacked_bytes(&json!({"files": {}})), None);
+        assert_eq!(
+            declared_unpacked_bytes(&json!({"files": {"1/a": {"sha256": "x"}}})),
+            None
+        );
+        assert_eq!(
+            declared_unpacked_bytes(&json!({"files": {"1/a": {"size": 0, "sha256": ""}}})),
+            None
+        );
+    }
+
+    /// F11b: cap enforcement — a declaration over the cap is 413, an
+    /// unmeasurable one is a hard failure (never a pass).
+    #[tokio::test]
+    async fn unpacked_size_cap_rejects_over_cap_and_unmeasurable_manifests() {
+        let tmp = std::env::temp_dir().join(format!("lite-server-size-cap-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let manifest_path = tmp.join("manifest.json");
+
+        tokio::fs::write(
+            &manifest_path,
+            r#"{"files":{"1/a":{"size":5000,"sha256":"x"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            enforce_unpacked_size_cap(&manifest_path, 1000).await,
+            Err(AppError::PayloadTooLarge {
+                actual_size: Some(5000),
+                ..
+            })
+        ));
+
+        tokio::fs::write(
+            &manifest_path,
+            r#"{"files":{"1/a":{"size":10,"sha256":"x"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert!(enforce_unpacked_size_cap(&manifest_path, 1000)
+            .await
+            .is_ok());
+
+        // No usable declaration → fail closed, naming the cap.
+        tokio::fs::write(&manifest_path, r#"{"files":{}}"#)
+            .await
+            .unwrap();
+        match enforce_unpacked_size_cap(&manifest_path, 1000).await {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("max_upload_bytes"), "{msg}")
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        tokio::fs::write(&manifest_path, "not json").await.unwrap();
+        assert!(enforce_unpacked_size_cap(&manifest_path, 1000)
+            .await
+            .is_err());
+        tokio::fs::remove_file(&manifest_path).await.unwrap();
+        assert!(enforce_unpacked_size_cap(&manifest_path, 1000)
+            .await
+            .is_err());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// F11b end-to-end: an artifact whose manifest declares no files at all
+    /// must fail the upload when the cap is configured — it used to read as
+    /// "declared 0 ≤ cap" and commit.
+    #[tokio::test]
+    async fn upload_with_unmeasurable_manifest_is_rejected_when_capped() {
+        let tmp =
+            std::env::temp_dir().join(format!("lite-server-size-nofiles-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_empty_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let mut config = Config::default();
+        config.server.max_upload_bytes = Some(1024);
+        let state = test_app_state_with_config(tmp.clone(), config);
+        let app = test_router(state);
+
+        let boundary = "----sizelessboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", &data);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an unmeasurable declaration must not read as 'under the cap'"
+        );
+        let _body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !tmp.join("mymodel").join("1").exists(),
+            "a rejected upload must leave no committed version"
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

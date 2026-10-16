@@ -797,6 +797,15 @@ const TRANSPORT_INVALID_FORWARD_HEADERS: &[&str] = &[
     "trailer",
 ];
 
+/// R23 (D42) + security: the server's own control namespace. These headers
+/// seed `RequestMeta.headers`, which the queue and the worker picker read as
+/// SCHEDULING controls — `x-lite-worker-id` pins a DAG node to a worker index,
+/// `x-lite-affinity-key`/`x-lite-priority` drive rendezvous affinity and queue
+/// order, `x-lite-timeout` sets the deadline, `x-lite-dag` picks the dag set.
+/// Forwarding any of them would let a client drive sub-step placement, so the
+/// whole namespace is reserved.
+const SERVER_CONTROL_HEADER_PREFIX: &str = "x-lite-";
+
 /// R23 (D42): validate one step's `forward_headers` allowlist.
 ///
 /// Names are lowercased — HTTP/gRPC header lookup is case-insensitive, so an
@@ -823,6 +832,13 @@ fn validate_forward_headers(step: &str, names: &[String]) -> Result<Vec<String>,
             return Err(AppError::Config(format!(
                 "step '{step}': forward_headers entry '{raw}' describes the transport, \
                  not the payload — the downstream body is re-assembled (R23)"
+            )));
+        }
+        if name.starts_with(SERVER_CONTROL_HEADER_PREFIX) {
+            return Err(AppError::Config(format!(
+                "step '{step}': forward_headers entry '{raw}' is in the server-reserved \
+                 'x-lite-*' control namespace (scheduling/deadline controls) and cannot \
+                 be forwarded (R23)"
             )));
         }
         if out.contains(&name) {
@@ -1058,7 +1074,8 @@ fn parse_ensemble_set(
         dag_selector: None,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
-        // load-time direct-parse path (insert_ready stats on its own).
+        // load-time direct-parse path, whose caller passes its own
+        // stat-before-read value to `EnsemblePlanCache::insert_ready`.
         source_mtime: None,
     })
 }

@@ -23,6 +23,19 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 use uuid::Uuid;
 
+/// Round2 A6: the stream-rejection reason label for an early exit. The
+/// ensemble executor no longer records a rejection itself — one request is
+/// counted once, at this adapter layer (which owns the request-level outcome)
+/// — so the informative `concurrency_limit` reason for a P10 streaming-DAG
+/// capacity rejection (`AppError::StreamingCapacityExceeded`) is derived here
+/// from the error; every other early exit is a generic `early_reject`.
+pub(crate) fn reject_reason(e: &AppError) -> &'static str {
+    match e {
+        AppError::StreamingCapacityExceeded(_) => "concurrency_limit",
+        _ => "early_reject",
+    }
+}
+
 async fn open_worker_stream(
     state: &Arc<AppState>,
     model_name: &str,
@@ -262,7 +275,7 @@ async fn generate_stream_entry(
             v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
-            "early_reject",
+            reject_reason(e),
         );
     }
     result
@@ -343,7 +356,7 @@ pub(crate) async fn openai_stream_entry(
             v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
-            "early_reject",
+            reject_reason(e),
         );
     }
     result
@@ -394,7 +407,7 @@ async fn sse_infer_entry(
             v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
-            "early_reject",
+            reject_reason(e),
         );
     }
     result
@@ -426,14 +439,17 @@ async fn sse_infer_entry_impl(
                 .to_string(),
         ));
     }
-    let (resolved_version, pinned) = resolve_version(state, model_name, version, &headers).await?;
+    let (resolved_version, pinned) =
+        match resolve_version(state, model_name, version, &headers).await {
+            Ok(v) => v,
+            // F-03: gate unknown-model probes — a resolution failure must not be
+            // distinguishable from "no credentials" (unary do_infer parity).
+            Err(e) => return Err(super::auth_gate_for_unknown_model(state, &headers, e)),
+        };
     *label_version = resolved_version.clone();
-    if !state.registry.is_ready(model_name, Some(&resolved_version)) {
-        return Err(AppError::ModelNotReady(format!(
-            "{} version {} is not ready",
-            model_name, resolved_version
-        )));
-    }
+    // F-03: policy checks BEFORE the readiness check — an unauthenticated
+    // probe must get 401 whether the model is missing, not ready, or fine
+    // (auth first, then rate limit). Unary do_infer parity.
     // Auth + rate limit (rate limit shares the /predict bucket with unary infer).
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
         enforce_auth(mv.policies.auth.as_ref(), &headers)?;
@@ -444,6 +460,12 @@ async fn sse_infer_entry_impl(
             &cx.client_ip,
         )
         .await?;
+    }
+    if !state.registry.is_ready(model_name, Some(&resolved_version)) {
+        return Err(AppError::ModelNotReady(format!(
+            "{} version {} is not ready",
+            model_name, resolved_version
+        )));
     }
     let sse = sse_infer_impl(
         state.clone(),
@@ -1530,6 +1552,9 @@ async fn handle_ws_stream(
         match resolve_version(&state, &model_name, version, &headers).await {
             Ok(v) => v,
             Err(e) => {
+                // F-03: gate unknown-model probes — a resolution failure must
+                // not be distinguishable from "no credentials" (do_infer parity).
+                let e = super::auth_gate_for_unknown_model(&state, &headers, e);
                 // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
                 // A2: 未解析的 (model, version) 用常量 label——其 series 永不随
                 // unload 清除,原始 label 会被模型名枚举无限放大。
@@ -1537,7 +1562,7 @@ async fn handle_ws_stream(
                 prometheus::record_stream_rejected(
                     m,
                     v,
-                    "4xx",
+                    super::status_family(e.http_status().as_u16() as i32),
                     ws_start.elapsed().as_secs_f64(),
                     "early_reject",
                 );
@@ -1547,26 +1572,9 @@ async fn handle_ws_stream(
             }
         };
 
-    if !state
-        .registry
-        .is_ready(&model_name, Some(&resolved_version))
-    {
-        // 未就绪 → 5xx。
-        prometheus::record_stream_rejected(
-            &model_name,
-            &resolved_version,
-            "5xx",
-            ws_start.elapsed().as_secs_f64(),
-            "early_reject",
-        );
-        ws_early_reject(
-            &mut socket,
-            &AppError::ModelNotReady(format!("{model_name} version {resolved_version}")),
-        )
-        .await;
-        return;
-    }
-
+    // F-03: policy checks BEFORE the readiness check — an unauthenticated
+    // probe must get 401 whether the model is missing, not ready, or fine
+    // (auth first, then rate limit). Unary do_infer parity.
     // Rate limit (same logic as HTTP infer). client_ip comes from the
     // RequestContext filled once by context_middleware (including the
     // direct-connection peer fallback), so key="ip" limits per real client.
@@ -1598,6 +1606,26 @@ async fn handle_ws_stream(
             ws_early_reject(&mut socket, &e).await;
             return;
         }
+    }
+
+    if !state
+        .registry
+        .is_ready(&model_name, Some(&resolved_version))
+    {
+        // 未就绪 → 5xx。
+        prometheus::record_stream_rejected(
+            &model_name,
+            &resolved_version,
+            "5xx",
+            ws_start.elapsed().as_secs_f64(),
+            "early_reject",
+        );
+        ws_early_reject(
+            &mut socket,
+            &AppError::ModelNotReady(format!("{model_name} version {resolved_version}")),
+        )
+        .await;
+        return;
     }
 
     // Wait for first message from client (the request payload). Bound:
@@ -2071,7 +2099,7 @@ async fn handle_ws_stream(
                     &resolved_version,
                     super::status_family(e.http_status().as_u16() as i32),
                     ws_start.elapsed().as_secs_f64(),
-                    "early_reject",
+                    reject_reason(&e),
                 );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;

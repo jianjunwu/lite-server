@@ -3,7 +3,7 @@
 //! forward back through the stream's registered channel. The inference span
 //! covers the whole handler (model/version known only after BidiOpen).
 
-use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
+use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit, gate_unknown_model_grpc};
 use crate::grpc::canary::{canary_pin, resolve_bidi_version};
 use crate::grpc::error::{
     app_error_to_grpc_status, err, error_type_to_grpc_code, grpc_code_to_status_family,
@@ -67,7 +67,12 @@ impl GrpcService {
             Some(instant) => {
                 match tokio::time::timeout_at(instant.into(), stream.message()).await {
                     Ok(res) => {
-                        res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+                        // D4: a transport read error's Display can leak
+                        // internal detail — log it, return a generic Status.
+                        res.map_err(|e| {
+                            tracing::warn!(error = %e, "bidi stream read failed");
+                            err(Status::internal("bidi stream read error"))
+                        })?
                     }
                     Err(_) => {
                         return Err(err(Status::deadline_exceeded(
@@ -79,7 +84,12 @@ impl GrpcService {
             None => match self.decoupled_idle_timeout {
                 Some(idle) => match tokio::time::timeout(idle, stream.message()).await {
                     Ok(res) => {
-                        res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+                        // D4: a transport read error's Display can leak
+                        // internal detail — log it, return a generic Status.
+                        res.map_err(|e| {
+                            tracing::warn!(error = %e, "bidi stream read failed");
+                            err(Status::internal("bidi stream read error"))
+                        })?
                     }
                     Err(_) => {
                         return Err(err(Status::deadline_exceeded(
@@ -87,10 +97,11 @@ impl GrpcService {
                         )));
                     }
                 },
-                None => stream
-                    .message()
-                    .await
-                    .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?,
+                None => stream.message().await.map_err(|e| {
+                    // D4: log the detail, return a generic Status.
+                    tracing::warn!(error = %e, "bidi stream read failed");
+                    err(Status::internal("bidi stream read error"))
+                })?,
             },
         };
 
@@ -127,15 +138,22 @@ impl GrpcService {
                             &model_name,
                             version.as_deref(),
                             pin.clone(),
-                        )?;
+                        )
+                        .map_err(|s| {
+                            // F-03: gate unknown-model probes (see
+                            // gate_unknown_model_grpc) — unary `infer` parity.
+                            gate_unknown_model_grpc(
+                                &self.registry,
+                                &grpc_metadata,
+                                &open.headers,
+                                s,
+                            )
+                        })?;
 
-                        if !self.registry.is_ready(&model_name, Some(&resolved_version)) {
-                            return Err(err(Status::unavailable(format!(
-                                "{} version {} is not ready",
-                                model_name, resolved_version
-                            ))));
-                        }
-
+                        // F-03: policy checks BEFORE the readiness check — an
+                        // unauthenticated probe must get Unauthenticated whether
+                        // the model is missing, not ready, or fine (auth first,
+                        // then rate limit). Unary `infer` parity.
                         // Auth: metadata first, then BidiOpen.headers (task C).
                         if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
                             enforce_auth_grpc(
@@ -150,6 +168,13 @@ impl GrpcService {
                                 &model_name,
                                 &client_ip,
                             )?;
+                        }
+
+                        if !self.registry.is_ready(&model_name, Some(&resolved_version)) {
+                            return Err(err(Status::unavailable(format!(
+                                "{} version {} is not ready",
+                                model_name, resolved_version
+                            ))));
                         }
 
                         let sid = format!("grpc-bidi-{}", Uuid::new_v4());
@@ -264,7 +289,10 @@ impl GrpcService {
             // First frame kind: content-type declares JSON vs opaque bytes
             // (WS frame-type parity). Mixed kinds → 400 inside push.
             let is_json = crate::grpc::payload::body_kind_label(&meta.headers) == "json";
-            let ct = meta.headers.get("content-type").cloned();
+            // Case-insensitive lookup — a literal `get("content-type")` would
+            // drop a client's `Content-Type` spelling.
+            let ct = crate::grpc::payload::header_value(&meta.headers, "content-type")
+                .map(str::to_string);
             // D33: a declared-inputs ensemble executes on the FIRST envelope
             // frame — the request stream is dropped afterwards (half-close
             // is then the client's normal finish; late data frames die with
@@ -469,7 +497,12 @@ impl GrpcService {
         let chunk_rx = client
             .send_stream(open_req, stream_id.clone())
             .await
-            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+            .map_err(|e| {
+                // D4: the transport error's Display carries the internal ZMQ
+                // endpoint — log it, return the sanitized Status.
+                tracing::warn!(error = %e, "bidi worker stream open failed");
+                err(app_error_to_grpc_status(&e))
+            })?;
         // G3: count the stream toward the slot's max_requests budget.
         self.app_state.inference_queue.record_stream_served(&model_name, &resolved_version, worker_id);
         (stream_id, chunk_rx, client.clone(), inflight_guard)

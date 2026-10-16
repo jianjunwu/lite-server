@@ -76,12 +76,16 @@ pub fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
     }
 }
 
-/// Entity tag for a download representation: size + mtime in hex. Weak but
-/// sufficient here — version dirs are written atomically (swap), and a
-/// repacked temp .lma is a fresh file each time, so a changed file always
-/// yields a different tag.
-pub fn make_etag(size: u64, mtime_secs: u64) -> String {
-    format!("\"{:x}-{:x}\"", size, mtime_secs)
+/// Entity tag for a download representation: its content hash, quoted.
+///
+/// A size+mtime tag is NOT a validator we can honour — two different
+/// representations of equal length written in the same second collide, and
+/// an `If-Range` match then splices version A's prefix onto version B's
+/// tail. Only representations whose bytes cannot change are tagged (a single
+/// file, a retained artifact); a representation we cannot pin down must not
+/// carry a validator at all (see `DownloadSource::etag`).
+pub fn make_etag(content_hash: &str) -> String {
+    format!("\"{}\"", content_hash)
 }
 
 /// Whether an `If-Range` value permits the range to be applied: only an
@@ -189,8 +193,11 @@ mod tests {
     }
 
     #[test]
-    fn should_build_etag_from_size_and_mtime() {
-        assert_eq!(make_etag(256, 0x65c3a9), "\"100-65c3a9\"");
+    fn should_build_etag_from_content_hash() {
+        assert_eq!(make_etag("deadbeef"), "\"deadbeef\"");
+        // Same length, different bytes → different validator (the size+mtime
+        // form collided here).
+        assert_ne!(make_etag("deadbeef"), make_etag("deadbeee"));
     }
 
     #[test]

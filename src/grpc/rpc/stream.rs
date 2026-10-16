@@ -2,7 +2,7 @@
 //! mechanism, with sequence-affinity worker pick and a two-stage
 //! (overall/idle) deadline bound when the client specifies one.
 
-use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
+use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit, gate_unknown_model_grpc};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::{
     app_error_to_grpc_status, err, error_type_to_grpc_code, grpc_code_to_status_family,
@@ -73,23 +73,24 @@ impl GrpcService {
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
                     .ok_or_else(|| {
-                        err(Status::not_found(format!(
-                            "{} has no active version",
-                            model_name
-                        )))
+                        // F-03: gate unknown-model probes (see
+                        // gate_unknown_model_grpc) — an unauthenticated probe
+                        // must not learn that the model is missing.
+                        err(gate_unknown_model_grpc(
+                            &self.registry,
+                            &grpc_metadata,
+                            &req.headers,
+                            Status::not_found(format!("{} has no active version", model_name)),
+                        ))
                     })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
+        // F-03: policy checks BEFORE the readiness check — an unauthenticated
+        // probe must get Unauthenticated whether the model is missing, not
+        // ready, or fine (auth first, then rate limit). Unary `infer` parity.
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
             enforce_grpc_rate_limit(
@@ -98,6 +99,13 @@ impl GrpcService {
                 model_name,
                 &client_ip,
             )?;
+        }
+
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
         }
 
         // FD-1: gateway-side JSON validation (HTTP ApiBody/B1 parity) —
@@ -165,7 +173,9 @@ impl GrpcService {
         let (stream_id, mut chunk_rx, cancel_client, inflight_guard) = if is_ensemble {
             let ensemble_input = crate::ensemble::ensemble_payload_from_bytes(
                 &req.data,
-                req.headers.get("content-type").cloned(),
+                // Header names are case-insensitive — shared lookup helper.
+                crate::grpc::payload::header_value(&req.headers, "content-type")
+                    .map(str::to_string),
             )
             .map_err(|e| {
                 crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e))
@@ -183,7 +193,10 @@ impl GrpcService {
                 // metadata and the element's data as received.
                 request_headers: crate::ensemble::header_pool_from_grpc(&grpc_metadata),
                 request_body: Some(req.data.clone()),
-                request_content_type: req.headers.get("content-type").cloned(),
+                // D43 (R24): None for a JSON content-type (HTTP parity), so a
+                // passthrough step parses the root instead of treating it as
+                // opaque binary.
+                request_content_type: crate::grpc::payload::request_content_type(&req.headers),
             };
             match crate::ensemble::execute_ensemble(
                 self.app_state.clone(),
@@ -282,7 +295,12 @@ impl GrpcService {
             let chunk_rx = client
                 .send_stream(open_req, stream_id.clone())
                 .await
-                .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+                .map_err(|e| {
+                    // D4: the transport error's Display carries the internal
+                    // ZMQ endpoint — log it, return the sanitized Status.
+                    tracing::warn!(error = %e, "worker stream open failed");
+                    err(app_error_to_grpc_status(&e))
+                })?;
             // G3: count the stream toward the slot's max_requests budget.
             self.app_state.inference_queue.record_stream_served(
                 model_name,

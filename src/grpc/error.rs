@@ -93,9 +93,21 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
 }
 
 /// Map an error_type string (from a structured stream error) to a gRPC code.
+///
+/// The stream error frame carries only `error_type` (no status code), so these
+/// arms must agree with the unary face's `http_status_to_grpc_code` for the
+/// same exception class (see the `model_error` arm below).
 pub(super) fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
     match error_type {
         "invalid_request_error" => tonic::Code::InvalidArgument,
+        // Parity with the unary face: the documented base `HTTPException`
+        // (python/lite_server/exceptions.py) defaults to `error_type =
+        // "model_error"` and its canonical use is a client-side 400, which
+        // unary maps to InvalidArgument via `http_status_to_grpc_code(400)`.
+        // Falling through to `Internal` made a plain client rejection look
+        // like a non-retryable server bug (and counted it in the 5xx family)
+        // as soon as the model raised the base class on a streaming path.
+        "model_error" => tonic::Code::InvalidArgument,
         "authentication_error" => tonic::Code::Unauthenticated,
         "permission_denied_error" => tonic::Code::PermissionDenied,
         "not_found_error" => tonic::Code::NotFound,
@@ -376,6 +388,12 @@ mod tests {
             error_type_to_grpc_code("model_not_ready"),
             tonic::Code::Unavailable
         );
+        // Parity: the base `HTTPException`'s default error_type is the same
+        // client-side 400 the unary face maps via http_status_to_grpc_code.
+        assert_eq!(
+            error_type_to_grpc_code("model_error"),
+            tonic::Code::InvalidArgument
+        );
         // P9-1: decoupled stream on a model without predict_decoupled.
         assert_eq!(
             error_type_to_grpc_code("not_implemented"),
@@ -385,6 +403,30 @@ mod tests {
         assert_eq!(
             error_type_to_grpc_code("UNKNOWN_CODE"),
             tonic::Code::Internal
+        );
+    }
+
+    /// Stream/unary parity: raising the documented base `HTTPException` on a
+    /// streaming path must not be classified differently from the unary face.
+    /// `python/lite_server/exceptions.py` defaults the base class to
+    /// `error_type = "model_error"` with a 400 status; unary maps that 400 to
+    /// `InvalidArgument` (`http_status_to_grpc_code`), so the stream face must
+    /// too — before this arm it fell through to `Internal` (a non-retryable
+    /// "server bug", counted in the 5xx family).
+    #[test]
+    fn model_error_type_has_stream_unary_parity() {
+        let unary = http_status_to_grpc_code(400);
+        assert_eq!(unary, tonic::Code::InvalidArgument);
+        let stream = error_type_to_grpc_code("model_error");
+        assert_eq!(
+            stream, unary,
+            "a base HTTPException(400) must reach a streaming client as the same \
+             code the unary face produces, not Internal"
+        );
+        assert_eq!(
+            grpc_code_to_status_family(stream),
+            "4xx",
+            "and it must be counted client-side, not in the 5xx family"
         );
     }
 

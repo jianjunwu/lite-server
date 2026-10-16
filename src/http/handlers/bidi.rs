@@ -39,24 +39,27 @@ const SEND_BUDGET_FALLBACK: std::time::Duration = std::time::Duration::from_secs
 
 /// H2B-1: bounded send to the response-body channel. The fast path
 /// (`try_send`) is timer-free — the 64-slot buffer absorbs normal bursts.
-/// Only a full channel (stalled reader) pays one Sleep; if the send still
-/// cannot complete within `budget`, the reader is wedged and the caller
-/// breaks out to the terminal path (which cancels the worker stream).
-/// Returns false when the frame could not be delivered (closed or timeout).
+/// Only a full channel (stalled reader) pays one Sleep, bounded by
+/// `min(deadline, idle)` through [`crate::streaming::send_bounded`] — the
+/// SAME bound `recv_chunk` applies. An idle-only bound let a short client
+/// deadline be missed by the whole idle budget while the send sat outside
+/// the recv await, holding the admission / in-flight / ensemble guards for
+/// the overshoot.
+/// Returns false when the frame could not be delivered (closed, or the
+/// bound fired).
 async fn send_frame_bounded(
     tx: &mpsc::Sender<Bytes>,
     frame: Bytes,
-    budget: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+    idle: Option<std::time::Duration>,
 ) -> bool {
     match tx.try_send(frame) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Closed(_)) => false,
-        Err(mpsc::error::TrySendError::Full(frame)) => {
-            matches!(
-                tokio::time::timeout(budget, tx.send(frame)).await,
-                Ok(Ok(()))
-            )
-        }
+        Err(mpsc::error::TrySendError::Full(frame)) => matches!(
+            crate::streaming::send_bounded(deadline, idle, tx.send(frame)).await,
+            crate::streaming::SendOutcome::Sent(Ok(()))
+        ),
     }
 }
 
@@ -140,7 +143,9 @@ async fn h2_bidi_entry(
             v,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
-            "early_reject",
+            // The ensemble executor no longer records the rejection — derive
+            // the P10 capacity reason here (one request = one count).
+            super::stream::reject_reason(e),
         );
     }
     result
@@ -179,19 +184,22 @@ async fn h2_bidi_entry_impl(
         ));
     }
 
-    // 2. Path validation → resolve_version → ready → auth → rate limit.
+    // 2. Path validation → resolve_version → auth → rate limit → ready.
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let (resolved_version, pinned) = resolve_version(&state, model_name, version, &headers).await?;
+    let (resolved_version, pinned) =
+        match resolve_version(&state, model_name, version, &headers).await {
+            Ok(v) => v,
+            // F-03: gate unknown-model probes — a resolution failure must not be
+            // distinguishable from "no credentials" (unary do_infer parity).
+            Err(e) => return Err(super::auth_gate_for_unknown_model(&state, &headers, e)),
+        };
     *label_version = resolved_version.clone();
-    if !state.registry.is_ready(model_name, Some(&resolved_version)) {
-        return Err(AppError::ModelNotReady(format!(
-            "{} version {} is not ready",
-            model_name, resolved_version
-        )));
-    }
+    // F-03: policy checks BEFORE the readiness check (auth first, then rate
+    // limit) — an unauthenticated probe must get 401 whether the model is
+    // missing, not ready, or fine. Unary do_infer parity.
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
         enforce_auth(mv.policies.auth.as_ref(), &headers)?;
         enforce_rate_limit(
@@ -201,6 +209,12 @@ async fn h2_bidi_entry_impl(
             &cx.client_ip,
         )
         .await?;
+    }
+    if !state.registry.is_ready(model_name, Some(&resolved_version)) {
+        return Err(AppError::ModelNotReady(format!(
+            "{} version {} is not ready",
+            model_name, resolved_version
+        )));
     }
 
     // 3. Read the first LPM frame (must be Open) from the body stream, with
@@ -677,9 +691,12 @@ async fn h2_bidi_entry_impl(
                     let open_time = std::time::Instant::now();
                     let mut first_chunk = true;
                     let mut last_chunk_time = open_time;
-                    // H2B-1: send-side budget mirrors the chunk-idle budget; a
-                    // stalled reader must trip the same reclaim as a stalled worker.
-                    let send_budget = stream_idle.unwrap_or(SEND_BUDGET_FALLBACK);
+                    // H2B-1: the send side carries the SAME bound the recv side
+                    // uses — min(overall client deadline, chunk-idle) — so a
+                    // stalled reader trips the request's own deadline instead of
+                    // waiting out the idle cap; the idle leg falls back to
+                    // SEND_BUDGET_FALLBACK when the operator disabled that budget.
+                    let send_idle = stream_idle.or(Some(SEND_BUDGET_FALLBACK));
                     // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
                     // 统一消费(family/cancelled 单一来源)。
                     let reason;
@@ -711,7 +728,13 @@ async fn h2_bidi_entry_impl(
                                     })),
                                 });
                                 // Bounded, same as the D35 reclaim path.
-                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                let _ = send_frame_bounded(
+                                    &tx,
+                                    frame,
+                                    None,
+                                    Some(streaming::TERMINAL_SEND_TIMEOUT),
+                                )
+                                .await;
                                 crate::callback::fire_inference_response(
                                     &cb_runner, &req_ctx, open_time,
                                 );
@@ -746,7 +769,13 @@ async fn h2_bidi_entry_impl(
                                 });
                                 // H2B-1: bounded — a wedged reader must not block
                                 // the terminal path; the frame is best-effort.
-                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                let _ = send_frame_bounded(
+                                    &tx,
+                                    frame,
+                                    None,
+                                    Some(streaming::TERMINAL_SEND_TIMEOUT),
+                                )
+                                .await;
                                 crate::callback::fire_inference_response(
                                     &cb_runner, &req_ctx, open_time,
                                 );
@@ -789,7 +818,8 @@ async fn h2_bidi_entry_impl(
                                 });
                                 // H2B-1: bounded send — a stalled reader times out
                                 // into the same terminal path as a client disconnect.
-                                if !send_frame_bounded(&tx, frame, send_budget).await {
+                                if !send_frame_bounded(&tx, frame, stream_deadline, send_idle).await
+                                {
                                     reason = prometheus::StreamCloseReason::Cancel;
                                     break;
                                 }
@@ -804,7 +834,13 @@ async fn h2_bidi_entry_impl(
                                     })),
                                 });
                                 // H2B-1: bounded — best-effort terminal frame.
-                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                let _ = send_frame_bounded(
+                                    &tx,
+                                    frame,
+                                    None,
+                                    Some(streaming::TERMINAL_SEND_TIMEOUT),
+                                )
+                                .await;
                                 crate::callback::fire_inference_response(
                                     &cb_runner, &req_ctx, open_time,
                                 );
@@ -822,7 +858,13 @@ async fn h2_bidi_entry_impl(
                                     payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
                                 });
                                 // H2B-1: bounded — best-effort terminal frame.
-                                let _ = send_frame_bounded(&tx, frame, send_budget).await;
+                                let _ = send_frame_bounded(
+                                    &tx,
+                                    frame,
+                                    None,
+                                    Some(streaming::TERMINAL_SEND_TIMEOUT),
+                                )
+                                .await;
                                 crate::callback::fire_inference_response(
                                     &cb_runner, &req_ctx, open_time,
                                 );
@@ -2286,5 +2328,44 @@ mod tests {
              sees the input end; the current `Err(_) => return` skips it and \
              the worker waits until its own timeout"
         );
+    }
+
+    /// H2B-1 (send side): a full response channel with a stalled reader must
+    /// give up at the request's OWN deadline — not wait out the (much longer)
+    /// chunk-idle budget. Pre-fix the helper only had the idle budget, so a
+    /// short `x-lite-timeout` request kept the admission / in-flight /
+    /// ensemble guards for the whole idle-cap overshoot.
+    #[tokio::test]
+    async fn send_frame_bounded_honours_the_overall_deadline() {
+        // Capacity 1, pre-filled: the next send blocks until the bound fires.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        tx.send(Bytes::from_static(b"fill"))
+            .await
+            .expect("first frame fills the slot");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        // An idle budget far longer than the deadline: an idle-only bound
+        // would block here for the whole 30s.
+        let idle = Some(std::time::Duration::from_secs(30));
+
+        let start = std::time::Instant::now();
+        let delivered =
+            send_frame_bounded(&tx, Bytes::from_static(b"chunk"), Some(deadline), idle).await;
+        let elapsed = start.elapsed();
+
+        assert!(!delivered, "a stalled reader must not receive the frame");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the send must be bounded by the overall deadline (~150ms), not the \
+             30s idle budget; took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "the send must wait out the deadline rather than fail instantly; took {elapsed:?}"
+        );
+
+        // The filler is still queued — nothing was delivered.
+        let first = rx.recv().await.expect("filler frame");
+        assert_eq!(first.as_ref(), b"fill");
     }
 }

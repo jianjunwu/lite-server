@@ -213,6 +213,16 @@ fn model_health_json(
 
     let total_workers = mv.workers.len();
 
+    // A Stopped registry entry means the crash monitor observed the worker
+    // PROCESS exit (mark_dead + mark_worker_stopped); routing skips such a
+    // slot, so it is never healthy — ejection, which lags behind it and can
+    // be disabled outright, is not the only liveness signal.
+    let stopped = |i: usize| {
+        mv.workers
+            .get(i)
+            .is_some_and(|w| w.status == crate::registry::types::WorkerStatus::Stopped)
+    };
+
     if let Some(outlier) = state
         .inference_queue
         .get_outlier_state(model_name, resolved_version)
@@ -221,12 +231,16 @@ fn model_health_json(
         let mut healthy_count = 0usize;
         for i in 0..total_workers {
             let ejected = outlier.is_ejected(i);
-            if !ejected {
+            // Dead (crashed, never auto-revived) and Stopped are unusable
+            // just like an ejected slot: a version with some workers gone is
+            // Impaired (still serving), with all gone it is Degraded.
+            let healthy = !ejected && !outlier.is_dead(i) && !stopped(i);
+            if healthy {
                 healthy_count += 1;
             }
             workers_json.push(json!({
                 "worker_id": i,
-                "healthy": !ejected,
+                "healthy": healthy,
                 "ejected": ejected,
             }));
         }
@@ -238,14 +252,27 @@ fn model_health_json(
             "workers": workers_json,
         })))
     } else {
-        // No outlier state means no active queue — report all unknown
-        let workers_json: Vec<Value> = (0..total_workers)
-            .map(|i| json!({"worker_id": i, "healthy": true, "ejected": false}))
-            .collect();
+        // No outlier state means no active queue: routing gives no evidence
+        // about this version's slots, so only the registry's own view can
+        // speak — a Stopped worker is known dead, and a slot with no
+        // registry entry to vouch for it is not claimed healthy either.
+        let mut workers_json = Vec::with_capacity(total_workers);
+        let mut healthy_count = 0usize;
+        for i in 0..total_workers {
+            let healthy = mv.workers.get(i).is_some() && !stopped(i);
+            if healthy {
+                healthy_count += 1;
+            }
+            workers_json.push(json!({
+                "worker_id": i,
+                "healthy": healthy,
+                "ejected": false,
+            }));
+        }
         Ok(Json(json!({
             "name": model_name,
             "version": resolved_version,
-            "healthy_workers": total_workers,
+            "healthy_workers": healthy_count,
             "total_workers": total_workers,
             "workers": workers_json,
         })))
@@ -397,13 +424,23 @@ pub async fn load_model_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
-    // Load model config
+    // Load model config. A parse/validation failure must be visible: the
+    // reconcile and ensemble paths fail closed the same way, and
+    // unwrap_or_default() would silently drop `policies` (auth keys,
+    // rate limits) while the model loads and serves with no gate.
     let config_path = state
         .repo_path
         .join(&model_name)
         .join(&version)
         .join("config.yaml");
-    let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+    let mut config = match crate::config::load_model_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(AppError::Config(format!(
+                "invalid config.yaml for {model_name}/{version}: {e}"
+            )));
+        }
+    };
     // Apply CLI model-default overrides, same as initial load (server.rs) and
     // hot reload — otherwise --max-queue-size etc. silently don't apply here.
     state.config.apply_model_defaults(&mut config);
@@ -693,25 +730,24 @@ pub(crate) async fn delete_version_impl(
         }
     }
 
-    // Delete directory. The artifact/swap-backup sweep below must run even
-    // when the removal fails: those files live OUTSIDE the version dir,
-    // and a leftover root .lma would resurrect the version via auto-unpack
-    // on restart. The removal error is reported after the sweep.
-    let version_dir = state.repo_path.join(model_name).join(version);
-    let removal = if version_dir.exists() {
-        tokio::fs::remove_dir_all(&version_dir).await
-    } else {
-        Ok(())
-    };
-
     // G5: linked artifact cleanup — the scanner-placed root .lma and the
     // .artifacts/ copy would otherwise resurrect the version on restart.
     // O1: the version-level swap backup (.{v}.old-*) is the same kind of
     // resurrection vector — the H7 startup sweep restores target-missing
-    // backups.
+    // backups. These sweeps run BEFORE the directory removal (same order as
+    // delete_model_core): they target paths outside the version dir, so
+    // neither a failed removal nor a process death / cancellation between
+    // the two awaits can leave a resurrection vector behind.
     let mut linked = remove_linked_artifacts(&state.repo_path, model_name, version).await;
     linked.extend(remove_swap_backups(&state.repo_path.join(model_name), version).await);
-    removal.map_err(AppError::Io)?;
+
+    // Delete the version directory (idempotent when absent).
+    let version_dir = state.repo_path.join(model_name).join(version);
+    if version_dir.exists() {
+        tokio::fs::remove_dir_all(&version_dir)
+            .await
+            .map_err(AppError::Io)?;
+    }
 
     // G4: deleting the active version is a traffic-shaping event — make the
     // resulting active state explicit in the logs.
@@ -2142,6 +2178,68 @@ mod delete_swap_backup_tests {
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 
+    /// F4 ordering (version path): `delete_version_impl` sweeps the
+    /// resurrection vectors BEFORE removing the version dir, mirroring
+    /// delete_model_core — a failed removal, a process death or a
+    /// cancellation between the two awaits must not leave the root .lma or
+    /// the `.{v}.old-*` swap backup behind (auto-unpack / the H7 sweep would
+    /// put the deleted version back).
+    #[tokio::test]
+    async fn delete_version_sweeps_resurrection_vectors_before_dir_removal() {
+        let repo = unique_repo("vsweep");
+        tokio::fs::create_dir_all(repo.join("vsweepmodel"))
+            .await
+            .unwrap();
+        // A FILE at the version path makes remove_dir_all fail
+        // (NotADirectory) on any platform.
+        tokio::fs::write(repo.join("vsweepmodel").join("1"), "not a dir")
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("vsweepmodel_v1.lma"), "artifact")
+            .await
+            .unwrap();
+        let artifacts = repo.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts).await.unwrap();
+        tokio::fs::write(artifacts.join("vsweepmodel_v1.lma"), "artifact")
+            .await
+            .unwrap();
+        let backup = repo
+            .join("vsweepmodel")
+            .join(format!(".1.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&backup).await.unwrap();
+
+        let state = drift_tests::state_with_repo(Config::default(), &repo);
+        let result = delete_version_impl(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "vsweepmodel",
+            "1",
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the dir-removal failure must still be reported"
+        );
+        assert!(
+            !repo.join("vsweepmodel_v1.lma").exists(),
+            "the root artifact must be swept before the failing dir removal"
+        );
+        assert!(
+            !artifacts.join("vsweepmodel_v1.lma").exists(),
+            "the .artifacts copy must be swept before the failing dir removal"
+        );
+        assert!(
+            no_dot_backup_under(&repo.join("vsweepmodel"), ".1.old-").await,
+            "the version-level swap backup must be swept before the failing dir removal"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
     /// F4: delete_model_core runs the artifact/swap-backup sweeps BEFORE
     /// the model-dir removal, so a failed removal cannot leave
     /// resurrection vectors behind.
@@ -2609,6 +2707,152 @@ mod delete_snapshot_failure_tests {
             result.is_ok(),
             "snapshot rewrite failure must not mask a successful delete: {result:?}"
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+}
+
+/// Per-worker liveness in the ModelHealth answer: `is_dead` (the crash
+/// monitor's process-exit bookkeeping, which deliberately does NOT eject)
+/// and `WorkerStatus::Stopped` must count as unhealthy — routing skips both.
+#[cfg(test)]
+mod model_health_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::config::ModelConfig;
+    use crate::registry::types::{WorkerInfo, WorkerStatus};
+
+    fn worker(id: u32, status: WorkerStatus) -> WorkerInfo {
+        WorkerInfo {
+            worker_id: id,
+            device: "cpu:0".to_string(),
+            endpoint: format!("ipc:///tmp/w{}.sock", id),
+            pid: Some(1000 + id),
+            status,
+            capacity: None,
+        }
+    }
+
+    fn register_slots(state: &Arc<AppState>, model: &str) {
+        state
+            .registry
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
+            .unwrap();
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![
+                    worker(0, WorkerStatus::Ready),
+                    worker(1, WorkerStatus::Ready),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_worker_is_not_reported_healthy() {
+        let state = drift_tests::state_with_repo(Config::default(), &std::env::temp_dir());
+        register_slots(&state, "healthmodel");
+
+        // A live outlier state for the version, with slot 1's process gone:
+        // mark_dead is the crash monitor's bookkeeping and does NOT eject.
+        let outlier = Arc::new(crate::inference_queue::OutlierState::new(2));
+        let config = ModelConfig {
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            max_queue_size: 10,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        state.inference_queue.register_model(
+            "healthmodel",
+            "1",
+            &config,
+            vec![],
+            vec![],
+            outlier.clone(),
+            None,
+        );
+        outlier.mark_dead(1);
+        state.registry.mark_worker_stopped("healthmodel", "1", 1);
+
+        let Json(value) = model_health_json(&state, "healthmodel", "1").unwrap();
+        assert_eq!(
+            value["workers"][1]["healthy"], false,
+            "a worker whose process exited must not be reported healthy: {value}"
+        );
+        assert_eq!(value["workers"][0]["healthy"], true);
+        assert_eq!(value["healthy_workers"], 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_is_not_reported_healthy_without_outlier_state() {
+        let state = drift_tests::state_with_repo(Config::default(), &std::env::temp_dir());
+        register_slots(&state, "healthnostate");
+        // No queue registered for this version → the unknown-state branch,
+        // which must not claim healthy what the registry says is dead.
+        state.registry.mark_worker_stopped("healthnostate", "1", 1);
+
+        let Json(value) = model_health_json(&state, "healthnostate", "1").unwrap();
+        assert_eq!(
+            value["workers"][1]["healthy"], false,
+            "a Stopped worker must not be reported healthy: {value}"
+        );
+        assert_eq!(value["workers"][0]["healthy"], true);
+        assert_eq!(value["healthy_workers"], 1);
+    }
+}
+
+/// The HTTP load path must not swallow an unparseable config.yaml: a
+/// silently substituted default config drops `policies`, which leaves the
+/// loaded version with no auth/rate-limit gate at all.
+#[cfg(test)]
+mod load_config_failure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn load_rejects_config_with_unset_env_key_instead_of_dropping_policies() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-load-badcfg-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let version_dir = tmp.join("cfgmodel").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        // An unset ${VAR} in policies.auth.keys is a load error (fail-closed
+        // env expansion), not an empty key.
+        tokio::fs::write(
+            version_dir.join("config.yaml"),
+            "policies:\n  auth:\n    keys:\n      - ${LITE_SERVER_TEST_UNSET_KEY_A1B2}\n",
+        )
+        .await
+        .unwrap();
+
+        let state = drift_tests::state_with_repo(crate::config::Config::default(), &tmp);
+        let err = load_model_handler(
+            State(state),
+            Path(("cfgmodel".to_string(), "1".to_string())),
+            audit_tests::test_cx(),
+        )
+        .await
+        .expect_err("an invalid config.yaml must fail the load, not be dropped");
+
+        match err {
+            AppError::Config(msg) => assert!(
+                msg.contains("invalid config.yaml"),
+                "the error must name the config problem: {msg}"
+            ),
+            other => panic!("expected a config error, got {other:?}"),
+        }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

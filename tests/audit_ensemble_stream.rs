@@ -1827,8 +1827,10 @@ async fn test_audit_stream_p10_capacity_429() {
         "429 body must name streaming capacity: {body}"
     );
 
-    // §6.3.3: the rejection is observable — record_stream_rejected fires on
-    // the P10 429 (requests_total 4xx for the ensemble model).
+    // FIX 2: the P10 rejection must be counted EXACTLY ONCE. The ensemble
+    // executor used to record it too (from inside execute_ensemble), on top of
+    // the adapter's generic early-reject — so one 429 bumped requests_total 4xx
+    // twice and stream_rejected_total twice under two reasons.
     let metrics = reqwest::Client::new()
         .get(format!("{}/metrics", base))
         .send()
@@ -1837,22 +1839,46 @@ async fn test_audit_stream_p10_capacity_429() {
         .text()
         .await
         .unwrap();
-    let rejected = metrics
-        .lines()
-        .filter(|l| {
-            l.starts_with(r#"liteserver_requests_total{model="ens_slow""#)
-                && l.contains(r#"status="4xx""#)
-        })
-        .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<u64>().ok()))
-        .sum::<u64>();
-    assert!(
-        rejected >= 1,
-        "P10 429 must be recorded (record_stream_rejected); metrics:\n{}",
+    let dump = || {
         metrics
             .lines()
             .filter(|l| l.contains("ens_slow"))
             .collect::<Vec<_>>()
             .join("\n")
+    };
+    let sum_for = |name: &str, extra: &str| -> u64 {
+        metrics
+            .lines()
+            .filter(|l| {
+                l.starts_with(name) && l.contains(r#"model="ens_slow""#) && l.contains(extra)
+            })
+            .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<u64>().ok()))
+            .sum::<u64>()
+    };
+    assert_eq!(
+        sum_for("liteserver_requests_total", r#"status="4xx""#),
+        1,
+        "one 429'd request must record exactly ONE requests_total 4xx; metrics:\n{}",
+        dump()
+    );
+    assert_eq!(
+        sum_for(
+            "liteserver_stream_rejected_total",
+            r#"reason="concurrency_limit""#
+        ),
+        1,
+        "the P10 rejection must be counted once, as concurrency_limit; metrics:\n{}",
+        dump()
+    );
+    assert_eq!(
+        sum_for(
+            "liteserver_stream_rejected_total",
+            r#"reason="early_reject""#
+        ),
+        0,
+        "the P10 rejection must NOT also be counted as a generic early_reject \
+         (executor + adapter double count); metrics:\n{}",
+        dump()
     );
 
     // First stream still completes with its chunks.
