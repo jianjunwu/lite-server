@@ -211,10 +211,21 @@ handlers and gRPC Admin, same record shape). Read-only endpoints
 | `key_fingerprint` | SHA-256 hex prefix (12 chars) of the configured API key — distinguishes pre-/post-rotation keys in the log **without** writing the secret; `None` for public / loopback / unconfigured policies |
 | `details` | Before/after values where applicable, e.g. `weights {"1": 70} -> {"2": 100}`, `previous_active=Some("1") -> 2`; failures are audited too (`activate` not-ready) |
 
-Records go to the dedicated log target `lite_server::audit` at `info` level
-(no extra configuration). EnvFilter uses the **underscore** form:
+Records go to the dedicated log target `lite_server::audit` at `info` level,
+and that target is pinned to `info` in every filter the server builds — so
+records appear with **no extra configuration**, and neither `logging.level: warn`
+nor a restrictive `RUST_LOG` can silence them. (Note the log crate name is
+spelled with an **underscore**: `lite_server`, not `lite-server`.)
+
+To filter *around* the audit target, `RUST_LOG` replaces the configured
+`logging.level` entirely, so it must carry a global level of its own — a
+directive list with only target entries disables every other target, which
+silences all ordinary server logging:
 
 ```sh
+# correct: everything at warn, audit still at info
+RUST_LOG=warn,lite_server::audit=info
+# WRONG: no global level -> nothing but audit records is emitted
 RUST_LOG=lite_server::audit=info
 ```
 

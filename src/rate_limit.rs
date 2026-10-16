@@ -71,7 +71,15 @@ impl RateLimiter {
         // C1: a non-positive rpm is a misconfigured policy. Fail closed with a
         // sane Retry-After — otherwise the bucket drains its burst tokens and
         // later requests compute retry_after = (1-0)/0, saturating to u64::MAX.
-        if rpm <= 0.0 {
+        //
+        // `rpm <= 0.0` alone misses NaN, because every comparison against NaN is
+        // false — so `requests_per_minute: .nan` sailed past this guard and the
+        // token arithmetic collapsed (`tokens.min(capacity)` and the `>= 1.0`
+        // check), silently turning the limiter into "no limit". `is_finite`
+        // catches NaN and ±inf in one comparison; `1e400` in YAML parses to inf
+        // and would otherwise replenish without bound. `rpm == 0.0` is NOT
+        // affected — it stays the deliberate "block everything" policy below.
+        if !rpm.is_finite() || rpm <= 0.0 {
             return AcquireResult::Rejected {
                 retry_after_secs: 1,
             };
@@ -254,6 +262,34 @@ mod tests {
         let removed = limiter.cleanup_stale(Duration::from_secs(0)); // everything stale
         assert_eq!(removed, 0); // in-use bucket preserved
         assert!(limiter.buckets.contains_key("inuse"));
+    }
+
+    /// A NaN (or infinite) `requests_per_minute` must fail closed like any other
+    /// misconfigured policy.
+    ///
+    /// `rpm <= 0.0` is false for NaN — every comparison against NaN is — so the
+    /// request sailed past the misconfiguration guard and the token arithmetic
+    /// collapsed, leaving the limiter unlimited. `1e400` in YAML parses to `inf`
+    /// and replenished without bound. Reached from `policies.rate_limit`, i.e.
+    /// an operator typo, not an attacker.
+    #[test]
+    fn test_acquire_rejects_non_finite_rpm() {
+        let limiter = RateLimiter::default();
+        for rpm in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for attempt in 0..5 {
+                let result = limiter.acquire("non-finite-rpm", rpm, 1.0);
+                assert!(
+                    matches!(
+                        result,
+                        AcquireResult::Rejected {
+                            retry_after_secs: 1
+                        }
+                    ),
+                    "rpm={rpm} must be rejected on attempt {attempt} (it must not become \
+                     unlimited after the burst is consumed)"
+                );
+            }
+        }
     }
 
     #[test]

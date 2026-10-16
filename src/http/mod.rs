@@ -399,7 +399,82 @@ async fn access_control_middleware(
     ) {
         return AppError::Unauthorized("access denied".into()).into_response();
     }
+    if admin_request_is_cross_site(class, &ac, &request) {
+        tracing::warn!(
+            path = %request.uri().path(),
+            origin = ?request.headers().get(axum::http::header::ORIGIN),
+            referer = ?request.headers().get(axum::http::header::REFERER),
+            "rejected a cross-site admin request: the loopback peer admits the connection, \
+             but the announced Origin/Referer names a different site"
+        );
+        return AppError::Unauthorized(
+            "cross-site admin request denied (Origin/Referer does not match Host)".into(),
+        )
+        .into_response();
+    }
     next.run(request).await
+}
+
+/// A1: CSRF guard for the Admin class.
+///
+/// An unconfigured admin endpoint is admitted because the transport peer is
+/// loopback, but a loopback ADDRESS is not a loopback CALLER: any page the
+/// operator visits can POST to `http://127.0.0.1:<port>/v2/models/<m>/reload`
+/// from the browser's own socket. The admin handlers take no body extractor at
+/// all (bare and versioned reload/unload are `State + Path + cx`), so a plain
+/// HTML form — a CORS "simple request", no preflight, no custom headers —
+/// reaches them with no credentials. Nothing else notices: the CORS layer skips
+/// admin paths entirely, so no `Origin` check exists ahead of the handler.
+///
+/// Only unsafe methods are gated (a cross-origin caller cannot read an admin
+/// response anyway, so a safe request leaks nothing), and only requests riding
+/// the loopback exemption: a request carrying a configured admin credential is
+/// authenticated on its own merits, and a browser cannot attach that credential
+/// cross-origin without a preflight that would fail. CLI/curl and a server-side
+/// reverse proxy send neither header, so they are unaffected — a proxy is the
+/// origin of the request it makes upstream and must not relay the browser's.
+fn admin_request_is_cross_site(
+    class: crate::access_control::EndpointClass,
+    ac: &crate::access_control::AccessControl,
+    request: &Request,
+) -> bool {
+    use axum::http::{header, Method};
+
+    if class != crate::access_control::EndpointClass::Admin {
+        return false;
+    }
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    ) {
+        return false;
+    }
+    if !ac.uses_loopback_exemption(class, crate::callback::Protocol::Http) {
+        return false;
+    }
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false; // no Host to compare against, so nothing to enforce
+    };
+    // `Origin` decides when present; otherwise `Referer`'s authority stands in
+    // (a form POST sends Origin in modern browsers, but not all do).
+    let announced = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::REFERER)
+                .and_then(|v| v.to_str().ok())
+        });
+    match announced {
+        None => false,
+        Some(value) => !crate::http::cors::origin_matches_host(value, host),
+    }
 }
 
 /// Compression predicate (P1-4): never compress SSE responses — buffering
@@ -1337,6 +1412,124 @@ mod tests {
     }
 
     // ===== P-FLOW (§4.0.9) admission + body limit =====
+
+    /// Unconfigured `access_control.admin` is enforced as `is_loopback`
+    /// (`access_control.rs:154-156`), where `is_loopback` is read from the TCP
+    /// peer with a `.unwrap_or(true)` fallback for UDS / missing ConnectInfo
+    /// (`access_control_middleware` below). `docs/configuration.md:259`
+    /// documents admin as "loopback only".
+    ///
+    /// A loopback ADDRESS is not a loopback CALLER. A page the operator visits
+    /// can `POST http://127.0.0.1:<port>/v2/models/<m>/reload`: a plain HTML
+    /// form is a CORS "simple request", so the browser sends no preflight, and
+    /// the browser's own socket makes the peer 127.0.0.1. The state-changing
+    /// admin handlers take no body extractor at all — bare/versioned
+    /// reload, unload and `DELETE /v2/models/:m` are all `State + Path + cx`
+    /// (e.g. `http/handlers/admin.rs:490`, `:523`) — so no content-type and no
+    /// custom header is required either, and the admin class never consults
+    /// `Origin` / `Sec-Fetch-Site`.
+    ///
+    /// The same trust also makes the documented "loopback only" claim false
+    /// behind a same-host reverse proxy, where every internet request arrives
+    /// from 127.0.0.1.
+    #[tokio::test]
+    async fn unconfigured_admin_rejects_a_cross_site_simple_post() {
+        let ac = Arc::new(crate::access_control::AccessControl::default());
+        assert!(
+            ac.admin_denies_non_loopback(),
+            "precondition: the default policy is Unconfigured for admin, so loopback is the gate"
+        );
+
+        // A real admin path, so `classify_http_path` yields EndpointClass::Admin.
+        // The handler is a stub so this pins the middleware decision without
+        // spawning a worker.
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/:model_name/reload",
+                axum::routing::post(|| async { "reached the admin handler" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                ac,
+                access_control_middleware,
+            ));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/reload")
+                    .header("host", "127.0.0.1:8000")
+                    // Browser-form shape: attacker origin, no credentials, and
+                    // the peer is loopback because the browser is local.
+                    .header("origin", "https://evil.example")
+                    .header("content-type", "text/plain;charset=UTF-8")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        51234,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "an unauthenticated cross-site POST reached the admin handler: the peer being \
+             loopback is an address, not a credential — any page the operator visits can forge it"
+        );
+    }
+
+    /// The counterpart guard: the CSRF check must reject only a DIFFERENT
+    /// site, never the operator's own tooling. A same-origin admin POST, and a
+    /// request that announces no caller origin at all (CLI/curl, or the BFF
+    /// acting as a server-side proxy), must both still reach the handler.
+    #[tokio::test]
+    async fn admin_post_without_a_cross_site_origin_still_reaches_the_handler() {
+        let ac = Arc::new(crate::access_control::AccessControl::default());
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/:model_name/reload",
+                axum::routing::post(|| async { "reached the admin handler" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                ac,
+                access_control_middleware,
+            ));
+
+        for (label, origin) in [
+            ("same origin", Some("http://127.0.0.1:8000")),
+            ("no origin announced (CLI/curl/proxy)", None),
+        ] {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/v2/models/m/reload")
+                .header("host", "127.0.0.1:8000");
+            if let Some(o) = origin {
+                builder = builder.header("origin", o);
+            }
+            let resp = app
+                .clone()
+                .oneshot(
+                    builder
+                        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            51234,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "the admin CSRF guard must not block {label}"
+            );
+        }
+    }
 
     fn admission_app(cap: usize) -> (axum::Router, crate::admission::AdmissionCounter) {
         let admission = crate::admission::AdmissionCounter::new(cap);

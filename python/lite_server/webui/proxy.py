@@ -32,8 +32,11 @@ HOP_BY_HOP = frozenset({
 # content-length is kept: the streamed body is byte-identical, and having the
 # length lets upstreams that don't read chunked bodies work unchanged.
 # x-lite-user is BFF-asserted identity — the browser's own value is forged.
+# origin/referer are stripped because the proxy is itself the origin of the
+# request it makes upstream; relaying the browser's own origin misrepresents
+# the caller (and would trip the upstream's admin CSRF guard).
 _STRIP_REQUEST = (HOP_BY_HOP - {"content-length"}) | {
-    "cookie", "authorization", "x-lite-user",
+    "cookie", "authorization", "x-lite-user", "origin", "referer",
 }
 
 # Response direction: upstream cookies must not be planted on the BFF origin.

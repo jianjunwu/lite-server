@@ -116,6 +116,10 @@ grpc:
 metrics:
   enabled: true                # 运行独立 Prometheus 监听器（server.metrics_port，明文——见下文 TLS 注记）。
                                # 作用域注意：主端口 /metrics 路由恒挂载（Admin 端点类），不受此开关影响。
+  host: 127.0.0.1              # 该监听器的绑定地址。不设 = 跟随 server.host（默认 0.0.0.0）——
+                               # 因此默认情况下 /metrics 对任何能路由到该端口的人可读，且**无鉴权**
+                               # （该监听器按设计如此，以便 Prometheus 抓取）。解析出的地址非 loopback
+                               # 时启动会输出告警。
   # GIE/EPP 兼容指标命名空间：在 /metrics 暴露
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization
   # （vllm 兼容命名，对接 K8s LLM 自动扩缩生态）。非法命名空间启动 fail-fast。
@@ -275,9 +279,14 @@ openai_compact:
 
 `key_fingerprint` = 配置 key 的 SHA-256 前 6 字节 hex（12 字符）——日志可区分轮换前后的 key，不落密钥明文；public / loopback / 未配置为 `None`。
 
-记录走独立 log target `lite_server::audit`，`info` 级别即出，无需额外配置。EnvFilter 用**下划线**形式：
+记录走独立 log target `lite_server::audit`，且在服务端构造的每个过滤器里都被**固定为 `info`** —— 因此「无需额外配置」即出，`logging.level: warn` 或收紧的 `RUST_LOG` 都无法将其静音。（注意 crate 名用**下划线**：`lite_server`，不是 `lite-server`。）
+
+若要用 `RUST_LOG` 围绕审计 target 做过滤，请注意它会**整体取代**配置里的 `logging.level`，因此必须自带全局级别 —— 只写 target 指令会关闭其余所有 target，等于把普通日志全部静音：
 
 ```sh
+# 正确：其余 warn，审计仍为 info
+RUST_LOG=warn,lite_server::audit=info
+# 错误：没有全局级别 → 除审计外什么都不输出
 RUST_LOG=lite_server::audit=info
 ```
 
@@ -467,7 +476,7 @@ policies:
                                  #   version = 总量不变，轮转摊到各 worker
     respawn: true                #   respawn 后对替补 worker 重新预热（默认 true）；重暖在后台
                                  #   进行（respawn 不阻塞崩溃恢复）；重暖失败则强制剔除该 slot
-                                 #   （版本 → Degraded）
+                                 #   （版本 → Impaired）
     samples:                     #   dummy 输入列表，按序消费——每样本一个文件覆盖一种
                                  #   输入形状/batch（M7；旧 dummy_input_ref/iterations 已移除）
       - input_ref: warmup/batch1.json   # dummy 请求体 JSON 路径，相对模型目录

@@ -36,6 +36,44 @@ fn normalize_log_level(level: &str) -> String {
     }
 }
 
+/// The audit target, pinned to `info` in every filter this module builds.
+///
+/// The D27 control-plane trail rides its own target (`lite_server::audit`, see
+/// [`crate::audit`]) precisely so it can be filtered on its own — but nothing
+/// ever pinned it, so it was subject to whatever level won. `logging.level:
+/// warn`, or any `RUST_LOG` above info, silently dropped every control-plane
+/// audit record while the server reported nothing wrong. An audit trail that
+/// disappears according to a logging setting is not an audit trail, and
+/// docs/observability.md promises records appear "with no extra configuration".
+const AUDIT_DIRECTIVE: &str = "lite_server::audit=info";
+
+/// Build the `EnvFilter` [`init`] installs.
+///
+/// `rust_log` is the value of `EnvFilter::DEFAULT_ENV` when set (`None` when
+/// unset). `RUST_LOG` wins over the configured `level` — pre-existing
+/// behaviour — but the override is announced rather than silent, because an
+/// operator setting `logging.level: debug` in config.yaml and `RUST_LOG=warn`
+/// in the environment previously had no way to see which one took effect.
+///
+/// `eprintln!` rather than a `warn!`: no subscriber is installed yet here.
+fn build_filter(level: &str, rust_log: Option<&str>) -> EnvFilter {
+    match rust_log {
+        Some(env) => {
+            eprintln!(
+                "logging: RUST_LOG is set, so the configured logging.level ('{level}') is \
+                 ignored — RUST_LOG takes precedence. (effective filter: {env},{AUDIT_DIRECTIVE})"
+            );
+            // Note: a RUST_LOG carrying only target directives (e.g.
+            // `lite_server::audit=info`) has no global level, and EnvFilter then
+            // disables every other target.
+            EnvFilter::new(format!("{env},{AUDIT_DIRECTIVE}"))
+        }
+        None => EnvFilter::new(format!(
+            "lite_server={level},tokio=warn,hyper=warn,{AUDIT_DIRECTIVE}"
+        )),
+    }
+}
+
 // allow: 启动一次性初始化,参数即日志配置各字段(level/输出/轮转/OTel
 // layer),两调用点(lib/main)直读配置装配,无收编语义。
 #[allow(clippy::too_many_arguments)]
@@ -53,8 +91,11 @@ pub fn init(
 ) -> LogGuard {
     // B3: normalize the level alias before building the filter (see helper).
     let level = normalize_log_level(level);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
+
+    let filter = build_filter(
+        &level,
+        std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref(),
+    );
 
     // stdout layer (always)
     let stdout_layer = fmt::layer().with_target(true).with_thread_ids(true);
@@ -431,6 +472,69 @@ impl Write for SizeRotatingAppender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An audit record must survive a filter that excludes `info`, or the D27
+    /// control-plane trail silently vanishes whenever an operator sets
+    /// `logging.level: warn` or a restrictive `RUST_LOG` — the case
+    /// docs/observability.md explicitly promises will not happen ("no extra
+    /// configuration"). Covers both ways the filter is built.
+    #[test]
+    fn audit_target_is_enabled_even_when_the_filter_excludes_info() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Targets(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Targets {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().to_string());
+            }
+        }
+
+        for (label, filter) in [
+            (
+                "the configured level excludes info",
+                build_filter("warn", None),
+            ),
+            ("RUST_LOG excludes info", build_filter("info", Some("warn"))),
+        ] {
+            let seen = Targets::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(seen.clone().with_filter(filter)),
+            );
+            crate::test_tracing::ensure_always_on_subscriber();
+            let recorder = seen.clone();
+            std::thread::spawn(move || {
+                let _guard = tracing::dispatcher::set_default(&dispatch);
+                tracing::callsite::rebuild_interest_cache();
+                crate::audit::control_plane(
+                    None,
+                    &crate::access_control::AccessControl::default(),
+                    crate::callback::Protocol::Http,
+                    "load",
+                    "m",
+                    None,
+                    "details",
+                );
+            })
+            .join()
+            .unwrap();
+
+            let targets = recorder.0.lock().unwrap().clone();
+            assert!(
+                targets.iter().any(|t| t == "lite_server::audit"),
+                "the control-plane audit record must be emitted when {label}; \
+                 captured targets: {targets:?}"
+            );
+        }
+    }
 
     /// After a panic inside the mutex, SizeRotatingAppender must still work.
     /// Without poisoning recovery, this test panics on the second .lock().unwrap().

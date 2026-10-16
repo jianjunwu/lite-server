@@ -553,6 +553,12 @@ fn validate_tls_side(
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
+    /// Bind address for the dedicated metrics listener. `None` follows
+    /// `server.host` (the historical behaviour), which defaults to `0.0.0.0`.
+    /// The listener serves `/metrics` with NO authentication, so a non-loopback
+    /// value exposes every metric to anyone who can route to the port; set a
+    /// loopback address (and scrape through a proxy) when that is not intended.
+    pub host: Option<String>,
     /// GIE/EPP 指标命名 namespace（P2-1 扩展，D32）：`{namespace}:total_queued_requests`
     /// / `{namespace}:kv_cache_utilization` 暴露到 /metrics，兼容 `vllm` 模式。
     /// 非法 namespace 在启动时快速失败（register_gie_metrics 校验）。
@@ -573,6 +579,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            host: None,
             metric_namespace: "liteserver".to_string(),
             timeline_max_points: 30,
             timeline_sample_interval_secs: 10,
@@ -1034,6 +1041,7 @@ impl Default for WorkerHooksConfig {
 // ===== Per-model policies (declared in model config.yaml, enforced by Rust) =====
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitPolicy {
     pub requests_per_minute: f64,
     #[serde(default = "default_rl_key")]
@@ -1082,7 +1090,15 @@ fn default_auth_header() -> String {
     "X-API-Key".into()
 }
 
+/// `deny_unknown_fields` is load-bearing, not tidiness: without it a typo'd
+/// field name is silently dropped by serde, and `keys` then defaults to `[]`,
+/// whose documented meaning is "any non-empty value passes"
+/// (`http/handlers/mod.rs::enforce_auth`). So `keys: [...]` mis-spelled as
+/// `key: [...]` turns a declared API-key allowlist into an open gate with no
+/// warning anywhere — the model still loads and serves. Failing the parse
+/// instead makes the mistake immediately visible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthPolicy {
     /// Header carrying the API key.
     #[serde(default = "default_auth_header")]
@@ -1660,6 +1676,43 @@ pub fn unix_socket_path(host: &str) -> Option<&str> {
     host.strip_prefix("unix:")
 }
 
+/// Resolve the model repository root to its canonical form, once, so every
+/// subsystem keys on the same spelling.
+///
+/// The repo path is used as an *identity* in several keyed structures: the H3
+/// control-plane write ledger (`WorkerManager::note_config_write` /
+/// `take_config_write`) and the `.lma` dedup set (`seen_lma`). `AppState` and
+/// `WorkerManager` used to take `config.model_repository.path` verbatim — a
+/// RELATIVE path by default (`./model_repo`) — while only the watcher
+/// canonicalized it, and `PathBuf` equality is literal and component-wise. The
+/// same file therefore had two identities, so the suppression ledger never
+/// matched its own entries (a `mode=write_only` PATCH still triggered a
+/// reload, the exact outcome H3 exists to prevent) and every `.lma` was
+/// re-processed on each reconcile tick.
+///
+/// Falls back to the raw path when it cannot be canonicalized (it does not
+/// exist yet) — the same fallback the watcher uses, so the two ends still
+/// agree on that spelling.
+pub fn resolve_repo_path(raw: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    let raw = raw.as_ref();
+    raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf())
+}
+
+impl Config {
+    /// The address the dedicated metrics listener binds: `metrics.host` when
+    /// configured, otherwise the HTTP TCP host (which itself follows
+    /// `server.host`).
+    ///
+    /// Single source for both the bind and the startup exposure check, so the
+    /// warning can never describe an address other than the one actually bound.
+    pub fn metrics_bind_host(&self, http_tcp_host: &str) -> String {
+        self.metrics
+            .host
+            .clone()
+            .unwrap_or_else(|| http_tcp_host.to_string())
+    }
+}
+
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&content)?;
@@ -1704,11 +1757,24 @@ fn expand_policy_env_vars(config: &mut ModelConfig) -> anyhow::Result<()> {
     };
     for key in auth.keys.iter_mut() {
         if let Some(var) = key.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-            *key = std::env::var(var).map_err(|_| {
+            let value = std::env::var(var).map_err(|_| {
                 anyhow::anyhow!(
                     "policies.auth.keys references ${{{var}}} but the variable is not set"
                 )
             })?;
+            // A variable that is SET BUT EMPTY is the normal shape of an
+            // unpopulated deployment (`docker run -e API_KEY`, `export
+            // API_KEY=`, an empty secret mount), and `std::env::var` reports it
+            // as `Ok("")`. Accepting that would install an empty API key: the
+            // load succeeds, and the gate then rejects EVERY request with
+            // "invalid API key" while no configuration error explains why. So
+            // empty is treated exactly like unset — fail closed. The
+            // server-level secret resolution already does this
+            // (`access_control.rs`, `resolve_secret`).
+            if value.is_empty() {
+                anyhow::bail!("policies.auth.keys references ${{{var}}} but the variable is empty");
+            }
+            *key = value;
         }
     }
     Ok(())
@@ -3337,6 +3403,113 @@ policies:
             err.to_string().contains("LITE_TEST_POLICY_MISSING"),
             "error must name the missing variable: {err}"
         );
+    }
+
+    /// `metrics.host` selects the dedicated metrics listener's bind address;
+    /// unset it follows the HTTP TCP host (the historical behaviour, kept so
+    /// existing remote-scraping deployments do not break). The listener has no
+    /// authentication, which is why the knob exists and why `server/mod.rs`
+    /// warns when the resolved address is remotely reachable.
+    #[test]
+    fn test_metrics_bind_host_follows_metrics_host_then_the_http_host() {
+        let default_cfg = Config::default();
+        assert_eq!(
+            default_cfg.metrics.host, None,
+            "precondition: unset by default, so the bind follows server.host"
+        );
+        assert_eq!(
+            default_cfg.metrics_bind_host("0.0.0.0"),
+            "0.0.0.0",
+            "unset must fall back to the HTTP TCP host"
+        );
+
+        let mut cfg = Config::default();
+        cfg.metrics.host = Some("127.0.0.1".to_string());
+        assert_eq!(
+            cfg.metrics_bind_host("0.0.0.0"),
+            "127.0.0.1",
+            "an explicit metrics.host must win over the HTTP host"
+        );
+    }
+
+    /// A mis-spelled field under `policies.auth` must fail the parse, not
+    /// silently reduce the gate to "any non-empty value passes".
+    ///
+    /// `AuthPolicy.keys` carries `#[serde(default)]`, and an empty `keys` list
+    /// means "accept any non-empty value" (`http/handlers/mod.rs::enforce_auth`,
+    /// the retired Python `RequireApiKey` semantics). Without
+    /// `deny_unknown_fields` serde drops the unknown field silently, so
+    /// writing `key: ["sk-prod"]` instead of `keys: [...]` leaves the model
+    /// serving with its declared API-key allowlist replaced by an open gate —
+    /// and nothing anywhere reports a problem.
+    #[test]
+    fn test_misspelled_auth_field_fails_the_load() {
+        let dir = std::env::temp_dir().join("lite-server-policy-typo-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        // `key` (singular) instead of `keys`.
+        std::fs::write(&path, "policies:\n  auth:\n    key: [\"sk-prod\"]\n").unwrap();
+
+        let outcome = load_model_config(&path);
+        match outcome {
+            Ok(cfg) => panic!(
+                "a mis-spelled `key` must fail the load rather than silently emptying `keys`, \
+                 which makes the API-key gate accept any caller: got {:?}",
+                cfg.policies.auth.map(|a| a.keys)
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("key") || msg.contains("unknown field"),
+                    "the error must name the unrecognized field: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `expand_policy_env_vars` documents the invariant "Fail-closed: an unset
+    /// variable is a load error, never an empty key." Only the UNSET case is
+    /// handled — and only that case has a test.
+    ///
+    /// `std::env::var` returns `Ok("")` for a variable that is set but empty, so
+    /// `keys: ["${VAR}"]` with `VAR=""` expands to `[""]`, the load SUCCEEDS, and
+    /// the model then rejects every request with "invalid API key"
+    /// (`http/handlers/mod.rs:456` compares against the key list) with no
+    /// configuration error anywhere to explain it. Empty env values are the
+    /// norm in container/CI deployments (`docker run -e API_KEY`,
+    /// `export API_KEY=`, an unpopulated secret mount).
+    ///
+    /// The server-level secret resolution gets this right — `resolve_secret`
+    /// (`access_control.rs:239`) explicitly rejects `Ok(v) if v.is_empty()` —
+    /// so this is a gap in the per-model path, not a deliberate policy.
+    #[test]
+    fn test_auth_keys_env_expansion_rejects_a_set_but_empty_variable() {
+        const VAR: &str = "LITE_TEST_POLICY_EMPTY";
+        std::env::set_var(VAR, "");
+        let dir = std::env::temp_dir().join("lite-server-policy-env-empty-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            format!("policies:\n  auth:\n    keys: [\"${{{VAR}}}\"]\n"),
+        )
+        .unwrap();
+
+        let outcome = load_model_config(&path);
+        std::env::remove_var(VAR);
+
+        match outcome {
+            Ok(cfg) => panic!(
+                "a set-but-empty ${{{VAR}}} must fail the load rather than silently become an \
+                 empty API key (which 401s every request with no config error to explain it): \
+                 got keys={:?}",
+                cfg.policies.auth.map(|a| a.keys)
+            ),
+            Err(e) => assert!(
+                e.to_string().contains(VAR),
+                "the error must name the variable: {e}"
+            ),
+        }
     }
 
     // --- Unix socket path detection ---

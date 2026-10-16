@@ -158,6 +158,21 @@ impl AccessControl {
         }
     }
 
+    /// True when this (class, protocol) pair is admitted by the
+    /// unconfigured-loopback exemption rather than by a configured credential.
+    ///
+    /// Callers use it to tell "authenticated" apart from "trusted because the
+    /// peer address looked local". The latter is forgeable by any browser — the
+    /// connection genuinely does originate from loopback — so it must not carry
+    /// authority by itself for a state-changing request. See the admin CSRF
+    /// guard, `http::admin_request_is_cross_site`.
+    pub fn uses_loopback_exemption(&self, class: EndpointClass, protocol: Protocol) -> bool {
+        matches!(
+            self.cell(class, protocol_axis(protocol)),
+            ResolvedControl::Unconfigured
+        )
+    }
+
     /// True if the admin class would deny a non-loopback peer under the current
     /// policy — used by startup pre-checks to warn operators who relied on the
     /// pre-P7-1 "bind = open" admin behavior (蓝图 §6.2 迁移保障).
@@ -363,10 +378,16 @@ impl OpenaiAuthGate {
 /// Strip an RFC 6750 `Bearer ` prefix (scheme is case-insensitive); any other
 /// form → None (falls through to the full-value comparison).
 fn strip_bearer(value: &str) -> Option<&str> {
-    if let Some(rest) = value.strip_prefix("Bearer ") {
+    // The scheme name is case-insensitive (RFC 6750 §2.1), which the doc above
+    // always claimed — but only the two spellings happened to be handled
+    // literally, so an RFC-conformant client sending `BEARER sk-x` (or any other
+    // casing) fell through to comparing the whole `BEARER sk-x` value against
+    // the secret and was rejected.
+    let (scheme, rest) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") {
         return Some(rest);
     }
-    value.strip_prefix("bearer ")
+    None
 }
 
 /// Classify an HTTP request path into an endpoint class (蓝图 §4.2). Health
@@ -658,6 +679,24 @@ mod tests {
     }
 
     // ===== constant-time compare sanity =====
+
+    /// RFC 6750 makes the auth scheme case-insensitive, so every casing of
+    /// `Bearer` must strip. Only two literal spellings used to be handled, which
+    /// rejected a conformant client outright.
+    #[test]
+    fn strip_bearer_is_case_insensitive_on_the_scheme() {
+        for value in ["Bearer sk-x", "bearer sk-x", "BEARER sk-x", "BeArEr sk-x"] {
+            assert_eq!(
+                strip_bearer(value),
+                Some("sk-x"),
+                "{value:?} must have its scheme stripped"
+            );
+        }
+        // Not the Bearer scheme → None, so the full value is compared instead.
+        assert_eq!(strip_bearer("Basic zzz"), None);
+        assert_eq!(strip_bearer("Bearer"), None, "a bare scheme is not a token");
+        assert_eq!(strip_bearer("BearerX sk-x"), None);
+    }
 
     #[test]
     fn ct_eq_matches_and_rejects() {

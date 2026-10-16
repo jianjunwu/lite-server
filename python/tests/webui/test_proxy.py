@@ -116,6 +116,24 @@ def test_should_not_forward_browser_credentials_to_upstream(client, upstream):
     assert "authorization" not in upstream.last_request["headers"]
 
 
+def test_should_not_forward_browser_origin_or_referer_to_upstream(client, upstream):
+    # The proxy is the origin of the upstream request; the browser's own
+    # Origin/Referer must not be relayed (a cross-origin value would trip the
+    # upstream's admin CSRF guard and break the admin UI).
+    client.get("/api/i/plain/v2/models", headers={
+        "origin": "http://localhost:5173",
+        "referer": "http://localhost:5173/settings",
+    })
+    assert "origin" not in upstream.last_request["headers"]
+    assert "referer" not in upstream.last_request["headers"]
+
+
+def test_should_inject_admin_key_while_stripping_browser_origin(client, upstream):
+    client.get("/api/i/keyed/v2/models", headers={"origin": "http://localhost:5173"})
+    assert upstream.last_request["headers"].get("x-admin-key") == "server-key"
+    assert "origin" not in upstream.last_request["headers"]
+
+
 def test_should_not_forward_upstream_set_cookie_to_browser(client):
     res = client.get("/api/i/plain/setcookie")
     assert res.status_code == 200

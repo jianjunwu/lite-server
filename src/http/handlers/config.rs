@@ -118,6 +118,80 @@ pub(crate) fn redact_tree(
     }
 }
 
+/// Does a value the server would have redacted hold the placeholder? Arrays
+/// are redacted element-wise (`redact_subtree`), so any element counts.
+fn holds_placeholder(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s == REDACTED,
+        Value::Array(items) => items.iter().any(holds_placeholder),
+        _ => false,
+    }
+}
+
+/// Path of the first value in `patch` that carries the redaction placeholder
+/// in a position the server itself redacts, or `None`.
+///
+/// `GET /config` replaces every secret with `***` (see [`redact_tree`]). A
+/// client that edits the returned tree and PATCHes it back would install that
+/// literal string as the secret — and `***` is a public constant, so the
+/// declared API-key gate would then accept it from any caller. The Web UI strips
+/// the placeholder client-side (`ui/web/src/components/config/configDraft.ts`),
+/// but that is not a server-side guarantee: curl, the Python SDK and the gRPC
+/// `UpdateModelConfig` RPC all reach this code without it.
+///
+/// Mirrors exactly what `redact_tree` masks — the whole-value subtrees in
+/// [`REDACTED_SUBTREES`], `*_key`/`*_secret` scalar leaves, and the values of
+/// any `headers` map — so a legitimate value that merely looks unusual is not
+/// caught.
+fn redaction_placeholder_path(patch: &Value, path: &str) -> Option<String> {
+    match patch {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if REDACTED_SUBTREES.contains(&child_path.as_str()) {
+                    if holds_placeholder(child) {
+                        return Some(child_path);
+                    }
+                    continue;
+                }
+                if is_secret_leaf(key) && !child.is_object() && !child.is_array() {
+                    if holds_placeholder(child) {
+                        return Some(child_path);
+                    }
+                    continue;
+                }
+                if key.eq_ignore_ascii_case("headers") {
+                    if let Value::Object(headers) = child {
+                        for (name, value) in headers {
+                            if holds_placeholder(value) {
+                                return Some(format!("{child_path}.{name}"));
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let Some(hit) = redaction_placeholder_path(child, &child_path) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if let Some(hit) = redaction_placeholder_path(item, &format!("{path}[{i}]")) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// First 16 hex chars of the file content SHA-256 — changes iff the file
 /// content changes (mtime-only etags would miss same-size rewrites within
 /// the same second).
@@ -483,6 +557,20 @@ pub(crate) async fn prepare_config_patch(
     if !req.patch.is_object() {
         return Err(ConfigPatchError::Invalid {
             message: "patch must be a JSON object (RFC 7386 merge-patch)".to_string(),
+            warnings: vec![],
+        });
+    }
+
+    // A patch echoing back what `GET /config` redacted would install `***` as
+    // the secret (see `redaction_placeholder_path`). Rejected before the merge
+    // so the message can name the field, and so a dry-run reports it too.
+    if let Some(field) = redaction_placeholder_path(&req.patch, "") {
+        return Err(ConfigPatchError::Invalid {
+            message: format!(
+                "patch sets `{field}` to `{REDACTED}`, which is the placeholder GET returns in \
+                 place of a secret rather than a secret itself — a merge-patch leaves omitted \
+                 fields untouched, so omit this one (or send the real value)"
+            ),
             warnings: vec![],
         });
     }
@@ -1036,6 +1124,44 @@ mod tests {
     }
 
     // ===== M2: PATCH core tests =====
+
+    /// `GET /config` redacts the API keys to the placeholder `["***"]`
+    /// (`REDACTED_SUBTREES`, `config.rs:23`). Nothing on the server refuses that
+    /// placeholder on the way back in, so the documented GET → edit → PATCH
+    /// round-trip installs the literal string `"***"` as the accepted API key.
+    ///
+    /// `"***"` is a public constant, and `enforce_auth`
+    /// (`http/handlers/mod.rs:456`) accepts any member of `keys` — so the
+    /// declared API-key gate then admits every caller who sends `***`, silently
+    /// downgrading a secret from "something only the operator knows" to
+    /// "something everyone knows".
+    ///
+    /// The Web UI papers over this client-side (`configDraft.ts:9` strips the
+    /// sentinel), which is exactly why it reads as handled — but a client-side
+    /// guard is not a server-side guarantee: curl, the Python SDK, and the gRPC
+    /// `UpdateModelConfig` RPC all reach the same code without it.
+    #[tokio::test]
+    async fn patch_rejects_the_redaction_sentinel_as_an_api_key() {
+        let repo = temp_repo("redaction-sentinel");
+        write_config(
+            &repo,
+            "m",
+            "1",
+            "policies:\n  auth:\n    keys: [\"sk-real\"]\n",
+        );
+        let state = test_state(repo);
+        let req = patch_req(
+            json!({"policies": {"auth": {"keys": [REDACTED]}}}),
+            ConfigPatchMode::WriteOnly,
+        );
+
+        let outcome = prepare_config_patch(&state, "m", "1", &req).await;
+        assert!(
+            outcome.is_err(),
+            "a patch that installs the redaction placeholder `***` as an API key must be \
+             rejected: it is a publicly known constant, so the gate would accept it from any caller"
+        );
+    }
 
     fn patch_req(patch: Value, mode: ConfigPatchMode) -> ConfigPatchRequest {
         ConfigPatchRequest {
@@ -1869,7 +1995,15 @@ mod tests {
         .await
         .unwrap();
 
-        let path = repo.join("m").join("1").join("config.yaml");
+        // Look the entry up the way the WATCHER does: from its own resolved
+        // repo root, not from the raw configured spelling. Using `repo`
+        // directly here is what previously made this test unable to catch the
+        // raw-vs-canonical mismatch — both ends were spelled the same way, so
+        // it passed while production's suppression was dead.
+        let path = crate::config::resolve_repo_path(&repo)
+            .join("m")
+            .join("1")
+            .join("config.yaml");
         let etag = content_etag(&std::fs::read(&path).unwrap());
         assert!(
             state.worker_manager.take_config_write(&path, &etag),
@@ -1919,7 +2053,13 @@ mod tests {
             }
         ));
 
-        let path = repo.join("m").join("1").join("config.yaml");
+        // Resolved the way the watcher resolves its root (see the sibling test
+        // above): asserting against the raw configured spelling would let the
+        // raw-vs-canonical mismatch go unnoticed.
+        let path = crate::config::resolve_repo_path(&repo)
+            .join("m")
+            .join("1")
+            .join("config.yaml");
         assert!(
             state
                 .worker_manager

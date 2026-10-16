@@ -83,6 +83,38 @@ fn default_port(scheme: &str) -> Option<u16> {
 }
 
 /// `host` / `host:port` / `[ipv6]:port` → (host, Option<port>)。
+/// True when `announced` — an `Origin` header value, or a `Referer` whose
+/// authority stands in for one — names the same authority as the request's
+/// `Host`. Used by the admin CSRF guard (see `http::admin_request_is_cross_site`).
+///
+/// An opaque origin (`Origin: null`, e.g. a sandboxed iframe) and anything
+/// unparseable never match, so they count as cross-site.
+///
+/// Comparison is authority-only: the `Host` header carries no scheme, so
+/// `http://h` and `https://h` are indistinguishable here and both match
+/// `Host: h`. That is the right granularity for a CSRF guard — an attacker who
+/// already controls the other scheme of the same authority is not the threat
+/// model — and it is deliberately not a general-purpose same-origin check.
+pub(crate) fn origin_matches_host(announced: &str, host: &str) -> bool {
+    let Some(origin) = normalize_origin(announced) else {
+        return false;
+    };
+    let Some((host_name, host_port)) = split_host_port(host.trim()) else {
+        return false;
+    };
+    if !origin.host.eq_ignore_ascii_case(&host_name) {
+        return false;
+    }
+    match (origin.port, host_port) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        // One side spelled the scheme's default port and the other omitted it
+        // (`Origin: https://h` vs `Host: h:443`): the same authority.
+        (None, Some(p)) => default_port(&origin.scheme) == Some(p),
+        (Some(p), None) => default_port(&origin.scheme) == Some(p),
+    }
+}
+
 fn split_host_port(authority: &str) -> Option<(String, Option<u16>)> {
     if let Some(close) = authority.find(']') {
         // `[ipv6]` or `[ipv6]:port`
