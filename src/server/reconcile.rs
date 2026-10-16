@@ -10,6 +10,128 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn, Instrument};
 
+/// What [`activate_after_load`] did this round. Returned for tests and
+/// observability; production callers log and discard.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PostLoadActivation {
+    /// The configured default (loaded this round) is now active.
+    DefaultActivated,
+    /// The configured default was loaded this round but could not be activated
+    /// (not Ready, or the registry rejected it).
+    DefaultFailed,
+    /// No usable active version remained, and the configured default — already
+    /// loaded and Ready — was re-activated. The fallback path that honours the
+    /// default instead of arbitrary load order; logs no "falling back" warning
+    /// because the default was respected after all.
+    DefaultReactivated,
+    /// No usable active version remained and the configured default could not
+    /// be honoured; `versions_loaded[0]` was activated instead. The ONLY path
+    /// that logs the "falling back" warning — steady-state ticks (nothing
+    /// loaded this round, active version serving) return [`Unchanged`] and
+    /// never warn.
+    FallbackActivated(String),
+    /// The fallback activation was attempted but failed (not Ready, or the
+    /// registry rejected it).
+    FallbackFailed,
+    /// Nothing to do: no usable-active loss, and nothing loaded to activate.
+    Unchanged,
+}
+
+/// Post-load activation policy, pure registry manipulation (no worker I/O) so
+/// it is unit-testable without spawning anything.
+///
+/// Honour the configured `default_version` when this round loaded it;
+/// otherwise, when no usable active version remains (a stale pin seeded by
+/// cache_registry restore pointing at a version that failed to reload must
+/// read as "no active version" — B1), fall back to a loaded version so the
+/// model is never left Ready with no active version (every unversioned
+/// request would 404 until an operator intervenes).
+pub(super) fn activate_after_load(
+    registry: &ModelRegistry,
+    name: &str,
+    default_version: Option<&str>,
+    versions_loaded: &[String],
+) -> PostLoadActivation {
+    if let Some(dv) = default_version {
+        if versions_loaded.iter().any(|v| v == dv) {
+            return match registry.activate_version(name, dv) {
+                Ok(true) => {
+                    info!("Activated default version {} for {}", dv, name);
+                    PostLoadActivation::DefaultActivated
+                }
+                Ok(false) => {
+                    warn!(
+                        "Failed to activate default version {} for {} (not ready)",
+                        dv, name
+                    );
+                    PostLoadActivation::DefaultFailed
+                }
+                Err(e) => {
+                    error!(
+                        "Error activating default version {} for {}: {}",
+                        dv, name, e
+                    );
+                    PostLoadActivation::DefaultFailed
+                }
+            };
+        }
+    }
+    // Deliberately NOT gated on `default_version`: whenever the configured
+    // default could not be activated (its config.yaml failed to load, it was
+    // not in the load target, or it was not Ready), serving the first loaded
+    // version is the strictly better failure mode.
+    if versions_loaded.is_empty() || registry.active_version_is_ready(name) {
+        return PostLoadActivation::Unchanged;
+    }
+    // Prefer the configured default when it is already loaded and Ready —
+    // operator intent beats arbitrary load order. This is the one fallback
+    // path that does NOT warn: the default is honoured after all.
+    let default_ready = default_version.filter(|dv| {
+        registry
+            .get(name, Some(dv))
+            .map(|mv| mv.status == crate::registry::types::VersionStatus::Ready)
+            .unwrap_or(false)
+    });
+    let (pick, honours_default) = match default_ready {
+        Some(dv) => (dv, true),
+        None => (versions_loaded[0].as_str(), false),
+    };
+    if !honours_default {
+        if let Some(dv) = default_version {
+            warn!(
+                "Configured default version {} for {} was not loaded this round; \
+                 falling back to a loaded version",
+                dv, name
+            );
+        }
+    }
+    match registry.activate_version(name, pick) {
+        Ok(true) => {
+            if honours_default {
+                info!(
+                    "Activated default version {} for {} (already loaded)",
+                    pick, name
+                );
+                PostLoadActivation::DefaultReactivated
+            } else {
+                info!("Activated version {} for {}", pick, name);
+                PostLoadActivation::FallbackActivated(pick.to_string())
+            }
+        }
+        Ok(false) => {
+            warn!(
+                "Failed to activate version {} for {} (not ready)",
+                pick, name
+            );
+            PostLoadActivation::FallbackFailed
+        }
+        Err(e) => {
+            error!("Error activating version {} for {}: {}", pick, name, e);
+            PostLoadActivation::FallbackFailed
+        }
+    }
+}
+
 /// Reconcile registry state with the model repository: load versions that
 /// should be present per the orchestration config, unload managed versions
 /// that should no longer be present (declarative semantics — the config is
@@ -122,56 +244,12 @@ pub(super) async fn reconcile_models(
             }
         }
 
-        // Activate the configured default version, if this round loaded it.
+        // Post-load activation: honour the configured default, else fall back
+        // so the model never sits Ready with no active version (B1). See
+        // `activate_after_load` for the warning policy (the "falling back"
+        // warning fires only when the fallback genuinely engages).
         let default_version = strategy.and_then(|s| s.default_version.clone());
-        if let Some(ref dv) = default_version {
-            if versions_loaded.contains(dv) {
-                match registry.activate_version(name, dv) {
-                    Ok(true) => info!("Activated default version {} for {}", dv, name),
-                    Ok(false) => warn!(
-                        "Failed to activate default version {} for {} (not ready)",
-                        dv, name
-                    ),
-                    Err(e) => error!(
-                        "Error activating default version {} for {}: {}",
-                        dv, name, e
-                    ),
-                }
-            } else {
-                warn!(
-                    "Configured default version {} for {} was not loaded this round; \
-                     falling back to a loaded version",
-                    dv, name
-                );
-            }
-        }
-
-        // Fallback: auto-activate the first loaded version, but only when no
-        // usable active version remains. A stale pin seeded by
-        // cache_registry restore (force_pin) — pointing at a version that
-        // failed to reload — must read as "no active version" here, or the
-        // model is stuck unusable after restart (B1).
-        //
-        // Deliberately NOT an `else` branch: whenever the configured default
-        // could not be activated (its config.yaml failed to load, it was not in
-        // the load target, or it was not Ready), leaving the model Ready with no
-        // active version makes every request without an explicit version 404
-        // until an operator intervenes. Serving the first loaded version is the
-        // strictly better failure mode, and the warning above records that the
-        // default was not honoured.
-        if !versions_loaded.is_empty() && !registry.active_version_is_ready(name) {
-            match registry.activate_version(name, &versions_loaded[0]) {
-                Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
-                Ok(false) => warn!(
-                    "Failed to activate version {} for {} (not ready)",
-                    versions_loaded[0], name
-                ),
-                Err(e) => error!(
-                    "Error activating version {} for {}: {}",
-                    versions_loaded[0], name, e
-                ),
-            }
-        }
+        activate_after_load(registry, name, default_version.as_deref(), &versions_loaded);
     }
 }
 /// Versions of a model that should be loaded per the strategy's load_policy:
@@ -334,6 +412,103 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
         }
+    }
+
+    // --- activate_after_load ---
+
+    /// Register `versions` (all Ready); the returned registry is the fixture.
+    fn registry_with_ready(model: &str, versions: &[&str]) -> ModelRegistry {
+        let registry = ModelRegistry::new();
+        for v in versions {
+            registry
+                .register(
+                    model,
+                    v,
+                    crate::config::ModelConfig::default(),
+                    crate::registry::types::ModelType::LitAPI,
+                    std::path::PathBuf::new(),
+                )
+                .unwrap();
+            registry.mark_ready(model, v).unwrap();
+        }
+        registry
+    }
+
+    /// Steady-state tick (nothing loaded this round, active version serving)
+    /// must be a no-op: the old inline code warned "was not loaded this round;
+    /// falling back" on EVERY poll tick for every model with a configured
+    /// default, with no fallback actually occurring — training operators to
+    /// ignore the one log line that means a real misconfiguration.
+    #[test]
+    fn activate_after_load_steady_state_is_unchanged_and_warn_free() {
+        let registry = registry_with_ready("m", &["1"]);
+        registry.activate_version("m", "1").unwrap();
+
+        let outcome = activate_after_load(&registry, "m", Some("1"), &[]);
+        assert_eq!(outcome, PostLoadActivation::Unchanged);
+        assert_eq!(registry.get_active_version("m").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn activate_after_load_honours_default_loaded_this_round() {
+        let registry = registry_with_ready("m", &["1"]);
+
+        let outcome = activate_after_load(&registry, "m", Some("1"), &["1".to_string()]);
+        assert_eq!(outcome, PostLoadActivation::DefaultActivated);
+        assert_eq!(registry.get_active_version("m").as_deref(), Some("1"));
+    }
+
+    /// Genuine fallback (default not honourable, no usable active version)
+    /// engages on the loaded version — and is the only path that logs the
+    /// "falling back" warning.
+    #[test]
+    fn activate_after_load_falls_back_when_default_not_honourable() {
+        let registry = registry_with_ready("m", &["1", "2"]);
+        registry.activate_version("m", "1").unwrap();
+        // The configured default "9" does not exist; version 1 stops serving
+        // (pin points at a broken version — the B1 stale-pin shape).
+        let _ = registry.set_status("m", "1", crate::registry::types::VersionStatus::Failed);
+
+        let outcome = activate_after_load(&registry, "m", Some("9"), &["2".to_string()]);
+        assert_eq!(
+            outcome,
+            PostLoadActivation::FallbackActivated("2".to_string())
+        );
+        assert_eq!(registry.get_active_version("m").as_deref(), Some("2"));
+    }
+
+    /// The fallback must PREFER the configured default when it is already
+    /// loaded and Ready — operator intent beats arbitrary load order. The old
+    /// fallback pinned `versions_loaded[0]` ignoring `default_version`
+    /// entirely, permanently activating the wrong version (the reconcile
+    /// fallback was the one activation path that did not prefer the default).
+    #[test]
+    fn activate_after_load_fallback_prefers_configured_default_when_ready() {
+        let registry = registry_with_ready("m", &["1", "2"]);
+        registry.activate_version("m", "2").unwrap();
+        // Version 2 (the active pin) breaks; version 1 — the configured
+        // default — is loaded and Ready. This round loaded version 3.
+        let _ = registry.set_status("m", "2", crate::registry::types::VersionStatus::Failed);
+
+        let outcome = activate_after_load(&registry, "m", Some("1"), &["3".to_string()]);
+        assert_eq!(outcome, PostLoadActivation::DefaultReactivated);
+        assert_eq!(
+            registry.get_active_version("m").as_deref(),
+            Some("1"),
+            "the fallback must re-activate the configured default, not versions_loaded[0]"
+        );
+    }
+
+    /// Nothing loaded this round and no usable active version → nothing the
+    /// helper can do (the caller logs nothing either — the activation attempt
+    /// below is gated on a non-empty loaded set).
+    #[test]
+    fn activate_after_load_no_loaded_versions_is_unchanged() {
+        let registry = registry_with_ready("m", &["1"]);
+        let _ = registry.set_status("m", "1", crate::registry::types::VersionStatus::Failed);
+
+        let outcome = activate_after_load(&registry, "m", Some("1"), &[]);
+        assert_eq!(outcome, PostLoadActivation::Unchanged);
     }
 
     #[test]

@@ -65,6 +65,25 @@ describe('model status mapping', () => {
     const merged = mergeModelList(undefined, loaded);
     expect(merged[0].status).not.toBe('ready');
   });
+
+  it('should_map_impaired_to_a_warning_kind', () => {
+    // VersionStatus::Impaired (the readiness split): serving with SOME
+    // workers ejected — an ordinary outlier-breaker outcome, NOT offline.
+    // Without a mapping it falls to 'offline', greying the version badge as
+    // if no worker were serving.
+    expect(statusKind('impaired')).toBe('warning');
+  });
+
+  it('should_report_an_impaired_model_as_ready_in_the_list', () => {
+    // Impaired versions still take traffic, so the model-level rollup stays
+    // 'ready' (green) — the version-level badge carries the warning.
+    const loaded = [
+      { name: 'm', version: '1', status: 'impaired', workers: 1 },
+    ] as never;
+
+    const merged = mergeModelList(undefined, loaded);
+    expect(merged[0].status).toBe('ready');
+  });
 });
 
 describe('playground error rendering', () => {

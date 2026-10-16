@@ -105,6 +105,11 @@ pub struct AccessControl {
     admin: CellPolicy,
     inference: CellPolicy,
     health: CellPolicy,
+    /// Extra Origin allowlist for the admin CSRF guard. Empty by default;
+    /// populated from `server.trusted_origins` at the HTTP build site. Covers
+    /// reverse-proxy deployments where the proxy relays the browser's Origin
+    /// but rewrites Host, so the guard's Host comparison can never match.
+    trusted_origins: Vec<crate::http::cors::NormalizedOrigin>,
 }
 
 impl AccessControl {
@@ -119,6 +124,7 @@ impl AccessControl {
                 http: health.clone(),
                 grpc: health,
             },
+            trusted_origins: Vec::new(),
         })
     }
 
@@ -171,6 +177,30 @@ impl AccessControl {
             self.cell(class, protocol_axis(protocol)),
             ResolvedControl::Unconfigured
         )
+    }
+
+    /// Install the `server.trusted_origins` allowlist (startup only, so a
+    /// malformed entry fails fast instead of silently never matching).
+    pub fn set_trusted_origins(&mut self, origins: &[String]) -> Result<(), AppError> {
+        let mut parsed = Vec::with_capacity(origins.len());
+        for raw in origins {
+            let origin = crate::http::cors::normalize_origin(raw).ok_or_else(|| {
+                AppError::Validation(format!("invalid trusted_origin entry: {raw}"))
+            })?;
+            parsed.push(origin);
+        }
+        self.trusted_origins = parsed;
+        Ok(())
+    }
+
+    /// True if the announced Origin exactly matches a configured
+    /// `server.trusted_origins` entry (normalized: default ports and scheme
+    /// case do not affect the comparison).
+    pub fn origin_is_trusted(&self, announced: &str) -> bool {
+        let Some(origin) = crate::http::cors::normalize_origin(announced) else {
+            return false;
+        };
+        self.trusted_origins.contains(&origin)
     }
 
     /// True if the admin class would deny a non-loopback peer under the current
@@ -810,6 +840,29 @@ mod tests {
         assert_eq!(fp, expected);
         // 不落明文
         assert!(!fp.contains("secret"));
+    }
+
+    #[test]
+    fn trusted_origin_matching_is_exact_and_normalized() {
+        let mut ac = AccessControl::default();
+        ac.set_trusted_origins(&[
+            "https://console.example".to_string(),
+            "http://127.0.0.1:3000".to_string(),
+        ])
+        .unwrap();
+
+        assert!(ac.origin_is_trusted("https://console.example"));
+        // Scheme/host case and the scheme's default port do not affect matching.
+        assert!(ac.origin_is_trusted("HTTPS://Console.Example"));
+        // An origin not on the list — even a parent domain — is not trusted.
+        assert!(!ac.origin_is_trusted("https://example"));
+        assert!(!ac.origin_is_trusted("https://console.example.evil.tld"));
+        assert!(!ac.origin_is_trusted("null"));
+        assert!(!ac.origin_is_trusted("not a url"));
+
+        // Malformed entries fail fast at install time.
+        let mut bad = AccessControl::default();
+        assert!(bad.set_trusted_origins(&["not a url".to_string()]).is_err());
     }
 
     #[test]

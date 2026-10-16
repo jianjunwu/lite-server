@@ -93,6 +93,9 @@ server:
                                # X-Real-IP are honored. Empty (default) = the direct TCP peer is
                                # always used and client proxy headers are IGNORED (prevents forged-
                                # IP rate-limit bypass). List your gateway/proxy here for its
+  trusted_origins: []         # Extra exact origins (scheme://host[:port]) admitted by the admin
+                               # CSRF guard. Needed when a reverse proxy relays the browser Origin
+                               # but rewrites Host. Empty (default) = Host match only.
                                # forwarded client IPs to reach key=ip rate-limiting.
   # Global CORS policy (applied when no per-model policies.cors matches, and
   # to non-model routes). null (default) = CORS pass-through (no headers attached).
@@ -363,6 +366,15 @@ security relies entirely on access-control key authentication.
 **Admin endpoints** — Admin-class endpoints are not browser-facing; the CORS
 middleware skips them (no ACAO attached). Configure a global `server.cors`
 policy only if you need cross-origin admin access.
+
+**Admin CSRF guard & reverse proxies** — Unsafe-method admin requests riding
+the loopback exemption are rejected when the announced `Origin`/`Referer` does
+not match `Host` (a loopback address is not a loopback caller). A reverse
+proxy that relays the browser's `Origin` but rewrites `Host` (the default
+nginx `proxy_pass` shape) can never match; either preserve the original Host
+(`proxy_set_header Host $host`) or list the UI's exact origin in
+`server.trusted_origins` (normalized `scheme://host[:port]` entries, e.g.
+`https://console.example`).
 
 ## Telemetry / OpenTelemetry
 

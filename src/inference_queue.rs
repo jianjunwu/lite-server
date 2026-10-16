@@ -2096,6 +2096,9 @@ async fn do_send_batch(
                         // Request-level error (e.g. BadRequestError) — deterministic,
                         // retrying on another worker can't help. Forward the
                         // worker's response verbatim (status_code/headers intact).
+                        // Deliberately NOT scored against the worker: the client
+                        // input alone caused this, and counting it would let a
+                        // replayed malformed request eject healthy workers.
                         if let Some(queue_item) = batch.pop() {
                             let _ = queue_item.response_tx.send(pb::Response {
                                 uid: queue_item.uid,
@@ -2105,9 +2108,6 @@ async fn do_send_batch(
                         }
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                         update_worker_saturation(model_name, version, inflight);
-                        if outlier.record_error(worker_idx) {
-                            prometheus::inc_worker_ejection(model_name, version);
-                        }
                         Err(BatchError {
                             worker_idx,
                             code: "Error".to_string(),
@@ -3434,6 +3434,41 @@ mod tests {
     }
 
     // ===== Graceful drain tests (§4.2) =====
+
+    /// Spawn a PAIR-socket worker that answers every unary request with a
+    /// Single Error carrying the given numeric `status_code` — a
+    /// deterministic request-level failure (e.g. the model rejected a
+    /// malformed payload with BadRequestError).
+    fn spawn_status_code_worker(endpoint: String, status_code: i32) -> std::thread::JoinHandle<()> {
+        use prost::Message;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        status: Some(pb::Status {
+                            code: "Error".to_string(),
+                            message: "bad request".to_string(),
+                        }),
+                        status_code,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
 
     fn drain_test_endpoint(name: &str) -> String {
         #[cfg(unix)]
@@ -5470,6 +5505,46 @@ mod tests {
             dispatch.budgets[0].count.load(Ordering::Relaxed),
             0,
             "warmup traffic never consumes the recycle budget"
+        );
+    }
+
+    /// A worker's Single Error carrying a 4xx status_code is a deterministic
+    /// client failure (BadRequestError etc.): the response is forwarded
+    /// verbatim and must NOT be scored against the worker — recording it as a
+    /// worker error would let a buggy client eject healthy workers by
+    /// replaying malformed requests.
+    #[tokio::test]
+    async fn should_not_score_request_level_4xx_against_worker() {
+        let endpoint0 = drain_test_endpoint("rq4-w0");
+        spawn_status_code_worker(endpoint0.clone(), 400);
+        let (mut dispatch, outlier, inflight) = budget_dispatch("rq4", 1, &[100], None);
+        Arc::get_mut(&mut dispatch).unwrap().zmq_clients =
+            vec![Arc::new(WorkerZmqClient::new(endpoint0))];
+
+        let threshold = EjectionConfig::default().error_threshold;
+        for _ in 0..threshold {
+            let (item, rx) = hint_item_rx("p", meta_with_headers(&[]));
+            send_batch_with_retry(vec![item], &dispatch, &inflight, Duration::from_secs(5), 1)
+                .await;
+            let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("response in time")
+                .expect("response channel open");
+            match resp.payload {
+                Some(pb::response::Payload::Single(s)) => {
+                    assert_eq!(s.status_code, 400, "caller receives the 4xx verbatim");
+                }
+                other => panic!("expected Single response, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            outlier.consecutive_errors(0),
+            0,
+            "deterministic client 4xx must not count as a worker error"
+        );
+        assert!(
+            !outlier.is_ejected(0),
+            "enough client 4xx to cross the threshold must never eject a healthy worker"
         );
     }
 

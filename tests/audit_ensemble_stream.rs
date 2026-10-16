@@ -1889,6 +1889,105 @@ async fn test_audit_stream_p10_capacity_429() {
     );
 }
 
+/// gRPC parity for the P10 accounting (observability-gap audit 2026-10-16):
+/// an ensemble streaming rejection over gRPC must bump
+/// `liteserver_stream_rejected_total{reason="concurrency_limit"}` exactly
+/// once. The HTTP adapters count it (see the SSE sibling above); the gRPC
+/// wrappers only recorded the generic `requests_total` 4xx, so any
+/// dashboard/alert keyed on the rejected series went silent for gRPC traffic.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_p10_capacity_429_grpc_counts_stream_rejected() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::StreamInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc(
+        &["ens_slow", "pre", "tail_slow"],
+        "  max_concurrent_streaming_dags: 1",
+    )
+    .await;
+    wait_ready_all(&base, &["ens_slow"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    // First stream holds the only slot (0.5s/chunk).
+    let first = client
+        .stream_infer(StreamInferRequest {
+            model_name: "ens_slow".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(r#"{"text":"one two"}"#),
+            headers: HashMap::new(),
+            sequence_id: None,
+        })
+        .await
+        .expect("first stream must open")
+        .into_inner();
+
+    // Give the first stream time to acquire the semaphore slot.
+    sleep(Duration::from_millis(700)).await;
+
+    // Second concurrent streaming DAG → ResourceExhausted (429).
+    let err = client
+        .stream_infer(StreamInferRequest {
+            model_name: "ens_slow".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(r#"{"text":"three"}"#),
+            headers: HashMap::new(),
+            sequence_id: None,
+        })
+        .await
+        .expect_err("P10 exhausted capacity must reject the second stream");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "P10 rejection maps to ResourceExhausted: {err}"
+    );
+
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .expect("/metrics")
+        .text()
+        .await
+        .unwrap();
+    let sum_for = |name: &str, extra: &str| -> u64 {
+        metrics
+            .lines()
+            .filter(|l| {
+                l.starts_with(name) && l.contains(r#"model="ens_slow""#) && l.contains(extra)
+            })
+            .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<u64>().ok()))
+            .sum::<u64>()
+    };
+    assert_eq!(
+        sum_for("liteserver_requests_total", r#"status="4xx""#),
+        1,
+        "one 429'd request must record exactly ONE requests_total 4xx"
+    );
+    assert_eq!(
+        sum_for(
+            "liteserver_stream_rejected_total",
+            r#"reason="concurrency_limit""#
+        ),
+        1,
+        "the gRPC P10 rejection must be counted once, as concurrency_limit"
+    );
+    assert_eq!(
+        sum_for(
+            "liteserver_stream_rejected_total",
+            r#"reason="early_reject""#
+        ),
+        0,
+        "the gRPC P10 rejection must NOT also be counted as a generic early_reject"
+    );
+
+    drop(first);
+}
+
 /// P0: config edit → reload → the next request uses the NEW plan
 /// (validation: reload invalidates the plan cache, D23).
 #[tokio::test]

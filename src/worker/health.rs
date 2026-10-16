@@ -167,7 +167,13 @@ fn reconcile_version_status(
                 Some(dep) => match dep.status {
                     // Settled non-serving: this step cannot run, and no
                     // in-flight load is going to change that on its own.
-                    VersionStatus::Degraded | VersionStatus::Failed => false,
+                    // `Unloading` is transitional but ALSO non-serving — a
+                    // reload must finish before the dep can take traffic, so
+                    // for the window the ensemble advertises Degraded rather
+                    // than admit requests the executor would 503.
+                    VersionStatus::Degraded | VersionStatus::Failed | VersionStatus::Unloading => {
+                        false
+                    }
                     // Serving, or still working its way there (a load is in
                     // flight) — not a settled failure.
                     _ => true,
@@ -270,8 +276,8 @@ impl WorkerManager {
     /// Apply an explicit serving state for a version and refresh gRPC health.
     ///
     /// Sync so the worker-respawn error paths (which cannot await, being
-    /// `inspect_err` closures) can re-assert the state the caller derived
-    /// before the spawn attempt. Callers are responsible for having derived
+    /// `inspect_err` closures) can apply the state derived from the worker
+    /// facts at failure time. Callers are responsible for having derived
     /// `status` from the worker facts — do not hand-code a state here.
     pub(super) fn set_version_status(
         &self,
@@ -610,17 +616,14 @@ mod tests {
         // the executor auto-loads sub-models on demand, so gating the request
         // here would block the very request that triggers the load. Same for a
         // load in flight.
-        reg.set_ensemble_deps(
-            "ens",
-            "1",
-            vec![("never_loaded".to_string(), None)],
-        );
+        reg.set_ensemble_deps("ens", "1", vec![("never_loaded".to_string(), None)]);
         assert_eq!(
             reconcile_version_status(&reg, "ens", "1", None),
             None,
             "an unloaded sub-model is auto-loadable, not a serving failure"
         );
-        reg.set_status("sub", "1", VersionStatus::WarmingUp).unwrap();
+        reg.set_status("sub", "1", VersionStatus::WarmingUp)
+            .unwrap();
         reg.set_ensemble_deps("ens", "1", vec![("sub".to_string(), None)]);
         assert_eq!(
             reconcile_version_status(&reg, "ens", "1", None),
@@ -647,6 +650,45 @@ mod tests {
         assert_eq!(
             reconcile_version_status(&reg, "ens", "1", None),
             Some(VersionStatus::Ready)
+        );
+    }
+
+    /// A dependency mid-`Unloading` cannot serve, and no in-flight load is
+    /// going to change that — the reload has to finish first. Advertising
+    /// `Ready` for that window admits requests the executor 503s on every
+    /// step touching that dep. (Distinct from Pending/Loading/WarmingUp,
+    /// which are "working its way up" and must NOT gate out the request that
+    /// triggers the load.)
+    #[test]
+    fn reconcile_ensemble_dep_unloading_is_not_runnable() {
+        let reg = ModelRegistry::new();
+        reg.register(
+            "ens",
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::Ensemble,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.mark_ready("ens", "1").unwrap();
+        reg.register(
+            "sub",
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::LitAPI,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.mark_ready("sub", "1").unwrap();
+        reg.activate_version("sub", "1").unwrap();
+        reg.set_ensemble_deps("ens", "1", vec![("sub".to_string(), None)]);
+
+        reg.set_status("sub", "1", VersionStatus::Unloading)
+            .unwrap();
+        assert_eq!(
+            reconcile_version_status(&reg, "ens", "1", None),
+            Some(VersionStatus::Degraded),
+            "a dependency being unloaded cannot serve — the ensemble must not advertise Ready"
         );
     }
 

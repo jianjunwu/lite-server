@@ -399,6 +399,10 @@ mod tests {
     /// that dir underneath it, then runs on indefinitely. A timed-out
     /// unpack must kill + reap its child, like the upload path does.
     #[cfg(unix)]
+    // LITESERVER_PYTHON is process-global: this test and the worker-process
+    // respawn-TOCTOU test both open an env window, so they share a named
+    // serial lock to keep the windows disjoint.
+    #[serial_test::serial(python_shim)]
     #[tokio::test]
     async fn unpack_timeout_must_not_orphan_the_child_process() {
         // Unique per run: LITESERVER_PYTHON is process-global, so parallel

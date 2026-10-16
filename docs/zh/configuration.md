@@ -82,6 +82,8 @@ server:
   trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
                                # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过
                                # key=ip 限流）。网关/代理需在此列出，其转发的客户端 IP 才能参与限流。
+  trusted_origins: []         # admin CSRF 防护额外放行的精确 origin（scheme://host[:port]）。
+                               # 反向代理转发浏览器 Origin 但改写 Host 时需要配置。空（默认）= 仅匹配 Host。
   # 全局 CORS 策略（无 per-model policies.cors 覆盖时生效，且覆盖非模型路由）。
   # null（默认）= CORS 直通（不附任何头）。字段同 per-model policies.cors。
   cors: null
@@ -323,6 +325,8 @@ server:
 **WebSocket** — 浏览器对 WS 握手不发 preflight 也不强制 ACAO，因此 CORS 中间件无法阻止跨站 WebSocket 劫持（CSWSH）。WS upgrade handler 用同一引擎独立校验 `Origin`（`ws_origin_allowed`）。未配置 CORS 策略时，WS 安全完全依赖访问控制 key 鉴权。
 
 **Admin 端点** — admin 类端点非浏览器面向；CORS 中间件跳过它们（不附加 ACAO）。仅在需要跨域 admin 访问时才配置全局 `server.cors` 策略。
+
+**Admin CSRF 防护与反向代理** — 走 loopback 豁免的非常方法 admin 请求，若 `Origin`/`Referer` 与 `Host` 不匹配会被拒绝（loopback 地址不等于 loopback 调用方）。反向代理转发浏览器 `Origin` 但改写 `Host`（nginx 默认 `proxy_pass` 形态）时永远无法匹配：要么保留原始 Host（`proxy_set_header Host $host`），要么把 UI 的精确 origin 列入 `server.trusted_origins`（规范化 `scheme://host[:port]` 条目，如 `https://console.example`）。
 
 ## 遥测 / OpenTelemetry
 

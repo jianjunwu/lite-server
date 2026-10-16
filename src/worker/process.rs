@@ -698,6 +698,48 @@ impl WorkerManager {
         result
     }
 
+    /// Derive the version state to leave behind when THIS slot's spawn fails,
+    /// from the worker facts AT CALL TIME (see the spawn-site comment). Sync —
+    /// `try_read`, never await — because the failure callers are
+    /// `inspect_err` closures that cannot await. A contended outlier lock
+    /// degrades to "no outlier state", i.e. registry siblings count as usable:
+    /// the safe direction (`Impaired`, still serving) rather than a spurious
+    /// `Degraded` that takes a healthy model out of service.
+    fn derive_spawn_failure_status(
+        &self,
+        model_name: &str,
+        version: &str,
+        worker_id: u32,
+    ) -> VersionStatus {
+        let key = model_version_key(model_name, version);
+        let outlier = self
+            .outlier_states
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.get(&key).cloned());
+        let siblings_usable = self
+            .registry
+            .get(model_name, Some(version))
+            .map(|mv| {
+                mv.workers
+                    .iter()
+                    .filter(|w| w.worker_id != worker_id)
+                    .filter(|w| {
+                        outlier
+                            .as_deref()
+                            .map(|o| o.is_usable(w.worker_id as usize))
+                            .unwrap_or(true)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if siblings_usable > 0 {
+            VersionStatus::Impaired
+        } else {
+            VersionStatus::Degraded
+        }
+    }
+
     async fn respawn_worker_inner(
         self: &Arc<Self>,
         model_name: &str,
@@ -834,36 +876,16 @@ impl WorkerManager {
         // `Loading` would be wrong for the other reason: it makes
         // `has_serving` false and stalls the siblings' traffic too. A
         // successful handshake restores the derived state below; a startup
-        // failure leaves the version at `on_spawn_failure` (runtime worker
-        // loss, not a load failure — `Failed` is load-phase only).
+        // failure leaves the version at the spawn-failure state (runtime
+        // worker loss, not a load failure — `Failed` is load-phase only).
         //
-        // Computed BEFORE the spawn attempt so the error paths further down —
-        // which are `inspect_err` closures and cannot await — have the value to
-        // re-assert.
-        let on_spawn_failure = {
-            let outlier = self.get_outlier_state(model_name, version).await;
-            let siblings_usable = self
-                .registry
-                .get(model_name, Some(version))
-                .map(|mv| {
-                    mv.workers
-                        .iter()
-                        .filter(|w| w.worker_id != worker_id)
-                        .filter(|w| {
-                            outlier
-                                .as_deref()
-                                .map(|o| o.is_usable(w.worker_id as usize))
-                                .unwrap_or(true)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            if siblings_usable > 0 {
-                VersionStatus::Impaired
-            } else {
-                VersionStatus::Degraded
-            }
-        };
+        // Derived at each use site, NOT cached: the error paths below run
+        // after the whole stop+spawn window (up to the startup timeout), and
+        // sibling facts can change inside that window (a sibling dies, or an
+        // ejection expires). Re-asserting a value computed before the window
+        // could pin a stale `Impaired` with zero usable workers — the gate
+        // admits and every request 503s.
+        let on_spawn_failure = self.derive_spawn_failure_status(model_name, version, worker_id);
         //
         // Graceful rolling recycle is the exception for the UPFRONT write: the
         // recycling slot is already out of routing (routing skips
@@ -921,18 +943,27 @@ impl WorkerManager {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))
-            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
+            .inspect_err(|_| {
+                let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+                self.set_version_status(model_name, version, status);
+            })?;
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
-            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
+            .inspect_err(|_| {
+                let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+                self.set_version_status(model_name, version, status);
+            })?;
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
-            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
+            .inspect_err(|_| {
+                let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+                self.set_version_status(model_name, version, status);
+            })?;
 
         // Wait for "ready" signal
         let mut reader = BufReader::new(stdout);
@@ -944,9 +975,13 @@ impl WorkerManager {
         .await
         .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
         .and_then(|r| r.map_err(AppError::Io))
-        .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
+        .inspect_err(|_| {
+            let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+            self.set_version_status(model_name, version, status);
+        })?;
         if n == 0 {
-            self.set_version_status(model_name, version, on_spawn_failure);
+            let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+            self.set_version_status(model_name, version, status);
             let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
             let msg = if stderr_tail.trim().is_empty() {
                 "worker exited before ready".to_string()
@@ -959,10 +994,14 @@ impl WorkerManager {
 
         let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
             .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))
-            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
+            .inspect_err(|_| {
+                let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+                self.set_version_status(model_name, version, status);
+            })?;
 
         if startup.status != "ready" {
-            self.set_version_status(model_name, version, on_spawn_failure);
+            let status = self.derive_spawn_failure_status(model_name, version, worker_id);
+            self.set_version_status(model_name, version, status);
             return Err(AppError::WorkerCrashed(format!(
                 "worker {} startup failed: {:?}",
                 worker_id, startup.message
@@ -2036,6 +2075,149 @@ mod tests {
         assert!(
             result.is_err(),
             "an out-of-range worker_id must fail the respawn, not panic the listener"
+        );
+    }
+
+    /// TOCTOU (readiness-split audit): the spawn-failure status was computed
+    /// BEFORE the spawn attempt and re-asserted verbatim on every failure
+    /// path. The stop+spawn window spans the whole startup timeout, and
+    /// sibling facts can change inside it: if the last usable sibling dies
+    /// mid-window, the stale re-assert pins the version at `Impaired` with
+    /// zero usable workers — the request gate admits and every request 503s.
+    /// The failure paths must re-derive the state from the facts at failure
+    /// time.
+    #[cfg(unix)]
+    // The LITESERVER_PYTHON env window is process-global: this test and
+    // `server::scanner`'s orphan test must not overlap (each would clear the
+    // other's override), so both take the same named serial lock.
+    #[serial_test::serial(python_shim)]
+    #[tokio::test]
+    async fn respawn_failure_status_recovers_from_stale_sibling_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-respawn-toctou-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&repo);
+        let model_dir = repo.join("mtoctou").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.py"), "# stub\n").unwrap();
+        std::fs::write(model_dir.join("config.yaml"), "max_batch_size: 1\n").unwrap();
+
+        // Shim "python": hangs on this test's unique repo (a replacement that
+        // never becomes ready); anything else passes through to the real
+        // interpreter so concurrent tests that also resolve LITESERVER_PYTHON
+        // during the env window are unaffected.
+        let shim = repo.join("shim-python.sh");
+        let pidfile = repo.join("shim.pid");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\"{}\"*)\n    echo $$ > {}\n    exec sleep 300\n    ;;\nesac\nexec python3 \"$@\"\n",
+                repo.display(),
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let queue = std::sync::Arc::new(crate::inference_queue::InferenceQueue::new());
+        let cb = std::sync::Arc::new(crate::callback::CallbackRunner::new());
+        let wm = std::sync::Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            queue,
+            "warn".to_string(),
+            cb,
+        ));
+
+        let model_config = crate::config::ModelConfig {
+            startup_timeout: 3.0,
+            ..Default::default()
+        };
+        registry
+            .register(
+                "mtoctou",
+                "1",
+                model_config,
+                ModelType::LitAPI,
+                model_dir.clone(),
+            )
+            .unwrap();
+        registry.mark_ready("mtoctou", "1").unwrap();
+        // Two slots: worker 0 is being respawned, worker 1 is the warm sibling.
+        let worker = |id: u32| crate::registry::types::WorkerInfo {
+            worker_id: id,
+            device: "cpu:0".to_string(),
+            endpoint: format!("ipc://toctou-{id}"),
+            pid: Some(1),
+            status: crate::registry::types::WorkerStatus::Ready,
+            capacity: None,
+        };
+        registry
+            .set_workers("mtoctou", "1", vec![worker(0), worker(1)])
+            .unwrap();
+
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(2));
+        wm.insert_outlier_for_test("mtoctou", "1", outlier.clone())
+            .await;
+
+        std::env::set_var("LITESERVER_PYTHON", &shim);
+        let respawn = tokio::spawn({
+            let wm = wm.clone();
+            async move {
+                wm.respawn_worker("mtoctou", "1", 0, "health_check", false)
+                    .await
+            }
+        });
+
+        // Wait for the shim to enter the spawn window (the wait is generous:
+        // under parallel suite load, macOS exec authorization can take
+        // seconds; the loop breaks as soon as the pidfile lands).
+        for _ in 0..200 {
+            if pidfile.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        std::env::remove_var("LITESERVER_PYTHON");
+        assert!(
+            pidfile.is_file(),
+            "shim must have started (spawn window open)"
+        );
+        // Precondition: with the sibling usable, the pre-spawn write derived
+        // Impaired — correct at that moment.
+        assert_eq!(
+            registry.get("mtoctou", Some("1")).map(|mv| mv.status),
+            Some(crate::registry::types::VersionStatus::Impaired)
+        );
+
+        // The sibling dies inside the spawn window, before the startup
+        // timeout fires.
+        outlier.mark_dead(1);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), respawn)
+            .await
+            .expect("respawn finishes after the startup timeout")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "the hung replacement must fail the respawn"
+        );
+
+        let status = registry.get("mtoctou", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Degraded),
+            "the failure path must re-derive from the facts at failure time: \
+             the sibling died mid-window, so zero usable workers remain. A \
+             stale `Impaired` re-assert would admit traffic and 503 every request"
         );
     }
 

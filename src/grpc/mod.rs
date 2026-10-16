@@ -446,11 +446,18 @@ impl LiteServer for GrpcService {
                 .is_some();
             let (m, v) =
                 crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
-            crate::metrics::prometheus::record_request_end(
+            // §6.3.3: the adapter wrapper owns the request-level outcome and
+            // counts the rejection once — `record_stream_rejected` records
+            // requests_total internally. `reason` classifies capacity
+            // rejections (P10 / G4, both ResourceExhausted) so the gRPC
+            // surface feeds `liteserver_stream_rejected_total` too, not only
+            // the generic requests_total (observability-gap audit 2026-10-16).
+            crate::metrics::prometheus::record_stream_rejected(
                 m,
                 v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
+                crate::grpc::error::grpc_stream_reject_reason(s.code()),
             );
         }
         echo_grpc_response_headers(result, &request_id, start)
@@ -542,11 +549,18 @@ impl LiteServer for GrpcService {
                 .is_some();
             let (m, v) =
                 crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
-            crate::metrics::prometheus::record_request_end(
+            // §6.3.3: the adapter wrapper owns the request-level outcome and
+            // counts the rejection once — `record_stream_rejected` records
+            // requests_total internally. `reason` classifies capacity
+            // rejections (P10 / G4, both ResourceExhausted) so the gRPC
+            // surface feeds `liteserver_stream_rejected_total` too, not only
+            // the generic requests_total (observability-gap audit 2026-10-16).
+            crate::metrics::prometheus::record_stream_rejected(
                 m,
                 v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
+                crate::grpc::error::grpc_stream_reject_reason(s.code()),
             );
         }
         echo_grpc_response_headers(result, &request_id, start)
@@ -596,11 +610,18 @@ impl LiteServer for GrpcService {
                 .is_some();
             let (m, v) =
                 crate::metrics::prometheus::reject_labels(registered, &model_label, &version_label);
-            crate::metrics::prometheus::record_request_end(
+            // §6.3.3: the adapter wrapper owns the request-level outcome and
+            // counts the rejection once — `record_stream_rejected` records
+            // requests_total internally. `reason` classifies capacity
+            // rejections (P10 / G4, both ResourceExhausted) so the gRPC
+            // surface feeds `liteserver_stream_rejected_total` too, not only
+            // the generic requests_total (observability-gap audit 2026-10-16).
+            crate::metrics::prometheus::record_stream_rejected(
                 m,
                 v,
                 grpc_code_to_status_family(s.code()),
                 start.elapsed().as_secs_f64(),
+                crate::grpc::error::grpc_stream_reject_reason(s.code()),
             );
         }
         echo_grpc_response_headers(result, &request_id, start)

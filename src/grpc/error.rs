@@ -200,6 +200,20 @@ pub(super) fn grpc_code_to_status_family(code: tonic::Code) -> &'static str {
     }
 }
 
+/// Classify a pre-open rejection of a gRPC STREAMING rpc for
+/// `liteserver_stream_rejected_total`. Both capacity gates surface as
+/// `ResourceExhausted`: the ensemble P10 slot (`StreamingCapacityExceeded`)
+/// and the per-model stream-concurrency permit (G4) — both are genuinely
+/// concurrency rejections. Everything else that fails before the response
+/// opens (auth, unknown model, validation, ...) is an early reject, matching
+/// the HTTP adapter's `reject_reason` semantics.
+pub(super) fn grpc_stream_reject_reason(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::ResourceExhausted => "concurrency_limit",
+        _ => "early_reject",
+    }
+}
+
 /// Log a gRPC error status with graded severity, then return it (P1-1 parity
 /// with HTTP error.rs:256-270 — gRPC handlers previously logged nothing).
 pub(crate) fn err(status: Status) -> Status {
@@ -301,6 +315,31 @@ mod tests {
     }
 
     // --- grpc_code_to_status_family ---
+
+    #[test]
+    fn should_classify_stream_reject_reason() {
+        // Both capacity gates (ensemble P10 slot, per-model G4 permit) map
+        // StreamingCapacityExceeded → 429 → ResourceExhausted; rate limiting
+        // is rejected in the interceptor before these wrappers and never
+        // reaches this classifier.
+        assert_eq!(
+            grpc_stream_reject_reason(tonic::Code::ResourceExhausted),
+            "concurrency_limit"
+        );
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::Unauthenticated,
+            tonic::Code::NotFound,
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+        ] {
+            assert_eq!(
+                grpc_stream_reject_reason(code),
+                "early_reject",
+                "{code:?} is not a capacity rejection"
+            );
+        }
+    }
 
     #[test]
     fn should_map_success_to_2xx() {

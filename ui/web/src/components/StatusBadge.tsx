@@ -12,7 +12,7 @@ export function statusKind(status: string | null | undefined): StatusKind {
   // through to 'offline', which the model list then promotes to a green
   // "Ready" badge for a version that is not serving.
   if (['loading', 'starting', 'initializing', 'pending', 'warming_up'].includes(s)) return 'loading';
-  if (['degraded', 'warning', 'unloading', 'draining'].includes(s)) return 'warning';
+  if (['degraded', 'warning', 'unloading', 'draining', 'impaired'].includes(s)) return 'warning';
   if (['failed', 'error', 'unhealthy'].includes(s)) return 'error';
   return 'offline';
 }

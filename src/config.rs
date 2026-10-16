@@ -258,6 +258,13 @@ pub struct ServerConfig {
     pub mtls_ca_path: Option<String>,
     /// Minimum TLS version (P5-1): "1.2" (default) or "1.3".
     pub tls_min_version: Option<String>,
+    /// Extra Origin allowlist for the admin CSRF guard, for reverse-proxy
+    /// deployments: the proxy relays the browser's `Origin` but rewrites
+    /// `Host`, so the guard's Host comparison can never match the operator's
+    /// UI origin. Entries are exact normalized origins
+    /// (`scheme://host[:port]`, default-port and case-insensitive), e.g.
+    /// `https://console.example`. Empty (default) = no extra trust.
+    pub trusted_origins: Vec<String>,
     /// P8-1: how long a `sequence_id → worker` affinity mapping is kept after
     /// its last use before the 60s cleanup sweep evicts it.
     pub sequence_ttl_secs: f32,
@@ -360,6 +367,7 @@ impl Default for ServerConfig {
             max_concurrent_streaming_dags: 128,
             max_request_body_bytes: Some(64 * 1024 * 1024), // 64 MiB
             max_upload_bytes: None,
+            trusted_origins: Vec::new(),
             trusted_proxies: Vec::new(),
             cors: None,
         }
@@ -2851,6 +2859,15 @@ mod tests {
     }
 
     // ===== P-XFF: trusted_proxies =====
+
+    #[test]
+    fn trusted_origins_defaults_empty_and_parses_from_yaml() {
+        assert!(Config::default().server.trusted_origins.is_empty());
+        let cfg: Config =
+            serde_yaml::from_str("server:\n  trusted_origins: [\"https://console.example\"]\n")
+                .unwrap();
+        assert_eq!(cfg.server.trusted_origins, vec!["https://console.example"]);
+    }
 
     #[test]
     fn trusted_proxies_defaults_empty() {

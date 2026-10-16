@@ -473,7 +473,9 @@ fn admin_request_is_cross_site(
         });
     match announced {
         None => false,
-        Some(value) => !crate::http::cors::origin_matches_host(value, host),
+        Some(value) => {
+            !crate::http::cors::origin_matches_host(value, host) && !ac.origin_is_trusted(value)
+        }
     }
 }
 
@@ -555,9 +557,9 @@ pub async fn start_http_server(
 
     // P7-1: resolve endpoint-class access control (value_env/value_file read
     // here so a missing source fails fast at startup). Shared shape with gRPC.
-    let access_control = std::sync::Arc::new(crate::access_control::AccessControl::build(
-        &config.access_control,
-    )?);
+    let mut ac = crate::access_control::AccessControl::build(&config.access_control)?;
+    ac.set_trusted_origins(&config.server.trusted_origins)?;
+    let access_control = std::sync::Arc::new(ac);
     // D27: admin handlers 的审计 key 指纹经 AppState 消费（Arc 包装前注入）。
     state.access_control = access_control.clone();
 
@@ -1529,6 +1531,77 @@ mod tests {
                 "the admin CSRF guard must not block {label}"
             );
         }
+    }
+
+    /// Reverse-proxy deployment: the browser talks to `https://console.example`
+    /// and nginx forwards to this server, rewriting `Host` to the upstream
+    /// authority while relaying the browser's `Origin` verbatim. The guard's
+    /// Host comparison can never match there, so an explicit
+    /// `server.trusted_origins` allowlist must admit the operator's UI origin
+    /// — and only origins on that list.
+    #[tokio::test]
+    async fn admin_post_from_a_configured_trusted_origin_passes_the_guard() {
+        let mut ac = crate::access_control::AccessControl::default();
+        ac.set_trusted_origins(&["https://console.example".to_string()])
+            .expect("valid trusted origin parses");
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/:model_name/reload",
+                axum::routing::post(|| async { "reached the admin handler" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(ac),
+                access_control_middleware,
+            ));
+
+        // Trusted origin: the proxied admin UI reaches the handler even though
+        // the rewritten Host no longer matches the Origin's authority.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/reload")
+                    .header("host", "127.0.0.1:8000")
+                    .header("origin", "https://console.example")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        51234,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an origin on server.trusted_origins must pass the admin CSRF guard"
+        );
+
+        // An origin NOT on the list is still rejected: the allowlist is exact,
+        // not a suffix or parent-domain match.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/reload")
+                    .header("host", "127.0.0.1:8000")
+                    .header("origin", "https://evil.example")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        51234,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "an origin not on server.trusted_origins must still be rejected"
+        );
     }
 
     fn admission_app(cap: usize) -> (axum::Router, crate::admission::AdmissionCounter) {

@@ -2,7 +2,8 @@
 //!
 //! A session stages chunks under `{repo}/.tmp-upload-{sid}/` — the same
 //! staging prefix as the multipart upload, so startup tmp cleanup (H7)
-//! covers crash residue. Chunks land atomically (`{ci}.part` + rename), the
+//! covers crash residue. Chunks land atomically (body streams to a unique
+//! `{ci}.{uuid}.part` outside the session lock, then a lock-guarded rename), the
 //! received-set is rebuilt by scanning the chunk dir (never in-memory
 //! state), so a session survives client refreshes AND server restarts.
 //! `complete` concatenates chunks in order, verifies size/sha256, then
@@ -332,12 +333,14 @@ pub async fn get_upload_session(
 /// body. Idempotent: re-PUTting a chunk index overwrites it (client retry
 /// after an ambiguous failure is always safe).
 ///
-/// Serialized with `complete` (and the delete handler) on the per-session
-/// lock, which is therefore held for the whole body read: two concurrent
-/// PUTs of the same chunk index would otherwise `File::create` (truncate)
-/// and write the same inode, and an interleaved pair leaves a MIXTURE of
-/// the two bodies at exactly the expected length — invisible to the
-/// byte-count check and, without a client-supplied sha256, committed.
+/// The body streams to a unique `{ci}.{uuid}.part` OUTSIDE the per-session
+/// lock, so concurrent chunk PUTs (different chunks of the same session, the
+/// feature's raison d'être) proceed in parallel and a stalled client cannot
+/// block `complete`/`delete`. The lock is taken only for the final
+/// rename: it keeps `complete` from assembling a chunk mid-rename and makes
+/// same-index retries last-writer-wins (each retry renames its own complete
+/// temp over the previous final name), instead of two writers interleaving
+/// bytes in one inode.
 pub async fn put_session_chunk(
     State(state): State<Arc<AppState>>,
     Path((model_name, version, sid, file_index, chunk_index)): Path<(
@@ -351,23 +354,10 @@ pub async fn put_session_chunk(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    let (staging, _meta) = load_session(&state, &model_name, &version, &sid).await?;
+    let (staging, meta) = load_session(&state, &model_name, &version, &sid).await?;
 
-    let lock = complete_locks()
-        .entry(staging.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    let _guard = lock.lock().await;
-
-    // Re-read under the lock: the pre-lock state check was a TOCTOU against
-    // a complete that assembles from these very chunk files (and against a
-    // delete that removes the staging dir).
-    let meta = read_meta(&staging).await?;
-    if meta.state != SessionState::Uploading {
-        return Err(AppError::Conflict(
-            "session is completing; no further chunks accepted".to_string(),
-        ));
-    }
+    // Fast validation from the pre-lock meta: bounds are immutable for the
+    // session's lifetime, so rejecting before consuming the body is safe.
     let file = meta
         .files
         .get(file_index)
@@ -393,7 +383,7 @@ pub async fn put_session_chunk(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(AppError::Io)?;
-    let part = dir.join(format!("{}.part", chunk_index));
+    let part = dir.join(format!("{}.{}.part", chunk_index, uuid::Uuid::new_v4()));
     let final_path = dir.join(chunk_index.to_string());
 
     let mut file_out = tokio::fs::File::create(&part).await.map_err(AppError::Io)?;
@@ -438,6 +428,26 @@ pub async fn put_session_chunk(
     if let Err(e) = write_result {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
+    }
+
+    // Critical section: meta state check + the atomic rename. The body is
+    // already on disk in our private temp, so a stalled/slow peer cannot
+    // hold this lock.
+    let lock = complete_locks()
+        .entry(staging.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    // Re-read under the lock: the pre-lock state check was a TOCTOU against
+    // a complete that assembles from these very chunk files (and against a
+    // delete that removes the staging dir).
+    let meta = read_meta(&staging).await?;
+    if meta.state != SessionState::Uploading {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(AppError::Conflict(
+            "session is completing; no further chunks accepted".to_string(),
+        ));
     }
     tokio::fs::rename(&part, &final_path)
         .await
@@ -1204,6 +1214,79 @@ mod tests {
             content.iter().filter(|b| **b == b'A').count(),
             content.iter().filter(|b| **b == b'B').count()
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// The per-session lock must not be held across the request body read: a
+    /// client that stalls mid-chunk must not block other chunk PUTs — let
+    /// alone `complete`/`delete` — for the same session.
+    #[tokio::test]
+    async fn test_stalled_chunk_body_does_not_block_other_session_requests() {
+        let tmp = unique_tmp("stall");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let app = test_router(test_app_state(tmp.clone()));
+        // Two chunks of 64 (the default test chunk_size).
+        let sid = init_session(
+            &app,
+            "mymodel",
+            "1",
+            json!([{ "name": "w.bin", "size": 128 }]),
+        )
+        .await;
+
+        // Chunk 0 upload whose body delivers one frame, then stalls until the
+        // test releases it — a slow client mid-chunk.
+        let (tx, rx) =
+            futures::channel::mpsc::unbounded::<Result<axum::body::Bytes, std::io::Error>>();
+        let app_slow = app.clone();
+        let sid_slow = sid.clone();
+        let slow_put = tokio::spawn(async move {
+            app_slow
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/v2/repository/models/mymodel/versions/1/upload-sessions/{}/files/0/chunks/0",
+                            sid_slow
+                        ))
+                        .header("content-type", "application/octet-stream")
+                        .body(Body::from_stream(rx))
+                        .unwrap(),
+                )
+                .await
+        });
+        tx.unbounded_send(Ok(axum::body::Bytes::from(vec![b'A'; 32])))
+            .unwrap();
+        // Give the server time to enter the body read.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // While chunk 0's body is stalled, chunk 1 (another chunk of the same
+        // session) must still be accepted.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            put_chunk_body(
+                &app,
+                "mymodel",
+                "1",
+                &sid,
+                0,
+                1,
+                piecewise_body(vec![b'B'; 64]),
+            ),
+        )
+        .await
+        .expect("concurrent chunk PUT must not wait on a stalled body read");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Release the stalled body: the remaining 32 bytes complete chunk 0.
+        tx.unbounded_send(Ok(axum::body::Bytes::from(vec![b'A'; 32])))
+            .unwrap();
+        drop(tx);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), slow_put)
+            .await
+            .expect("stalled PUT completes once its body finishes");
+        assert_eq!(resp.unwrap().unwrap().status(), StatusCode::OK);
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

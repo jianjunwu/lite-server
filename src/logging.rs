@@ -63,10 +63,23 @@ fn build_filter(level: &str, rust_log: Option<&str>) -> EnvFilter {
                 "logging: RUST_LOG is set, so the configured logging.level ('{level}') is \
                  ignored — RUST_LOG takes precedence. (effective filter: {env},{AUDIT_DIRECTIVE})"
             );
-            // Note: a RUST_LOG carrying only target directives (e.g.
-            // `lite_server::audit=info`) has no global level, and EnvFilter then
-            // disables every other target.
-            EnvFilter::new(format!("{env},{AUDIT_DIRECTIVE}"))
+            // `EnvFilter::new` is parse_lossy: a typo'd RUST_LOG would drop
+            // the invalid directive and, with no valid global level left,
+            // silently log the whole server at ERROR. Reject the override
+            // wholesale and keep the configured level instead (fail loud,
+            // not quiet).
+            match EnvFilter::try_new(format!("{env},{AUDIT_DIRECTIVE}")) {
+                Ok(filter) => filter,
+                Err(e) => {
+                    eprintln!(
+                        "logging: RUST_LOG is invalid ({e}); ignoring it and using the \
+                         configured logging.level ('{level}') instead"
+                    );
+                    EnvFilter::new(format!(
+                        "lite_server={level},tokio=warn,hyper=warn,{AUDIT_DIRECTIVE}"
+                    ))
+                }
+            }
         }
         None => EnvFilter::new(format!(
             "lite_server={level},tokio=warn,hyper=warn,{AUDIT_DIRECTIVE}"
@@ -534,6 +547,32 @@ mod tests {
                  captured targets: {targets:?}"
             );
         }
+    }
+
+    /// `EnvFilter::new` is parse_lossy: a typo'd RUST_LOG (`lite_server=debu`)
+    /// drops the invalid directive, and when no valid global level survives
+    /// the whole server silently logs at ERROR — startup goes near-silent and
+    /// the operator's configured `logging.level` is lost. The filter this
+    /// module used before the audit-directive change rejected an invalid
+    /// RUST_LOG wholesale and fell back to the configured level; restore that.
+    #[test]
+    fn invalid_rust_log_falls_back_to_the_configured_level() {
+        let filter = build_filter("debug", Some("lite_server=debu"));
+        assert_eq!(
+            filter.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::DEBUG),
+            "an invalid RUST_LOG must fall back to the configured level, not ERROR"
+        );
+    }
+
+    #[test]
+    fn valid_rust_log_still_takes_precedence_over_the_configured_level() {
+        let filter = build_filter("warn", Some("debug"));
+        assert_eq!(
+            filter.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::DEBUG),
+            "a valid RUST_LOG must keep overriding the configured level"
+        );
     }
 
     /// After a panic inside the mutex, SizeRotatingAppender must still work.
