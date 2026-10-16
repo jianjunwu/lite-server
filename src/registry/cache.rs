@@ -61,6 +61,12 @@ struct PersistedModel {
     load_policy: String,
     max_loaded_versions: Option<usize>,
     weights: BTreeMap<String, u32>,
+    /// `orchestration.models[].default_version`, so a forced delete of the
+    /// active version after a restart still restores the operator's declared
+    /// default rather than an arbitrary co-loaded version. Defaulted so
+    /// snapshots written before this field existed still load.
+    #[serde(default)]
+    default_version: Option<String>,
 }
 
 fn load_policy_to_string(p: LoadPolicy) -> &'static str {
@@ -79,16 +85,19 @@ fn build_snapshot(registry: &ModelRegistry) -> RegistrySnapshot {
     let models = registry
         .snapshot_strategies()
         .into_iter()
-        .map(|(name, load_policy, max_loaded_versions, weights)| {
-            (
-                name,
-                PersistedModel {
-                    load_policy: load_policy_to_string(load_policy).to_string(),
-                    max_loaded_versions,
-                    weights,
-                },
-            )
-        })
+        .map(
+            |(name, load_policy, max_loaded_versions, weights, default_version)| {
+                (
+                    name,
+                    PersistedModel {
+                        load_policy: load_policy_to_string(load_policy).to_string(),
+                        max_loaded_versions,
+                        weights,
+                        default_version,
+                    },
+                )
+            },
+        )
         .collect();
     RegistrySnapshot {
         models,
@@ -154,6 +163,7 @@ pub async fn restore(registry: &ModelRegistry, repo_path: &Path) -> usize {
             load_policy: pm.load_policy.clone(),
             max_loaded_versions: pm.max_loaded_versions,
             weights: Some(pm.weights.iter().map(|(k, v)| (k.clone(), *v)).collect()),
+            default_version: pm.default_version.clone(),
             ..Default::default()
         };
         if let Err(e) = registry.set_strategy(name, &strategy) {
@@ -230,6 +240,7 @@ mod tests {
                             w.insert("2".to_string(), 7);
                             w
                         },
+                        default_version: Some("2".to_string()),
                     },
                 );
                 m
@@ -275,6 +286,7 @@ mod tests {
                 w.insert("1".to_string(), 5u32);
                 w
             }),
+            default_version: Some("1".to_string()),
             ..Default::default()
         };
         reg.set_strategy("m1", &strategy).unwrap();
@@ -337,6 +349,7 @@ mod tests {
                         load_policy: "explicit".to_string(),
                         max_loaded_versions: None,
                         weights: BTreeMap::new(),
+                        default_version: Some("1".to_string()),
                     },
                 );
                 m.insert(
@@ -345,6 +358,7 @@ mod tests {
                         load_policy: "explicit".to_string(),
                         max_loaded_versions: None,
                         weights: BTreeMap::new(),
+                        default_version: None,
                     },
                 );
                 m

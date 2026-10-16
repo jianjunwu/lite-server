@@ -503,7 +503,8 @@ policies:
   分摊到各 worker。
 - **respawn 重暖**(`respawn: true`，默认）：崩溃/健康剔除后的替补
   worker 在版本回到 `ready` 之前先完成重暖（pin 到其槽位）。重暖失败
-  会把冷槽位熔断摘出——版本保持 `degraded`，熔断器的半开试探仍可在
+  会把冷槽位熔断摘出——版本保持 `impaired`（其余 worker 继续服务；
+  `degraded` 专指「已无 worker 在轮换中」），熔断器的半开试探仍可在
   后续真实流量上将其恢复——并计入
   `liteserver_worker_respawn_failures_total{reason="warmup"}`；绝不会
   把版本标记为 `failed`（运行期恢复 ≠ 加载失败）。

@@ -826,23 +826,54 @@ impl WorkerManager {
 
         // Spawn new worker
         //
-        // During respawn the version drops to Degraded (NOT Loading): with
-        // multiple workers the surviving slots keep serving, and Degraded still
-        // counts as serving (`routing_pick` / `has_serving`), so a single-slot
-        // respawn doesn't take the whole version out of rotation for the startup
-        // window. `Loading` would make `has_serving` false and stall all traffic.
-        // A successful handshake marks it Ready again; a startup failure leaves
-        // it Degraded (runtime worker loss, not a load failure — Failed is
-        // load-phase only).
+        // This slot is out of rotation for the whole stop+spawn window, so the
+        // version is at most `Impaired` — NOT `Degraded`, which means "no
+        // worker left" and would take the whole model out of service even
+        // though the sibling slots are still healthy. When this was the only
+        // worker there is nothing left to serve, and `Degraded` is correct.
+        // `Loading` would be wrong for the other reason: it makes
+        // `has_serving` false and stalls the siblings' traffic too. A
+        // successful handshake restores the derived state below; a startup
+        // failure leaves the version at `on_spawn_failure` (runtime worker
+        // loss, not a load failure — `Failed` is load-phase only).
         //
-        // Graceful rolling recycle is the exception: the infer gate
-        // (`registry.is_ready`) is strict-Ready, so degrading the version
-        // would 503 ALL traffic for the whole stop+spawn window even though
-        // the sibling slots are healthy. The recycling slot is already
-        // ejected (routing avoids it), so the version stays Ready.
+        // Computed BEFORE the spawn attempt so the error paths further down —
+        // which are `inspect_err` closures and cannot await — have the value to
+        // re-assert.
+        let on_spawn_failure = {
+            let outlier = self.get_outlier_state(model_name, version).await;
+            let siblings_usable = self
+                .registry
+                .get(model_name, Some(version))
+                .map(|mv| {
+                    mv.workers
+                        .iter()
+                        .filter(|w| w.worker_id != worker_id)
+                        .filter(|w| {
+                            outlier
+                                .as_deref()
+                                .map(|o| o.is_usable(w.worker_id as usize))
+                                .unwrap_or(true)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if siblings_usable > 0 {
+                VersionStatus::Impaired
+            } else {
+                VersionStatus::Degraded
+            }
+        };
+        //
+        // Graceful rolling recycle is the exception for the UPFRONT write: the
+        // recycling slot is already out of routing (routing skips
+        // `is_recycling`), so the version's derived state is unchanged and the
+        // stop+spawn window should not perturb it. A *failed* recycle still
+        // falls back to `on_spawn_failure`, because then the slot is gone for
+        // good rather than briefly.
         if !graceful {
             self.registry
-                .set_status(model_name, version, VersionStatus::Degraded)?;
+                .set_status(model_name, version, on_spawn_failure)?;
         }
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         // Same resolver as the initial spawn (single source of truth), so a
@@ -890,18 +921,18 @@ impl WorkerManager {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))
-            .inspect_err(|_| self.mark_degraded(model_name, version))?;
+            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
-            .inspect_err(|_| self.mark_degraded(model_name, version))?;
+            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
-            .inspect_err(|_| self.mark_degraded(model_name, version))?;
+            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
 
         // Wait for "ready" signal
         let mut reader = BufReader::new(stdout);
@@ -913,9 +944,9 @@ impl WorkerManager {
         .await
         .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
         .and_then(|r| r.map_err(AppError::Io))
-        .inspect_err(|_| self.mark_degraded(model_name, version))?;
+        .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
         if n == 0 {
-            self.mark_degraded(model_name, version);
+            self.set_version_status(model_name, version, on_spawn_failure);
             let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
             let msg = if stderr_tail.trim().is_empty() {
                 "worker exited before ready".to_string()
@@ -928,10 +959,10 @@ impl WorkerManager {
 
         let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
             .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))
-            .inspect_err(|_| self.mark_degraded(model_name, version))?;
+            .inspect_err(|_| self.set_version_status(model_name, version, on_spawn_failure))?;
 
         if startup.status != "ready" {
-            self.mark_degraded(model_name, version);
+            self.set_version_status(model_name, version, on_spawn_failure);
             return Err(AppError::WorkerCrashed(format!(
                 "worker {} startup failed: {:?}",
                 worker_id, startup.message
@@ -1151,19 +1182,24 @@ impl WorkerManager {
             }
         }
 
-        // Replacement worker is up: Degraded → Ready (loaded_at preserved).
-        // A graceful recycle never degraded the version, so restore Ready
-        // only when it IS currently Degraded (kill mode, or the status
-        // coordinator flipped it during a slow recycle) — never flip a
-        // version that is Degraded for another slot's sake.
-        let is_degraded = self
+        // Replacement worker is up: RE-DERIVE the version's state instead of
+        // unconditionally marking it Ready. Marking Ready outright would claim
+        // every worker is healthy while another slot is still ejected; leaving
+        // the state untouched would keep a recovered version looking impaired.
+        // The derivation lands on Ready when this really was the last outage
+        // and on `Impaired` (still serving) when a sibling is out — never on a
+        // state that refuses traffic while a worker is up.
+        //
+        // A graceful recycle normally never changed the state, so re-derive
+        // only when the version is not already serving (kill mode, or a
+        // coordinator tick that flipped it during a slow recycle).
+        let already_serving = self
             .registry
             .get(model_name, Some(version))
-            .map(|mv| mv.status == VersionStatus::Degraded)
+            .map(|mv| mv.status.is_serving())
             .unwrap_or(false);
-        if !graceful || is_degraded {
-            self.registry.mark_ready(model_name, version)?;
-            self.sync_grpc_health().await;
+        if !graceful || !already_serving {
+            self.reconcile_status_now(model_name, version).await;
         }
 
         // Record metric
@@ -1214,15 +1250,16 @@ impl WorkerManager {
                     crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
                         .with_label_values(&[&model, &ver, "warmup"])
                         .inc();
-                    // B8: only flip the version Degraded when the slot still
-                    // belongs to this generation — a reload must not inherit
-                    // the old generation's failure.
+                    // B8: only touch the version when the slot still belongs to
+                    // this generation — a reload must not inherit the old
+                    // generation's failure.
                     if slot_occupied_by(&wm.registry, &model, &ver, worker_id, worker_pid) {
-                        // The slot left rotation — flip to Degraded
-                        // event-driven (there is no periodic coordinator
-                        // when health_check_interval == 0).
-                        wm.mark_degraded(&model, &ver);
-                        wm.sync_grpc_health().await;
+                        // Event-driven re-derivation: there may be no periodic
+                        // coordinator at all (health_check_interval == 0). The
+                        // force-eject above already left the outlier state
+                        // current, so this lands on Impaired (the other slots
+                        // serve) or Degraded (nothing left).
+                        wm.reconcile_status_now(&model, &ver).await;
                     }
                 }
             });

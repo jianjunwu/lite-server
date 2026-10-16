@@ -243,7 +243,21 @@ impl LiteServer for GrpcService {
                     .registry
                     .get(&model_label, Some(&version_label))
                     .is_some();
-            record_grpc_request_end(&model_label, &version_label, registered, start, &result);
+            // D44/D46: the worker's status_code rides the response — a
+            // sub-model / output-step override must land in its own family,
+            // not "2xx" (HTTP parity: status_family(single.status_code)).
+            let worker_status_code = result
+                .as_ref()
+                .map(|r| r.get_ref().status_code)
+                .unwrap_or(0);
+            record_grpc_request_end(
+                &model_label,
+                &version_label,
+                registered,
+                start,
+                &result,
+                worker_status_code,
+            );
         }
         echo_grpc_response_headers(result, &request_id, start)
     }
@@ -317,7 +331,30 @@ impl LiteServer for GrpcService {
                     .registry
                     .get(&model_label, Some(&version_label))
                     .is_some();
-            record_grpc_request_end(&model_label, &version_label, registered, start, &result);
+            // D44/D46: a batch is ONE request whose per-element worker
+            // `status_code`s are client-visible — record under the worst
+            // element's family so a batch of failed elements is not counted
+            // 2xx (no HTTP batch analogue; a per-element counter does not
+            // exist).
+            let worker_status_code = result
+                .as_ref()
+                .map(|r| {
+                    r.get_ref()
+                        .items
+                        .iter()
+                        .map(|i| i.status_code)
+                        .max_by_key(|c| c / 100)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            record_grpc_request_end(
+                &model_label,
+                &version_label,
+                registered,
+                start,
+                &result,
+                worker_status_code,
+            );
         }
         echo_grpc_response_headers(result, &request_id, start)
     }
@@ -1407,6 +1444,40 @@ mod request_metrics_tests {
         })
     }
 
+    /// PAIR worker answering every unary request with an Ok Single carrying a
+    /// worker-reported `status_code` (D44/D46: the worker may override the
+    /// transport status while `Status.code` stays "Ok").
+    fn spawn_status_code_worker(endpoint: String, status_code: i32) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::from_static(b"{\"ok\":true}"),
+                        status: Some(pb::Status {
+                            code: "Ok".to_string(),
+                            message: String::new(),
+                        }),
+                        status_code,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
     /// PAIR worker answering a stream Open with one Chunk + Done; other
     /// requests (e.g. the trailing Cancel) get a bare ack so the client's
     /// request/response exchange completes instead of hanging to timeout.
@@ -1605,6 +1676,42 @@ mod request_metrics_tests {
         );
     }
 
+    /// D44/D46: a worker-reported non-2xx `status_code` must land in its own
+    /// metric family even though `Status.code == "Ok"` — HTTP parity
+    /// (`http/handlers/inference.rs` records `status_family(single.status_code)`).
+    /// Before the fix `record_grpc_request_end` hardcoded "2xx" for every `Ok`.
+    #[tokio::test]
+    async fn should_record_worker_status_code_family_not_2xx() {
+        let model = "met_ws_status";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_status_code_worker(endpoint.clone(), 503);
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let c5 = REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let c2 = REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before5 = c5.get();
+        let before2 = c2.get();
+
+        let resp = service.infer(infer_request(model, "1")).await;
+        let resp = resp.expect("infer must succeed");
+        assert_eq!(
+            resp.into_inner().status_code,
+            503,
+            "the worker's status_code rides the response (D44/D46)"
+        );
+        assert_eq!(
+            c5.get(),
+            before5 + 1.0,
+            "a worker-reported 503 must record one 5xx request"
+        );
+        assert_eq!(
+            c2.get(),
+            before2,
+            "a worker-reported 503 must NOT record 2xx"
+        );
+    }
+
     #[tokio::test]
     async fn should_record_4xx_when_model_not_found() {
         let service = build_service(
@@ -1763,10 +1870,13 @@ mod request_metrics_tests {
     //     "no workers available") — Unavailable, but never the gate's
     //     "not ready" message, which is what these tests assert. ---
 
-    /// v1 active+Ready (weight 0); v2 was Ready, now Degraded, holding all
-    /// weight — an empty-version request deterministically resolves to the
-    /// not-Ready v2. No queue/worker wiring: the gate fires before dispatch.
-    fn degraded_weighted_service(model: &str) -> GrpcService {
+    /// v2 is the ACTIVE version with NO worker left in rotation (`Degraded` —
+    /// the outlier breaker ejected them all); v1 is Ready with weight 0.
+    /// `routing_pick` only considers SERVING (`Ready`/`Impaired`) versions, so
+    /// an empty-version request finds no weighted candidate and falls back to
+    /// the active version — the not-serving v2. No queue/worker wiring: the
+    /// gate fires before dispatch.
+    fn degraded_active_service(model: &str) -> GrpcService {
         use crate::registry::types::VersionStatus;
         let registry = Arc::new(ModelRegistry::new());
         for v in ["1", "2"] {
@@ -1781,7 +1891,9 @@ mod request_metrics_tests {
                 .unwrap();
             registry.mark_ready(model, v).unwrap();
         }
-        registry.activate_version(model, "1").unwrap();
+        // Activate while still Ready (activate_version refuses a non-Ready
+        // version), THEN lose every worker.
+        registry.activate_version(model, "2").unwrap();
         registry
             .set_status(model, "2", VersionStatus::Degraded)
             .unwrap();
@@ -1835,12 +1947,13 @@ mod request_metrics_tests {
         );
     }
 
-    /// Same root cause without any opt-in flag: a weighted rollout whose
-    /// non-active version degraded — routing_pick (Degraded is a candidate)
-    /// resolves empty-version requests to it; the gate must reject.
+    /// Same root cause without any opt-in flag: the ACTIVE version has lost
+    /// every worker (`Degraded`) — an empty-version request resolves to it
+    /// (routing_pick only considers serving versions, so the fallback lands on
+    /// the non-serving active) and the gate must reject.
     #[tokio::test]
-    async fn grpc_readiness_gate_bypasses_degraded_weighted_version() {
-        let service = degraded_weighted_service("gate_degraded");
+    async fn grpc_readiness_gate_rejects_degraded_active_version() {
+        let service = degraded_active_service("gate_degraded");
 
         let err = service
             .infer(infer_request("gate_degraded", ""))
@@ -1854,9 +1967,35 @@ mod request_metrics_tests {
         );
     }
 
+    /// `Impaired` (SOME workers ejected, the rest still serving) is on the
+    /// SERVING axis: the gate admits it and the request is dispatched. Pinned
+    /// explicitly because the axis is easy to invert — only `Degraded` (NO
+    /// worker left) may 503.
+    #[tokio::test]
+    async fn impaired_version_is_still_served() {
+        use crate::registry::types::VersionStatus;
+        let model = "impaired_serves";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_ok_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        // Outlier ejection of every-but-one worker lands on Impaired.
+        service
+            .registry
+            .set_status(model, "1", VersionStatus::Impaired)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service.infer(infer_request(model, "1")).await;
+        assert!(
+            resp.is_ok(),
+            "an Impaired version is still in rotation and must serve: {:?}",
+            resp.err()
+        );
+    }
+
     #[tokio::test]
     async fn batch_infer_readiness_gate_checks_resolved_version() {
-        let service = degraded_weighted_service("gate_batch");
+        let service = degraded_active_service("gate_batch");
 
         let err = service
             .batch_infer(Request::new(pb::BatchInferRequest {
@@ -1877,7 +2016,7 @@ mod request_metrics_tests {
 
     #[tokio::test]
     async fn stream_infer_readiness_gate_checks_resolved_version() {
-        let service = degraded_weighted_service("gate_stream");
+        let service = degraded_active_service("gate_stream");
 
         let err = service
             .stream_infer(Request::new(pb::StreamInferRequest {
@@ -1894,6 +2033,157 @@ mod request_metrics_tests {
             err.message().contains("not ready"),
             "resolved Degraded v2 → gate must 503; got: {}",
             err.message()
+        );
+    }
+
+    // --- F-03: streaming paths must match unary infer's auth-first ordering
+    //     and its unknown-model gate (no existence / readiness oracle). ---
+
+    fn secured_policies() -> crate::config::ModelPolicies {
+        crate::config::ModelPolicies {
+            auth: Some(crate::config::AuthPolicy {
+                header: "x-api-key".to_string(),
+                keys: vec!["sk-a".to_string()],
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn secured_config() -> ModelConfig {
+        ModelConfig {
+            policies: secured_policies(),
+            ..test_config(1, 0.0, 10)
+        }
+    }
+
+    /// A registry with one secured+ready model (which arms the F-03 gate) and
+    /// one secured model that is registered but NOT serving.
+    fn secured_registry() -> (Arc<ModelRegistry>, GrpcService) {
+        use crate::registry::types::VersionStatus;
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "secured_ready",
+                "1",
+                secured_config(),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
+            .unwrap();
+        registry.set_policies("secured_ready", "1", Some(secured_policies()));
+        registry.mark_ready("secured_ready", "1").unwrap();
+        registry
+            .register(
+                "secured_notready",
+                "1",
+                secured_config(),
+                ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
+            .unwrap();
+        registry.set_policies("secured_notready", "1", Some(secured_policies()));
+        registry
+            .set_status("secured_notready", "1", VersionStatus::Failed)
+            .unwrap();
+        let service =
+            build_service_with_canary(registry.clone(), Arc::new(InferenceQueue::new()), false);
+        (registry, service)
+    }
+
+    /// F-03: an unauthenticated request to a NONEXISTENT model must yield
+    /// Unauthenticated on every streaming RPC — never NotFound, which would
+    /// leak which models exist.
+    #[tokio::test]
+    async fn streaming_paths_gate_unknown_model_behind_auth() {
+        let (_registry, service) = secured_registry();
+
+        let s = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: "no_such_model".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "stream_infer: nonexistent model must not leak existence; got {s}"
+        );
+
+        let s = service
+            .batch_infer(Request::new(pb::BatchInferRequest {
+                model_name: "no_such_model".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "batch_infer: nonexistent model must not leak existence; got {s}"
+        );
+
+        let s = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: "no_such_model".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "decoupled_infer: nonexistent model must not leak existence; got {s}"
+        );
+    }
+
+    /// F-03: an unauthenticated request to a registered-but-NOT-SERVING model
+    /// must yield Unauthenticated, not Unavailable("... is not ready") — auth
+    /// runs before the readiness check on every streaming RPC (unary parity).
+    #[tokio::test]
+    async fn streaming_paths_run_auth_before_readiness() {
+        let (_registry, service) = secured_registry();
+
+        let s = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: "secured_notready".to_string(),
+                version: "1".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "stream_infer: not-ready model must not leak readiness; got {s}"
+        );
+
+        let s = service
+            .batch_infer(Request::new(pb::BatchInferRequest {
+                model_name: "secured_notready".to_string(),
+                version: "1".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "batch_infer: not-ready model must not leak readiness; got {s}"
+        );
+
+        let s = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: "secured_notready".to_string(),
+                version: "1".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "decoupled_infer: not-ready model must not leak readiness; got {s}"
         );
     }
 

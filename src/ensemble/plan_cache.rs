@@ -440,16 +440,29 @@ impl EnsemblePlanCache {
 
     /// Direct insert from the lifecycle load path (P0/P6): the plan was
     /// parsed at load time, so the first request hits the cache without
-    /// paying the parse. mtime is stat'ed here (once, at load).
-    pub fn insert_ready(&self, key: PlanKey, plan: Arc<EnsemblePlan>) {
-        let mtime = std::fs::metadata(&plan.config_path)
-            .and_then(|m| m.modified())
-            .ok();
+    /// paying the parse.
+    ///
+    /// `source_mtime` is the caller's STAT-BEFORE-READ observation of
+    /// `plan.config_path`. It is a parameter rather than a stat taken here
+    /// because this function runs after the caller read and parsed the file,
+    /// and the interval re-check compares mtimes: stat'ing now could pin the
+    /// NEW mtime onto the OLD content, so a plan invalidated by a write landing
+    /// in between would look fresh and be served indefinitely — the reverse
+    /// order the hot path documents as unsound (see the single-flight loader
+    /// below, which uses `plan.source_mtime` for the same reason). Passing
+    /// `None` (metadata unreadable) is safe: the re-check treats it as a
+    /// mismatch and re-parses.
+    pub fn insert_ready(
+        &self,
+        key: PlanKey,
+        plan: Arc<EnsemblePlan>,
+        source_mtime: Option<std::time::SystemTime>,
+    ) {
         self.plans.insert(
             key,
             PlanCell::Ready {
                 plan,
-                mtime,
+                mtime: source_mtime,
                 last_stat: tokio::time::Instant::now(),
             },
         );

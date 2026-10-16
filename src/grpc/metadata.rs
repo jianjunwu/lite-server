@@ -75,16 +75,35 @@ fn inject_echo_headers(metadata: &mut MetadataMap, request_id: &str, elapsed: Du
     }
 }
 
+/// Map a worker-reported HTTP status code to a request-metric family —
+/// D44 parity with `http/handlers::status_family`: `0` (unset) counts as
+/// success.
+fn worker_status_family(status_code: i32) -> &'static str {
+    match status_code / 100 {
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "2xx", // 0 (unset) counts as success
+    }
+}
+
 /// P2-1：unary 请求指标统一记录点（成功 "2xx"；错误按 `grpc_code_to_status_family`）。
+///
+/// D44/D46: a `Status.code == "Ok"` response is not necessarily a 2xx — the
+/// worker's `status_code` (the output step's override) is client-visible on
+/// `InferResponse`/`BatchInferResponse`, so the family comes from it when
+/// present, mirroring the HTTP side (`status_family(single.status_code)`).
 pub(super) fn record_grpc_request_end<T>(
     model: &str,
     version: &str,
     registered: bool,
     start: Instant,
     result: &Result<T, Status>,
+    worker_status_code: i32,
 ) {
     let family = match result {
-        Ok(_) => "2xx",
+        Ok(_) => worker_status_family(worker_status_code),
         Err(s) => grpc_code_to_status_family(s.code()),
     };
     // A2 (leak-gap-audit-0821): unresolved pairs record under a constant

@@ -10,20 +10,27 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// (model_name, load_policy, max_loaded_versions, weights) row returned by
-/// [`ModelRegistry::snapshot_strategies`] — BTreeMap for deterministic JSON
-/// key ordering in the cache_registry snapshot.
+/// (model_name, load_policy, max_loaded_versions, weights, default_version) row
+/// returned by [`ModelRegistry::snapshot_strategies`] — BTreeMap for
+/// deterministic JSON key ordering in the cache_registry snapshot.
 pub type StrategySnapshot = (
     String,
     LoadPolicy,
     Option<usize>,
     std::collections::BTreeMap<String, u32>,
+    Option<String>,
 );
 
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
     models: DashMap<String, ModelEntry>,
     active_versions: DashMap<String, String>,
+    /// Per-version ensemble dependency sets, recorded when the plan is parsed at
+    /// load. `(sub_model, explicit version)`; `None` version = resolved at
+    /// execution time. Kept beside the entries rather than inside
+    /// `ModelVersion` because it needs no persistence — the deps are re-recorded
+    /// on every load, which is exactly when the plan is parsed again.
+    ensemble_deps: DashMap<String, Vec<(String, Option<String>)>>,
 }
 
 impl ModelRegistry {
@@ -31,7 +38,38 @@ impl ModelRegistry {
         Self {
             models: DashMap::new(),
             active_versions: DashMap::new(),
+            ensemble_deps: DashMap::new(),
         }
+    }
+
+    fn ensemble_deps_key(model_name: &str, version: &str) -> String {
+        // Neither component may contain `/` (`validation::validate_identifier`),
+        // so the join is unambiguous.
+        format!("{model_name}/{version}")
+    }
+
+    /// Record an ensemble version's dependency set (see the field doc). Called
+    /// from the load path right after the plan is parsed.
+    pub fn set_ensemble_deps(
+        &self,
+        model_name: &str,
+        version: &str,
+        deps: Vec<(String, Option<String>)>,
+    ) {
+        self.ensemble_deps
+            .insert(Self::ensemble_deps_key(model_name, version), deps);
+    }
+
+    /// The recorded dependency set, or `None` when this version's plan has not
+    /// been parsed yet — `None` means UNKNOWN, not "no dependencies".
+    pub fn ensemble_deps(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        self.ensemble_deps
+            .get(&Self::ensemble_deps_key(model_name, version))
+            .map(|deps| deps.clone())
     }
 
     /// Return (name, version, ModelVersion) tuples for all loaded models.
@@ -103,34 +141,42 @@ impl ModelRegistry {
         entry.versions.get(&version).cloned()
     }
 
+    /// True when the version can take traffic — `Ready` or `Impaired`
+    /// ([`VersionStatus::is_serving`]). This is the gate every request path
+    /// asks, so it must agree with the readiness rollups (`has_serving`, the
+    /// gRPC health mapping) or a model answers 200 on `/readyz` and 503 on
+    /// every inference.
+    ///
+    /// `Degraded` is NOT serving: it means no worker is left in rotation, and
+    /// the outlier breaker cannot recover that on its own.
     pub fn is_ready(&self, model_name: &str, version: Option<&str>) -> bool {
         match self.get(model_name, version) {
-            Some(mv) => mv.status == VersionStatus::Ready,
+            Some(mv) => mv.status.is_serving(),
             None => false,
         }
     }
 
-    /// True iff the model's active version is SERVING (`Ready` or `Degraded`).
+    /// True iff the model's active version is SERVING (`Ready` or `Impaired`).
     /// A pin seeded by cache_registry restore (`force_pin_active_version`)
-    /// bypasses the Ready gate, so it is only a hint: when the pinned version
+    /// bypasses the serving gate, so it is only a hint: when the pinned version
     /// fails to reload (corrupt model.py, missing dependency, worker crash →
     /// `Loading`/`Failed`) the pin is NOT usable. Callers that gate on "has a
     /// serving active version" (reconcile's auto-activate fallback) must use
     /// this rather than `get_active_version(..).is_some()`, or a stale pin
     /// strands the model with no serving version and no self-heal path (B1).
     ///
-    /// `Degraded` counts as serving — a transient worker ejection (outlier)
-    /// flips a version to `Degraded` while it keeps serving and self-heals, and
-    /// `routing_pick` / `has_serving` both treat `Ready | Degraded` as serving.
-    /// Reading a Degraded active version as "not usable" would let reconcile
-    /// steal activation away from a still-serving (admin-intended) version, so
-    /// this predicate aligns with the codebase's serving definition. The
-    /// stranded-pin case B1 targets (`Failed`/`Loading`/`WarmingUp`/`Pending`)
-    /// still reads false.
+    /// `Impaired` counts as serving — the ordinary outlier ejection flips a
+    /// version to `Impaired` while the surviving workers keep serving and the
+    /// circuit self-heals, and `routing_pick` / `has_serving` treat it the same
+    /// way. Reading an Impaired active version as "not usable" would let
+    /// reconcile steal activation away from a still-serving (admin-intended)
+    /// version, so this predicate aligns with the codebase's serving
+    /// definition. The stranded-pin case B1 targets
+    /// (`Failed`/`Loading`/`WarmingUp`/`Pending`) still reads false.
     pub fn active_version_is_ready(&self, model_name: &str) -> bool {
         match self.get_active_version(model_name) {
             Some(v) => match self.get(model_name, Some(&v)) {
-                Some(mv) => matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded),
+                Some(mv) => mv.status.is_serving(),
                 None => false,
             },
             None => false,
@@ -172,10 +218,11 @@ impl ModelRegistry {
     }
 
     /// Snapshot the per-model strategy fields that are not derivable from disk
-    /// (load_policy, max_loaded_versions, weights). Used by cache_registry so a
-    /// model added via admin/file-watcher (not in config) keeps its strategy
-    /// across a restart. Config-defined strategies are re-applied after restore,
-    /// so they win; this only matters for config-absent models.
+    /// (load_policy, max_loaded_versions, weights, default_version). Used by
+    /// cache_registry so a model added via admin/file-watcher (not in config)
+    /// keeps its strategy across a restart. Config-defined strategies are
+    /// re-applied after restore, so they win; this only matters for
+    /// config-absent models.
     pub fn snapshot_strategies(&self) -> Vec<StrategySnapshot> {
         self.models
             .iter()
@@ -185,6 +232,7 @@ impl ModelRegistry {
                     r.load_policy.clone(),
                     r.max_loaded_versions,
                     r.weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                    r.default_version.clone(),
                 )
             })
             .collect()
@@ -295,7 +343,7 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Weighted random pick among serving (`Ready`/`Degraded`) versions with
+    /// Weighted random pick among serving (`Ready`/`Impaired`) versions with
     /// weight > 0 (§4.3). Hot path: one shared read + a tiny candidate Vec.
     /// Returns `None` when no candidate exists — callers fall back to the
     /// active version.
@@ -304,9 +352,7 @@ impl ModelRegistry {
         let candidates: Vec<(&String, u32)> = entry
             .versions
             .iter()
-            .filter(|(_, mv)| {
-                mv.weight > 0 && matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded)
-            })
+            .filter(|(_, mv)| mv.weight > 0 && mv.status.is_serving())
             .map(|(v, mv)| (v, mv.weight))
             .collect();
         // u64 accumulator: u32 weights from operator config can sum past
@@ -498,6 +544,11 @@ impl ModelRegistry {
     }
 
     pub fn remove(&self, model_name: &str, version: &str) -> Result<(), AppError> {
+        // The dependency set dies with the version, whether or not the entry
+        // survives (a model may still have other versions loaded).
+        self.ensemble_deps
+            .remove(&Self::ensemble_deps_key(model_name, version));
+
         // Step 1: Remove the version from the model entry
         let mut should_remove_model = false;
         {
@@ -519,14 +570,33 @@ impl ModelRegistry {
         let active_version = self.active_versions.get(model_name).map(|r| r.clone());
         if active_version.as_deref() == Some(version) {
             self.active_versions.remove(model_name);
-            // Try auto-activate another ready version
             if let Some(entry) = self.models.get(model_name) {
-                for (v, mv) in entry.versions.iter() {
-                    if mv.status == VersionStatus::Ready {
-                        self.active_versions
-                            .insert(model_name.to_string(), v.clone());
-                        break;
-                    }
+                let serving = |v: &str| {
+                    entry
+                        .versions
+                        .get(v)
+                        .is_some_and(|mv| mv.status.is_serving())
+                };
+                // Pick the replacement DETERMINISTICALLY. Taking "the first
+                // serving version" while iterating a `HashMap` was arbitrary —
+                // neither the configured default nor the newest — and varied
+                // from run to run, so a forced delete could silently switch
+                // traffic to a different co-loaded version than the operator
+                // intended. Prefer the model's configured default_version when
+                // it is still serving; otherwise the highest serving version,
+                // using the same semver-aware ordering reconcile applies.
+                let by_default = entry.default_version.clone().filter(|dv| serving(dv));
+                let replacement = by_default.or_else(|| {
+                    let candidates: Vec<String> = entry
+                        .versions
+                        .iter()
+                        .filter(|(_, mv)| mv.status.is_serving())
+                        .map(|(v, _)| v.clone())
+                        .collect();
+                    crate::server::pick_latest_version(&candidates)
+                });
+                if let Some(v) = replacement {
+                    self.active_versions.insert(model_name.to_string(), v);
                 }
             }
         }
@@ -596,6 +666,9 @@ impl ModelRegistry {
         if let Some(weights) = &strategy.weights {
             entry.weights = weights.clone();
         }
+        // Remembered so a later forced delete of the active version can restore
+        // the operator's declared default instead of guessing (see `remove`).
+        entry.default_version = strategy.default_version.clone();
         Ok(())
     }
 
@@ -706,6 +779,7 @@ mod tests {
             (VersionStatus::Loading, "loading"),
             (VersionStatus::WarmingUp, "warming_up"),
             (VersionStatus::Ready, "ready"),
+            (VersionStatus::Impaired, "impaired"),
             (VersionStatus::Degraded, "degraded"),
             (VersionStatus::Failed, "failed"),
             (VersionStatus::Unloading, "unloading"),
@@ -816,30 +890,44 @@ mod tests {
     }
 
     #[test]
-    fn active_version_is_ready_treats_degraded_as_serving() {
-        // Audit (0.8.0-rc0, B1 regression): `active_version_is_ready` gates
-        // reconcile's auto-activate fallback (reconcile.rs:120). It currently
-        // uses `is_ready`, which only accepts `Ready`. But `Degraded` is still
-        // SERVING — `routing_pick` (mod.rs:275) and `has_serving`
-        // (types.rs:179) both treat `Ready | Degraded` as serving, and a
-        // transient worker ejection (outlier) flips a version to `Degraded`
-        // while it keeps serving and self-heals. Reading a Degraded active
-        // version as "not usable" lets reconcile steal activation to
-        // `versions_loaded[0]` at runtime, abandoning the admin-intended
-        // (still-serving) version. The pin-stranded case B1 targets
-        // (Failed/Loading/WarmingUp/Pending) must still read false; Degraded
-        // must read true.
+    fn active_version_is_ready_treats_impaired_as_serving() {
+        // `active_version_is_ready` gates reconcile's auto-activate fallback
+        // (reconcile.rs:120). A partially-impaired version (some workers
+        // ejected) KEEPS SERVING — `routing_pick` and `has_serving` treat
+        // `Ready | Impaired` as serving and the circuit self-heals the slot.
+        // Reading an Impaired active version as "not usable" lets reconcile
+        // steal activation to `versions_loaded[0]` at runtime, abandoning the
+        // admin-intended (still-serving) version. The pin-stranded case B1
+        // targets (Failed/Loading/WarmingUp/Pending) must still read false.
         let reg = ModelRegistry::new();
         reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
             .unwrap();
         reg.mark_ready("m1", "1").unwrap();
         reg.activate_version("m1", "1").unwrap();
-        // Runtime: a worker is ejected → version degrades but KEEPS SERVING.
-        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        // Runtime: a worker is ejected → version is impaired but KEEPS SERVING.
+        reg.set_status("m1", "1", VersionStatus::Impaired).unwrap();
         assert!(
             reg.active_version_is_ready("m1"),
-            "a Degraded active version is still serving (Ready|Degraded) and \
+            "an Impaired active version is still serving (Ready|Impaired) and \
              must read as usable, else reconcile steals activation at runtime"
+        );
+    }
+
+    #[test]
+    fn active_version_is_ready_rejects_a_degraded_version() {
+        // `Degraded` means NO worker is left in rotation, so the version does
+        // not serve. Reconcile is then free to re-activate a usable version
+        // rather than leaving the model bound to one that cannot answer.
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        reg.activate_version("m1", "1").unwrap();
+        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        assert!(
+            !reg.active_version_is_ready("m1"),
+            "a Degraded active version has no usable worker and must not read \
+             as serving"
         );
     }
 
@@ -908,8 +996,8 @@ mod tests {
         assert_eq!(first.status, VersionStatus::Ready);
         let stamped = first.loaded_at.expect("loaded_at stamped on first Ready");
 
-        // Degraded → Ready (coordinator / respawn path) preserves the stamp.
-        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        // Impaired → Ready (coordinator / respawn path) preserves the stamp.
+        reg.set_status("m1", "1", VersionStatus::Impaired).unwrap();
         reg.mark_ready("m1", "1").unwrap();
         let second = reg.get("m1", Some("1")).unwrap();
         assert_eq!(second.loaded_at, Some(stamped));
@@ -1087,9 +1175,14 @@ mod tests {
             assert_eq!(reg.routing_pick("m1"), Some("2".to_string()));
         }
 
-        // Degraded still counts as serving.
-        reg.set_status("m1", "2", VersionStatus::Degraded).unwrap();
+        // Impaired still counts as serving.
+        reg.set_status("m1", "2", VersionStatus::Impaired).unwrap();
         assert_eq!(reg.routing_pick("m1"), Some("2".to_string()));
+
+        // Degraded does not: no worker is left in rotation, so routing must not
+        // hand it traffic (callers fall back to the active version).
+        reg.set_status("m1", "2", VersionStatus::Degraded).unwrap();
+        assert_eq!(reg.routing_pick("m1"), None);
     }
 
     #[test]
@@ -1168,16 +1261,93 @@ mod tests {
         assert!(status.serving_model_names().is_empty());
     }
 
+    fn strategy_with_default(default: Option<&str>) -> crate::config::ModelStrategyConfig {
+        crate::config::ModelStrategyConfig {
+            name: "m1".to_string(),
+            load_policy: "explicit".to_string(),
+            default_version: default.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// With no configured `default_version`, the replacement for a deleted
+    /// active version must be DETERMINISTIC. It used to be "the first serving
+    /// version found while iterating a `HashMap`" — neither the newest nor the
+    /// configured default, and different from run to run.
     #[test]
-    fn server_status_degraded_counts_as_serving() {
+    fn removing_the_active_version_picks_the_highest_serving_replacement() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2", "3"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.activate_version("m1", "2").unwrap();
+
+        reg.remove("m1", "2").unwrap();
+
+        assert_eq!(
+            reg.get_active_version("m1").as_deref(),
+            Some("3"),
+            "the replacement must be the highest serving version"
+        );
+    }
+
+    /// When the operator declared a `default_version` and traffic is on another
+    /// version, deleting the active one must restore the declared default —
+    /// not silently move to whatever else is co-loaded.
+    #[test]
+    fn removing_the_active_version_prefers_the_configured_default() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2", "3"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        // Declared default is 1; traffic is on 2.
+        reg.set_strategy("m1", &strategy_with_default(Some("1")))
+            .unwrap();
+        reg.activate_version("m1", "2").unwrap();
+
+        reg.remove("m1", "2").unwrap();
+
+        assert_eq!(
+            reg.get_active_version("m1").as_deref(),
+            Some("1"),
+            "deleting the active version must restore the configured default_version while it \
+             is still serving"
+        );
+    }
+
+    #[test]
+    fn server_status_impaired_counts_as_serving() {
         let reg = ModelRegistry::new();
         reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
             .unwrap();
-        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        reg.set_status("m1", "1", VersionStatus::Impaired).unwrap();
         let status = reg.server_status();
         assert!(status.has_serving());
         assert_eq!(status.serving_model_names(), vec!["m1".to_string()]);
         assert!(status.initializing().is_empty());
+    }
+
+    #[test]
+    fn server_status_degraded_is_not_serving() {
+        // Readiness must never claim a version serves when the request gate
+        // refuses it — that mismatch is what made /readyz return 200 while
+        // every inference to the model returned 503.
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        let status = reg.server_status();
+        assert!(!status.has_serving(), "Degraded has no usable worker");
+        assert!(status.serving_model_names().is_empty());
+        assert!(
+            !reg.is_ready("m1", Some("1")),
+            "the request gate must agree with the readiness rollup"
+        );
     }
 
     #[test]

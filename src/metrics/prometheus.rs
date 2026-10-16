@@ -100,13 +100,13 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
-    // P-WARM (§4.3): per-version readiness. 1 while serving (Ready/Degraded),
+    // P-WARM (§4.3): per-version readiness. 1 while serving (Ready/Impaired),
     // 0 otherwise (Pending/Loading/WarmingUp/Failed/Unloading) — so a version
     // held in WarmingUp or parked in Failed is visible to scrapers/LB checks.
     pub static ref MODEL_READY: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
             "liteserver_model_ready",
-            "1 when the version is serving (Ready/Degraded), 0 otherwise (incl. WarmingUp/Failed)"
+            "1 when the version is serving (Ready/Impaired), 0 otherwise (incl. WarmingUp/Failed)"
         ),
         &["model", "version"]
     ).unwrap();
@@ -1155,7 +1155,7 @@ pub fn remove_version_weight(model: &str, version: &str) {
     let _ = VERSION_WEIGHT.remove_label_values(&[model, version]);
 }
 
-/// P-WARM (§4.3): set per-version readiness (1 = serving Ready/Degraded,
+/// P-WARM (§4.3): set per-version readiness (1 = serving Ready/Impaired,
 /// 0 = not serving, incl. WarmingUp/Failed). Called from the health sync on
 /// every status transition so the gauge tracks the live state machine.
 pub fn set_model_ready(model: &str, version: &str, ready: bool) {

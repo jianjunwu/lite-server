@@ -25,20 +25,35 @@ pub(super) struct GrpcHealthState {
 pub(super) type GrpcHealthHandle = Arc<RwLock<Option<GrpcHealthState>>>;
 
 /// Push registry health to the gRPC Health service (phase 3):
-/// - service `""` — whole server: SERVING while any version is Ready/Degraded
-/// - service `"{model}"` — SERVING when the model's active version is
-///   Ready/Degraded; Loading/Failed/no-active → NOT_SERVING
+/// - service `""` — whole server: SERVING while any version is serving
+/// - service `"{model}"` — SERVING when the model's active version is serving;
+///   Loading/Failed/no-active → NOT_SERVING
 ///
-/// Degraded counts as SERVING: it still takes traffic. Services for models
-/// no longer in the registry are cleared.
+/// "Serving" is exactly [`VersionStatus::is_serving`] — `Ready` or `Impaired`.
+/// `Degraded` is NOT serving (no worker left in rotation), and the same
+/// predicate gates the request paths, so a client can never get a 200 from
+/// health and a 503 from inference. Services for models no longer in the
+/// registry are cleared.
 async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
     use tonic_health::ServingStatus;
+
+    let status = registry.server_status();
+
+    // P-WARM (§4.3): mirror per-version readiness to Prometheus BEFORE the
+    // reporter check below. The gauge tracks the state machine, not gRPC: with
+    // gRPC disabled (`grpc.enabled: false` / `--no-grpc`) there is no reporter,
+    // so doing this inside the reporter scope left `liteserver_model_ready`
+    // never written — an orchestrator or alert scraping it saw nothing while
+    // /readyz and inference behaved normally. Same predicate as the gRPC status
+    // and the request gate, so the three cannot disagree.
+    for e in &status.entries {
+        crate::metrics::prometheus::set_model_ready(&e.name, &e.version, e.status.is_serving());
+    }
 
     let mut guard = handle.write().await;
     let Some(state) = guard.as_mut() else {
         return;
     };
-    let status = registry.server_status();
 
     let overall = if status.has_serving() {
         ServingStatus::Serving
@@ -59,16 +74,15 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
     for e in &status.entries {
         // Per-version service "{model}/{version}" (§4.5).
         let version_svc = format!("{}/{}", e.name, e.version);
-        let version_serving = matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded);
+        let version_serving = e.status.is_serving();
         let version_status = if version_serving {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
         };
-        // P-WARM (§4.3): mirror the per-version readiness to Prometheus so a
-        // WarmingUp/Failed version is visible to scrapers (gRPC health only
-        // carries a binary serving/not-serving per service).
-        crate::metrics::prometheus::set_model_ready(&e.name, &e.version, version_serving);
+        // The P-WARM readiness gauge is written above, outside the reporter
+        // scope (gRPC health only carries a binary serving/not-serving per
+        // service, and the gauge must exist even when gRPC does not).
         state
             .reporter
             .set_service_status(version_svc.clone(), version_status)
@@ -87,7 +101,7 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
                     .iter()
                     .find(|e2| e2.name == e.name && e2.version == v)
             })
-            .map(|e2| matches!(e2.status, VersionStatus::Ready | VersionStatus::Degraded))
+            .map(|e2| e2.status.is_serving())
             .unwrap_or(false);
         let svc_status = if serving {
             ServingStatus::Serving
@@ -124,23 +138,75 @@ fn reconcile_version_status(
     outlier: Option<&OutlierState>,
 ) -> Option<VersionStatus> {
     let mv = registry.get(model_name, Some(version))?;
-    match mv.status {
-        VersionStatus::Ready | VersionStatus::Degraded => {}
-        _ => return None,
+    // Only the states this coordinator owns are reconciled; the load-phase
+    // states (Pending/Loading/WarmingUp/Failed/Unloading) belong to the load
+    // path, and Failed deliberately does not self-heal here.
+    if !matches!(
+        mv.status,
+        VersionStatus::Ready | VersionStatus::Impaired | VersionStatus::Degraded
+    ) {
+        return None;
     }
+    // An ensemble owns no workers of its own: its readiness is its
+    // DEPENDENCIES'. Every step must be runnable for any request to succeed, so
+    // "some sub-models down" is not a partially-serving state — the ensemble
+    // refuses traffic, which is also what the executor does per step. Recording
+    // the deps (at plan parse) is what makes this derivable; while they are
+    // still UNKNOWN this returns no change, i.e. the load-time `Ready`, and the
+    // executor's per-step gate remains the only protection — exactly the
+    // previous behaviour, so nothing regresses on that path.
+    if mv.model_type == crate::registry::types::ModelType::Ensemble {
+        let deps = registry.ensemble_deps(model_name, version)?;
+        let steps_runnable = deps.iter().all(|(dep_model, dep_version)| {
+            match registry.get(dep_model, dep_version.as_deref()) {
+                // Absent (or no active version): the executor auto-loads
+                // sub-models on demand (`ensure_sub_model_loaded`), so this is
+                // NOT a serving failure — treating it as one would gate out the
+                // very request whose execution triggers the load.
+                None => true,
+                Some(dep) => match dep.status {
+                    // Settled non-serving: this step cannot run, and no
+                    // in-flight load is going to change that on its own.
+                    VersionStatus::Degraded | VersionStatus::Failed => false,
+                    // Serving, or still working its way there (a load is in
+                    // flight) — not a settled failure.
+                    _ => true,
+                },
+            }
+        });
+        let target = if steps_runnable {
+            VersionStatus::Ready
+        } else {
+            VersionStatus::Degraded
+        };
+        return (target != mv.status).then_some(target);
+    }
+
     let total = mv.workers.len();
     let healthy = match outlier {
         Some(o) => mv
             .workers
             .iter()
-            .filter(|w| !o.is_ejected(w.worker_id as usize))
+            .filter(|w| o.is_usable(w.worker_id as usize))
             .count(),
         None => total,
     };
-    let target = if total > 0 && healthy == total {
-        VersionStatus::Ready
-    } else {
+    let target = if total == 0 {
+        // A LitAPI version with no workers at all cannot serve. (An ensemble
+        // has no workers by design and was handled above.)
         VersionStatus::Degraded
+    } else if healthy == total {
+        VersionStatus::Ready
+    } else if healthy == 0 {
+        // Nothing usable left in rotation. The outlier breaker cannot recover
+        // this on its own, so the version genuinely stops serving.
+        VersionStatus::Degraded
+    } else {
+        // Some workers ejected, the rest still taking traffic — the ORDINARY
+        // outcome of the outlier breaker, so it must stay servable. Reporting
+        // this as Degraded is what previously made one tripped worker 503 an
+        // entire model while every readiness surface called it healthy.
+        VersionStatus::Impaired
     };
     (target != mv.status).then_some(target)
 }
@@ -173,15 +239,51 @@ impl WorkerManager {
         self.queue_grpc_health_sync();
     }
 
-    /// Mark a version Degraded after a runtime worker loss (e.g. respawn
-    /// failure). The coordinator takes it from there; outlier recovery can
-    /// bring it back to Ready.
-    pub(super) fn mark_degraded(&self, model_name: &str, version: &str) {
-        if let Err(e) = self
-            .registry
-            .set_status(model_name, version, VersionStatus::Degraded)
-        {
-            warn!(model = %model_name, version = %version, "failed to mark version degraded: {}", e);
+    /// Re-derive and apply this version's serving state right now from the
+    /// current worker facts (ejection + death), instead of waiting for a
+    /// coordinator tick. The coordinator may be disabled entirely
+    /// (`health_check_interval == 0`), and an event-driven caller must not
+    /// leave a stale state standing in the meantime.
+    ///
+    /// Uses the same derivation as the coordinator (`reconcile_version_status`),
+    /// so a partially-impaired version lands on `Impaired` — still serving —
+    /// and only a version with no usable worker left lands on `Degraded`.
+    pub(super) async fn reconcile_status_now(&self, model_name: &str, version: &str) {
+        let outlier = self.get_outlier_state(model_name, version).await;
+        match reconcile_version_status(&self.registry, model_name, version, outlier.as_deref()) {
+            // `mark_ready` rather than `set_status` so a genuine recovery keeps
+            // the original load timestamp and clears any stale failure reason.
+            Some(VersionStatus::Ready) => {
+                if let Err(e) = self.registry.mark_ready(model_name, version) {
+                    warn!(
+                        model = %model_name, version = %version,
+                        "failed to mark version ready: {}", e
+                    );
+                }
+                self.queue_grpc_health_sync();
+            }
+            Some(other) => self.set_version_status(model_name, version, other),
+            None => {}
+        }
+    }
+
+    /// Apply an explicit serving state for a version and refresh gRPC health.
+    ///
+    /// Sync so the worker-respawn error paths (which cannot await, being
+    /// `inspect_err` closures) can re-assert the state the caller derived
+    /// before the spawn attempt. Callers are responsible for having derived
+    /// `status` from the worker facts — do not hand-code a state here.
+    pub(super) fn set_version_status(
+        &self,
+        model_name: &str,
+        version: &str,
+        status: VersionStatus,
+    ) {
+        if let Err(e) = self.registry.set_status(model_name, version, status) {
+            warn!(
+                model = %model_name, version = %version, status = ?status,
+                "failed to set version status: {}", e
+            );
         }
         self.queue_grpc_health_sync();
     }
@@ -334,13 +436,52 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_ready_with_ejected_worker_degrades() {
+    fn reconcile_ready_with_one_ejected_worker_becomes_impaired() {
+        // A partially-impaired version is the ORDINARY outcome of the outlier
+        // breaker (default threshold: 3 consecutive errors), so it must stay
+        // servable — `Impaired`, not `Degraded`. `Degraded` now means "no
+        // worker left"; emitting it here would take the whole model out of
+        // service because a single slot tripped, while every readiness surface
+        // still reported it healthy.
         let reg = ready_registry(2);
         let outlier = OutlierState::new(2);
         for _ in 0..3 {
             outlier.record_error(0);
         }
         assert!(outlier.is_ejected(0));
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            Some(VersionStatus::Impaired)
+        );
+    }
+
+    #[test]
+    fn reconcile_ready_with_every_worker_ejected_degrades() {
+        // Nothing usable left: the circuit cannot recover this on its own, so
+        // the version genuinely stops serving.
+        let reg = ready_registry(2);
+        let outlier = OutlierState::new(2);
+        // `force_eject` because the default max-ejection-percent cap (50% of
+        // 2 slots = 1) would refuse the second outlier-driven ejection.
+        assert!(outlier.force_eject(0));
+        assert!(outlier.force_eject(1));
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            Some(VersionStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn reconcile_ready_with_a_dead_worker_counts_it_unusable() {
+        // The crash monitor marks a slot dead WITHOUT ejecting it (`mark_dead`
+        // deliberately leaves the circuit alone so the health checker keeps
+        // observing the slot), so counting ejections alone would report a
+        // version as fully healthy while every request to it fails on the dead
+        // worker. This is the readiness half of that defect.
+        let reg = ready_registry(1);
+        let outlier = OutlierState::new(1);
+        outlier.mark_dead(0);
+        assert!(!outlier.is_ejected(0), "test setup: death does not eject");
         assert_eq!(
             reconcile_version_status(&reg, "m", "1", Some(&outlier)),
             Some(VersionStatus::Degraded)
@@ -422,5 +563,133 @@ mod tests {
             reconcile_version_status(&reg, "m", "1", Some(&outlier)),
             None
         );
+    }
+
+    /// An ensemble owns no workers, so its readiness has to come from its
+    /// DEPENDENCIES. The executor gates every step on the sub-model being
+    /// strictly ready, so an ensemble that advertises `Ready` while a sub-model
+    /// is down reports one thing to `/readyz` (and gRPC Health) and does another
+    /// to every client — all requests 503.
+    #[test]
+    fn reconcile_ensemble_follows_its_sub_models() {
+        let reg = ModelRegistry::new();
+        reg.register(
+            "ens",
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::Ensemble,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.mark_ready("ens", "1").unwrap();
+        reg.register(
+            "sub",
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::LitAPI,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.mark_ready("sub", "1").unwrap();
+        reg.activate_version("sub", "1").unwrap();
+
+        // Deps UNKNOWN (plan not parsed yet) → no change, so the load-time
+        // Ready stands and the executor's per-step gate remains the protection.
+        assert_eq!(reconcile_version_status(&reg, "ens", "1", None), None);
+
+        // `None` version = resolved at execution time, i.e. the sub-model's
+        // active version — how the executor resolves it too.
+        reg.set_ensemble_deps("ens", "1", vec![("sub".to_string(), None)]);
+        assert_eq!(
+            reconcile_version_status(&reg, "ens", "1", None),
+            None,
+            "a dependency that is serving must leave the ensemble Ready"
+        );
+
+        // A dependency that is not loaded at all must NOT degrade the ensemble:
+        // the executor auto-loads sub-models on demand, so gating the request
+        // here would block the very request that triggers the load. Same for a
+        // load in flight.
+        reg.set_ensemble_deps(
+            "ens",
+            "1",
+            vec![("never_loaded".to_string(), None)],
+        );
+        assert_eq!(
+            reconcile_version_status(&reg, "ens", "1", None),
+            None,
+            "an unloaded sub-model is auto-loadable, not a serving failure"
+        );
+        reg.set_status("sub", "1", VersionStatus::WarmingUp).unwrap();
+        reg.set_ensemble_deps("ens", "1", vec![("sub".to_string(), None)]);
+        assert_eq!(
+            reconcile_version_status(&reg, "ens", "1", None),
+            None,
+            "a sub-model that is still loading must not degrade the ensemble"
+        );
+        reg.mark_ready("sub", "1").unwrap();
+
+        // The sub-model loses its last worker → the ensemble is not serving
+        // either, and must say so. Apply the transition the coordinator would,
+        // so the recovery below is a real round-trip rather than a no-op against
+        // an unchanged status.
+        reg.set_status("sub", "1", VersionStatus::Degraded).unwrap();
+        let down = reconcile_version_status(&reg, "ens", "1", None);
+        assert_eq!(
+            down,
+            Some(VersionStatus::Degraded),
+            "an ensemble whose dependency cannot serve must not advertise itself as ready"
+        );
+        reg.set_status("ens", "1", down.unwrap()).unwrap();
+
+        // ... and it recovers when the dependency does.
+        reg.mark_ready("sub", "1").unwrap();
+        assert_eq!(
+            reconcile_version_status(&reg, "ens", "1", None),
+            Some(VersionStatus::Ready)
+        );
+    }
+
+    /// P-WARM: the per-version readiness gauge must be written even when gRPC
+    /// health is disabled. It used to be set only INSIDE the reporter scope,
+    /// which returns early when no reporter is installed (`grpc.enabled: false`
+    /// / `--no-grpc`) — so `liteserver_model_ready` was never emitted at all,
+    /// and an orchestrator or alert scraping it saw nothing while `/readyz` and
+    /// inference behaved perfectly normally.
+    #[tokio::test]
+    async fn model_ready_gauge_is_written_without_a_grpc_reporter() {
+        const MODEL: &str = "gauge-without-grpc";
+        crate::metrics::prometheus::remove_model_ready(MODEL, "1");
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_READY
+                .with_label_values(&[MODEL, "1"])
+                .get(),
+            0.0,
+            "precondition: the gauge starts clear, so a stale value cannot pass this test"
+        );
+
+        let reg = ModelRegistry::new();
+        reg.register(
+            MODEL,
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::LitAPI,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.mark_ready(MODEL, "1").unwrap();
+
+        // No reporter installed — the early return this test exists for.
+        let handle: GrpcHealthHandle = Arc::new(tokio::sync::RwLock::new(None));
+        sync_grpc_health(&reg, &handle).await;
+
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_READY
+                .with_label_values(&[MODEL, "1"])
+                .get(),
+            1.0,
+            "the serving-state gauge must be written whether or not gRPC health is running"
+        );
+        crate::metrics::prometheus::remove_model_ready(MODEL, "1");
     }
 }

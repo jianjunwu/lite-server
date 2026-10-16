@@ -502,6 +502,21 @@ impl OutlierState {
         true
     }
 
+    /// Can this slot take traffic right now — neither ejected (circuit open)
+    /// nor dead (process exited)?
+    ///
+    /// The single predicate behind "how many workers are left", which drives
+    /// the version's serving state (`reconcile_version_status`): `Ready` when
+    /// every slot is usable, `Impaired` when some are, `Degraded` when none
+    /// are. `is_ejected` alone is not enough — the crash monitor marks a slot
+    /// dead without ejecting it (`mark_dead` deliberately leaves the circuit
+    /// alone so the health checker can keep observing it), so counting only
+    /// ejections reports a version as fully healthy while every request to it
+    /// fails on the dead slot.
+    pub fn is_usable(&self, worker_idx: usize) -> bool {
+        !self.is_ejected(worker_idx) && !self.is_dead(worker_idx)
+    }
+
     /// Is the worker's process known to be dead? (false for unknown index)
     pub fn is_dead(&self, worker_idx: usize) -> bool {
         self.workers

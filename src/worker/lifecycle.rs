@@ -533,7 +533,17 @@ impl WorkerManager {
         // false-positive on comments mentioning "ensemble:")
         let mut is_ensemble = false;
         let mut ensemble_content: Option<String> = None;
+        let mut config_mtime: Option<std::time::SystemTime> = None;
         if config_yaml.exists() {
+            // Stat BEFORE the read. The plan cached below carries this value,
+            // and the cache's interval re-check compares mtimes — a mtime taken
+            // AFTER the parse could pin the new value onto the content we are
+            // about to parse, so a config write landing in between would be
+            // mistaken for a fresh plan and the stale one served indefinitely.
+            config_mtime = tokio::fs::metadata(&config_yaml)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok());
             if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
                 if crate::config::config_content_is_ensemble(&content) {
                     is_ensemble = true;
@@ -594,12 +604,26 @@ impl WorkerManager {
                 let config_path = config_yaml.clone();
                 match crate::ensemble::parse_ensemble_plan(content, &config_path) {
                     Ok(plan) => {
+                        // Record the dependency set so the status coordinator can
+                        // derive this version's readiness from it: an ensemble
+                        // owns no workers, so without this its status can only
+                        // ever be the load-time `Ready` while the executor 503s
+                        // whenever a sub-model is down.
+                        self.registry.set_ensemble_deps(
+                            model_name,
+                            version,
+                            plan.steps
+                                .iter()
+                                .map(|s| (s.model.clone(), s.version.clone()))
+                                .collect(),
+                        );
                         plans.insert_ready(
                             crate::ensemble::PlanKey {
                                 model: model_name.to_string(),
                                 version: version.to_string(),
                             },
                             std::sync::Arc::new(plan),
+                            config_mtime,
                         );
                     }
                     Err(e) => {
@@ -626,6 +650,19 @@ impl WorkerManager {
                 version.to_string(),
             );
             crate::metrics::prometheus::record_model_load(model_name, version, true);
+            // Same coordinator as a worker-backed version: it re-derives this
+            // version's serving state from its recorded dependencies on each
+            // tick (see `reconcile_version_status`), so a sub-model going down
+            // stops the ensemble from advertising itself as ready. `0` keeps the
+            // documented event-driven-only behaviour.
+            if model_config.health_check_interval > 0.0 {
+                self.start_status_coordinator(
+                    model_name,
+                    version,
+                    Duration::from_secs_f32(model_config.health_check_interval),
+                )
+                .await;
+            }
             self.sync_grpc_health().await;
             info!("Ensemble {} version {} loaded", model_name, version);
             return Ok(());
@@ -999,7 +1036,7 @@ impl WorkerManager {
             }
         }
 
-        // Status coordinator: periodic Ready/Degraded reconciliation at the
+        // Status coordinator: periodic Ready/Impaired/Degraded reconciliation at the
         // configured cadence; 0 disables it (status stays event-driven).
         if model_config.health_check_interval > 0.0 {
             self.start_status_coordinator(
@@ -2441,7 +2478,7 @@ class TestAPI(LitAPI):
             model: "m".to_string(),
             version: "1".to_string(),
         };
-        cache.insert_ready(key.clone(), Arc::new(plan));
+        cache.insert_ready(key.clone(), Arc::new(plan), None);
         assert!(cache.plans.get(&key).is_some(), "precondition: plan cached");
 
         wm.force_unload_version("m", "1")

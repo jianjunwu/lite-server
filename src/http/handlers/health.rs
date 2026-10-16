@@ -27,7 +27,7 @@ pub async fn livez_handler(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({"status": "alive"})).into_response()
 }
 
-/// Readiness: 200 while at least one version can serve (Ready or Degraded);
+/// Readiness: 200 while at least one version can serve (Ready or Impaired);
 /// 503 otherwise. A single failed model never takes readiness down. C3 (P4-2):
 /// also 503 once draining — readiness is the primary LB摘流 signal.
 pub async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {

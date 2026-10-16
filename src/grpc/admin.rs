@@ -129,10 +129,9 @@ async fn pump_download_chunks(
                 // here would read as a successful short download.
                 let _ = tokio::time::timeout(
                     DOWNLOAD_SEND_TIMEOUT,
-                    tx.send(Err(Status::internal(format!(
-                        "read {} failed mid-download",
-                        path.display()
-                    )))),
+                    // The offending path was logged above; keep it out of the
+                    // client-visible Status (D4).
+                    tx.send(Err(Status::internal("read failed mid-download"))),
                 )
                 .await;
                 return;
@@ -162,6 +161,7 @@ fn version_status_str(s: &VersionStatus) -> &'static str {
         Loading => "loading",
         WarmingUp => "warming_up",
         Ready => "ready",
+        Impaired => "impaired",
         Degraded => "degraded",
         Failed => "failed",
         Unloading => "unloading",
@@ -378,7 +378,19 @@ impl Admin for GrpcAdminService {
             .join(&model_name)
             .join(&version)
             .join("config.yaml");
-        let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+        // M7 (fail-closed): a config.yaml that fails to load must fail the
+        // RPC, not silently substitute `ModelConfig::default()` — that drops
+        // `policies` (auth / rate-limit gates) while the model still loads and
+        // serves. Mirrors the HTTP load path (http/handlers/admin.rs) and the
+        // ensemble autoload site.
+        let mut config = match crate::config::load_model_config(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(to_status(AppError::Config(format!(
+                    "invalid config.yaml for {model_name}/{version}: {e}"
+                ))));
+            }
+        };
         self.app_state.config.apply_model_defaults(&mut config);
 
         self.app_state
@@ -1117,11 +1129,13 @@ impl Admin for GrpcAdminService {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("DownloadModel: open {} failed: {}", src.path.display(), e);
+                // The offending path was logged above; keep it out of the
+                // client-visible Status (D4 — no path leak).
                 return Err(match e.kind() {
                     std::io::ErrorKind::NotFound => {
-                        Status::not_found(format!("{} no longer exists", src.path.display()))
+                        Status::not_found("model artifact no longer exists")
                     }
-                    _ => Status::internal(format!("failed to open {}", src.path.display())),
+                    _ => Status::internal("failed to open model artifact"),
                 });
             }
         };
@@ -2459,6 +2473,59 @@ mod tests {
             resp.is_err(),
             "an open failure must fail the RPC; today it returns OK with \
              a zero-chunk stream"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// M7 (fail-closed): a `config.yaml` whose `policies.auth.keys` references
+    /// an UNSET `${VAR}` is a load error. The gRPC LoadModel path must fail
+    /// with a status naming the config problem — never `unwrap_or_default()`,
+    /// which would load the model with its auth/rate-limit policies silently
+    /// gone (enforce_auth then returns Ok for every request).
+    #[tokio::test]
+    async fn load_model_with_unset_env_var_fails_instead_of_dropping_policies() {
+        let repo = unique_repo("load-cfg-env");
+        let dir = repo.join("cfgm").join("1");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("model.py"), "def predict(x): return x")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  auth:\n    header: x-api-key\n    keys: [\"${LITESERVER_TEST_UNSET_KEY}\"]\n",
+        )
+        .await
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            registry.clone(),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let err = client
+            .load_model(pb::LoadModelRequest {
+                model_name: "cfgm".to_string(),
+                version: "1".to_string(),
+            })
+            .await
+            .expect_err("an unloadable config.yaml must fail the RPC");
+        // Config errors map to the 400 class (InvalidArgument), like the HTTP
+        // load path; the detail (which variable is unset) is server-side only.
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "an unloadable config.yaml must fail as a config error, got: {err}"
+        );
+        assert!(
+            registry.get("cfgm", Some("1")).is_none(),
+            "the model must NOT be loaded with its policies dropped"
         );
 
         let _ = shutdown_tx.send(());

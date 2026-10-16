@@ -6,10 +6,12 @@ use std::time::SystemTime;
 /// Explicit lifecycle state machine for a model version.
 ///
 /// ```text
-/// Pending ──spawn──▶ Loading ──handshake──▶ WarmingUp ──ok──▶ Ready ◀──▶ Degraded
+/// Pending ──spawn──▶ Loading ──handshake──▶ WarmingUp ──ok──▶ Ready ◀──▶ Impaired
 ///                      │                         │                ▲            │
 ///                      │                         └──fail──▶ Failed       (coordinator
 ///                      └──load failure──▶ Failed                  reconciles)
+///                                                                              │
+///                                                         all workers gone ──▶ Degraded
 /// ```
 ///
 /// `WarmingUp` (P-WARM): workers have handshaked but the model is still being
@@ -19,9 +21,17 @@ use std::time::SystemTime;
 /// like a load failure.
 ///
 /// `Failed` is only set during load/warmup (startup crash / timeout / warmup
-/// failure); runtime worker loss is `Degraded` (outlier ejection auto-recovers).
-/// The status coordinator is the sole writer of `Ready`/`Degraded` transitions
-/// at runtime; `Loading`→`WarmingUp`→`Ready` stays event-driven in the load path.
+/// failure); runtime worker loss is `Impaired` while at least one worker still
+/// serves, and `Degraded` once none does (outlier ejection auto-recovers from
+/// either). The status coordinator is the sole writer of the
+/// `Ready`/`Impaired`/`Degraded` transitions at runtime;
+/// `Loading`→`WarmingUp`→`Ready` stays event-driven in the load path.
+///
+/// Serving axis — the only question request gates should ask: `Ready |
+/// Impaired`. Use [`VersionStatus::is_serving`] rather than writing the match
+/// by hand, and do not treat `Degraded` as "still takes traffic": conflating
+/// the two is what previously made a single ejected worker 503 an entire model
+/// while every readiness surface reported it serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionStatus {
@@ -34,12 +44,33 @@ pub enum VersionStatus {
     WarmingUp,
     /// All workers healthy, serving traffic.
     Ready,
-    /// Serving but impaired (some/all workers ejected).
+    /// Serving with SOME workers ejected (circuit open). Requests are accepted
+    /// and routing skips the impaired workers; the circuit's half-open probe
+    /// recovers the slot lazily. This is the ordinary outcome of the outlier
+    /// breaker, so it must keep taking traffic — refusing it would 503 the
+    /// whole model because one worker tripped.
+    Impaired,
+    /// NOT serving: no worker is left in rotation (all ejected or dead). The
+    /// outlier breaker cannot recover this by itself, so requests are refused
+    /// until a replacement worker is up.
     Degraded,
     /// Load/warmup failed; does not accept requests.
     Failed,
     /// Unload in progress.
     Unloading,
+}
+
+impl VersionStatus {
+    /// True when this version can serve requests: `Ready` (all workers
+    /// healthy) or `Impaired` (some ejected, the rest still taking traffic).
+    ///
+    /// Single source of truth for the serving axis — request gates, readiness
+    /// rollups, the gRPC health mapping and `routing_pick` must all agree, or a
+    /// version reports one thing to an orchestrator and does another to a
+    /// client.
+    pub fn is_serving(self) -> bool {
+        matches!(self, VersionStatus::Ready | VersionStatus::Impaired)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +89,13 @@ pub struct ModelEntry {
     /// `register` initializes `ModelVersion.weight` from this map.
     #[serde(default)]
     pub weights: HashMap<String, u32>,
+    /// `orchestration.models[].default_version` as configured. The active
+    /// pointer normally already is this version, so the value is only consulted
+    /// when something removes the active version (`ModelRegistry::remove`) —
+    /// there it distinguishes the operator's declared intent from an arbitrary
+    /// co-loaded version.
+    #[serde(default)]
+    pub default_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,7 +115,7 @@ pub struct ModelVersion {
     pub model_dir: PathBuf,
     pub workers: Vec<WorkerInfo>,
     /// When the version first entered `Ready` (handshake completed). `None`
-    /// while still Pending/Loading and preserved across Ready↔Degraded.
+    /// while still Pending/Loading and preserved across any transition.
     #[serde(default)]
     pub loaded_at: Option<SystemTime>,
     /// Last time a request was routed to this version (coarse, 1s granularity;
@@ -144,6 +182,7 @@ impl ModelEntry {
             load_policy: LoadPolicy::default(),
             max_loaded_versions: None,
             weights: HashMap::new(),
+            default_version: None,
         }
     }
 }
@@ -170,11 +209,9 @@ pub struct ServerStatus {
 }
 
 impl ServerStatus {
-    /// Any version able to serve traffic (Ready or Degraded).
+    /// Any version able to serve traffic (`Ready` or `Impaired`).
     pub fn has_serving(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+        self.entries.iter().any(|e| e.status.is_serving())
     }
 
     /// Versions still initializing (Pending / Loading / WarmingUp), as
@@ -199,7 +236,7 @@ impl ServerStatus {
         let mut names: Vec<String> = self
             .entries
             .iter()
-            .filter(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+            .filter(|e| e.status.is_serving())
             .map(|e| e.name.clone())
             .collect();
         names.dedup(); // entries sorted by name, so dedup suffices

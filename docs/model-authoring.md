@@ -515,8 +515,9 @@ Coverage, recovery, and observability semantics:
 - **Respawn re-warm** (`respawn: true`, default): a replacement worker after
   a crash/health-kill is re-warmed (pinned to its slot) before the version
   returns to `ready`. A failed re-warm ejects the cold slot — the version
-  stays `degraded` and the circuit's half-open probe can still recover it on
-  later traffic — and counts
+  stays `impaired` (still serving on its remaining workers; `degraded` is
+  reserved for "no worker left in rotation") and the circuit's half-open probe
+  can still recover it on later traffic — and counts
   `liteserver_worker_respawn_failures_total{reason="warmup"}`; it never marks
   the version `failed` (runtime recovery ≠ load failure).
 - **Budgets and pacing**: `timeout_secs` bounds each dummy inference;
