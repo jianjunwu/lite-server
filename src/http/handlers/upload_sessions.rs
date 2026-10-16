@@ -442,7 +442,20 @@ pub async fn put_session_chunk(
     // Re-read under the lock: the pre-lock state check was a TOCTOU against
     // a complete that assembles from these very chunk files (and against a
     // delete that removes the staging dir).
-    let meta = read_meta(&staging).await?;
+    let meta = match read_meta(&staging).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            // A delete that won the race removed the staging dir after our
+            // pre-lock create_dir_all/part-file setup, so the re-created
+            // chunk tree (with our temp part) would linger as an orphan
+            // without session.json. Sweep it before returning the 404.
+            let _ = tokio::fs::remove_file(&part).await;
+            if !meta_path(&staging).is_file() {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+            }
+            return Err(e);
+        }
+    };
     if meta.state != SessionState::Uploading {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(AppError::Conflict(
